@@ -98,10 +98,15 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Initialize Rust ecosystem
+      - name: Initialize Rust ecosystem (Native Host)
+        if: ${{ !matrix.use_cross }}
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+
+      - name: Initialize Rust ecosystem (Cross Container Host)
+        if: ${{ matrix.use_cross }}
+        uses: dtolnay/rust-toolchain@stable
 
       - name: Activate rust compilation caching
         uses: swatinem/rust-cache@v2
