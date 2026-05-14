@@ -47,7 +47,8 @@ pub async fn run_wintun_tunnel(
          $route = Get-NetRoute -DestinationPrefix '0.0.0.0/0' | Sort-Object RouteMetric | Select-Object -First 1\n\
          $gw = $route.NextHop\n\
          $ifIndex = $route.InterfaceIndex\n\
-         New-NetRoute -DestinationPrefix \"$remote_ip/32\" -NextHop $gw -InterfaceIndex $ifIndex -RouteMetric 1 -ErrorAction SilentlyContinue\n",
+         New-NetRoute -DestinationPrefix \"$remote_ip/32\" -NextHop $gw -InterfaceIndex $ifIndex -RouteMetric 1 -ErrorAction SilentlyContinue\n\
+         New-NetRoute -DestinationPrefix \"1.1.1.1/32\" -NextHop $gw -InterfaceIndex $ifIndex -RouteMetric 1 -ErrorAction SilentlyContinue\n",
         server_ip_str
     );
 
@@ -131,7 +132,8 @@ pub async fn run_wintun_tunnel(
     // 9. Run cleanup routing script
     let cleanup_script = format!(
         "$remote_ip = '{}'\n\
-         Remove-NetRoute -DestinationPrefix \"$remote_ip/32\" -Confirm:$false -ErrorAction SilentlyContinue\n",
+         Remove-NetRoute -DestinationPrefix \"$remote_ip/32\" -Confirm:$false -ErrorAction SilentlyContinue\n\
+         Remove-NetRoute -DestinationPrefix \"1.1.1.1/32\" -Confirm:$false -ErrorAction SilentlyContinue\n",
         server_ip_str
     );
 
