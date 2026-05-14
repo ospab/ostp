@@ -1,87 +1,16 @@
-# OSTP Hybrid Build Script (Windows Native + WSL Linux)
+# OSTP High-Performance Cross-Platform Build & Release Pipeline
 
 $ProjectRoot = Split-Path -Parent $PSScriptRoot
 Push-Location $ProjectRoot
 
-Write-Output "Starting OSTP Build Pipeline in $ProjectRoot"
+Write-Output "Starting Universal OSTP Build & Release Pipeline in $ProjectRoot"
 
-# Stop any currently running instances to release file locks on compiled binaries
+# Unblock binaries by terminating any existing active instances
 Stop-Process -Name ostp -ErrorAction SilentlyContinue | Out-Null
 
-$DistDir = Join-Path $ProjectRoot "dist"
-$WinDist = Join-Path $DistDir "windows"
-$LinuxDist = Join-Path $DistDir "linux"
-
-New-Item -ItemType Directory -Force -Path $WinDist | Out-Null
-New-Item -ItemType Directory -Force -Path $LinuxDist | Out-Null
-
-# Strictly purge old distribution binaries to prevent caching false positives
-Remove-Item -Path (Join-Path $WinDist "ostp.exe") -Force -ErrorAction SilentlyContinue | Out-Null
-Remove-Item -Path (Join-Path $LinuxDist "ostp") -Force -ErrorAction SilentlyContinue | Out-Null
-
-Write-Output "Building Windows Binary natively"
-$TempTarget = Join-Path $env:TEMP "ostp_target_build"
-$env:CARGO_TARGET_DIR = $TempTarget
-
-& cargo build --release --bin ostp
-
-if ($LASTEXITCODE -ne 0) {
-    Write-Output "❌ Windows build failed"
-    Pop-Location
-    exit 1
-}
-
-$WinExe = Join-Path $TempTarget "release\ostp.exe"
-if (Test-Path $WinExe) {
-    Copy-Item -Path $WinExe -Destination $WinDist -Force
-    Write-Output "✔ Windows binary successfully copied to: dist/windows/ostp.exe"
-} else {
-    Write-Output "❌ Windows binary not found after build"
-    Pop-Location
-    exit 1
-}
-
-# Reset target directory env
-Remove-Item Env:\CARGO_TARGET_DIR -ErrorAction SilentlyContinue | Out-Null
-
-Write-Output "Building Linux binary via WSL"
-if (Get-Command wsl -ErrorAction SilentlyContinue) {
-    # Anchor build target inside host workspace to persist artifacts across WSL session life-cycles
-    $LinuxBuildDir = Join-Path $ProjectRoot "target_linux"
-    New-Item -ItemType Directory -Force -Path $LinuxBuildDir | Out-Null
-    
-    $LinuxBuildUnix = $LinuxBuildDir.Replace("\", "/")
-    $WslBuildDir = & wsl wslpath -u $LinuxBuildUnix
-    
-    & wsl rustup target add x86_64-unknown-linux-musl
-    # Build directly into the host-mapped target_linux directory
-    & wsl env CC_x86_64_unknown_linux_musl=gcc CARGO_TARGET_DIR=$WslBuildDir cargo build --release --target x86_64-unknown-linux-musl --bin ostp
-    
-    if ($LASTEXITCODE -ne 0) {
-        Write-Output "❌ Linux build failed"
-        Pop-Location
-        exit 1
-    }
-    
-    # Native copy of the artifact entirely on host side (completely avoids wsl cp pitfalls)
-    $LinuxTargetBin = Join-Path $LinuxBuildDir "x86_64-unknown-linux-musl\release\ostp"
-    
-    if (Test-Path $LinuxTargetBin) {
-        Copy-Item -Path $LinuxTargetBin -Destination $LinuxDist -Force
-        Write-Output "✔ Linux binary successfully copied to dist/linux/ostp"
-    } else {
-        Write-Output "❌ Compiled Linux binary was not found at target: $LinuxTargetBin"
-        Pop-Location
-        exit 1
-    }
-} else {
-    Write-Output "⚠ WSL not available, skipping Linux server build"
-}
-
-Write-Output "Build Completed Successfully"
-
-# Automated metadata version increment
+# 1. Read and automatically bump version inside Cargo.toml PRIOR to compilation
 $CargoToml = Join-Path $ProjectRoot "Cargo.toml"
+$Version = "0.1.0"
 if (Test-Path $CargoToml) {
     $Content = [System.IO.File]::ReadAllText($CargoToml)
     if ($Content -match 'version\s*=\s*"(\d+)\.(\d+)\.(\d+)"') {
@@ -89,11 +18,183 @@ if (Test-Path $CargoToml) {
         $Minor = [int]$Matches[2]
         $Patch = [int]$Matches[3]
         $NewPatch = $Patch + 1
-        $NewVersionStr = 'version = "{0}.{1}.{2}"' -f $Major, $Minor, $NewPatch
+        $Version = "{0}.{1}.{2}" -f $Major, $Minor, $NewPatch
+        $NewVersionStr = 'version = "' + $Version + '"'
         $NewContent = $Content -replace 'version\s*=\s*"\d+\.\d+\.\d+"', $NewVersionStr
         [System.IO.File]::WriteAllText($CargoToml, $NewContent)
-        Write-Output "✔ Successfully bumped workspace version to $Major.$Minor.$NewPatch"
+        Write-Output "✔ Bounded workspace package to target release version: v$Version"
     }
+}
+
+$DistDir = Join-Path $ProjectRoot "dist"
+$StagingDir = Join-Path $DistDir "staging"
+
+# Wipe legacy artifacts to prepare a clean clean slate
+if (Test-Path $DistDir) { Remove-Item -Path $DistDir -Recurse -Force -ErrorAction SilentlyContinue }
+New-Item -ItemType Directory -Force -Path $DistDir | Out-Null
+
+# Collection for dynamically mapping successful build archives
+$ReleaseArchives = @()
+
+# ---------------------------------------------------------------------
+# PHASE 1: WINDOWS COMPILATION MATRIX (Native Host)
+# ---------------------------------------------------------------------
+$WindowsTargets = @(
+    @{ Target = "x86_64-pc-windows-msvc"; Arch = "x64"; BinaryName = "ostp.exe" },
+    @{ Target = "i686-pc-windows-msvc"; Arch = "x86"; BinaryName = "ostp.exe" }
+)
+
+Write-Output "========================================================="
+Write-Output " PHASE 1: Compiling Windows Architectures"
+Write-Output "========================================================="
+$TempWinTargetDir = Join-Path $env:TEMP "ostp_target_win"
+
+foreach ($item in $WindowsTargets) {
+    $target = $item.Target
+    $arch = $item.Arch
+    $bin = $item.BinaryName
+    
+    Write-Output "--> Compiling target: Windows $arch [$target]..."
+    
+    # Attempt setup of the rust toolchain for this architecture
+    & rustup target add $target 2>&1 | Out-Null
+    
+    $env:CARGO_TARGET_DIR = $TempWinTargetDir
+    & cargo build --release --target $target --bin ostp
+    
+    if ($LASTEXITCODE -eq 0) {
+        $compiledBin = Join-Path $TempWinTargetDir "$target\release\$bin"
+        if (Test-Path $compiledBin) {
+            $archiveName = "ostp-v$Version-windows-$arch.zip"
+            $targetStaging = Join-Path $StagingDir "windows-$arch"
+            New-Item -ItemType Directory -Force -Path $targetStaging | Out-Null
+            
+            # Stage and package binary natively
+            Copy-Item -Path $compiledBin -Destination $targetStaging -Force
+            
+            $archivePath = Join-Path $DistDir $archiveName
+            Compress-Archive -Path "$targetStaging\*" -DestinationPath $archivePath -Force
+            
+            $ReleaseArchives += $archivePath
+            Write-Output "✔ SUCCESSFULLY PACKAGED: $archiveName"
+        }
+    } else {
+        Write-Output "⚠ FAILED compiling Windows $arch ($target). Missing local platform C++ toolchain components."
+    }
+}
+# Restore environment variables
+Remove-Item Env:\CARGO_TARGET_DIR -ErrorAction SilentlyContinue | Out-Null
+
+# ---------------------------------------------------------------------
+# PHASE 2: LINUX CROSS-COMPILATION MATRIX (via WSL + rust-lld)
+# ---------------------------------------------------------------------
+Write-Output "`n========================================================="
+Write-Output " PHASE 2: Compiling Linux Architectures via WSL"
+Write-Output "========================================================="
+
+if (Get-Command wsl -ErrorAction SilentlyContinue) {
+    # Anchor output cache on Windows disk to survive WSL instance cycling
+    $LinuxBuildDir = Join-Path $ProjectRoot "target_linux"
+    New-Item -ItemType Directory -Force -Path $LinuxBuildDir | Out-Null
+    $LinuxBuildUnix = $LinuxBuildDir.Replace("\", "/")
+    $WslBuildDir = & wsl wslpath -u $LinuxBuildUnix
+
+    $LinuxTargets = @(
+        @{ Target = "x86_64-unknown-linux-musl"; Arch = "x64"; BinaryName = "ostp" },
+        @{ Target = "aarch64-unknown-linux-musl"; Arch = "arm64"; BinaryName = "ostp" },
+        @{ Target = "armv7-unknown-linux-musleabihf"; Arch = "armv7"; BinaryName = "ostp" }
+    )
+
+    foreach ($item in $LinuxTargets) {
+        $target = $item.Target
+        $arch = $item.Arch
+        $bin = $item.BinaryName
+        
+        Write-Output "--> Compiling target: Linux $arch [$target] via rust-lld..."
+        
+        & wsl rustup target add $target 2>&1 | Out-Null
+        
+        # Invoke Cargo cross-compiling via toolless rust-lld LLVM backend for Musl targets!
+        & wsl env RUSTFLAGS="-C linker=rust-lld" CARGO_TARGET_DIR=$WslBuildDir cargo build --release --target $target --bin ostp
+        
+        if ($LASTEXITCODE -eq 0) {
+            $compiledBin = Join-Path $LinuxBuildDir "$target\release\$bin"
+            if (Test-Path $compiledBin) {
+                $archiveName = "ostp-v$Version-linux-$arch.tar.gz"
+                $targetStaging = Join-Path $StagingDir "linux-$arch"
+                New-Item -ItemType Directory -Force -Path $targetStaging | Out-Null
+                
+                Copy-Item -Path $compiledBin -Destination $targetStaging -Force
+                
+                # Translate staging paths to Linux formats for WSL tar archiving
+                $wslStagingDir = & wsl wslpath -u ($targetStaging.Replace("\", "/"))
+                $wslArchiveFile = & wsl wslpath -u ((Join-Path $DistDir $archiveName).Replace("\", "/"))
+                
+                # Generate clean compressed tarball natively via WSL tar engine
+                & wsl tar -czf $wslArchiveFile -C $wslStagingDir $bin
+                
+                $ReleaseArchives += Join-Path $DistDir $archiveName
+                Write-Output "✔ SUCCESSFULLY PACKAGED: $archiveName"
+            }
+        } else {
+            Write-Output "⚠ FAILED compiling Linux $arch ($target)."
+        }
+    }
+} else {
+    Write-Output "⚠ WSL utility not discovered on host. Skipping Linux binary compilations."
+}
+
+# Dissolve staging buffer directory
+if (Test-Path $StagingDir) { Remove-Item -Path $StagingDir -Recurse -Force -ErrorAction SilentlyContinue }
+
+Write-Output "`n========================================================="
+Write-Output " RELEASE ARTIFACTS SUMMARY"
+Write-Output "========================================================="
+if ($ReleaseArchives.Count -gt 0) {
+    $ReleaseArchives | ForEach-Object { Write-Output " [+] $_" }
+} else {
+    Write-Output "❌ CRITICAL: No architectures compiled successfully."
+    Pop-Location
+    exit 1
+}
+
+# ---------------------------------------------------------------------
+# PHASE 3: AUTOMATED GITHUB PUBLISHING (Via User configured GH CLI)
+# ---------------------------------------------------------------------
+Write-Output "`n========================================================="
+Write-Output " PHASE 3: Automated GitHub Release Deployment"
+Write-Output "========================================================="
+
+if (Get-Command gh -ErrorAction SilentlyContinue) {
+    Write-Output "Assessing GitHub authentication credentials..."
+    & gh auth status *>&1 | Out-Null
+    
+    if ($LASTEXITCODE -eq 0) {
+        Write-Output "✔ GitHub authenticated. Pushing workspace changes and tagging..."
+        
+        # Synchronize current Git tree to ensure tag maps to active HEAD
+        & git add Cargo.toml; & git commit -m "Release preparation: bump version to v$Version [skip ci]"; & git push
+        
+        Write-Output "Constructing Release on remote repository..."
+        
+        # Assemble formatted array of quotes paths for release payloads
+        $FilePaths = $ReleaseArchives | ForEach-Object { "`"$_`"" }
+        
+        # Trigger gh release mechanism with automated changelog generation
+        $ReleaseCmd = "gh release create v$Version --title `"Release v$Version`" --notes `"Official cross-platform distribution of Ospab Stealth Transport Protocol (OSTP).`" --generate-notes " + ($FilePaths -join " ")
+        
+        Invoke-Expression $ReleaseCmd
+        
+        if ($LASTEXITCODE -eq 0) {
+            Write-Output "`n🚀 HOORAY! Universal Release v$Version is officially LIVE on GitHub!"
+        } else {
+            Write-Output "`n❌ Deployment failed during gh CLI upload."
+        }
+    } else {
+        Write-Output "⚠ gh CLI not logged in. Use 'gh auth login' inside your terminal to authorize auto-deployment."
+    }
+} else {
+    Write-Output "ℹ gh CLI is not present on the PATH. Skipping automatic GitHub publication."
 }
 
 Pop-Location
