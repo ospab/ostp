@@ -184,42 +184,33 @@ if ($ReleaseArchives.Count -gt 0) {
 }
 
 # ---------------------------------------------------------------------
-# PHASE 3: AUTOMATED GITHUB PUBLISHING (Via User configured GH CLI)
+# PHASE 3: TRIGGER GLOBAL CI/CD RELEASE PIPELINE (Via Git Tag)
 # ---------------------------------------------------------------------
 Write-Output "`n========================================================="
-Write-Output " PHASE 3: Automated GitHub Release Deployment"
+Write-Output " PHASE 3: Launching Unified Global Cloud Release"
 Write-Output "========================================================="
 
-if (Get-Command gh -ErrorAction SilentlyContinue) {
-    Write-Output "Assessing GitHub authentication credentials..."
-    & gh auth status *>&1 | Out-Null
-    
-    if ($LASTEXITCODE -eq 0) {
-        Write-Output "✔ GitHub authenticated. Pushing workspace changes and tagging..."
-        
-        # Synchronize current Git tree to ensure tag maps to active HEAD
-        & git add Cargo.toml; & git commit -m "Release preparation: bump version to v$Version [skip ci]"; & git push
-        
-        Write-Output "Constructing Release on remote repository..."
-        
-        # Assemble formatted array of quotes paths for release payloads
-        $FilePaths = $ReleaseArchives | ForEach-Object { "`"$_`"" }
-        
-        # Trigger gh release mechanism with automated changelog generation
-        $ReleaseCmd = "gh release create v$Version --title `"Release v$Version`" --notes `"Official cross-platform distribution of Ospab Stealth Transport Protocol (OSTP).`" --generate-notes " + ($FilePaths -join " ")
-        
-        Invoke-Expression $ReleaseCmd
-        
-        if ($LASTEXITCODE -eq 0) {
-            Write-Output "`n🚀 HOORAY! Universal Release v$Version is officially LIVE on GitHub!"
-        } else {
-            Write-Output "`n❌ Deployment failed during gh CLI upload."
-        }
-    } else {
-        Write-Output "⚠ gh CLI not logged in. Use 'gh auth login' inside your terminal to authorize auto-deployment."
-    }
+Write-Output "Synchronizing workspace version metadata to origin master..."
+# Commit current Cargo.toml bump to establish version lineage
+& git add Cargo.toml
+& git commit -m "CI/CD: prepare version v$Version [skip ci]" --allow-empty | Out-Null
+& git push origin master | Out-Null
+
+Write-Output "Generating release tracking tag: v$Version"
+# Purge local tracking tag if pre-existing to guarantee clean sync
+& git tag -d "v$Version" 2>&1 | Out-Null
+& git tag "v$Version"
+
+Write-Output "Deploying trigger tag to GitHub..."
+# Pushing the tag forces GitHub Actions to instantly spin up the cloud builders
+& git push origin "v$Version" --force
+
+if ($LASTEXITCODE -eq 0) {
+    Write-Output "`n🚀 EXCELLENT! Release trigger successfully synchronized with Cloud runners!"
+    Write-Output "✨ GitHub Actions is now compiling all 13 architectures in parallel."
+    Write-Output "🔗 Live monitoring link: https://github.com/ospab/ostp/actions"
 } else {
-    Write-Output "ℹ gh CLI is not present on the PATH. Skipping automatic GitHub publication."
+    Write-Output "`n❌ Failed to deliver release tag to remote origin."
 }
 
 Pop-Location
