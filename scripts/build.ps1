@@ -1,6 +1,7 @@
 # OSTP High-Performance Cross-Platform Build & Release Pipeline
 param(
-    [switch]$Flatten # Consolidate raw uncompressed binaries with arch suffixes under dist/release/
+    [switch]$Flatten,      # Consolidate raw uncompressed binaries with arch suffixes under dist/release/
+    [switch]$TriggerOnly   # Bypasses all local builds to instantly execute global cloud CI/CD tag injection
 )
 
 $ProjectRoot = Split-Path -Parent $PSScriptRoot
@@ -38,6 +39,11 @@ New-Item -ItemType Directory -Force -Path $DistDir | Out-Null
 
 # Collection for dynamically mapping successful build archives
 $ReleaseArchives = @()
+
+# ---------------------------------------------------------------------
+# CONDITIONAL BUILD SUITE execution
+# ---------------------------------------------------------------------
+if (-not $TriggerOnly) {
 
 # ---------------------------------------------------------------------
 # PHASE 1: WINDOWS COMPILATION MATRIX (Native Host)
@@ -175,6 +181,10 @@ if ($ReleaseArchives.Count -gt 0) {
     Write-Output "❌ CRITICAL: No architectures compiled successfully."
     Pop-Location
     exit 1
+}
+
+} else {
+    Write-Output "`n--> [TRIGGER ONLY MODE] Bypassing all local compilations as requested."
 }
 
 # ---------------------------------------------------------------------
