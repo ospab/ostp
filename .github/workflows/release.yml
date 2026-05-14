@@ -80,6 +80,7 @@ jobs:
             artifact_name: ostp
             release_name: ostp-linux-mipsle.tar.gz
             use_cross: true
+            toolchain: nightly
           - os: ubuntu-latest
             target: riscv64gc-unknown-linux-gnu
             artifact_name: ostp
@@ -103,11 +104,14 @@ jobs:
         if: ${{ !matrix.use_cross }}
         uses: dtolnay/rust-toolchain@stable
         with:
+          toolchain: ${{ matrix.toolchain || 'stable' }}
           targets: ${{ matrix.target }}
 
       - name: Initialize Rust ecosystem (Cross Container Host)
         if: ${{ matrix.use_cross }}
         uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ matrix.toolchain || 'stable' }}
 
       - name: Activate rust compilation caching
         if: ${{ !matrix.use_cross }}
@@ -117,9 +121,16 @@ jobs:
         if: ${{ matrix.os == 'ubuntu-latest' && !matrix.use_cross }}
         run: sudo apt-get update && sudo apt-get install -y musl-tools
 
-      - name: Execute Standard Native Compilation
-        if: ${{ !matrix.use_cross }}
+      - name: Execute Standard Native Compilation (Windows)
+        if: ${{ !matrix.use_cross && matrix.os == 'windows-latest' }}
         run: cargo build --release --target ${{ matrix.target }} --bin ostp
+
+      - name: Execute Standard Native Compilation (Unix)
+        if: ${{ !matrix.use_cross && matrix.os != 'windows-latest' }}
+        shell: bash
+        run: |
+          [ -f "$HOME/.cargo/env" ] && source "$HOME/.cargo/env"
+          cargo build --release --target ${{ matrix.target }} --bin ostp
 
       - name: Execute Specialized Cross-Compilation
         if: ${{ matrix.use_cross }}
