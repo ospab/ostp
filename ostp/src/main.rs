@@ -8,7 +8,7 @@ use std::path::PathBuf;
 #[command(author, version, about = "OSTP Core - Ospab Stealth Transport Protocol", long_about = None)]
 struct Args {
     /// Path to the JSON configuration file
-    #[arg(short, long, default_value = "config.json")]
+    #[arg(long, default_value = "config.json")]
     config: PathBuf,
 
     /// Optional mode to initialize the config for (client or server)
