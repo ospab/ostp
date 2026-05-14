@@ -1,4 +1,7 @@
 # OSTP High-Performance Cross-Platform Build & Release Pipeline
+param(
+    [switch]$Flatten # Consolidate raw uncompressed binaries with arch suffixes under dist/release/
+)
 
 $ProjectRoot = Split-Path -Parent $PSScriptRoot
 Push-Location $ProjectRoot
@@ -77,6 +80,14 @@ foreach ($item in $WindowsTargets) {
             
             $ReleaseArchives += $archivePath
             Write-Output "✔ SUCCESSFULLY PACKAGED: $archiveName"
+            
+            if ($Flatten) {
+                $RawReleaseDir = Join-Path $DistDir "release"
+                New-Item -ItemType Directory -Force -Path $RawReleaseDir | Out-Null
+                $FlatName = "ostp-$arch.exe"
+                Copy-Item -Path $compiledBin -Destination (Join-Path $RawReleaseDir $FlatName) -Force
+                Write-Output "   -> Flat copied: dist/release/$FlatName"
+            }
         }
     } else {
         Write-Output "⚠ FAILED compiling Windows $arch ($target). Missing local platform C++ toolchain components."
@@ -135,6 +146,14 @@ if (Get-Command wsl -ErrorAction SilentlyContinue) {
                 
                 $ReleaseArchives += Join-Path $DistDir $archiveName
                 Write-Output "✔ SUCCESSFULLY PACKAGED: $archiveName"
+                
+                if ($Flatten) {
+                    $RawReleaseDir = Join-Path $DistDir "release"
+                    New-Item -ItemType Directory -Force -Path $RawReleaseDir | Out-Null
+                    $FlatName = "ostp-$arch"
+                    Copy-Item -Path $compiledBin -Destination (Join-Path $RawReleaseDir $FlatName) -Force
+                    Write-Output "   -> Flat copied: dist/release/$FlatName"
+                }
             }
         } else {
             Write-Output "⚠ FAILED compiling Linux $arch ($target)."
