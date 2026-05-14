@@ -99,6 +99,8 @@ if ($exeFile) {
     Start-Sleep -Seconds 1
     
     Copy-Item -Path $exeFile.FullName -Destination (Join-Path $InstallDir "ostp.exe") -Force
+    # Force file system timestamps to current local time to reflect successful execution
+    (Get-Item (Join-Path $InstallDir "ostp.exe")).LastWriteTime = [DateTime]::Now
     Write-Host "Executable successfully deployed to $(Join-Path $InstallDir 'ostp.exe')."
 } else {
     Write-Error "Binary file ostp.exe not found in archive package."
