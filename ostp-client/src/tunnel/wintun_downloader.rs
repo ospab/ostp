@@ -14,17 +14,30 @@ pub fn download_wintun_dll(debug: bool) -> Result<()> {
         if debug {
             println!("[ostp-client] wintun.dll not found. Downloading automatically...");
         }
+
+        // Correctly map compilation target architecture to Wintun zip layout folder structure
+        let arch = if cfg!(target_arch = "x86_64") {
+            "amd64"
+        } else if cfg!(target_arch = "aarch64") {
+            "arm64"
+        } else if cfg!(target_arch = "arm") {
+            "arm"
+        } else {
+            "x86"
+        };
         
         let zip_path = dir.join("wintun.zip").to_string_lossy().replace('\\', "/");
         let temp_path = dir.join("wintun_temp").to_string_lossy().replace('\\', "/");
         let dll_dest = dll_path.to_string_lossy().replace('\\', "/");
 
+        // Explicitly filter via Where-Object to select ONLY the single architecture matching dll.
+        // This guarantees we never overwrite the correct x64 dll with x86/ARM formats during Expand-Archive recursions.
         let ps_script = format!(
             "Invoke-WebRequest -Uri 'https://www.wintun.net/builds/wintun-0.14.1.zip' -OutFile '{}' -UseBasicParsing -ErrorAction Stop; \
              Expand-Archive -Path '{}' -DestinationPath '{}' -Force; \
-             Get-ChildItem -Path '{}' -Filter 'wintun.dll' -Recurse | Copy-Item -Destination '{}' -Force; \
+             Get-ChildItem -Path '{}' -Filter 'wintun.dll' -Recurse | Where-Object {{ $_.FullName -match 'bin[\\\\/]{}[\\\\/]' }} | Copy-Item -Destination '{}' -Force; \
              Remove-Item '{}', '{}' -Recurse -Force",
-            zip_path, zip_path, temp_path, temp_path, dll_dest, zip_path, temp_path
+            zip_path, zip_path, temp_path, temp_path, arch, dll_dest, zip_path, temp_path
         );
 
         let output = std::process::Command::new("powershell")
@@ -34,10 +47,10 @@ pub fn download_wintun_dll(debug: bool) -> Result<()> {
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(anyhow!("Failed to download wintun.dll: {stderr}"));
+            return Err(anyhow!("Failed to download and extract wintun.dll for architecture {}: {}", arch, stderr));
         }
         if debug {
-            println!("[ostp-client] wintun.dll downloaded and installed successfully!");
+            println!("[ostp-client] wintun.dll ({}) successfully downloaded and registered!", arch);
         }
     }
     Ok(())
@@ -58,12 +71,22 @@ pub fn download_tun2socks(debug: bool) -> Result<()> {
         if debug {
             println!("[ostp-client] tun2socks.exe not found. Downloading automatically...");
         }
+
+        let arch = if cfg!(target_arch = "x86_64") {
+            "amd64"
+        } else if cfg!(target_arch = "aarch64") {
+            "arm64"
+        } else if cfg!(target_arch = "arm") {
+            "arm"
+        } else {
+            "386"
+        };
         
         let zip_path = dir.join("tun2socks.zip").to_string_lossy().replace('\\', "/");
         let temp_path = dir.join("tun2socks_temp").to_string_lossy().replace('\\', "/");
         let dest_path = tun2socks_path.to_string_lossy().replace('\\', "/");
 
-        let url = "https://github.com/xjasonlyu/tun2socks/releases/download/v2.5.2/tun2socks-windows-amd64.zip";
+        let url = format!("https://github.com/xjasonlyu/tun2socks/releases/download/v2.6.0/tun2socks-windows-{}.zip", arch);
 
         let ps_script = format!(
             "Invoke-WebRequest -Uri '{}' -OutFile '{}' -UseBasicParsing -ErrorAction Stop; \
@@ -80,10 +103,10 @@ pub fn download_tun2socks(debug: bool) -> Result<()> {
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(anyhow!("Failed to download tun2socks.exe: {stderr}"));
+            return Err(anyhow!("Failed to download tun2socks.exe: {}", stderr));
         }
         if debug {
-            println!("[ostp-client] tun2socks.exe downloaded and installed successfully!");
+            println!("[ostp-client] tun2socks.exe ({}) downloaded and installed successfully!", arch);
         }
     }
     Ok(())
