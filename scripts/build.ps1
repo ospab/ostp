@@ -1,11 +1,14 @@
 # OSTP Hybrid Build Script (Windows Native + WSL Linux)
 
-Write-Output "Starting OSTP Build Pipeline"
+$ProjectRoot = Split-Path -Parent $PSScriptRoot
+Push-Location $ProjectRoot
+
+Write-Output "Starting OSTP Build Pipeline in $ProjectRoot"
 
 # Stop any currently running instances to release file locks on compiled binaries
 Stop-Process -Name ostp -ErrorAction SilentlyContinue | Out-Null
 
-$DistDir = Join-Path $PSScriptRoot "dist"
+$DistDir = Join-Path $ProjectRoot "dist"
 $WinDist = Join-Path $DistDir "windows"
 $LinuxDist = Join-Path $DistDir "linux"
 
@@ -20,6 +23,7 @@ $env:CARGO_TARGET_DIR = $TempTarget
 
 if ($LASTEXITCODE -ne 0) {
     Write-Output "❌ Windows build failed"
+    Pop-Location
     exit 1
 }
 
@@ -29,6 +33,7 @@ if (Test-Path $WinExe) {
     Write-Output "✔ Windows binary successfully copied to: dist/windows/ostp.exe"
 } else {
     Write-Output "❌ Windows binary not found after build"
+    Pop-Location
     exit 1
 }
 
@@ -42,17 +47,21 @@ if (Get-Command wsl -ErrorAction SilentlyContinue) {
     
     if ($LASTEXITCODE -ne 0) {
         Write-Output "❌ Linux build failed"
+        Pop-Location
         exit 1
     }
     
-    # Copy from WSL native temp directory back to host
-    & wsl cp /tmp/ostp_linux_build/x86_64-unknown-linux-musl/release/ostp ./dist/linux/ostp
+    # Determine WSL translation of the destination folder
+    $WslLinuxDist = & wsl wslpath -u $LinuxDist
+    # Copy from WSL temp directory into the actual host mapped linux dist
+    & wsl cp /tmp/ostp_linux_build/x86_64-unknown-linux-musl/release/ostp $WslLinuxDist/ostp
     
     $LinuxBin = Join-Path $LinuxDist "ostp"
     if (Test-Path $LinuxBin) {
         Write-Output "✔ Linux binary successfully copied to dist/linux/ostp"
     } else {
         Write-Output "❌ Linux binary copy failed"
+        Pop-Location
         exit 1
     }
 } else {
@@ -62,7 +71,7 @@ if (Get-Command wsl -ErrorAction SilentlyContinue) {
 Write-Output "Build Completed Successfully"
 
 # Automated metadata version increment
-$CargoToml = Join-Path $PSScriptRoot "Cargo.toml"
+$CargoToml = Join-Path $ProjectRoot "Cargo.toml"
 if (Test-Path $CargoToml) {
     $Content = [System.IO.File]::ReadAllText($CargoToml)
     if ($Content -match 'version\s*=\s*"(\d+)\.(\d+)\.(\d+)"') {
@@ -76,3 +85,5 @@ if (Test-Path $CargoToml) {
         Write-Output "✔ Successfully bumped workspace version to $Major.$Minor.$NewPatch"
     }
 }
+
+Pop-Location
