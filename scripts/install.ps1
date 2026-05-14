@@ -43,7 +43,7 @@ $url = "https://github.com/$repo/releases/download/$tag/$archive"
 $zipPath = Join-Path $env:TEMP "ostp_temp_$($PID).zip"
 $extractPath = Join-Path $env:TEMP "ostp_extract_$($PID)"
 
-Write-Host "Downloading asset windows-$arch: $url ..."
+Write-Host "Downloading asset windows-${arch}: $url ..."
 Invoke-WebRequest -Uri $url -OutFile $zipPath
 
 if (-not (Test-Path $zipPath)) {
