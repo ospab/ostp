@@ -43,9 +43,7 @@ $ReleaseArchives = @()
 # PHASE 1: WINDOWS COMPILATION MATRIX (Native Host)
 # ---------------------------------------------------------------------
 $WindowsTargets = @(
-    @{ Target = "x86_64-pc-windows-msvc"; Arch = "x64"; BinaryName = "ostp.exe" },
-    @{ Target = "i686-pc-windows-msvc"; Arch = "x86"; BinaryName = "ostp.exe" },
-    @{ Target = "aarch64-pc-windows-msvc"; Arch = "arm64"; BinaryName = "ostp.exe" }
+    @{ Target = "x86_64-pc-windows-msvc"; Arch = "x64"; BinaryName = "ostp.exe" }
 )
 
 Write-Output "========================================================="
@@ -112,11 +110,7 @@ if (Get-Command wsl -ErrorAction SilentlyContinue) {
     $WslBuildDir = & wsl wslpath -u $LinuxBuildUnix
 
     $LinuxTargets = @(
-        @{ Target = "x86_64-unknown-linux-musl"; Arch = "x64"; BinaryName = "ostp" },
-        @{ Target = "i686-unknown-linux-musl"; Arch = "x86"; BinaryName = "ostp" },
-        @{ Target = "aarch64-unknown-linux-musl"; Arch = "arm64"; BinaryName = "ostp" },
-        @{ Target = "armv7-unknown-linux-musleabihf"; Arch = "armv7"; BinaryName = "ostp" },
-        @{ Target = "x86_64-unknown-freebsd"; Arch = "x64"; BinaryName = "ostp" }
+        @{ Target = "x86_64-unknown-linux-musl"; Arch = "x64"; BinaryName = "ostp" }
     )
 
     foreach ($item in $LinuxTargets) {
