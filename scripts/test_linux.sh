@@ -12,7 +12,14 @@ NC='\033[0m' # No Color
 
 # Locate target binary
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
-OSTP_BIN="$SCRIPT_DIR/../dist/linux/ostp"
+
+# Check if binary is in the same directory (production server layout)
+if [ -f "$SCRIPT_DIR/ostp" ]; then
+    OSTP_BIN="$SCRIPT_DIR/ostp"
+else
+    # Fallback to workspace development layout
+    OSTP_BIN="$SCRIPT_DIR/../dist/linux/ostp"
+fi
 
 # Temporary Sandbox Directory for Isolating Tests
 SANDBOX="/tmp/ostp_test_sandbox_$$"
