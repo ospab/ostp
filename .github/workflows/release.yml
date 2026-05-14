@@ -2,6 +2,8 @@ name: Universal CI/CD Release Matrix
 
 on:
   push:
+    branches:
+      - "master"
     tags:
       - "v*"
   workflow_dispatch:
@@ -113,20 +115,20 @@ jobs:
         run: cargo build --release --target ${{ matrix.target }} --bin ostp
 
       - name: Execute Specialized Cross-Compilation
-        if: matrix.use_cross
+        if: ${{ matrix.use_cross }}
         run: |
           cargo install cross --git https://github.com/cross-rs/cross.git
           cross build --release --target ${{ matrix.target }} --bin ostp
 
       - name: Package release artifact (Windows)
-        if: matrix.os == 'windows-latest'
+        if: ${{ matrix.os == 'windows-latest' }}
         shell: pwsh
         run: |
           cd target/${{ matrix.target }}/release
           Compress-Archive -Path ${{ matrix.artifact_name }} -DestinationPath ../../../${{ matrix.release_name }}
 
       - name: Package release artifact (Unix Systems)
-        if: matrix.os != 'windows-latest'
+        if: ${{ matrix.os != 'windows-latest' }}
         run: |
           cd target/${{ matrix.target }}/release
           tar -czf ../../../${{ matrix.release_name }} ${{ matrix.artifact_name }}
