@@ -8,9 +8,15 @@ use crate::tunnel;
 use std::sync::Arc;
 
 #[cfg(target_os = "windows")]
+#[link(name = "kernel32")]
 extern "system" {
     fn FreeConsole() -> i32;
     fn GetConsoleWindow() -> *mut std::ffi::c_void;
+}
+
+#[cfg(target_os = "windows")]
+#[link(name = "user32")]
+extern "system" {
     fn ShowWindow(hwnd: *mut std::ffi::c_void, cmd_show: i32) -> i32;
 }
 
