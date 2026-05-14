@@ -68,6 +68,7 @@ pub async fn run_client(config: crate::config::ClientConfig) -> Result<()> {
 
     if config.mode == "tun" {
         tunnel::download_wintun_dll(config.debug)?;
+        tunnel::download_tun2socks(config.debug)?;
     }
 
     let (proxy_events_tx, proxy_events_rx) = mpsc::channel(10000);
@@ -153,7 +154,7 @@ pub async fn run_client(config: crate::config::ClientConfig) -> Result<()> {
     let wintun_shutdown_rx = shutdown_tx.subscribe();
     let wintun_task = if config_clone.mode == "tun" {
         Some(tokio::spawn(async move {
-            tunnel::run_wintun_tunnel(wintun_shutdown_rx, config_clone.debug).await
+            tunnel::run_wintun_tunnel(config_clone, wintun_shutdown_rx).await
         }))
     } else {
         None

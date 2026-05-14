@@ -3,6 +3,7 @@ mod wintun_downloader;
 mod wintun_handler;
 
 pub use wintun_downloader::download_wintun_dll;
+pub use wintun_downloader::download_tun2socks;
 pub use wintun_handler::run_wintun_tunnel;
 
 use tokio::sync::{mpsc, watch};
