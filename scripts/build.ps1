@@ -7,6 +7,10 @@ param(
 $ProjectRoot = Split-Path -Parent $PSScriptRoot
 Push-Location $ProjectRoot
 
+Write-Output "Synchronizing latest workspace source code from origin master..."
+# Leverage autostash and rebase to pull cleanly even with uncommitted local edits
+& git pull origin master --rebase --autostash | Out-Null
+
 Write-Output "Starting Universal OSTP Build & Release Pipeline in $ProjectRoot"
 
 # Unblock binaries by terminating any existing active instances
