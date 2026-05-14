@@ -31,7 +31,7 @@ The pipeline utilizes a highly optimized modular framework:
 For rapid, interactive provisioning on standard Linux host environments, execute the unified installer via a single terminal command:
 
 ```bash
-bash <(curl -Ls https://raw.githubusercontent.com/ospab/ostp/main/scripts/install.sh)
+bash <(curl -Ls https://raw.githubusercontent.com/ospab/ostp/master/scripts/install.sh)
 ```
 
 *This routine autonomously fetches correct binary releases, registers a resilient system daemon, and interactively initializes configuration templates utilizing the binary's native compiler.*
