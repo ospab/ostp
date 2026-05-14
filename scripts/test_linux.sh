@@ -202,6 +202,52 @@ wait $CLI_PID 2>/dev/null
 print_result "client active daemon termination" 0
 
 # ---------------------------------------------------------------------
+# SECTION 6: CLIENT-SERVER HANDSHAKE & CONNECTION TEST
+# ---------------------------------------------------------------------
+
+# 1. Prepare configurations with shared key and distinct ports
+CONN_PORT=49220
+CLI_CONN_SOCKS=49221
+SHARED_KEY=$("$OSTP_BIN" -g)
+
+# Re-generate clean configs for the integration run
+"$OSTP_BIN" --init server --config config_srv_conn.json > /dev/null 2>&1
+"$OSTP_BIN" --init client --config config_cli_conn.json > /dev/null 2>&1
+
+# Apply custom port and shared key to Server config
+sed -i "s/\"listen\": \".*\"/\"listen\": \"127.0.0.1:$CONN_PORT\"/g" config_srv_conn.json
+sed -i "s/\"access_keys\": \[.*\]/\"access_keys\": [\"$SHARED_KEY\"]/g" config_srv_conn.json
+
+# Apply custom target, proxy port, and shared key to Client config
+sed -i "s/\"socks5_bind\": \".*\"/\"socks5_bind\": \"127.0.0.1:$CLI_CONN_SOCKS\"/g" config_cli_conn.json
+sed -i "s/\"server\": \".*\"/\"server\": \"127.0.0.1:$CONN_PORT\"/g" config_cli_conn.json
+sed -i "s/\"access_key\": \".*\"/\"access_key\": \"$SHARED_KEY\"/g" config_cli_conn.json
+
+# 2. Start Server Daemon
+"$OSTP_BIN" --config config_srv_conn.json > server_conn.log 2>&1 &
+SRV_CONN_PID=$!
+
+sleep 1
+
+# 3. Start Client Daemon
+"$OSTP_BIN" --config config_cli_conn.json > client_conn.log 2>&1 &
+CLI_CONN_PID=$!
+
+# Allow time for handshaking (Noise protocol exchange over loopback)
+sleep 3
+
+# 4. Validate active handshake in client logs
+grep -q "Bridge connection established" client_conn.log
+print_result "client-server secure handshake completion" $? "Handshake signatures missing in log. Log output: $(cat client_conn.log)"
+
+# 5. Teardown integration run
+kill $CLI_CONN_PID 2>/dev/null
+kill $SRV_CONN_PID 2>/dev/null
+wait $CLI_CONN_PID 2>/dev/null
+wait $SRV_CONN_PID 2>/dev/null
+print_result "integrated handshake daemon teardown" 0
+
+# ---------------------------------------------------------------------
 # FINAL CLEANUP
 # ---------------------------------------------------------------------
 cd "$SCRIPT_DIR"
