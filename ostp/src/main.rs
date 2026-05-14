@@ -140,25 +140,43 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    // Auto-generate a production config if explicitly requested via --init, or if not existing
-    if args.init.is_some() || !args.config.exists() {
-        let is_server = args.init.as_deref() == Some("server");
+    // Handle explicit configuration initialization
+    if let Some(ref mode_str) = args.init {
+        let is_server = mode_str == "server";
         let dummy = if is_server {
             UnifiedConfig {
                 log_level: Some("info".to_string()),
                 mode: AppMode::Server(ServerConfig {
                     listen: "0.0.0.0:50000".to_string(),
                     access_keys: vec![generate_secure_key("hex")],
-                    turn_server: None,
+                    turn_server: Some("turn.example.com:3478".to_string()),
                     debug: Some(false),
-                    outbound: None,
+                    outbound: Some(OutboundConfig {
+                        enabled: false,
+                        protocol: "socks5".to_string(),
+                        address: "127.0.0.1".to_string(),
+                        port: 1080,
+                        rules: vec![
+                            OutboundRule {
+                                domain_suffix: Some(vec!["google.com".to_string(), "github.com".to_string()]),
+                                ip_cidr: Some(vec!["8.8.8.8/32".to_string()]),
+                                action: Some("proxy".to_string()),
+                            },
+                            OutboundRule {
+                                domain_suffix: Some(vec!["lan".to_string(), "local".to_string()]),
+                                ip_cidr: Some(vec!["192.168.0.0/16".to_string()]),
+                                action: Some("direct".to_string()),
+                            }
+                        ],
+                        default_action: Some("direct".to_string()),
+                    }),
                 }),
             }
         } else {
             UnifiedConfig {
                 log_level: Some("info".to_string()),
                 mode: AppMode::Client(ClientConfig {
-                    server: "127.0.0.1:50000".to_string(),
+                    server: "YOUR_SERVER_IP_HERE:50000".to_string(),
                     access_key: generate_secure_key("hex"),
                     socks5_bind: Some("127.0.0.1:1088".to_string()),
                     tun: Some(TunConfig {
@@ -166,27 +184,43 @@ async fn main() -> Result<()> {
                         wintun_path: Some("./wintun.dll".to_string()),
                         ipv4_address: Some("10.1.0.2/24".to_string()),
                     }),
-                    turn: None,
+                    turn: Some(TurnConfigRaw {
+                        enabled: false,
+                        server_addr: "turn.example.com:3478".to_string(),
+                        username: Some("demo_user".to_string()),
+                        access_key: Some("demo_pass".to_string()),
+                    }),
                     debug: Some(false),
                     exclude: Some(ExcludeConfig {
-                        domains: Some(Vec::new()),
-                        ips: Some(Vec::new()),
-                        processes: Some(Vec::new()),
+                        domains: Some(vec!["localhost".to_string(), "lan".to_string()]),
+                        ips: Some(vec!["127.0.0.1/32".to_string(), "192.168.0.0/16".to_string()]),
+                        processes: Some(vec!["chrome.exe".to_string()]),
                     }),
                     mux: Some(MuxConfig {
-                        enabled: Some(false),
-                        sessions: Some(1),
+                        enabled: Some(true),
+                        sessions: Some(4),
                     }),
                 }),
             }
         };
         fs::write(&args.config, serde_json::to_string_pretty(&dummy)?)?;
-        println!("Initialized configuration at {:?}", args.config);
+        println!("🚀 Successfully initialized MODERN configuration schema at {:?}", args.config);
+        println!("💡 Open the file to customize outbound rules, exclusions, and credentials.");
+        return Ok(());
+    }
 
-        // If init was requested directly, terminate now.
-        if args.init.is_some() {
-            return Ok(());
-        }
+    // Validate config file existence
+    if !args.config.exists() {
+        anyhow::bail!(
+            "❌ Configuration file {:?} not found.\n\n\
+             👉 To generate a complete production configuration template, run:\n\
+             \t./ostp --init server\n\
+             \tor\n\
+             \t./ostp --init client\n\n\
+             👉 Or specify a custom configuration file path using:\n\
+             \t./ostp --config /path/to/your_config.json",
+            args.config
+        );
     }
 
     let config_content = fs::read_to_string(&args.config)?;
