@@ -201,7 +201,7 @@ Write-Output "========================================================="
 Write-Output "Synchronizing workspace version metadata to origin master..."
 # Commit current Cargo.toml bump to establish version lineage
 & git add Cargo.toml
-& git commit -m "CI/CD: prepare version v$Version [skip ci]" --allow-empty | Out-Null
+& git commit -m "CI/CD: release version v$Version" --allow-empty | Out-Null
 & git push origin master | Out-Null
 
 Write-Output "Generating release tracking tag: v$Version"
