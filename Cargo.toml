@@ -25,3 +25,4 @@ tokio = { version = "1.37", features = ["rt-multi-thread", "macros", "net", "tim
 tracing = "0.1"
 x25519-dalek = "2"
 sha2 = "0.10"
+portable-atomic = "1.10"

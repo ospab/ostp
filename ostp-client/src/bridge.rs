@@ -1,5 +1,6 @@
 use std::time::{Duration, SystemTime};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
+use portable_atomic::AtomicU64;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};

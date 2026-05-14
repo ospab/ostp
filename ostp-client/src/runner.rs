@@ -74,8 +74,8 @@ pub async fn run_client(config: crate::config::ClientConfig) -> Result<()> {
     let (client_msgs_tx, client_msgs_rx) = mpsc::channel(10000);
 
     let metrics = Arc::new(BridgeMetrics {
-        bytes_sent: std::sync::atomic::AtomicU64::new(0),
-        bytes_recv: std::sync::atomic::AtomicU64::new(0),
+        bytes_sent: portable_atomic::AtomicU64::new(0),
+        bytes_recv: portable_atomic::AtomicU64::new(0),
     });
 
     let bridge = Bridge::new(&config, metrics)?;

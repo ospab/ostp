@@ -78,8 +78,8 @@ pub extern "system" fn Java_net_ostp_client_OstpClientSdk_startClient(
     let (client_msgs_tx, client_msgs_rx) = mpsc::channel(512);
 
     let metrics = Arc::new(BridgeMetrics {
-        bytes_sent: std::sync::atomic::AtomicU64::new(0),
-        bytes_recv: std::sync::atomic::AtomicU64::new(0),
+        bytes_sent: portable_atomic::AtomicU64::new(0),
+        bytes_recv: portable_atomic::AtomicU64::new(0),
     });
 
     let bridge = match Bridge::new(&config, Arc::clone(&metrics)) {
