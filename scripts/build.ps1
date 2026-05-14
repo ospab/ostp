@@ -15,6 +15,10 @@ $LinuxDist = Join-Path $DistDir "linux"
 New-Item -ItemType Directory -Force -Path $WinDist | Out-Null
 New-Item -ItemType Directory -Force -Path $LinuxDist | Out-Null
 
+# Clear old binaries to prevent false positive checks if copy fails
+Remove-Item -Path (Join-Path $WinDist "ostp.exe") -ErrorAction SilentlyContinue | Out-Null
+Remove-Item -Path (Join-Path $LinuxDist "ostp") -ErrorAction SilentlyContinue | Out-Null
+
 Write-Output "Building Windows Binary natively"
 $TempTarget = Join-Path $env:TEMP "ostp_target_build"
 $env:CARGO_TARGET_DIR = $TempTarget
@@ -51,8 +55,10 @@ if (Get-Command wsl -ErrorAction SilentlyContinue) {
         exit 1
     }
     
+    # Fix Windows backslashes for WSL path translator passing
+    $LinuxDistUnix = $LinuxDist.Replace("\", "/")
     # Determine WSL translation of the destination folder
-    $WslLinuxDist = & wsl wslpath -u $LinuxDist
+    $WslLinuxDist = & wsl wslpath -u $LinuxDistUnix
     # Copy from WSL temp directory into the actual host mapped linux dist
     & wsl cp /tmp/ostp_linux_build/x86_64-unknown-linux-musl/release/ostp $WslLinuxDist/ostp
     
