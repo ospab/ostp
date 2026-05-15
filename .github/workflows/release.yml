@@ -129,7 +129,7 @@ jobs:
         if: ${{ !matrix.use_cross && matrix.os != 'windows-latest' }}
         shell: bash
         run: |
-          cargo build --release --target ${{ matrix.target }} --bin ostp
+          rustup run ${{ matrix.toolchain || 'stable' }} cargo build --release --target ${{ matrix.target }} --bin ostp
 
       - name: Execute Specialized Cross-Compilation
         if: ${{ matrix.use_cross }}
