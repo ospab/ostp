@@ -438,16 +438,10 @@ struct HelperPipeState {
 }
 
 fn find_helper_exe() -> Option<PathBuf> {
-    // First look next to current exe
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            let candidate = dir.join("ostp-tun-helper.exe");
-            if candidate.exists() {
-                return Some(candidate);
-            }
-        }
-    }
-    // Dev: look in target/debug next to workspace root
+    // The helper is always built to the same target dir as the GUI exe.
+    // In dev mode: target/debug/ostp-tun-helper.exe (same dir as ostp-gui.exe)
+    // In release:  target/release/ostp-tun-helper.exe (same dir as ostp-gui.exe)
+    // In installed build: next to ostp-gui.exe
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
             let candidate = dir.join("ostp-tun-helper.exe");
