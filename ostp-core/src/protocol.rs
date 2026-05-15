@@ -417,7 +417,8 @@ impl ProtocolMachine {
         let now = Instant::now();
         for frame in self.sent_history.iter_mut() {
             if frame.retries >= self.max_retries {
-                continue;
+                tracing::error!("FATAL: Frame {} exceeded max retries ({}). Connection is dead.", frame.nonce, self.max_retries);
+                return Err(ProtocolError::State("connection dead, max retries exceeded".into()));
             }
             if now.duration_since(frame.last_sent) >= self.rto {
                 frame.last_sent = now;
