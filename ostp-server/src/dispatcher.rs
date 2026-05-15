@@ -5,6 +5,10 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, RwLock};
 
+/// Maximum number of concurrent authenticated sessions.
+/// Excess handshake attempts are silently dropped — no response, no state allocated.
+const MAX_SESSIONS: usize = 1024;
+
 pub enum DispatchOutcome {
     Unauthorized,
     Accepted {
@@ -198,6 +202,11 @@ impl Dispatcher {
                         }
 
                         if !self.replay_cache.contains_key(&payload.to_vec()) {
+                            // §4 fix: hard cap on concurrent sessions to prevent RAM exhaustion
+                            if self.peer_machines.len() >= MAX_SESSIONS {
+                                return Ok(DispatchOutcome::Unauthorized);
+                            }
+
                             self.replay_cache.insert(payload.to_vec(), ts);
 
                             machine.set_session_keys(candidate_session_id, obf_key);

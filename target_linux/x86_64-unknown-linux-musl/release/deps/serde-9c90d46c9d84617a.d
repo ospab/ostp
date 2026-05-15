@@ -1,0 +1,14 @@
+/mnt/d/ospab-projects/ostp/target_linux/x86_64-unknown-linux-musl/release/deps/serde-9c90d46c9d84617a.d: /home/deb/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/lib.rs /home/deb/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/integer128.rs /home/deb/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/mod.rs /home/deb/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/de.rs /home/deb/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/ser.rs /mnt/d/ospab-projects/ostp/target_linux/x86_64-unknown-linux-musl/release/build/serde-bc0b8608130c5176/out/private.rs
+
+/mnt/d/ospab-projects/ostp/target_linux/x86_64-unknown-linux-musl/release/deps/libserde-9c90d46c9d84617a.rlib: /home/deb/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/lib.rs /home/deb/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/integer128.rs /home/deb/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/mod.rs /home/deb/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/de.rs /home/deb/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/ser.rs /mnt/d/ospab-projects/ostp/target_linux/x86_64-unknown-linux-musl/release/build/serde-bc0b8608130c5176/out/private.rs
+
+/mnt/d/ospab-projects/ostp/target_linux/x86_64-unknown-linux-musl/release/deps/libserde-9c90d46c9d84617a.rmeta: /home/deb/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/lib.rs /home/deb/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/integer128.rs /home/deb/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/mod.rs /home/deb/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/de.rs /home/deb/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/ser.rs /mnt/d/ospab-projects/ostp/target_linux/x86_64-unknown-linux-musl/release/build/serde-bc0b8608130c5176/out/private.rs
+
+/home/deb/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/lib.rs:
+/home/deb/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/integer128.rs:
+/home/deb/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/mod.rs:
+/home/deb/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/de.rs:
+/home/deb/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/ser.rs:
+/mnt/d/ospab-projects/ostp/target_linux/x86_64-unknown-linux-musl/release/build/serde-bc0b8608130c5176/out/private.rs:
+
+# env-dep:OUT_DIR=/mnt/d/ospab-projects/ostp/target_linux/x86_64-unknown-linux-musl/release/build/serde-bc0b8608130c5176/out
