@@ -1,10 +1,32 @@
 mod proxy;
 mod wintun_downloader;
 mod wintun_handler;
+mod linux_handler;
 
 pub use wintun_downloader::download_wintun_dll;
 pub use wintun_downloader::download_tun2socks;
-pub use wintun_handler::run_wintun_tunnel;
+
+pub async fn run_tun_tunnel(
+    config: crate::config::ClientConfig,
+    shutdown: watch::Receiver<bool>,
+) -> anyhow::Result<()> {
+    #[cfg(target_os = "windows")]
+    {
+        wintun_handler::run_wintun_tunnel(config, shutdown).await
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        linux_handler::run_linux_tunnel(config, shutdown).await
+    }
+
+    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+    {
+        let _ = shutdown;
+        let _ = config;
+        anyhow::bail!("Operating system unsupported, text an issue at github.");
+    }
+}
 
 use tokio::sync::{mpsc, watch};
 

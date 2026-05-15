@@ -42,14 +42,19 @@ pub async fn run_wintun_tunnel(
         println!("[ostp-client] Injecting system routing tables and excluding remote proxy...");
     }
 
+    let current_exe = std::env::current_exe()?.to_string_lossy().into_owned();
+
     let setup_script = format!(
         "$remote_ip = '{}'\n\
-         $route = Get-NetRoute -DestinationPrefix '0.0.0.0/0' | Sort-Object RouteMetric | Select-Object -First 1\n\
+         $exe_path = '{}'\n\
+         $route = Get-NetRoute -DestinationPrefix '0.0.0.0/0' | Where-Object {{ $_.InterfaceAlias -notmatch 'tun' -and $_.InterfaceAlias -notmatch 'wintun' }} | Sort-Object RouteMetric | Select-Object -First 1\n\
          $gw = $route.NextHop\n\
          $ifIndex = $route.InterfaceIndex\n\
          New-NetRoute -DestinationPrefix \"$remote_ip/32\" -NextHop $gw -InterfaceIndex $ifIndex -RouteMetric 1 -ErrorAction SilentlyContinue\n\
-         New-NetRoute -DestinationPrefix \"1.1.1.1/32\" -NextHop $gw -InterfaceIndex $ifIndex -RouteMetric 1 -ErrorAction SilentlyContinue\n",
-        server_ip_str
+         New-NetRoute -DestinationPrefix \"1.1.1.1/32\" -NextHop $gw -InterfaceIndex $ifIndex -RouteMetric 1 -ErrorAction SilentlyContinue\n\
+         New-NetFirewallRule -DisplayName 'OSTP Tunnel In' -Direction Inbound -Program $exe_path -Action Allow -Enabled True -ErrorAction SilentlyContinue\n\
+         New-NetFirewallRule -DisplayName 'OSTP Tunnel Out' -Direction Outbound -Program $exe_path -Action Allow -Enabled True -ErrorAction SilentlyContinue\n",
+        server_ip_str, current_exe
     );
 
     let out = Command::new("powershell")
@@ -133,7 +138,8 @@ pub async fn run_wintun_tunnel(
     let cleanup_script = format!(
         "$remote_ip = '{}'\n\
          Remove-NetRoute -DestinationPrefix \"$remote_ip/32\" -Confirm:$false -ErrorAction SilentlyContinue\n\
-         Remove-NetRoute -DestinationPrefix \"1.1.1.1/32\" -Confirm:$false -ErrorAction SilentlyContinue\n",
+         Remove-NetRoute -DestinationPrefix \"1.1.1.1/32\" -Confirm:$false -ErrorAction SilentlyContinue\n\
+         Remove-NetFirewallRule -DisplayName 'OSTP Tunnel*' -ErrorAction SilentlyContinue\n",
         server_ip_str
     );
 
@@ -146,10 +152,3 @@ pub async fn run_wintun_tunnel(
     Ok(())
 }
 
-#[cfg(not(target_os = "windows"))]
-pub async fn run_wintun_tunnel(
-    _config: crate::config::ClientConfig,
-    _shutdown: watch::Receiver<bool>,
-) -> Result<()> {
-    Err(anyhow!("Wintun is only supported on Windows!"))
-}

@@ -112,7 +112,55 @@ pub fn download_tun2socks(debug: bool) -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(target_os = "windows"))]
-pub fn download_tun2socks(_debug: bool) -> Result<()> {
+#[cfg(target_os = "linux")]
+pub fn download_tun2socks(debug: bool) -> Result<()> {
+    let exe = std::env::current_exe()?;
+    let dir = exe.parent().ok_or_else(|| anyhow::anyhow!("failed to get binary directory"))?;
+    let tun2socks_path = dir.join("tun2socks");
+
+    if !tun2socks_path.exists() {
+        if debug {
+            println!("[ostp-client] tun2socks not found. Downloading automatically for Linux...");
+        }
+
+        let arch = if cfg!(target_arch = "x86_64") {
+            "amd64"
+        } else if cfg!(target_arch = "aarch64") {
+            "arm64"
+        } else if cfg!(target_arch = "arm") {
+            "arm"
+        } else {
+            "386"
+        };
+
+        let tar_path = dir.join("tun2socks.tar.gz").to_string_lossy().into_owned();
+        let dest_path = tun2socks_path.to_string_lossy().into_owned();
+        let url = format!("https://github.com/xjasonlyu/tun2socks/releases/download/v2.6.0/tun2socks-linux-{}.tar.gz", arch);
+
+        let sh_script = format!(
+            "curl -L -o '{}' '{}' && tar -xzf '{}' -C '{}' --wildcards '*/tun2socks' --strip-components=1 || tar -xzf '{}' -C '{}' tun2socks; \
+             chmod +x '{}'; \
+             rm -f '{}'",
+            tar_path, url, tar_path, dir.to_string_lossy(), tar_path, dir.to_string_lossy(), dest_path, tar_path
+        );
+
+        let output = std::process::Command::new("sh")
+            .args(["-c", &sh_script])
+            .current_dir(dir)
+            .output()?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(anyhow::anyhow!("Failed to download tun2socks for Linux: {}", stderr));
+        }
+        if debug {
+            println!("[ostp-client] tun2socks ({}) downloaded and installed successfully!", arch);
+        }
+    }
     Ok(())
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "linux")))]
+pub fn download_tun2socks(_debug: bool) -> Result<()> {
+    Err(anyhow::anyhow!("Operating system unsupported, text an issue at github."))
 }

@@ -177,7 +177,7 @@ pub async fn run_client(config: crate::config::ClientConfig) -> Result<()> {
     let wintun_shutdown_rx = shutdown_tx.subscribe();
     let wintun_task = if config_clone.mode == "tun" {
         Some(tokio::spawn(async move {
-            tunnel::run_wintun_tunnel(config_clone, wintun_shutdown_rx).await
+            tunnel::run_tun_tunnel(config_clone, wintun_shutdown_rx).await
         }))
     } else {
         None
