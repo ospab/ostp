@@ -35,7 +35,6 @@ impl TryFrom<u8> for FrameKind {
 pub struct FrameHeader {
     pub version: u8,
     pub kind: FrameKind,
-    pub flags: u8,
     pub stream_id: u16,
     pub payload_len: u32,
     pub pad_len: u16,
@@ -45,8 +44,7 @@ impl FrameHeader {
     pub fn encode(&self, out: &mut BytesMut) {
         out.put_u8(self.version);
         out.put_u8(self.kind as u8);
-        out.put_u8(self.flags);
-        out.put_u8(0); // reserved
+        out.put_u16(0); // 2 reserved bytes
         out.put_u16(self.stream_id);
         out.put_u32(self.payload_len);
         out.put_u16(self.pad_len);
@@ -59,7 +57,7 @@ impl FrameHeader {
 
         let version = buf[0];
         let kind = FrameKind::try_from(buf[1])?;
-        let flags = buf[2];
+        // buf[2] and buf[3] are reserved
         let stream_id = u16::from_be_bytes([buf[4], buf[5]]);
         let payload_len = u32::from_be_bytes([buf[6], buf[7], buf[8], buf[9]]);
         let pad_len = u16::from_be_bytes([buf[10], buf[11]]);
@@ -67,7 +65,6 @@ impl FrameHeader {
         Ok(Self {
             version,
             kind,
-            flags,
             stream_id,
             payload_len,
             pad_len,

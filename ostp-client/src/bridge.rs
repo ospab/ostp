@@ -21,6 +21,18 @@ pub struct BridgeMetrics {
     pub bytes_recv: AtomicU64,
 }
 
+async fn send_datagram(socket: &UdpSocket, frame: &Bytes, turn_enabled: bool) -> std::io::Result<usize> {
+    if turn_enabled {
+        let mut out = bytes::BytesMut::with_capacity(4 + frame.len());
+        bytes::BufMut::put_u16(&mut out, 0x4000);
+        bytes::BufMut::put_u16(&mut out, frame.len() as u16);
+        out.extend_from_slice(frame);
+        socket.send(&out).await
+    } else {
+        socket.send(frame).await
+    }
+}
+
 struct SessionState {
     socket: Arc<UdpSocket>,
     machine: ProtocolMachine,
@@ -144,12 +156,22 @@ impl Bridge {
                                             let socket = Arc::new(sock);
                                             let socket_clone = socket.clone();
                                             let udp_tx_clone = udp_tx.clone();
+                                            let is_turn = self.turn_enabled;
                                             tokio::spawn(async move {
                                                 let mut buf = vec![0_u8; 65535];
                                                 loop {
                                                     match socket_clone.recv(&mut buf).await {
                                                         Ok(n) => {
-                                                            let inbound = Bytes::copy_from_slice(&buf[..n]);
+                                                            let inbound = if is_turn && n >= 4 && buf[0] == 0x40 && buf[1] == 0x00 {
+                                                                let len = u16::from_be_bytes([buf[2], buf[3]]) as usize;
+                                                                if 4 + len <= n {
+                                                                    Bytes::copy_from_slice(&buf[4..4+len])
+                                                                } else {
+                                                                    Bytes::copy_from_slice(&buf[..n])
+                                                                }
+                                                            } else {
+                                                                Bytes::copy_from_slice(&buf[..n])
+                                                            };
                                                             if udp_tx_clone.send((idx, inbound)).await.is_err() {
                                                                 break;
                                                             }
@@ -274,7 +296,7 @@ impl Bridge {
                                             }
                                         }
                                         ProtocolAction::SendDatagram(frame) => {
-                                            let _ = session.socket.send(&frame).await;
+                                            let _ = send_datagram(&session.socket, &frame, self.turn_enabled).await;
                                             self.metrics.bytes_sent.fetch_add(frame.len() as u64, Ordering::Relaxed);
                                         }
                                         _ => {}
@@ -319,7 +341,7 @@ impl Bridge {
                             let out_payload = Bytes::from(relay_msg.encode());
                             match session.machine.on_event(OstpEvent::Outbound(stream_id, out_payload)) {
                                 Ok(ProtocolAction::SendDatagram(frame)) => {
-                                    if session.socket.send(&frame).await.is_ok() {
+                                    if send_datagram(&session.socket, &frame, self.turn_enabled).await.is_ok() {
                                         self.metrics.bytes_sent.fetch_add(frame.len() as u64, Ordering::Relaxed);
                                         if self.debug {
                                             let _ = tx.send(UiEvent::Log(format!(
@@ -333,7 +355,7 @@ impl Bridge {
                                     let mut sent = 0usize;
                                     for item in list {
                                         if let ProtocolAction::SendDatagram(frame) = item {
-                                            if session.socket.send(&frame).await.is_ok() {
+                                            if send_datagram(&session.socket, &frame, self.turn_enabled).await.is_ok() {
                                                 self.metrics.bytes_sent.fetch_add(frame.len() as u64, Ordering::Relaxed);
                                                 sent += 1;
                                             }
@@ -436,7 +458,7 @@ impl Bridge {
                                             }
                                         }
                                         ProtocolAction::SendDatagram(frame) => {
-                                            let _ = session.socket.send(&frame).await;
+                                            let _ = send_datagram(&session.socket, &frame, self.turn_enabled).await;
                                             self.metrics.bytes_sent.fetch_add(frame.len() as u64, Ordering::Relaxed);
                                         }
                                         _ => {}
@@ -568,7 +590,7 @@ impl Bridge {
             ProtocolAction::SendDatagram(frame) => frame,
             _ => anyhow::bail!("protocol did not emit handshake datagram"),
         };
-        socket.send(&handshake_frame).await?;
+        send_datagram(&socket, &handshake_frame, self.turn_enabled).await?;
         self.metrics.bytes_sent.fetch_add(handshake_frame.len() as u64, Ordering::Relaxed);
 
         let mut buf = vec![0_u8; 4096];
@@ -580,7 +602,16 @@ impl Bridge {
         .context("handshake timeout waiting server response")??;
         self.metrics.bytes_recv.fetch_add(size as u64, Ordering::Relaxed);
 
-        let inbound = Bytes::copy_from_slice(&buf[..size]);
+        let inbound = if self.turn_enabled && size >= 4 && buf[0] == 0x40 && buf[1] == 0x00 {
+            let len = u16::from_be_bytes([buf[2], buf[3]]) as usize;
+            if 4 + len <= size {
+                Bytes::copy_from_slice(&buf[4..4+len])
+            } else {
+                Bytes::copy_from_slice(&buf[..size])
+            }
+        } else {
+            Bytes::copy_from_slice(&buf[..size])
+        };
         machine.on_event(OstpEvent::Inbound(inbound))?;
         let rtt_ms = start.elapsed().as_secs_f64() * 1000.0;
         

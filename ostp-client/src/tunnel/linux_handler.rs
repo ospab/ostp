@@ -61,8 +61,35 @@ pub async fn run_linux_tunnel(
         if in_path {
             tun2socks_exe = std::path::PathBuf::from("tun2socks");
         } else {
-            return Err(anyhow!("tun2socks executable not found in local dir or PATH. Please ensure dependencies are present."));
+            return Err(anyhow!(
+                "CRITICAL: 'tun2socks' binary is missing!\n\
+                OSTP requires tun2socks for TUN mode on Linux. Please download the appropriate binary for your architecture from: \n\
+                https://github.com/xjasonlyu/tun2socks/releases \n\
+                and place it in the same directory as the ostp executable ({}), or install it globally in your PATH.",
+                dir.display()
+            ));
         }
+    }
+
+    // 1.5. Pre-flight system checks
+    let is_root = Command::new("id")
+        .arg("-u")
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "0")
+        .unwrap_or(false);
+
+    if !is_root {
+        return Err(anyhow!("FATAL: OSTP TUN mode requires root privileges on Linux. Please run via sudo."));
+    }
+
+    let has_ip_cmd = Command::new("which")
+        .arg("ip")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+
+    if !has_ip_cmd {
+        return Err(anyhow!("FATAL: 'ip' command not found. OSTP TUN mode requires 'iproute2' package to be installed."));
     }
 
     // 2. Resolve Server IP for routing table exclusion

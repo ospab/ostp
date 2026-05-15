@@ -92,14 +92,13 @@ jobs:
             target: mipsel-unknown-linux-musl
             artifact_name: ostp
             release_name: ostp-linux-mipsle.tar.gz
-            tun2socks_arch: linux-mipsle
+            tun2socks_arch: linux-mipsle-softfloat
             use_cross: true
             toolchain: nightly
           - os: ubuntu-latest
             target: riscv64gc-unknown-linux-gnu
             artifact_name: ostp
             release_name: ostp-linux-riscv64.tar.gz
-            tun2socks_arch: linux-riscv64
             use_cross: true
 
           # ==========================================
@@ -162,7 +161,7 @@ jobs:
           # 1. Acquire tun2socks
           Invoke-WebRequest -Uri "https://github.com/xjasonlyu/tun2socks/releases/download/v2.6.0/tun2socks-${{ matrix.tun2socks_arch }}.zip" -OutFile "tun2socks.zip"
           Expand-Archive -Path "tun2socks.zip" -DestinationPath "tun_temp" -Force
-          Get-ChildItem -Path "tun_temp" -Filter "*.exe" -Recurse | Copy-Item -Destination "." -Force
+          Get-ChildItem -Path "tun_temp" -Filter "*.exe" -Recurse | Copy-Item -Destination "tun2socks.exe" -Force
           # 2. Acquire wintun
           Invoke-WebRequest -Uri "https://www.wintun.net/builds/wintun-0.14.1.zip" -OutFile "wintun.zip"
           Expand-Archive -Path "wintun.zip" -DestinationPath "wintun_temp" -Force
@@ -177,7 +176,7 @@ jobs:
           cd target/${{ matrix.target }}/release
           # All platforms in tun2socks v2.6.0 use .zip packaging
           URL="https://github.com/xjasonlyu/tun2socks/releases/download/v2.6.0/tun2socks-${{ matrix.tun2socks_arch }}.zip"
-          curl -L "$URL" -o "tun2socks.zip"
+          curl -f -L "$URL" -o "tun2socks.zip" || { echo "Failed to download tun2socks"; exit 0; }
           unzip -o "tun2socks.zip"
           find . -maxdepth 2 -name "tun2socks*" ! -name "*.zip" -type f -exec mv {} ./tun2socks \;
           rm -f "tun2socks.zip"

@@ -294,6 +294,7 @@ impl ProtocolMachine {
             if nonce == self.expected_recv_nonce {
                 app_actions.push(action);
                 self.expected_recv_nonce = self.expected_recv_nonce.checked_add(1).ok_or_else(|| {
+                    tracing::error!("FATAL: Recv nonce sequence exhausted (2^64 frames). Session must be terminated to prevent AEAD keystream reuse!");
                     ProtocolError::Crypto("recv nonce sequence exhausted".to_string())
                 })?;
 
@@ -301,6 +302,7 @@ impl ProtocolMachine {
                 while let Some(buffered_action) = self.reorder_buffer.remove(&self.expected_recv_nonce) {
                     app_actions.push(buffered_action);
                     self.expected_recv_nonce = self.expected_recv_nonce.checked_add(1).ok_or_else(|| {
+                        tracing::error!("FATAL: Recv nonce sequence exhausted (2^64 frames). Session must be terminated to prevent AEAD keystream reuse!");
                         ProtocolError::Crypto("recv nonce sequence exhausted".to_string())
                     })?;
                 }
@@ -359,7 +361,6 @@ impl ProtocolMachine {
         let header = FrameHeader {
             version: 1,
             kind,
-            flags: 0,
             stream_id,
             payload_len: payload.len() as u32,
             pad_len: padding.len() as u16,
@@ -379,6 +380,7 @@ impl ProtocolMachine {
 
         let nonce = self.send_nonce;
         self.send_nonce = self.send_nonce.checked_add(1).ok_or_else(|| {
+            tracing::error!("FATAL: Send nonce sequence exhausted (2^64 frames). Session must be terminated to prevent AEAD keystream reuse!");
             ProtocolError::Crypto("send nonce sequence exhausted".to_string())
         })?;
 

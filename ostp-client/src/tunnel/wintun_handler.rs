@@ -41,7 +41,13 @@ pub async fn run_wintun_tunnel(
     let tun2socks_exe = dir.join("tun2socks.exe");
 
     if !tun2socks_exe.exists() {
-        return Err(anyhow!("tun2socks.exe not found in current directory! Please make sure the pre-packaged dependency is present near the executable."));
+        return Err(anyhow!(
+            "CRITICAL: 'tun2socks.exe' binary is missing!\n\
+            OSTP requires tun2socks for TUN mode on Windows. Please download the appropriate binary from: \n\
+            https://github.com/xjasonlyu/tun2socks/releases \n\
+            and place it in the same directory as the ostp executable ({}).",
+            dir.display()
+        ));
     }
 
     // 2. Resolve Server IP for routing table exclusion
