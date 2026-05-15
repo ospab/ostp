@@ -175,20 +175,12 @@ jobs:
         shell: bash
         run: |
           cd target/${{ matrix.target }}/release
-          # Fetch using correct extension (Linux = .tar.gz, Darwin/FreeBSD = .zip)
-          if [[ "${{ matrix.tun2socks_arch }}" == *"linux"* ]]; then
-            URL="https://github.com/xjasonlyu/tun2socks/releases/download/v2.6.0/tun2socks-${{ matrix.tun2socks_arch }}.tar.gz"
-            curl -L "$URL" -o "tun2socks.tar.gz"
-            tar -xzf "tun2socks.tar.gz"
-            find . -maxdepth 2 -name "tun2socks*" ! -name "*.tar.gz" -type f -exec mv {} ./tun2socks \;
-            rm -f "tun2socks.tar.gz"
-          else
-            URL="https://github.com/xjasonlyu/tun2socks/releases/download/v2.6.0/tun2socks-${{ matrix.tun2socks_arch }}.zip"
-            curl -L "$URL" -o "tun2socks.zip"
-            unzip -o "tun2socks.zip"
-            find . -maxdepth 2 -name "tun2socks*" ! -name "*.zip" -type f -exec mv {} ./tun2socks \;
-            rm -f "tun2socks.zip"
-          fi
+          # All platforms in tun2socks v2.6.0 use .zip packaging
+          URL="https://github.com/xjasonlyu/tun2socks/releases/download/v2.6.0/tun2socks-${{ matrix.tun2socks_arch }}.zip"
+          curl -L "$URL" -o "tun2socks.zip"
+          unzip -o "tun2socks.zip"
+          find . -maxdepth 2 -name "tun2socks*" ! -name "*.zip" -type f -exec mv {} ./tun2socks \;
+          rm -f "tun2socks.zip"
           chmod +x tun2socks || true
 
       - name: Package release artifact (Windows)
