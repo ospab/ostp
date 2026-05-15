@@ -32,7 +32,7 @@ fn hide_console() {
 }
 
 #[cfg(target_os = "windows")]
-fn is_admin() -> bool {
+pub fn is_admin() -> bool {
     std::process::Command::new("net")
         .arg("session")
         .stdout(std::process::Stdio::null())
@@ -100,6 +100,12 @@ fn relaunch_as_admin() -> Result<()> {
 }
 
 pub async fn run_client(config: crate::config::ClientConfig) -> Result<()> {
+    #[cfg(target_os = "windows")]
+    if config.mode == "tun" && !is_admin() {
+        println!("[ostp-client] TUN mode requires Administrator privileges. Relaunching executable as Admin...");
+        relaunch_as_admin()?;
+    }
+
     let bg = std::env::args().any(|a| a == "--bg");
 
     if bg {
@@ -130,8 +136,7 @@ pub async fn run_client_core(
 ) -> Result<()> {
     #[cfg(target_os = "windows")]
     if config.mode == "tun" && !is_admin() {
-        println!("[ostp-client] TUN mode requires Administrator privileges. Relaunching executable as Admin...");
-        relaunch_as_admin()?;
+        return Err(anyhow::anyhow!("Administrator privileges are required to initialize TUN mode. Please run the application as Administrator."));
     }
 
     if config.mode == "tun" && !config.exclusions.processes.is_empty() {

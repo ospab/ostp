@@ -234,6 +234,11 @@ async fn start_tunnel(state: tauri::State<'_, AppState>) -> Result<bool, String>
         dns_server: client_cfg.tun.as_ref().and_then(|t| t.dns.clone()),
     };
 
+    #[cfg(target_os = "windows")]
+    if mapped_config.mode == "tun" && !ostp_client::runner::is_admin() {
+        return Err("Administrator privileges are required to initialize TUN mode. Please run the application as Administrator.".to_string());
+    }
+
     let metrics = Arc::new(BridgeMetrics {
         bytes_sent: portable_atomic::AtomicU64::new(0),
         bytes_recv: portable_atomic::AtomicU64::new(0),

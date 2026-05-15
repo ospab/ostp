@@ -118,7 +118,7 @@ async function handleToggleConnect() {
         setUIState('disconnected');
       }
     } catch (err) {
-      console.error(err);
+      alert('Error starting tunnel: ' + err);
       setUIState('disconnected');
     }
   } else {
