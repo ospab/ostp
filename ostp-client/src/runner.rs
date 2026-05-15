@@ -112,18 +112,33 @@ pub async fn run_client(config: crate::config::ClientConfig) -> Result<()> {
         relaunch_as_admin()?;
     }
 
-    if config.mode == "tun" && !config.exclusions.processes.is_empty() {
-        println!("[ostp-client] WARNING: process exclusions are not supported in the current TUN implementation");
-    }
-
-
-    let (proxy_events_tx, proxy_events_rx) = mpsc::channel(10000);
-    let (client_msgs_tx, client_msgs_rx) = mpsc::channel(10000);
-
     let metrics = Arc::new(BridgeMetrics {
         bytes_sent: portable_atomic::AtomicU64::new(0),
         bytes_recv: portable_atomic::AtomicU64::new(0),
     });
+
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+    tokio::spawn(async move {
+        if let Ok(_) = wait_for_shutdown_signal().await {
+            let _ = shutdown_tx.send(true);
+        }
+    });
+
+    run_client_core(config, metrics, shutdown_rx).await
+}
+
+pub async fn run_client_core(
+    config: crate::config::ClientConfig,
+    metrics: Arc<BridgeMetrics>,
+    mut shutdown_rx_ext: watch::Receiver<bool>,
+) -> Result<()> {
+    if config.mode == "tun" && !config.exclusions.processes.is_empty() {
+        println!("[ostp-client] WARNING: process exclusions are not supported in the current TUN implementation");
+    }
+
+    let (proxy_events_tx, proxy_events_rx) = mpsc::channel(10000);
+    let (client_msgs_tx, client_msgs_rx) = mpsc::channel(10000);
 
     let bridge = Bridge::new(&config, metrics)?;
 
@@ -206,8 +221,9 @@ pub async fn run_client(config: crate::config::ClientConfig) -> Result<()> {
         None
     };
 
-    // Wait for Ctrl-C / signal
-    wait_for_shutdown_signal().await?;
+    // Wait for external / UI shutdown signal
+    let _ = shutdown_rx_ext.changed().await;
+    
     let _ = cmd_tx.send(BridgeCommand::Shutdown).await;
 
     let _ = shutdown_tx.send(true);

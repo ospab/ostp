@@ -4,6 +4,7 @@ members = [
     "ostp-client",
     "ostp-server",
     "ostp-jni", "ostp",
+    "ostp-gui/src-tauri"
 ]
 resolver = "2"
 
