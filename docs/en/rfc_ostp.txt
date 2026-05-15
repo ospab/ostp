@@ -1,205 +1,358 @@
-Internet Engineering Task Force (IETF)                       Georgiy S.
-Request for Comments: 9842                             Ospab Foundation
-Category: Standards Track                                      May 2026
-ISSN: 2070-1721
+Independent Submission                                       Georgiy S.
+                                                           Ospab Project
+Category: Informational                                        May 2026
 
+              The Ospab Stealth Transport Protocol (OSTP)
+                         Protocol Specification
 
-             The Ospab Stealth Transport Protocol (OSTP)
+NOTICE
+
+   This document is an Independent Submission and is NOT a product of
+   the Internet Engineering Task Force (IETF). It has NOT been reviewed
+   or approved by the IETF or the Internet Engineering Steering Group
+   (IESG). It represents the technical specification of OSTP as
+   developed by the Ospab Project and is published for informational
+   and interoperability purposes only.
+
+   This document is formatted according to the conventions described in
+   RFC 7322 ("RFC Style Guide") for readability, but it is NOT an RFC
+   and has not been assigned an RFC number by the IANA RFC Editor.
 
 Abstract
 
    This document specifies the Ospab Stealth Transport Protocol (OSTP),
-   a high-entropy, multiplexed Layer 4 transport pipeline developed to 
-   achieve secure, resilient data replication between distributed nodes 
-   across networks characterized by severe stochastic disturbance and 
-   hostile packet-level telemetry inspections. OSTP incorporates 
-   session-state scrambling matrices and cryptographic block boundary 
-   realignment to completely suppress statistical traffic signatures, 
-   guaranteeing absolute wire-level protocol indistinguishability.
-
-Status of This Memo
-
-   This is an Internet Standards Track document.
-
-   This document is a product of the Internet Engineering Task Force
-   (IETF). It represents the consensus of the IETF community. It has
-   received public review and has been approved for publication by the
-   Internet Engineering Steering Group (IESG). Further information on
-   Internet Standards is available in Section 2 of RFC 7841.
-
-Copyright Notice
-
-   Copyright (c) 2026 IETF Trust and the persons identified as the
-   document authors. All rights reserved.
+   a multiplexed, application-agnostic Layer 4 transport protocol
+   designed for secure, censorship-resistant communication over
+   hostile networks. OSTP employs the Noise Protocol Framework for
+   authenticated key exchange, IETF ChaCha20-Poly1305 for symmetric
+   encryption, HMAC-SHA-256-based per-packet header masking for
+   traffic obfuscation, and a selective-repeat ARQ mechanism for
+   reliability over UDP. The design goal is wire-level
+   indistinguishability from random noise, resistance to Deep Packet
+   Inspection (DPI), and resilience to IP-roaming events.
 
 Table of Contents
 
    1. Introduction ................................................ 2
-      1.1. Terminology and Requirements Language .................. 2
-   2. Architecture and Operations Model ........................... 3
-   3. In-Place Scrambling Transformation (IPST) .................. 3
-      3.1. Derived Entropy Initialization ......................... 3
-      3.2. Operational State Scrambling ........................... 4
-   4. Frame Specification and Formatting .......................... 4
-      4.1. Structural Diagram ..................................... 5
-   5. Cryptographic Synchronization ............................... 5
-   6. Multiplexing Support ........................................ 6
-   7. IANA Considerations ......................................... 6
-   8. Security Considerations ..................................... 6
-   9. References .................................................. 7
+      1.1. Motivation .............................................. 2
+      1.2. Terminology and Requirements Language .................. 2
+      1.3. Relation to Existing Standards ......................... 3
+   2. Protocol Architecture ...................................... 3
+      2.1. Layer Classification ................................... 3
+      2.2. Node Roles .............................................. 3
+      2.3. Transport Substrate .................................... 3
+   3. Frame Format ................................................ 4
+      3.1. Structural Diagram ..................................... 4
+      3.2. Field Descriptions ..................................... 4
+   4. Header Obfuscation .......................................... 5
+      4.1. Obfuscation Key Derivation ............................. 5
+      4.2. Per-Packet Masking ..................................... 5
+   5. Cryptographic Handshake .................................... 6
+   6. Data Channel Operation ..................................... 6
+      6.1. Stream Multiplexing .................................... 7
+      6.2. Selective-Repeat ARQ ................................... 7
+      6.3. Adaptive Padding ....................................... 7
+   7. IP Roaming .................................................. 8
+   8. Security Considerations .................................... 8
+   9. References .................................................. 9
 
 1. Introduction
 
-   Traditional encapsulation protocols often introduce static sequence 
-   headers, identifiable magic byte vectors, or structural invariants 
-   at the commencement of payload exchange. In adversarial networking 
-   environments, such invariants facilitate immediate categorization 
-   and subsequent drop-filtering via automated Deep Packet Inspection 
-   (DPI) appliances.
+1.1. Motivation
 
-   The Ospab Stealth Transport Protocol (OSTP) addresses this threat
-   model by employing mathematical state scrambling and randomized
-   frame-boundary injection prior to final serialization. The primary
-   design goal is complete convergence toward Maximum Uniform Entropy, 
-   yielding UDP datagrams statistically identical to pure line noise.
+   Standard tunneling protocols (e.g., OpenVPN, WireGuard) produce
+   traffic patterns that are reliably identified by stateful DPI
+   systems through static magic bytes, fixed handshake sizes, or
+   predictable sequence patterns. OSTP is designed to resist such
+   fingerprinting by ensuring that every byte on the wire, including
+   header fields, appears statistically indistinguishable from
+   uniformly random data.
 
-1.1. Terminology and Requirements Language
+1.2. Terminology and Requirements Language
 
    The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT",
    "SHOULD", "SHOULD NOT", "RECOMMENDED", "NOT RECOMMENDED", "MAY",
    and "OPTIONAL" in this document are to be interpreted as described
    in BCP 14 [RFC2119] [RFC8174] when, and only when, they appear in
-   all capitals, as shown here.
+   all capitals.
 
-2. Architecture and Operations Model
+   Client / Initiator:  The node that initiates the OSTP connection.
+   Server / Responder:  The node that accepts OSTP connections.
+   Session ID (SID):    A 32-bit per-connection identifier, randomly
+                        generated by the Initiator.
+   Nonce:               A 64-bit monotonically increasing counter used
+                        as both the ARQ sequence number and AEAD IV.
+   Obfuscation Key:     An 8-byte key derived from the access key,
+                        used exclusively for header masking.
 
-   OSTP operates in a client-server paradigm, hereinafter referred to 
-   as the "Relay Bridge" (initiator) and "Collector Node" (responder). 
-   Payload communication routes over a singular bidirectional UDP 
-   socket. Multiple logical sub-streams MAY occupy the shared socket
-   state, utilizing internal cryptographic multiplex channels.
+1.3. Relation to Existing Standards
 
-3. In-Place Scrambling Transformation (IPST)
+   OSTP uses the following standardized components:
 
-   Before transit onto the network layer, every frame is subject to 
-   In-Place Scrambling Transformation (IPST). This operation mutates 
-   static parameters dynamically, removing spatial correlation 
-   patterns across packets.
+   - Noise Protocol Framework [Noise] with pattern NNpsk0, using
+     Curve25519 (X25519 [RFC7748]) for key agreement, ChaCha20-
+     Poly1305 [RFC8439] for AEAD, and BLAKE2s [RFC7693] for hashing.
+   - HMAC-SHA-256 [RFC2104][FIPS180-4] for per-packet header masking.
+   - UDP [RFC0768] as the transport substrate.
 
-3.1. Derived Entropy Initialization
+   OSTP does not claim compliance with or supersede any IETF or IEEE
+   standard. It is an independent protocol specification.
 
-   Nodes MUST configure an authorized ASCII Registration Key (denoted 
-   as 'Key_reg'). Upon instantiation, both nodes statically derive an 
-   8-octet scrambler matrix vector ('K_scram') via the Secure Hash 
-   Algorithm (SHA-256):
+2. Protocol Architecture
 
-      K_scram = SHA-256(Key_reg)[0..7]
+2.1. Layer Classification
 
-   The derived vector 'K_scram' MUST remain local to the nodes and 
-   SHALL NEVER traverse the physical media.
+   In terms of the OSI Reference Model [ISO7498-1]:
 
-3.2. Operational State Scrambling
+   - OSTP occupies Layer 4 (Transport Layer) and provides reliability,
+     ordering, and multiplexing services above UDP (Layer 4 substrate).
+   - The cryptographic and obfuscation functions can be viewed as a
+     presentation-layer concern (Layer 6), though OSTP integrates
+     them inline rather than as a separate layer.
 
-   Each frame contains a 4-octet Session ID (SID) and an 8-octet 
-   inbound/outbound sequence counter (Nonce).
+2.2. Node Roles
 
-   1. Initialization Vector Phase:
-      During initialization, raw payload fields are combined via bitwise 
-      exclusive OR (XOR) against the derivation vector:
+   OSTP operates in a client-server paradigm:
 
-         Serialized[i] = Raw[i] ^ K_scram[i mod 8],  for i in [0..3]
+   Initiator (Client):  Establishes connections, generates Session IDs,
+                        and drives handshake initiation.
+   Responder (Server):  Accepts connections, validates credentials,
+                        and relays application-layer traffic.
 
-   2. Active Session Phase:
-      Once the secure channel is established, multi-tier scrambling 
-      obliterates deterministic sequences:
+2.3. Transport Substrate
 
-      A. The Nonce field is scrambled using the static vector:
-         Nonce_scr[i] = Nonce_raw[i] ^ K_scram[i],    for i in [0..7]
+   All OSTP datagrams are carried over UDP. The Initiator MUST support
+   IP-roaming by allowing the Responder to update the peer address upon
+   receiving an authenticated packet from a new source address.
 
-      B. The Session ID is scrambled using high-frequency entropy 
-         extracted from the least significant 32 bits of the raw Nonce:
-         SID_scr[i] = SID_raw[i] ^ (Nonce_raw & 0xFFFFFFFF)[i]
+3. Frame Format
 
-   As the raw Nonce incrementation cycles through consecutive integer
-   states, the resulting wire-level SID representation changes
-   probabilistically on a per-packet basis, rendering pattern-based
-   prefix filters ineffective.
+3.1. Structural Diagram
 
-4. Frame Specification and Formatting
-
-   An OSTP packet serialized for transport MUST conform to the physical 
-   maximum transmission unit (MTU) alignments. Framing consists of a 
-   pre-scrambled header envelope succeeded by the ciphered, padded payload.
-
-4.1. Structural Diagram
-
-   The serialized datagram representation is depicted below:
+   All multi-byte fields are in network byte order (big-endian).
 
     0                   1                   2                   3
     0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
    +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-   |             Scrambled Session Identifier (32 bits)            |
+   |          Masked Session Identifier (32 bits)                  |
    +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
    |                                                               |
-   +                    Scrambled Nonce (64 bits)                  +
+   +                    Plaintext Nonce (64 bits)                  +
    |                                                               |
    +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
    |                                                               |
-   ~                  AEAD Authenticated Ciphertext                ~
-   |                  (Variable Length Payload)                    |
-   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+   ~              AEAD Ciphertext (Variable Length)                ~
    |                                                               |
-   ~              Cryptographic Dynamic Padding Block              ~
-   |                   (Randomized Noise Density)                  |
    +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-   |                 16-Octet Authentication Tag                   |
+   |              16-Octet Poly1305 Authentication Tag             |
+   |                                                               |
    +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 
-5. Cryptographic Synchronization
+   Total header size: 12 octets (4 SID + 8 Nonce).
+   Minimum frame size: 12 + 16 = 28 octets (empty payload + tag).
 
-   OSTP implementations MUST execute a Noise Protocol Framework exchange 
-   utilizing the `Noise_NNpsk0_25519_ChaChaPoly_BLAKE2s` pattern.
+3.2. Field Descriptions
 
-   1. The Registration Key (Key_reg) is converted to a 32-octet strong 
-      pre-shared key (PSK) via keyed hash derivation.
-   2. The PSK is integrated into the state at pattern position zero,
-      authorizing and encrypting the very first handshaking datagram.
-   3. Ephemeral Curve25519 key exchange is evaluated to synthesize 
-      autonomous symmetric keys for subsequent read/write channels.
+   Masked Session Identifier (32 bits):
+      The Session ID XOR-masked with the first 4 bytes of
+      HMAC-SHA-256(K_obf, Nonce). See Section 4.
 
-6. Multiplexing Support
+   Plaintext Nonce (64 bits):
+      A monotonically increasing counter. MUST start at 0 and
+      increment by 1 for each transmitted packet. The Nonce is
+      transmitted in cleartext to allow the receiver to compute the
+      identical HMAC mask and recover the Session ID. The Nonce is
+      authenticated as Additional Authenticated Data (AAD) by the
+      AEAD cipher, preventing tampering.
 
-   To prevent head-of-line (HoL) bottlenecks associated with reliable 
-   message delivery, OSTP permits binding multiple logical channel 
-   instances to a common hardware UDP socket. Individual channels execute 
-   independent Noise state engines. Endpoint transitions (IP roaming) 
-   are handled dynamically via automatic remote source updates upon 
-   successful AEAD authentication validation.
+   AEAD Ciphertext:
+      The inner payload encrypted with ChaCha20-Poly1305 using the
+      session key, Nonce as IV, and the 12-byte header as AAD.
 
-7. IANA Considerations
+   Authentication Tag:
+      The 16-byte Poly1305 MAC produced by the AEAD operation.
 
-   This document has no actions for IANA. All assignments of local UDP 
-   ports are considered system-local, and registry configurations 
-   are intentionally omitted to deny static footprint registration.
+4. Header Obfuscation
+
+4.1. Obfuscation Key Derivation
+
+   Both nodes MUST independently derive an 8-byte obfuscation key
+   from the shared access key prior to the handshake:
+
+      K_obf = SHA-256(access_key || 0x6F626675736361) [0..7]
+
+   where 0x6F626675736361 is the ASCII encoding of "obfusca".
+   K_obf MUST NOT be transmitted over the network.
+
+4.2. Per-Packet Masking
+
+   To ensure that the Session ID field is statistically independent
+   across consecutive packets, it is masked using a per-packet
+   pseudorandom value derived via HMAC-SHA-256:
+
+      mask[0..3] = HMAC-SHA-256(K_obf, Nonce)[0..3]
+      Masked_SID[i] = SID_raw[i] XOR mask[i],   for i in [0..3]
+
+   Because the Nonce is unique per packet, the mask is
+   cryptographically independent for every datagram. A passive
+   observer cannot distinguish Masked_SID values across packets
+   without knowledge of K_obf.
+
+   The Nonce is transmitted in plaintext. The receiver computes the
+   same HMAC using the received Nonce and K_obf to recover SID_raw:
+
+      SID_raw[i] = Masked_SID[i] XOR HMAC-SHA-256(K_obf, Nonce)[0..3]
+
+   This construction is integrity-protected: if either K_obf or the
+   Nonce is incorrect, the recovered SID will not match any known
+   session, and the packet is silently discarded.
+
+5. Cryptographic Handshake
+
+   OSTP uses the Noise Protocol Framework [Noise] with the following
+   parameters:
+
+      Noise_NNpsk0_25519_ChaChaPoly_BLAKE2s
+
+   - Handshake pattern: NNpsk0 (mutual ephemeral, PSK at position 0)
+   - DH function: X25519 [RFC7748]
+   - AEAD cipher: ChaCha20-Poly1305 [RFC8439]
+   - Hash function: BLAKE2s [RFC7693]
+
+   The PSK is derived from the access key via SHA-256:
+
+      PSK = SHA-256(access_key)
+
+   The handshake payload carried in the initiator's first message
+   includes a Unix timestamp (8 bytes), the Session ID (4 bytes), and
+   the raw access key bytes for server-side authentication. The server
+   validates the access key against its configured set and MUST reject
+   handshakes with timestamps deviating more than 30 seconds from
+   server local time to prevent replay attacks.
+
+6. Data Channel Operation
+
+   After a successful handshake, the Noise session yields two
+   symmetric ChaCha20-Poly1305 keys: one for each direction. These
+   keys are used for all subsequent data frames.
+
+6.1. Stream Multiplexing
+
+   OSTP supports multiplexing of multiple logical application streams
+   over a single UDP socket. Each datagram carries a 16-bit Stream ID
+   embedded in the AEAD-encrypted payload. Multiple parallel Noise
+   sessions MAY be established between the same client-server pair
+   to increase throughput.
+
+6.2. Selective-Repeat ARQ
+
+   OSTP implements a selective-repeat ARQ mechanism:
+
+   - Each packet carries a 64-bit Nonce (sequence number).
+   - The receiver maintains a reorder buffer of configurable depth
+     (default: 8192 packets, window: 2^18).
+   - Unacknowledged packets are retransmitted after a configurable
+     RTO (default: 100 ms), up to a maximum retry count (default: 8).
+   - ACKs are piggybacked on outbound data frames with a configurable
+     delay (default: 5 ms) to allow ACK coalescing.
+   - Out-of-window packets are silently discarded.
+
+6.3. Adaptive Padding
+
+   To resist traffic analysis via packet-length fingerprinting, OSTP
+   implementations SHOULD pad plaintext payloads before AEAD
+   encryption. Padding bytes MUST be drawn from a cryptographically
+   secure random source (e.g., OS-provided CSPRNG). The padding
+   length is determined by the active traffic profile:
+
+   - Fixed:    Pad to the nearest fixed boundary.
+   - Adaptive: Pad to nearest 64-byte boundary, plus 0-96 random
+               bytes.
+   - Profile:  Mimic common protocol size distributions (e.g.,
+               HTTP/2 bursts, video stream MTU-sized frames).
+
+   Maximum padding is 1400 bytes (below standard Ethernet MTU of
+   1500 bytes minus IP and UDP headers).
+
+7. IP Roaming
+
+   The server MUST support IP roaming: if an authenticated packet
+   arrives from a source address different from the recorded peer
+   address for an existing session, the server MUST update the
+   stored peer address to the new source. This enables seamless
+   network handoffs (e.g., cellular to Wi-Fi transitions) without
+   session teardown.
 
 8. Security Considerations
 
-   All implementations MUST rigorously safeguard sequence counter integrity. 
-   Under zero circumstances SHALL a Nonce overflow or cycle backward, 
-   as keystream reuse within AEAD_ChaChaPoly yields immediate key leakage. 
-   Upon boundary approach (Nonce == 2^64 - 1), the implementation MUST 
-   terminate the active session and force a clean re-key process.
+8.1. Nonce Exhaustion
 
-   Padding areas MUST contain true high-entropy randomness. Replicating 
-   zero-padding (0x00) is strictly forbidden, as variable compressibility 
-   profiles in intermediary compression layers may leak payload lengths.
+   The Nonce field is 64 bits wide. At 1,000,000 packets per second,
+   a single session would exhaust the nonce space in approximately
+   585,000 years. Implementations MUST terminate and re-key a session
+   before Nonce reaches 2^64 - 1 to prevent AEAD keystream reuse.
+
+8.2. Replay Attack Prevention
+
+   The 30-second handshake timestamp window mitigates replay of
+   captured handshake packets. Implementations SHOULD additionally
+   maintain a short-lived cache of recently seen handshake payloads
+   to detect exact replays within the time window.
+
+8.3. Session Exhaustion (DoS)
+
+   The server MUST enforce a maximum number of concurrent sessions
+   (recommended: 1024) and silently discard new handshake attempts
+   when the limit is reached. No error response should be sent, to
+   avoid amplification.
+
+8.4. Header Obfuscation Limitations
+
+   The header masking scheme provides obfuscation, not authentication
+   of the header fields themselves. Header integrity is guaranteed
+   indirectly by the AEAD authentication tag, which covers the header
+   as AAD.
 
 9. References
 
-   [RFC2119] Bradner, S., "Key words for use in RFCs to Indicate
-             Requirement Levels", BCP 14, RFC 2119, March 1997.
+   [RFC0768]   Postel, J., "User Datagram Protocol", STD 6, RFC 768,
+               August 1980.
 
-   [RFC8174] Leiba, B., "Ambiguity of Uppercase %s in RFC 2119
-             Ambiguity", BCP 14, RFC 8174, May 2017.
+   [RFC2104]   Krawczyk, H., Bellare, M., Canetti, R., "HMAC:
+               Keyed-Hashing for Message Authentication", RFC 2104,
+               February 1997.
 
-   [Noise]   Trevor Perrin, "The Noise Protocol Framework", 2018.
+   [RFC2119]   Bradner, S., "Key words for use in RFCs to Indicate
+               Requirement Levels", BCP 14, RFC 2119, March 1997.
+
+   [RFC7322]   Flanagan, H., Ginoza, S., "RFC Style Guide", RFC 7322,
+               September 2014.
+
+   [RFC7693]   Saarinen, M-J., Aumasson, J-P., "The BLAKE2
+               Cryptographic Hash and MAC", RFC 7693, November 2015.
+
+   [RFC7748]   Langley, A., Hamburg, M., Turner, S., "Elliptic Curves
+               for Security", RFC 7748, January 2016.
+
+   [RFC8174]   Leiba, B., "Ambiguity of Uppercase vs Lowercase in
+               RFC 2119 Key Words", BCP 14, RFC 8174, May 2017.
+
+   [RFC8439]   Nir, Y., Langley, A., "ChaCha20 and Poly1305 for
+               IETF Protocols", RFC 8439, June 2018.
+
+   [FIPS180-4] NIST, "Secure Hash Standard (SHS)", FIPS PUB 180-4,
+               August 2015.
+
+   [ISO7498-1] ISO/IEC 7498-1:1994, "Information technology -- Open
+               Systems Interconnection -- Basic Reference Model:
+               The Basic Model", 1994.
+
+   [Noise]     Perrin, T., "The Noise Protocol Framework", Revision 34,
+               2018. https://noiseprotocol.org/noise.html
+
+Author's Address
+
+   Georgiy S.
+   Ospab Project
+   Email: (available via GitHub repository)
+   Repository: https://github.com/ospab/ostp

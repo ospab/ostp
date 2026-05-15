@@ -1,93 +1,173 @@
-# IEEE P2974.1™ Draft Standard for High-Assurance Multiplexed Industrial Telemetry Transport
+# OSTP Technical Specification
+## OSI Layer Classification and Protocol Architecture
 
-**Status:** Work-in-Progress Draft (For Engineering Consortium Review Only)  
-**Document Reference:** IEEE-P2974.1-D04  
-**Subject Area:** Networked Sensors, Distributed Industrial Grids, SCADA Relaying  
-
----
-
-## 1. Overview and Scope
-
-### 1.1 Introduction
-This standard defines the wire format, state machine, and operational parameters of the **Ospab Stealth Transport Protocol (OSTP)**. OSTP is an application-agnostic, Layer 4 multiplexed transport pipeline designed to facilitate high-entropy, low-latency data replication between telemetry collectors (Collectors) and localized sensor bridges (Relays) over unreliable, packet-switched networks exhibiting severe electromagnetic line noise or analytical monitoring intercepts.
-
-### 1.2 Scope
-The scope of this specification includes:
-*   Differential spectral framing architectures to minimize traffic signature footprints.
-*   Zero-trust pre-shared cryptographic node initialization channels.
-*   Encapsulated channel multiplexing routines allowing distinct synchronous sub-streams to traverse parallel transport instances without mutual head-of-line blocking.
+**Document Type:** Independent Technical Specification  
+**Status:** Informational  
+**Issuer:** Ospab Project (independent open-source project, not a registered legal entity)  
+**Last Updated:** May 2026
 
 ---
 
-## 2. Mathematical Notation and Conventions
-
-*   **$\oplus$**: Bitwise Exclusive OR (XOR).
-*   **$\text{SHA-256}(X)$**: Secure Hash Algorithm yielding 32 octets.
-*   **$\text{AEAD}_{\text{ChaChaPoly}}(Key, Nonce, AAD, PT)$**: Authenticated Encryption with Associated Data using IETF ChaCha20-Poly1305.
-*   **$\text{Noise\_NNpsk0}$**: Noise Protocol Framework initialization pattern with a 32-octet Pre-Shared Key applied at pattern zero index.
+> [!IMPORTANT]
+> This document is an **independent technical specification** authored by the Ospab Project. It is **not** an IEEE standard, an IETF RFC, or a product of any recognized standards body. It is formatted for clarity and references real, published standards (IEEE, IETF, ISO/IEC) to clarify how OSTP relates to existing specifications.
 
 ---
 
-## 3. Core Frame Format (Wire Specification)
+## 1. OSI Reference Model Classification
 
-OSTP datagrams traversing the physical network interface are restricted to maximum MTU alignments and are categorized into Handshake Frames and Data Frames. All frames undergo an **In-Place Matrix Scrambling (IPMS)** transformation before transit to maintain constant uniform entropy across all fields.
+OSTP is classified according to the **ISO/IEC 7498-1:1994** Open Systems Interconnection (OSI) Basic Reference Model:
 
-### 3.1 In-Place Matrix Scrambling (IPMS)
+| OSI Layer | Number | OSTP Role |
+|---|---|---|
+| Application | 7 | Not in scope (handled by the client application) |
+| Presentation | 6 | **Partial** — OSTP performs encryption and data transformation |
+| Session | 5 | **Partial** — OSTP manages session state (handshake, teardown, roaming) |
+| **Transport** | **4** | **Primary** — OSTP provides reliable, ordered, multiplexed delivery over UDP |
+| Network | 3 | Not in scope (uses IP, provided by OS) |
+| Data Link | 2 | Not in scope |
+| Physical | 1 | Not in scope |
 
-Prior to ingestion by physical Layer 3 endpoints, static identification values must undergo dynamic byte-layer transformations to suppress consistent statistical signatures (e.g., constant prefixes).
-
-Let $K_{\text{obf}}$ be the static 8-octet signal obfuscation key derived as:
-$$K_{\text{obf}} = \text{SHA-256}(Key_{\text{access}})[0..7]$$
-
-#### 3.1.1 Handshake Mode IPMS
-For initial channel establishment packets (where $S_{\text{active}} = \text{False}$):
-$$\text{Payload}_{\text{scrambled}}[i] = \text{Payload}_{\text{raw}}[i] \oplus K_{\text{obf}}[i \pmod 8], \quad \forall i \in [0..3]$$
-
-#### 3.1.2 Operational Mode IPMS
-For subsequent high-speed transmission cycles (where $S_{\text{active}} = \text{True}$):
-The 8-octet packet counter ($Nonce_{\text{raw}}$) and 4-octet channel address ($SessionID_{\text{raw}}$) undergo two-tier skew-shaping:
-
-1.  **Counter Masking:**
-    $$Nonce_{\text{scrambled}}[i] = Nonce_{\text{raw}}[i] \oplus K_{\text{obf}}[i], \quad i \in [0..7]$$
-2.  **Channel Identity Masking:**
-    $$SessionID_{\text{scrambled}}[i] = SessionID_{\text{raw}}[i] \oplus (Nonce_{\text{raw}} \& \text{0xFFFFFFFF})[i], \quad i \in [0..3]$$
-
-Since $Nonce_{\text{raw}}$ increments deterministically upon each transmission, the resultant $SessionID_{\text{scrambled}}$ prefix exhibits zero operational auto-correlation across consecutive packets, rendering statistical filtering models obsolete.
+OSTP's primary classification is **Layer 4 (Transport)**, operating above UDP. It is analogous in positioning to QUIC [RFC 9000] and KCP, which are also Transport-layer protocols implemented above UDP.
 
 ---
 
-## 4. Cryptographic Pipeline Initialization
+## 2. IETF Protocol Category
 
-The validation handshake sequence utilizes the `Noise_NNpsk0_25519_ChaChaPoly_BLAKE2s` specification. All verification variables, including node registry tokens ($Key_{\text{access}}$), are wrapped in the initial cipher payload $e, psk$ pattern.
+The Ospab Project does not hold an RFC number. The following table shows the correct category this protocol *would* fall into under IETF taxonomy (RFC 2026, RFC 7841):
 
-```text
-  Initiator (Relay Bridge)                 Responder (Collector Node)
-  ------------------------                 --------------------------
-         |                                            |
-         |  [Scrambled e, es, psk]                    |
-         |------------------------------------------->| (Session Instantiation)
-         |                                            |
-         |                     [Scrambled e, ee]      |
-         |<-------------------------------------------| (Transport Key Split)
-         |                                            |
+| Attribute | Value |
+|---|---|
+| Intended category | **Informational** (not Standards Track) |
+| Submission type | **Independent Submission** (via Independent Submissions Editor) |
+| RFC number | **None assigned** — this is not a published RFC |
+| Standards body | None — this is not an IETF, IEEE, or ISO standard |
+
+The distinction matters: a protocol can be well-designed and use only standardized primitives without itself being standardized. OSTP is in this category, alongside many production protocols (e.g., WireGuard was an Informational RFC 8669, VXLAN was an Informational RFC 7348).
+
+---
+
+## 3. Cryptographic Primitive Classification
+
+All cryptographic components used by OSTP are standardized and published by recognized bodies:
+
+| Primitive | Standard | Published By |
+|---|---|---|
+| Key Agreement | X25519 (ECDH over Curve25519) | RFC 7748 (IETF) |
+| AEAD Cipher | ChaCha20-Poly1305 | RFC 8439 (IETF) |
+| Hash / HMAC | SHA-256, HMAC-SHA-256 | FIPS PUB 180-4 (NIST), RFC 2104 (IETF) |
+| Handshake Framework | Noise Protocol Framework (NNpsk0) | Independent Spec [noiseprotocol.org] |
+| Hash (Noise internal) | BLAKE2s | RFC 7693 (IETF) |
+| Transport Substrate | UDP | RFC 768 (IETF) |
+
+OSTP does **not** use any proprietary or unreviewed cryptographic algorithms. All primitives listed above are publicly specified and have received significant academic and industry scrutiny.
+
+---
+
+## 4. Frame Format Specification
+
+### 4.1 Wire Format
+
+All multi-byte fields use network byte order (big-endian), consistent with IETF convention (RFC 1700).
+
+```
+ 0                   1                   2                   3
+ 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|          Masked Session Identifier (32 bits)                  |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                                                               |
++                    Plaintext Nonce (64 bits)                  +
+|                                                               |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                                                               |
+~            AEAD Ciphertext + Padding (Variable)               ~
+|                                                               |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|            16-Octet Poly1305 Authentication Tag               |
+|                                                               |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 ```
 
+**Header size:** 12 bytes (fixed)  
+**Minimum datagram size:** 28 bytes (12 header + 16 auth tag, empty payload)  
+**Maximum datagram size:** bounded by UDP MTU (typically ≤ 1472 bytes for standard Ethernet)
+
+### 4.2 Header Obfuscation
+
+The Session ID field is masked per-packet using HMAC-SHA-256, so that no static identifier appears on the wire:
+
+```
+K_obf     = SHA-256(access_key || "obfusca")[0..7]
+mask[0..3] = HMAC-SHA-256(K_obf, Nonce)[0..3]
+Wire_SID  = SID_raw XOR mask
+```
+
+Because the Nonce is unique per packet, `mask` is cryptographically independent for every datagram. The Nonce is transmitted in plaintext; its integrity is protected by the AEAD authentication tag which covers the 12-byte header as Additional Authenticated Data (AAD).
+
 ---
 
-## 5. Spectral Frame Padding (Adaptive Alignment)
+## 5. ARQ Reliability Classification
 
-To counter traffic profiling through Packet Length Analysis (PLA), the protocol utilizes a discrete adaptive alignment system. Telemetry payloads are dynamically resized by the `AdaptivePadder` sub-system using one of the conformant scaling strategies specified below prior to the AEAD application block.
+OSTP's reliability mechanism is classified as **Selective Repeat ARQ** (SR-ARQ), a well-established technique described in:
 
-### 5.1 Scaling Strategies
-1.  **Fixed Boundary Alignment**: Payload lengths are expanded to static preconfigured telemetry buffer alignments.
-2.  **High-Fidelity Adaptive Grid**: Padding lengths are bucketed dynamically to modulo-64 boundaries, augmented by cryptographically generated high-entropy noise vectors ranging between $0$ and $96$ octets to randomize analytical signatures.
-3.  **Profile-Aligned Block Sizes**: Frames are structured to conform strictly to common operational system thresholds, such as VideoStream (MTU-optimized) or RPC Burst topologies.
+- Tanenbaum, A. S., "Computer Networks", 5th ed., Prentice Hall, 2011. (Chapter 3.4)
+- Forouzan, B. A., "Data Communications and Networking", 5th ed., McGraw-Hill, 2012.
+- ISO/IEC 7498-1 (error recovery at transport layer)
 
-### 5.2 Data Padding Composition
-Conformant implementations MUST fill designated padding regions with true cryptographic randomness derived from an OS-provided entropy pool (e.g., `/dev/urandom`) to negate secondary information leaks through dynamic packet compression analyzer attempts.
+Selective Repeat ARQ allows the receiver to request retransmission of only lost packets, unlike Go-Back-N ARQ which requires retransmitting all packets after a loss. This makes OSTP more efficient on high-loss links.
+
+| Parameter | Default Value | Description |
+|---|---|---|
+| Sequence number width | 64 bits | Nonce field, monotonically increasing |
+| Reorder window | 2^18 (262,144) | Maximum acceptable out-of-order offset |
+| Reorder buffer | 8,192 packets | Maximum buffered-out-of-order packets |
+| RTO | 100 ms | Retransmission timeout |
+| ACK delay | 5 ms | Coalescing delay before sending ACK |
+| Max retries | 8 | Per-packet retransmission limit |
 
 ---
 
-## 6. Multiplexing Geometry
+## 6. Comparison to Related Protocols
 
-The protocol supports internal transport pipeline splitting, defined as the capability to host multiple logically separate Noise sessions over a singular physical local socket descriptor. This guarantees High Availability (HA) failover, seamless edge-node IP-roaming, and load distribution under high sensor grid polling frequency conditions.
+| Feature | OSTP | WireGuard | QUIC | OpenVPN (UDP) |
+|---|---|---|---|---|
+| Transport substrate | UDP | UDP | UDP | UDP |
+| OSI Layer | 4 | 3–4 | 4 | 3–4 |
+| Handshake framework | Noise NNpsk0 | Noise IKpsk2 | TLS 1.3 | TLS |
+| AEAD cipher | ChaCha20-Poly1305 | ChaCha20-Poly1305 | AES-GCM / ChaCha | AES-CBC / AES-GCM |
+| Built-in reliability (ARQ) | Yes (Selective Repeat) | No (relies on IP) | Yes (QUIC streams) | No |
+| Traffic obfuscation | Yes (HMAC-masked headers, adaptive padding) | No | Partial (QUIC spin bit) | No |
+| IP roaming support | Yes | Yes | Yes | No |
+| Stream multiplexing | Yes | No (single tunnel) | Yes | No |
+| Standardized | No (independent) | RFC 8669 (Informational) | RFC 9000 (Standards Track) | No |
+
+---
+
+## 7. Threat Model Summary
+
+OSTP is designed against the following adversary model:
+
+1. **Passive deep packet inspection (DPI):** Mitigated by per-packet HMAC-masked headers and adaptive payload padding, ensuring no static signatures are present on the wire.
+2. **Active probing:** An active prober sends arbitrary data to the server. Mitigated by requiring a valid authenticated Noise handshake — the server produces no response to invalid packets.
+3. **Replay attacks:** Mitigated by a 30-second timestamp window in the handshake payload and a short-lived handshake replay cache.
+4. **Session flooding (DoS):** Mitigated by a hard cap of 1,024 concurrent sessions on the server; excess handshakes are silently dropped.
+5. **IP roaming attacks:** Prevented by the requirement that all peer address updates are gated on successful AEAD authentication of the incoming packet.
+
+---
+
+## 8. Standards Referenced
+
+The following published standards are referenced or used by OSTP:
+
+| Standard | Title | Body |
+|---|---|---|
+| ISO/IEC 7498-1:1994 | OSI Basic Reference Model | ISO/IEC JTC 1 |
+| RFC 768 | User Datagram Protocol | IETF |
+| RFC 2104 | HMAC: Keyed-Hashing for Message Authentication | IETF |
+| RFC 2119 | Key words for use in RFCs | IETF |
+| RFC 7693 | The BLAKE2 Cryptographic Hash and MAC | IETF |
+| RFC 7748 | Elliptic Curves for Security (X25519) | IETF |
+| RFC 8174 | Ambiguity of Uppercase vs Lowercase in RFC 2119 | IETF |
+| RFC 8439 | ChaCha20 and Poly1305 for IETF Protocols | IETF |
+| FIPS PUB 180-4 | Secure Hash Standard (SHA-256) | NIST |
+| Noise Spec Rev.34 | The Noise Protocol Framework | Trevor Perrin (independent) |
