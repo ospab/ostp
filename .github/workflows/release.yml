@@ -129,7 +129,6 @@ jobs:
         if: ${{ !matrix.use_cross && matrix.os != 'windows-latest' }}
         shell: bash
         run: |
-          [ -f "$HOME/.cargo/env" ] && source "$HOME/.cargo/env"
           cargo build --release --target ${{ matrix.target }} --bin ostp
 
       - name: Execute Specialized Cross-Compilation
