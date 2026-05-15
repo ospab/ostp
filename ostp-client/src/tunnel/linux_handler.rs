@@ -138,6 +138,7 @@ pub async fn run_linux_tunnel(
     // 4. Setup commands (Using standard /1 routing trick for fail-proof overriding)
     let setup_script = format!(
         "ip tuntap add name ostp_tun mode tun || true; \
+         ip link set dev ostp_tun mtu 1300; \
          ip addr add 10.1.0.2/24 dev ostp_tun || true; \
          ip link set dev ostp_tun up; \
          ip route add {} via {} dev {}; \

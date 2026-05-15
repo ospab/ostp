@@ -137,6 +137,7 @@ pub async fn run_wintun_tunnel(
     // to the physical interface DNS servers, which are physically routed and work flawlessly.
     let net_setup = "\
         netsh interface ipv4 set address name=\"ostp_tun\" static 10.1.0.2 255.255.255.0 10.1.0.1\n\
+        netsh interface ipv4 set subinterface \"ostp_tun\" mtu=1300 store=persistent\n\
         netsh interface ipv4 set interface name=\"ostp_tun\" metric=5\n";
     
     let _ = Command::new("powershell")

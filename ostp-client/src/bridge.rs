@@ -533,7 +533,7 @@ impl Bridge {
             psk,
             session_id,
             handshake_payload,
-            max_padding: 1400, // §7 FIX: Allow padding up to full MTU size to break traffic analysis fingerprints
+            max_padding: 1280, // Safe MTU size to avoid UDP fragmentation on Windows/PPPoE
             padding_strategy: PaddingStrategy::Profile(self.profile),
             obfuscation_key: obf_key,
             max_reorder: 262144,
