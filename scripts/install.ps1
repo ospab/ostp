@@ -92,18 +92,29 @@ if (-not (Test-Path $zipPath)) {
 if (Test-Path $extractPath) { Remove-Item $extractPath -Recurse -Force }
 Expand-Archive -Path $zipPath -DestinationPath $extractPath -Force
 
-$exeFile = Get-ChildItem -Path $extractPath -Filter "*.exe" -Recurse | Select-Object -First 1
-if ($exeFile) {
-    Write-Host "Stopping any active instances of ostp to unlock binary target..."
-    Stop-Process -Name "ostp" -ErrorAction SilentlyContinue
-    Start-Sleep -Seconds 1
+$extractedFiles = Get-ChildItem -Path $extractPath -File -Recurse
+if ($extractedFiles.Count -gt 0) {
+    Write-Host "Stopping any active instances of ostp to unlock binary targets..."
+    Stop-Process -Name "ostp", "tun2socks" -Force -ErrorAction SilentlyContinue
+    Start-Sleep -Seconds 2
     
-    Copy-Item -Path $exeFile.FullName -Destination (Join-Path $InstallDir "ostp.exe") -Force
-    # Force file system timestamps to current local time to reflect successful execution
-    (Get-Item (Join-Path $InstallDir "ostp.exe")).LastWriteTime = [DateTime]::Now
-    Write-Host "Executable successfully deployed to $(Join-Path $InstallDir 'ostp.exe')."
+    foreach ($file in $extractedFiles) {
+        $destPath = Join-Path $InstallDir $file.Name
+        if (Test-Path $destPath) {
+            # Rename the existing executable out of the way to bypass file locks
+            $oldPath = $destPath + ".old_$PID"
+            Rename-Item -Path $destPath -NewName $oldPath -ErrorAction SilentlyContinue
+        }
+        Copy-Item -Path $file.FullName -Destination $destPath -Force
+        (Get-Item $destPath).LastWriteTime = [DateTime]::Now
+    }
+    
+    # Try to clean up any leftover old files
+    Get-ChildItem -Path $InstallDir -Filter "*.old_*" | Remove-Item -Force -ErrorAction SilentlyContinue
+    
+    Write-Host "Executables and dependencies successfully deployed to $InstallDir."
 } else {
-    Write-Error "Binary file ostp.exe not found in archive package."
+    Write-Error "No files found in archive package."
     exit 1
 }
 
