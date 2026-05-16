@@ -30,7 +30,7 @@ if (Test-Path $CargoToml) {
         $NewVersionStr = 'version = "' + $Version + '"'
         $NewContent = $Content -replace 'version\s*=\s*"\d+\.\d+\.\d+"', $NewVersionStr
         [System.IO.File]::WriteAllText($CargoToml, $NewContent)
-        Write-Output "✔ Bounded workspace package to target release version: v$Version"
+        Write-Output "[OK] Bounded workspace package to target release version: v$Version"
     }
 }
 
@@ -88,7 +88,7 @@ foreach ($item in $WindowsTargets) {
             Compress-Archive -Path "$targetStaging\*" -DestinationPath $archivePath -Force
             
             $ReleaseArchives += $archivePath
-            Write-Output "✔ SUCCESSFULLY PACKAGED: $archiveName"
+            Write-Output "[OK] SUCCESSFULLY PACKAGED: $archiveName"
             
             if ($Flatten) {
                 $RawReleaseDir = Join-Path $DistDir "release"
@@ -99,7 +99,7 @@ foreach ($item in $WindowsTargets) {
             }
         }
     } else {
-        Write-Output "⚠ FAILED compiling Windows $arch ($target). Missing local platform C++ toolchain components."
+        Write-Output "[WARN] FAILED compiling Windows $arch ($target). Missing local platform C++ toolchain components."
     }
 }
 # Restore environment variables
@@ -155,7 +155,7 @@ if (Get-Command wsl -ErrorAction SilentlyContinue) {
                 & wsl tar -czf $wslArchiveFile -C $wslStagingDir $bin
                 
                 $ReleaseArchives += Join-Path $DistDir $archiveName
-                Write-Output "✔ SUCCESSFULLY PACKAGED: $archiveName"
+                Write-Output "[OK] SUCCESSFULLY PACKAGED: $archiveName"
                 
                 if ($Flatten) {
                     $RawReleaseDir = Join-Path $DistDir "release"
@@ -166,11 +166,11 @@ if (Get-Command wsl -ErrorAction SilentlyContinue) {
                 }
             }
         } else {
-            Write-Output "⚠ FAILED compiling Linux $arch ($target)."
+            Write-Output "[WARN] FAILED compiling Linux $arch ($target)."
         }
     }
 } else {
-    Write-Output "⚠ WSL utility not discovered on host. Skipping Linux binary compilations."
+    Write-Output "[WARN] WSL utility not discovered on host. Skipping Linux binary compilations."
 }
 
 # Dissolve staging buffer directory
@@ -182,7 +182,7 @@ Write-Output "========================================================="
 if ($ReleaseArchives.Count -gt 0) {
     $ReleaseArchives | ForEach-Object { Write-Output " [+] $_" }
 } else {
-    Write-Output "❌ CRITICAL: No architectures compiled successfully."
+    Write-Output "[ERROR] CRITICAL: No architectures compiled successfully."
     Pop-Location
     exit 1
 }
@@ -214,11 +214,11 @@ Write-Output "Deploying trigger tag to GitHub..."
 & git push origin "v$Version" --force
 
 if ($LASTEXITCODE -eq 0) {
-    Write-Output "`n🚀 EXCELLENT! Release trigger successfully synchronized with Cloud runners!"
-    Write-Output "✨ GitHub Actions is now compiling all 13 architectures in parallel."
-    Write-Output "🔗 Live monitoring link: https://github.com/ospab/ostp/actions"
+    Write-Output "`n[OK] EXCELLENT! Release trigger successfully synchronized with Cloud runners!"
+    Write-Output "[INFO] GitHub Actions is now compiling all 13 architectures in parallel."
+    Write-Output "[INFO] Live monitoring link: https://github.com/ospab/ostp/actions"
 } else {
-    Write-Output "`n❌ Failed to deliver release tag to remote origin."
+    Write-Output "`n[ERROR] Failed to deliver release tag to remote origin."
 }
 
 Pop-Location

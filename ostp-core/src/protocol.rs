@@ -415,12 +415,21 @@ impl ProtocolMachine {
         }
 
         let now = Instant::now();
+        let base_rto_ms = self.rto.as_millis().max(1) as u64;
         for frame in self.sent_history.iter_mut() {
-            if frame.retries >= self.max_retries {
-                tracing::error!("FATAL: Frame {} exceeded max retries ({}). Connection is dead.", frame.nonce, self.max_retries);
-                return Err(ProtocolError::State("connection dead, max retries exceeded".into()));
+            if frame.retries == self.max_retries {
+                tracing::warn!(
+                    "Frame {} exceeded max retries ({}); continuing with backoff",
+                    frame.nonce,
+                    self.max_retries
+                );
             }
-            if now.duration_since(frame.last_sent) >= self.rto {
+
+            let retry_over = frame.retries.saturating_sub(self.max_retries);
+            let backoff_factor = 1u64 << retry_over.min(6);
+            let effective_rto = Duration::from_millis(base_rto_ms.saturating_mul(backoff_factor));
+
+            if now.duration_since(frame.last_sent) >= effective_rto {
                 frame.last_sent = now;
                 frame.retries = frame.retries.saturating_add(1);
                 actions.push(ProtocolAction::SendDatagram(frame.bytes.clone()));

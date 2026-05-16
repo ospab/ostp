@@ -102,7 +102,7 @@ impl Bridge {
         mut bridge_rx: mpsc::Receiver<BridgeCommand>,
         mut shutdown: watch::Receiver<bool>,
         mut proxy_rx: mpsc::Receiver<ProxyEvent>,
-        proxy_tx: mpsc::Sender<(u16, ProxyToClientMsg)>,
+        proxy_tx: mpsc::UnboundedSender<(u16, ProxyToClientMsg)>,
     ) -> Result<()> {
         let mut metrics_tick = interval(Duration::from_millis(500));
         let mut keepalive_tick = tokio::time::interval(Duration::from_secs(5));
@@ -167,17 +167,17 @@ impl Bridge {
                                                         match relay_msg {
                                                             RelayMessage::ConnectOk => {
                                                                 let _ = tx.send(UiEvent::Log(format!("Relay CONNECT OK stream_id={stream_id}"))).await;
-                                                                let _ = proxy_tx.send((stream_id, ProxyToClientMsg::ConnectOk)).await;
+                                                                let _ = proxy_tx.send((stream_id, ProxyToClientMsg::ConnectOk));
                                                             }
                                                             RelayMessage::Data(data) => {
-                                                                let _ = proxy_tx.send((stream_id, ProxyToClientMsg::Data(Bytes::from(data)))).await;
+                                                                let _ = proxy_tx.send((stream_id, ProxyToClientMsg::Data(Bytes::from(data))));
                                                             }
                                                             RelayMessage::Close => {
-                                                                let _ = proxy_tx.send((stream_id, ProxyToClientMsg::Close)).await;
+                                                                let _ = proxy_tx.send((stream_id, ProxyToClientMsg::Close));
                                                             }
                                                             RelayMessage::Error(msg) => {
                                                                 let _ = tx.send(UiEvent::Log(format!("Relay error for stream {stream_id}: {msg}"))).await;
-                                                                let _ = proxy_tx.send((stream_id, ProxyToClientMsg::Error(msg))).await;
+                                                                let _ = proxy_tx.send((stream_id, ProxyToClientMsg::Error(msg)));
                                                             }
                                                             RelayMessage::Pong(ts) => {
                                                                 let now = SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
@@ -188,7 +188,7 @@ impl Bridge {
                                                     }
                                                     Err(err) => {
                                                         let _ = tx.send(UiEvent::Log(format!("Relay decode error for stream {stream_id}: {err}"))).await;
-                                                        let _ = proxy_tx.send((stream_id, ProxyToClientMsg::Error("relay decode failed".to_string()))).await;
+                                                        let _ = proxy_tx.send((stream_id, ProxyToClientMsg::Error("relay decode failed".to_string())));
                                                     }
                                                 }
                                             }
@@ -209,6 +209,7 @@ impl Bridge {
                             sessions_opt = None;
                             udp_rx_opt = None;
                             stream_map.clear();
+                            self.reset_proxy_streams(&tx, &proxy_tx, "udp reader closed");
                             let _ = tx.send(UiEvent::TunnelStopped).await;
                         }
                     }
@@ -223,6 +224,7 @@ impl Bridge {
                                 sessions_opt = None;
                                 udp_rx_opt = None;
                                 stream_map.clear();
+                                self.reset_proxy_streams(&tx, &proxy_tx, "manual stop");
                                 tx.send(UiEvent::TunnelStopped).await.ok();
                                 let stop_msg = if self.mode == "tun" { "TUN Tunnel stopped" } else { "Bridge stopped" };
                                 tx.send(UiEvent::Log(stop_msg.to_string())).await.ok();
@@ -327,6 +329,7 @@ impl Bridge {
                                         _proxy_guard = None;
                                         sessions_opt = None;
                                         stream_map.clear();
+                                        self.reset_proxy_streams(&tx, &proxy_tx, "config reload");
                                         // User logic handles UI restart
                                         let _ = tx.send(UiEvent::TunnelStopped).await;
                                     }
@@ -357,6 +360,7 @@ impl Bridge {
                             _proxy_guard = None;
                             sessions_opt = None;
                             stream_map.clear();
+                            self.reset_proxy_streams(&tx, &proxy_tx, "keepalive timeout");
                             let _ = tx.send(UiEvent::TunnelStopped).await;
                             self.metrics.connection_state.store(0, Ordering::Relaxed);
                             continue;
@@ -421,6 +425,7 @@ impl Bridge {
                             sessions_opt = None;
                             udp_rx_opt = None;
                             stream_map.clear();
+                            self.reset_proxy_streams(&tx, &proxy_tx, "protocol fatal error");
                             let _ = tx.send(UiEvent::TunnelStopped).await;
                             self.metrics.connection_state.store(0, Ordering::Relaxed);
                         }
@@ -434,7 +439,7 @@ impl Bridge {
                         if let Some(sessions) = sessions_opt.as_mut() {
                             if sessions.is_empty() {
                                 if let ProxyEvent::NewStream { stream_id, .. } = ev {
-                                    let _ = proxy_tx.send((stream_id, ProxyToClientMsg::Error("tunnel stopped".into()))).await;
+                                    let _ = proxy_tx.send((stream_id, ProxyToClientMsg::Error("tunnel stopped".into())));
                                 }
                                 continue;
                             }
@@ -508,7 +513,7 @@ impl Bridge {
                         } else {
                             // Drop it, not connected
                             if let ProxyEvent::NewStream { stream_id, .. } = ev {
-                                let _ = proxy_tx.send((stream_id, ProxyToClientMsg::Error("tunnel stopped".into()))).await;
+                                let _ = proxy_tx.send((stream_id, ProxyToClientMsg::Error("tunnel stopped".into())));
                             }
                         }
                     }
@@ -520,6 +525,28 @@ impl Bridge {
 
         tx.send(UiEvent::Log("Bridge stopped".to_string())).await.ok();
         Ok(())
+    }
+
+    fn reset_proxy_streams(
+        &self,
+        tx: &mpsc::Sender<UiEvent>,
+        proxy_tx: &mpsc::UnboundedSender<(u16, ProxyToClientMsg)>,
+        reason: &str,
+    ) {
+        if proxy_tx
+            .send((0, ProxyToClientMsg::Close))
+            .is_err()
+        {
+            let tx_clone = tx.clone();
+            let reason_str = reason.to_string();
+            tokio::spawn(async move {
+                let _ = tx_clone
+                    .send(UiEvent::Log(format!(
+                        "Failed to reset local proxy streams ({reason_str})"
+                    )))
+                    .await;
+            });
+        }
     }
 
     async fn emit_metrics(&mut self, tx: &mpsc::Sender<UiEvent>) {

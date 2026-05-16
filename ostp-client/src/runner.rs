@@ -154,7 +154,7 @@ pub async fn run_client_core(
     }
 
     let (proxy_events_tx, proxy_events_rx) = mpsc::channel(10000);
-    let (client_msgs_tx, client_msgs_rx) = mpsc::channel(10000);
+    let (client_msgs_tx, client_msgs_rx) = mpsc::unbounded_channel();
 
     let bridge = Bridge::new(&config, metrics)?;
 

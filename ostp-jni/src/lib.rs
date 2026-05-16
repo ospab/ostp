@@ -75,7 +75,7 @@ pub extern "system" fn Java_net_ostp_client_OstpClientSdk_startClient(
     };
 
     let (proxy_events_tx, proxy_events_rx) = mpsc::channel(512);
-    let (client_msgs_tx, client_msgs_rx) = mpsc::channel(512);
+    let (client_msgs_tx, client_msgs_rx) = mpsc::unbounded_channel();
 
     let metrics = Arc::new(BridgeMetrics {
         bytes_sent: portable_atomic::AtomicU64::new(0),

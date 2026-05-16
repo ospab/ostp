@@ -15,7 +15,7 @@ pub async fn run_local_socks5_proxy(
     debug: bool,
     mut shutdown: watch::Receiver<bool>,
     proxy_events_tx: mpsc::Sender<ProxyEvent>,
-    mut client_msgs_rx: mpsc::Receiver<(u16, ProxyToClientMsg)>,
+    mut client_msgs_rx: mpsc::UnboundedReceiver<(u16, ProxyToClientMsg)>,
 ) -> Result<()> {
     let connect_timeout = Duration::from_millis(cfg.connect_timeout_ms.max(1));
     let listener = TcpListener::bind(&cfg.bind_addr)
@@ -31,7 +31,7 @@ pub async fn run_local_socks5_proxy(
     let (connect_tx, mut connect_rx) = mpsc::channel(128);
 
     let mut next_stream_id: u16 = 1;
-    let mut active_streams: HashMap<u16, mpsc::Sender<ProxyToClientMsg>> = HashMap::new();
+    let mut active_streams: HashMap<u16, mpsc::UnboundedSender<ProxyToClientMsg>> = HashMap::new();
 
     loop {
         tokio::select! {
@@ -46,7 +46,7 @@ pub async fn run_local_socks5_proxy(
                 next_stream_id = next_stream_id.wrapping_add(1);
                 if next_stream_id == 0 { next_stream_id = 1; }
 
-                let (tx, rx) = mpsc::channel(256);
+                let (tx, rx) = mpsc::unbounded_channel();
                 active_streams.insert(stream_id, tx);
 
                 let event_tx = proxy_events_tx.clone();
@@ -78,8 +78,17 @@ pub async fn run_local_socks5_proxy(
                 });
             }
             Some((stream_id, msg)) = client_msgs_rx.recv() => {
-                if let Some(tx) = active_streams.get(&stream_id) {
-                    if tx.send(msg).await.is_err() {
+                if stream_id == 0 {
+                    if let ProxyToClientMsg::Close = msg {
+                        if debug {
+                            eprintln!("[ostp-client] Resetting all active proxy streams on reconnect");
+                        }
+                        for (_, tx) in active_streams.drain() {
+                            let _ = tx.send(ProxyToClientMsg::Close);
+                        }
+                    }
+                } else if let Some(tx) = active_streams.get(&stream_id) {
+                    if tx.send(msg).is_err() {
                         active_streams.remove(&stream_id);
                     }
                 }
@@ -116,7 +125,7 @@ async fn handle_proxy_client(
     mut client: TcpStream,
     stream_id: u16,
     event_tx: mpsc::Sender<ProxyEvent>,
-    mut rx: mpsc::Receiver<ProxyToClientMsg>,
+    mut rx: mpsc::UnboundedReceiver<ProxyToClientMsg>,
     close_tx: mpsc::Sender<u16>,
     connect_timeout: Duration,
     debug: bool,

@@ -61,7 +61,7 @@ pub async fn run_local_proxy(
     debug: bool,
     shutdown: watch::Receiver<bool>,
     proxy_events_tx: mpsc::Sender<ProxyEvent>,
-    client_msgs_rx: mpsc::Receiver<(u16, ProxyToClientMsg)>,
+    client_msgs_rx: mpsc::UnboundedReceiver<(u16, ProxyToClientMsg)>,
 ) -> anyhow::Result<()> {
     run_local_socks5_proxy(cfg, ostp, exclusions, debug, shutdown, proxy_events_tx, client_msgs_rx).await
 }

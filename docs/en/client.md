@@ -59,7 +59,7 @@ To minimize latency and overhead for trusted resources, the OSTP client incorpor
 
 ---
 
-## Multiplexing & Known Session Constraints
+## Multiplexing
 
 The wire protocol provides support for bundling multiple physical UDP session handles into a single logical transport pipeline via the `"mux"` block:
 
@@ -70,12 +70,5 @@ The wire protocol provides support for bundling multiple physical UDP session ha
 }
 ```
 
-### Current Implementation Limits:
-> [!WARNING]
-> **Currently, utilizing more than 1 multiplexed session (`sessions > 1`) is NOT supported and will result in complete traffic loss.**
->
-> **Observed Bug Behavior:**
-> If multiple sessions are initiated (e.g., `sessions: 3`), the client executes successful handshakes for each endpoint (yielding repeated `Connected UDP directly to` lines in diagnostic logs), and the server initializes the matching tracking slots. However, during the payload demultiplexing phase, the server pipeline fails to bridge payloads back to active streams, dropping all encapsulated packets.
-> 
-> **Resolution Requirement:**
-> You MUST ensure that the `"mux"` block remains disabled (`"enabled": false`) OR is manually constrained to exactly **1** session (`"sessions": 1`).
+### Current Status
+Multi-session multiplexing (`sessions > 1`) is supported. Use the `"mux"` block to scale concurrent transport sessions as needed for throughput or resiliency.
