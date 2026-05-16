@@ -60,7 +60,8 @@ impl Dispatcher {
                 let mut header = [0u8; 12];
                 if packet.len() >= 12 {
                     header.copy_from_slice(&packet[0..12]);
-                    ostp_core::crypto::deobfuscate_packet_inplace(&mut header, &peer_state.obfuscation_key, false);
+                    let ciphertext = &packet[12..];
+                    ostp_core::crypto::deobfuscate_header_inplace(&mut header, ciphertext, &peer_state.obfuscation_key, false);
                     let candidate_sid = u32::from_be_bytes([header[0], header[1], header[2], header[3]]);
                     if candidate_sid == sid {
                         session_id_opt = Some(sid);
@@ -84,7 +85,8 @@ impl Dispatcher {
                     if packet.len() >= 12 {
                         let mut header = [0u8; 12];
                         header.copy_from_slice(&packet[0..12]);
-                        ostp_core::crypto::deobfuscate_packet_inplace(&mut header, &peer_state.obfuscation_key, false);
+                        let ciphertext = &packet[12..];
+                        ostp_core::crypto::deobfuscate_header_inplace(&mut header, ciphertext, &peer_state.obfuscation_key, false);
                         let candidate_sid = u32::from_be_bytes([header[0], header[1], header[2], header[3]]);
                         if candidate_sid == sid {
                             session_id_opt = Some(sid);
