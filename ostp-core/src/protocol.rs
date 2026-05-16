@@ -229,7 +229,11 @@ impl ProtocolMachine {
             let nonce = u64::from_be_bytes(raw_vec[4..12].try_into().unwrap());
             
             if nonce < self.expected_recv_nonce {
-                // Duplicate or delayed packet already processed, drop silently
+                // Duplicate packet! The ACK we sent was likely lost or delayed.
+                // We MUST trigger an immediate ACK to unblock the sender's congestion window.
+                if let Some(ack_frame) = self.force_build_ack()? {
+                    return Ok(ProtocolAction::SendDatagram(ack_frame));
+                }
                 return Ok(ProtocolAction::Noop);
             }
 
@@ -466,6 +470,19 @@ impl ProtocolMachine {
         let frame = self.build_control_datagram(0, FrameKind::Ack, payload)?;
         self.ack_pending = false;
         self.last_ack_sent = now;
+        Ok(Some(frame))
+    }
+
+    fn force_build_ack(&mut self) -> Result<Option<Bytes>, ProtocolError> {
+        let payload = self.build_ack_payload();
+        if payload.is_empty() {
+            self.ack_pending = false;
+            return Ok(None);
+        }
+
+        let frame = self.build_control_datagram(0, FrameKind::Ack, payload)?;
+        self.ack_pending = false;
+        self.last_ack_sent = Instant::now();
         Ok(Some(frame))
     }
 
