@@ -315,27 +315,26 @@ async fn run_app() -> Result<()> {
         let key = generate_secure_key("hex");
         let content = if is_server {
             format!(r#"{{
-  "_comment": "OSTP Server Configuration",
+  // OSTP Server Configuration
   "mode": "server",
   "log_level": "info",
   
-  "_comment_listen": "The address and port the server listens on for incoming OSTP connections.",
+  // The address and port the server listens on for incoming OSTP connections.
   "listen": "0.0.0.0:50000",
   
-  "_comment_access_keys": "List of valid keys. Clients must use one of these to connect.",
+  // List of valid keys. Clients must use one of these to connect.
   "access_keys": [
     "{}"
   ],
   
-  "_comment_outbound": "Optional proxy for outbound traffic. If enabled, the server routes traffic through this proxy.",
+  // Optional proxy for outbound traffic.
   "outbound": {{
     "enabled": false,
     "protocol": "socks5",
     "address": "127.0.0.1",
     "port": 9050,
-    "_comment_default_action": "Can be 'proxy' (route all traffic through proxy by default) or 'direct' (bypass proxy by default).",
+    // default_action: 'proxy' (all through proxy) or 'direct' (bypass proxy by default).
     "default_action": "proxy",
-    "_comment_rules": "Specific routing rules. Action can be 'proxy', 'direct', or 'block'.",
     "rules": [
       {{
         "domain_suffix": [".onion"],
@@ -347,20 +346,20 @@ async fn run_app() -> Result<()> {
 }}"#, key)
         } else {
             format!(r#"{{
-  "_comment": "OSTP Client Configuration",
+  // OSTP Client Configuration
   "mode": "client",
   "log_level": "info",
   
-  "_comment_server": "Address of the remote OSTP server",
+  // Address of the remote OSTP server
   "server": "127.0.0.1:50000",
   
-  "_comment_access_key": "Must match one of the access_keys on the server",
+  // Must match one of the access_keys on the server
   "access_key": "{}",
   
-  "_comment_socks5_bind": "The local port where the system/browser should connect (HTTP/SOCKS5)",
+  // The local port for HTTP/SOCKS5 proxying
   "socks5_bind": "127.0.0.1:1088",
   
-  "_comment_tun": "Virtual network adapter settings (requires tun2socks.exe to be present)",
+  // Virtual network adapter settings
   "tun": {{
     "enable": false,
     "wintun_path": "./wintun.dll",
@@ -368,7 +367,7 @@ async fn run_app() -> Result<()> {
     "dns": "1.1.1.1"
   }},
   
-  "_comment_exclude": "Bypass tunnel for these domains/IPs (only works in proxy mode)",
+  // Bypass tunnel for these domains/IPs
   "exclude": {{
     "domains": ["localhost", "127.0.0.1"],
     "ips": [],
@@ -411,7 +410,8 @@ async fn run_app() -> Result<()> {
     }
 
     let config_content = fs::read_to_string(&args.config)?;
-    let config: UnifiedConfig = serde_json::from_str(&config_content)
+    let mut stripped = json_comments::StripComments::new(config_content.as_bytes());
+    let config: UnifiedConfig = serde_json::from_reader(&mut stripped)
         .map_err(|e| anyhow!("Failed to parse config: {}", e))?;
 
     config.validate()?;

@@ -45,12 +45,13 @@ irm https://raw.githubusercontent.com/ospab/ostp/master/scripts/install.ps1 | ie
 ```
 
 ### Сервер (config.json)
-```json
+```jsonc
 {
-  "_comment": "OSTP Server Configuration",
+  // Конфигурация Сервера OSTP
   "mode": "server",
   "listen": "0.0.0.0:50000",
   "access_keys": ["ВАШ_КЛЮЧ"],
+  // Опционально: пересылка трафика через другой прокси
   "outbound": {
     "enabled": false,
     "protocol": "socks5",
@@ -62,13 +63,14 @@ irm https://raw.githubusercontent.com/ospab/ostp/master/scripts/install.ps1 | ie
 ```
 
 ### Клиент (config.json)
-```json
+```jsonc
 {
-  "_comment": "OSTP Client Configuration",
+  // Конфигурация Клиента OSTP
   "mode": "client",
   "server": "IP_СЕРВЕРА:50000",
   "access_key": "ВАШ_КЛЮЧ",
   "socks5_bind": "127.0.0.1:1088",
+  // Настройки виртуального сетевого адаптера
   "tun": {
     "enable": false,
     "wintun_path": "./wintun.dll",

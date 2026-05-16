@@ -45,12 +45,13 @@ Initialize a default config file:
 ```
 
 ### Server (config.json)
-```json
+```jsonc
 {
-  "_comment": "OSTP Server Configuration",
+  // OSTP Server Configuration
   "mode": "server",
   "listen": "0.0.0.0:50000",
   "access_keys": ["YOUR_KEY"],
+  // Optional: forward traffic to another proxy
   "outbound": {
     "enabled": false,
     "protocol": "socks5",
@@ -62,13 +63,14 @@ Initialize a default config file:
 ```
 
 ### Client (config.json)
-```json
+```jsonc
 {
-  "_comment": "OSTP Client Configuration",
+  // OSTP Client Configuration
   "mode": "client",
   "server": "SERVER_IP:50000",
   "access_key": "YOUR_KEY",
   "socks5_bind": "127.0.0.1:1088",
+  // Virtual network adapter settings
   "tun": {
     "enable": false,
     "wintun_path": "./wintun.dll",

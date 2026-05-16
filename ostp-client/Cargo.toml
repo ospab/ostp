@@ -13,5 +13,6 @@ ostp-core = { path = "../ostp-core" }
 rand.workspace = true
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+json-comments = "0.2"
 portable-atomic.workspace = true
 chrono = "0.4"

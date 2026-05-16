@@ -160,7 +160,8 @@ impl ClientConfig {
 
         let raw = std::fs::read_to_string(&path)
             .with_context(|| format!("failed to read {}", path.display()))?;
-        let raw: RawUnifiedConfig = serde_json::from_str(&raw)
+        let mut stripped = json_comments::StripComments::new(raw.as_bytes());
+        let raw: RawUnifiedConfig = serde_json::from_reader(&mut stripped)
             .with_context(|| format!("failed to parse {}", path.display()))?;
 
         let is_tun = raw.tun.as_ref().and_then(|t| t.enable).unwrap_or(false);
