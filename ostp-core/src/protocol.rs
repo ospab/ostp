@@ -89,6 +89,7 @@ struct SentFrame {
     bytes: Bytes,
     last_sent: Instant,
     retries: u8,
+    is_retransmittable: bool,
 }
 
 impl ProtocolMachine {
@@ -356,7 +357,7 @@ impl ProtocolMachine {
         self.build_datagram(stream_id, kind, payload, false)
     }
 
-    fn build_datagram(&mut self, stream_id: u16, kind: FrameKind, payload: Bytes, track: bool) -> Result<Bytes, ProtocolError> {
+    fn build_datagram(&mut self, stream_id: u16, kind: FrameKind, payload: Bytes, is_retransmittable: bool) -> Result<Bytes, ProtocolError> {
         let padding = self.padder.build_padding(payload.len());
         let header = FrameHeader {
             version: 1,
@@ -395,9 +396,7 @@ impl ProtocolMachine {
 
         let final_bytes = Bytes::from(out);
         
-        if track {
-            self.push_sent_frame(nonce, final_bytes.clone());
-        }
+        self.push_sent_frame(nonce, final_bytes.clone(), is_retransmittable);
 
         Ok(final_bytes)
     }
@@ -417,6 +416,10 @@ impl ProtocolMachine {
         let now = Instant::now();
         let base_rto_ms = self.rto.as_millis().max(1) as u64;
         for frame in self.sent_history.iter_mut() {
+            if !frame.is_retransmittable {
+                continue;
+            }
+
             if frame.retries == self.max_retries {
                 tracing::warn!(
                     "Frame {} exceeded max retries ({}); continuing with backoff",
@@ -518,12 +521,13 @@ impl ProtocolMachine {
         None
     }
 
-    fn push_sent_frame(&mut self, nonce: u64, bytes: Bytes) {
+    fn push_sent_frame(&mut self, nonce: u64, bytes: Bytes, is_retransmittable: bool) {
         self.sent_history.push_back(SentFrame {
             nonce,
             bytes,
             last_sent: Instant::now(),
             retries: 0,
+            is_retransmittable,
         });
         while self.sent_history.len() > self.max_sent_history {
             self.sent_history.pop_front();
