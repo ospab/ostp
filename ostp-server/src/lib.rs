@@ -145,7 +145,12 @@ pub async fn run_server(
         while let Some(ev) = ui_event_rx.recv().await {
             match ev {
                 UiEvent::Log(msg) => {
-                    if debug || msg.starts_with("Listening on ") || msg.starts_with("Hot-reloaded ") {
+                    if debug 
+                        || msg.starts_with("Listening on ") 
+                        || msg.starts_with("Hot-reloaded ") 
+                        || msg.starts_with("Client ") 
+                        || msg.starts_with("Cleaning up resources") 
+                    {
                         println!("[ostp-server] {msg}");
                     }
                 }
