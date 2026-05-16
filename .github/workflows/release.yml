@@ -99,6 +99,7 @@ jobs:
             target: riscv64gc-unknown-linux-gnu
             artifact_name: ostp
             release_name: ostp-linux-riscv64.tar.gz
+            tun2socks_arch: linux-riscv64
             use_cross: true
 
           # ==========================================
@@ -138,7 +139,13 @@ jobs:
 
       - name: Execute Standard Native Compilation (Windows)
         if: ${{ !matrix.use_cross && matrix.os == 'windows-latest' }}
-        run: cargo build --release --target ${{ matrix.target }} --bin ostp
+        run: |
+          cd ostp-gui
+          npm install
+          npx tauri build --no-bundle --target ${{ matrix.target }}
+          cd ..
+          cargo build --release --target ${{ matrix.target }} --bin ostp
+          cargo build --release --target ${{ matrix.target }} --bin ostp-tun-helper
 
       - name: Execute Standard Native Compilation (Unix)
         if: ${{ !matrix.use_cross && matrix.os != 'windows-latest' }}
@@ -186,11 +193,24 @@ jobs:
         if: ${{ matrix.os == 'windows-latest' }}
         shell: pwsh
         run: |
-          cd target/${{ matrix.target }}/release
-          $files = @("${{ matrix.artifact_name }}")
-          if (Test-Path "tun2socks.exe") { $files += "tun2socks.exe" }
-          if (Test-Path "wintun.dll") { $files += "wintun.dll" }
-          Compress-Archive -Path $files -DestinationPath ../../../${{ matrix.release_name }}
+          $build_dir = "target/${{ matrix.target }}/release"
+          $staging = "staging_dir"
+          New-Item -ItemType Directory -Path "$staging/gui" -Force
+          New-Item -ItemType Directory -Path "$staging/ostp" -Force
+          
+          # 1. Fill OSTP (CLI) folder
+          Copy-Item "$build_dir/ostp.exe" -Destination "$staging/ostp/"
+          if (Test-Path "$build_dir/tun2socks.exe") { Copy-Item "$build_dir/tun2socks.exe" -Destination "$staging/ostp/" }
+          if (Test-Path "$build_dir/wintun.dll") { Copy-Item "$build_dir/wintun.dll" -Destination "$staging/ostp/" }
+          
+          # 2. Fill GUI folder
+          Copy-Item "$build_dir/ostp-gui.exe" -Destination "$staging/gui/"
+          Copy-Item "$build_dir/ostp-tun-helper.exe" -Destination "$staging/gui/"
+          if (Test-Path "$build_dir/tun2socks.exe") { Copy-Item "$build_dir/tun2socks.exe" -Destination "$staging/gui/" }
+          if (Test-Path "$build_dir/wintun.dll") { Copy-Item "$build_dir/wintun.dll" -Destination "$staging/gui/" }
+          
+          # 3. Zip it up
+          Compress-Archive -Path "$staging/*" -DestinationPath "${{ matrix.release_name }}" -Force
 
       - name: Package release artifact (Unix Systems)
         if: ${{ matrix.os != 'windows-latest' }}

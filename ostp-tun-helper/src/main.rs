@@ -1,26 +1,24 @@
 // ostp-tun-helper/src/main.rs
-//
-// Privileged helper for TUN mode. Runs with Administrator rights.
-// Communicates with ostp-gui via a named pipe IPC channel.
-//
-// Protocol over the named pipe (newline-delimited JSON):
-//   GUI -> Helper: {"cmd":"start","config":<config json string>}
-//   GUI -> Helper: {"cmd":"stop"}
-//   Helper -> GUI: {"type":"status","value":0|1|2}       (0=stopped,1=connecting,2=connected)
-//   Helper -> GUI: {"type":"log","message":"..."}
-//   Helper -> GUI: {"type":"metrics","bytes_sent":N,"bytes_recv":N}
-
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::Duration;
+use std::fs::OpenOptions;
+use std::io::Write as _;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{watch, Mutex};
+use tokio::net::TcpListener;
 use portable_atomic::Ordering;
 
-const PIPE_NAME: &str = r"\\.\pipe\ostp-tun-helper";
+fn log_to_file(msg: &str) {
+    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open("ostp-helper.log") {
+        let _ = writeln!(file, "[{}] {}", chrono::Local::now().format("%Y-%m-%d %H:%M:%S"), msg);
+    }
+}
+
+const BIND_ADDR: &str = "127.0.0.1:53211";
 
 #[derive(Deserialize)]
 #[serde(tag = "cmd", rename_all = "lowercase")]
@@ -45,43 +43,42 @@ struct TunnelState {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // The helper is always launched by the GUI. If no client connects within
-    // 60 seconds, exit to avoid lingering admin processes.
-    run_pipe_server().await
+    log_to_file("Helper started (TCP mode)");
+    if let Err(e) = run_server().await {
+        log_to_file(&format!("Fatal error: {}", e));
+    }
+    log_to_file("Helper exiting");
+    Ok(())
 }
 
-async fn run_pipe_server() -> Result<()> {
-    use tokio::net::windows::named_pipe::{ServerOptions};
-
+async fn run_server() -> Result<()> {
     let state = Arc::new(Mutex::new(TunnelState {
         shutdown_tx: None,
         metrics: None,
     }));
 
-    // Create the named pipe server
-    let server = ServerOptions::new()
-        .first_pipe_instance(true)
-        .create(PIPE_NAME)?;
+    log_to_file(&format!("Attempting to bind to {}", BIND_ADDR));
+    let listener = TcpListener::bind(BIND_ADDR).await.map_err(|e| {
+        log_to_file(&format!("Bind failed: {}", e));
+        e
+    })?;
+    log_to_file("Listening successfully");
 
     // Wait for GUI to connect (60 second timeout)
-    let connect_timeout = tokio::time::timeout(
-        Duration::from_secs(60),
-        server.connect()
-    ).await;
-
-    let pipe = match connect_timeout {
-        Ok(Ok(())) => server,
+    let (socket, _) = match tokio::time::timeout(Duration::from_secs(60), listener.accept()).await {
+        Ok(Ok(s)) => s,
         _ => {
-            // No client connected — exit silently
+            log_to_file("No connection from GUI within 60s, exiting");
             return Ok(());
         }
     };
 
-    let (reader_half, writer_half) = tokio::io::split(pipe);
+    log_to_file("GUI connected via TCP");
+
+    let (reader_half, writer_half) = tokio::io::split(socket);
     let writer = Arc::new(Mutex::new(writer_half));
     let mut reader = BufReader::new(reader_half);
 
-    // Helper to send a message back to GUI
     let send_msg = {
         let writer = writer.clone();
         move |msg: HelperMsg| {
@@ -94,13 +91,12 @@ async fn run_pipe_server() -> Result<()> {
         }
     };
 
-    // Read commands from GUI
     let mut line = String::new();
     loop {
         line.clear();
         let n = reader.read_line(&mut line).await.unwrap_or(0);
         if n == 0 {
-            // GUI disconnected — stop tunnel and exit
+            log_to_file("GUI disconnected, stopping tunnel");
             let mut st = state.lock().await;
             if let Some(tx) = st.shutdown_tx.take() {
                 let _ = tx.send(true);
@@ -109,9 +105,7 @@ async fn run_pipe_server() -> Result<()> {
         }
 
         let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
+        if trimmed.is_empty() { continue; }
 
         let cmd: GuiCmd = match serde_json::from_str(trimmed) {
             Ok(c) => c,
@@ -123,7 +117,7 @@ async fn run_pipe_server() -> Result<()> {
 
         match cmd {
             GuiCmd::Start { config } => {
-                // Stop any existing tunnel first
+                log_to_file("Received START command");
                 {
                     let mut st = state.lock().await;
                     if let Some(tx) = st.shutdown_tx.take() {
@@ -132,10 +126,10 @@ async fn run_pipe_server() -> Result<()> {
                     tokio::time::sleep(Duration::from_millis(100)).await;
                 }
 
-                // Parse config
                 let cfg: ostp_client::config::ClientConfig = match serde_json::from_str(&config) {
                     Ok(c) => c,
                     Err(e) => {
+                        log_to_file(&format!("Config parse error: {}", e));
                         send_msg(HelperMsg::Error { message: format!("Config parse error: {}", e) });
                         continue;
                     }
@@ -155,37 +149,23 @@ async fn run_pipe_server() -> Result<()> {
                     st.metrics = Some(metrics.clone());
                 }
 
-                // Spawn the tunnel
                 let metrics_for_runner = metrics.clone();
-                let send_log = {
-                    let writer = writer.clone();
-                    move |msg: String| {
-                        let writer = writer.clone();
-                        let json = serde_json::to_string(&HelperMsg::Log { message: msg }).unwrap_or_default();
-                        tokio::spawn(async move {
-                            let mut w = writer.lock().await;
-                            let _ = w.write_all(format!("{}\n", json).as_bytes()).await;
-                        });
-                    }
-                };
-
-                let writer_for_tick = writer.clone();
-                let metrics_for_tick = metrics.clone();
-
+                let writer_for_err = writer.clone();
                 tokio::spawn(async move {
+                    log_to_file("Starting tunnel core...");
                     match ostp_client::runner::run_client_core(cfg, metrics_for_runner, shutdown_rx).await {
-                        Ok(_) => {}
+                        Ok(_) => { log_to_file("Tunnel core stopped normally"); }
                         Err(e) => {
+                            log_to_file(&format!("Tunnel core error: {}", e));
                             let json = serde_json::to_string(&HelperMsg::Error { message: e.to_string() }).unwrap_or_default();
-                            let mut w = writer_for_tick.lock().await;
+                            let mut w = writer_for_err.lock().await;
                             let _ = w.write_all(format!("{}\n", json).as_bytes()).await;
                         }
                     }
                 });
 
-                // Spawn a tick that forwards status + metrics to GUI every second
                 let writer_tick = writer.clone();
-                let metrics_tick = metrics_for_tick.clone();
+                let metrics_tick = metrics.clone();
                 tokio::spawn(async move {
                     let mut last_state = 99u8;
                     loop {
@@ -195,13 +175,11 @@ async fn run_pipe_server() -> Result<()> {
                         let recv = metrics_tick.bytes_recv.load(Ordering::Relaxed);
 
                         let mut w = writer_tick.lock().await;
-                        // Only send status change events
                         if cs != last_state {
                             last_state = cs;
                             let json = serde_json::to_string(&HelperMsg::Status { value: cs }).unwrap_or_default();
                             if w.write_all(format!("{}\n", json).as_bytes()).await.is_err() { break; }
                         }
-                        // Always send metrics
                         let json = serde_json::to_string(&HelperMsg::Metrics { bytes_sent: sent, bytes_recv: recv }).unwrap_or_default();
                         if w.write_all(format!("{}\n", json).as_bytes()).await.is_err() { break; }
                         drop(w);
@@ -210,8 +188,8 @@ async fn run_pipe_server() -> Result<()> {
 
                 send_msg(HelperMsg::Status { value: 1 });
             }
-
             GuiCmd::Stop => {
+                log_to_file("Received STOP command");
                 let mut st = state.lock().await;
                 if let Some(tx) = st.shutdown_tx.take() {
                     let _ = tx.send(true);
@@ -221,6 +199,5 @@ async fn run_pipe_server() -> Result<()> {
             }
         }
     }
-
     Ok(())
 }

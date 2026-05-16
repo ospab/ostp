@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::{watch, Mutex};
 use tokio::task::JoinHandle;
@@ -83,18 +83,14 @@ enum HelperMsg {
 
 // ── Application state ─────────────────────────────────────────────────────────
 
-// For proxy (non-TUN) mode: runs in-process.
 struct InProcessState {
     shutdown_tx: Option<watch::Sender<bool>>,
     metrics: Arc<BridgeMetrics>,
     handle: JoinHandle<Result<(), String>>,
 }
 
-// For TUN mode: communicates with the privileged helper via named pipe.
 struct HelperState {
-    /// Shared state updated by pipe reader task
     pipe_state: Arc<Mutex<HelperPipeState>>,
-    /// Send commands to helper over named pipe
     cmd_tx: tokio::sync::mpsc::Sender<String>,
 }
 
@@ -133,6 +129,41 @@ fn get_config_path() -> PathBuf {
     PathBuf::from("config.json")
 }
 
+fn map_to_client_config(raw: &ClientConfigRaw, mode: &str) -> ostp_client::config::ClientConfig {
+    let turn_cfg = raw.turn.as_ref();
+    ostp_client::config::ClientConfig {
+        mode: mode.to_string(),
+        debug: raw.debug.unwrap_or(false),
+        ostp: ostp_client::config::OstpConfig {
+            server_addr: raw.server.clone(),
+            local_bind_addr: "0.0.0.0:0".to_string(),
+            access_key: raw.access_key.clone(),
+            handshake_timeout_ms: 5000,
+            io_timeout_ms: 5000,
+        },
+        local_proxy: ostp_client::config::LocalProxyConfig {
+            bind_addr: raw.socks5_bind.clone().unwrap_or_else(|| "127.0.0.1:1088".to_string()),
+            connect_timeout_ms: 5000,
+        },
+        turn: ostp_client::config::TurnConfig {
+            enabled: turn_cfg.map(|t| t.enabled).unwrap_or(false),
+            server_addr: turn_cfg.and_then(|t| Some(t.server_addr.clone())).unwrap_or_default(),
+            username: turn_cfg.and_then(|t| t.username.clone()).unwrap_or_default(),
+            access_key: turn_cfg.and_then(|t| t.access_key.clone()).unwrap_or_default(),
+        },
+        exclusions: ostp_client::config::ExclusionConfig {
+            domains: raw.exclude.as_ref().and_then(|e| e.domains.clone()).unwrap_or_default(),
+            ips: raw.exclude.as_ref().and_then(|e| e.ips.clone()).unwrap_or_default(),
+            processes: raw.exclude.as_ref().and_then(|e| e.processes.clone()).unwrap_or_default(),
+        },
+        multiplex: ostp_client::config::MultiplexConfig {
+            enabled: raw.mux.as_ref().and_then(|m| m.enabled).unwrap_or(false),
+            sessions: raw.mux.as_ref().and_then(|m| m.sessions).unwrap_or(1),
+        },
+        dns_server: raw.tun.as_ref().and_then(|t| t.dns.clone()),
+    }
+}
+
 // ── Tauri commands ────────────────────────────────────────────────────────────
 
 #[tauri::command]
@@ -140,15 +171,37 @@ async fn get_config() -> Result<String, String> {
     let path = get_config_path();
     if !path.exists() {
         return Ok(r#"{
+  "_comment": "OSTP Client Configuration",
   "mode": "client",
   "log_level": "info",
+  
+  "_comment_server": "Address of the remote OSTP server",
   "server": "127.0.0.1:50000",
+  
+  "_comment_access_key": "Must match one of the access_keys on the server",
   "access_key": "your-secret-access-key-hex-or-base64",
+  
+  "_comment_socks5_bind": "The local port where the system/browser should connect (HTTP/SOCKS5)",
   "socks5_bind": "127.0.0.1:1088",
+  
+  "_comment_tun": "Virtual network adapter settings (requires tun2socks.exe to be present)",
   "tun": {
-    "enable": true,
+    "enable": false,
     "wintun_path": "./wintun.dll",
-    "ipv4_address": "10.1.0.2/24"
+    "ipv4_address": "10.1.0.2/24",
+    "dns": "1.1.1.1"
+  },
+  
+  "_comment_exclude": "Bypass tunnel for these domains/IPs (only works in proxy mode)",
+  "exclude": {
+    "domains": ["localhost", "127.0.0.1"],
+    "ips": [],
+    "processes": []
+  },
+  
+  "mux": {
+    "enabled": false,
+    "sessions": 1
   },
   "debug": false
 }"#.into());
@@ -171,9 +224,7 @@ async fn get_tunnel_status(state: tauri::State<'_, AppState>) -> Result<u8, Stri
     match &guard.tunnel {
         None => Ok(0),
         Some(TunnelHandle::InProcess(s)) => {
-            if s.handle.is_finished() {
-                return Ok(0);
-            }
+            if s.handle.is_finished() { return Ok(0); }
             Ok(s.metrics.connection_state.load(Ordering::Relaxed))
         }
         Some(TunnelHandle::Helper(h)) => {
@@ -208,9 +259,7 @@ async fn stop_tunnel(state: tauri::State<'_, AppState>) -> Result<bool, String> 
     match guard.tunnel.take() {
         None => {}
         Some(TunnelHandle::InProcess(mut s)) => {
-            if let Some(tx) = s.shutdown_tx.take() {
-                let _ = tx.send(true);
-            }
+            if let Some(tx) = s.shutdown_tx.take() { let _ = tx.send(true); }
             drop(s.handle);
         }
         Some(TunnelHandle::Helper(h)) => {
@@ -224,79 +273,38 @@ async fn stop_tunnel(state: tauri::State<'_, AppState>) -> Result<bool, String> 
 async fn start_tunnel(state: tauri::State<'_, AppState>) -> Result<bool, String> {
     let mut guard = state.0.lock().await;
 
-    // Already running?
-    match &guard.tunnel {
-        Some(TunnelHandle::InProcess(s)) if !s.handle.is_finished() => return Ok(true),
-        Some(TunnelHandle::Helper(_)) => return Ok(true),
-        _ => {}
+    if let Some(ref t) = guard.tunnel {
+        match t {
+            TunnelHandle::InProcess(s) if !s.handle.is_finished() => return Ok(true),
+            TunnelHandle::Helper(_) => return Ok(true),
+            _ => {}
+        }
     }
-    // Clean up finished handle
     guard.tunnel = None;
 
     let path = get_config_path();
-    if !path.exists() {
-        return Err("config.json not found. Go to Settings and configure your connection first.".into());
-    }
-
     let content = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
-    let unified: UnifiedConfig = serde_json::from_str(&content)
-        .map_err(|e| format!("Config parse error: {}", e))?;
+    let unified: UnifiedConfig = serde_json::from_str(&content).map_err(|e| format!("Config parse error: {}", e))?;
 
     let client_cfg = match unified.mode {
         AppMode::Client(c) => c,
-        AppMode::Server(_) => return Err("Configuration is in Server mode. GUI only supports Client mode.".into()),
+        AppMode::Server(_) => return Err("GUI only supports Client mode.".into()),
     };
 
     let is_tun_enabled = client_cfg.tun.as_ref().map(|t| t.enable).unwrap_or(false);
 
     if is_tun_enabled {
-        // ── TUN mode: launch privileged helper ────────────────────────────────
-        start_tun_via_helper(&mut guard, client_cfg, content).await
+        start_tun_via_helper(&mut guard, &client_cfg).await
     } else {
-        // ── Proxy mode: run in-process ────────────────────────────────────────
-        start_proxy_in_process(&mut guard, client_cfg).await
+        start_proxy_in_process(&mut guard, &client_cfg).await
     }
 }
 
-// ── In-process proxy tunnel ──────────────────────────────────────────────────
-
 async fn start_proxy_in_process(
     guard: &mut AppStateInner,
-    client_cfg: ClientConfigRaw,
+    raw: &ClientConfigRaw,
 ) -> Result<bool, String> {
-    let turn_cfg = client_cfg.turn.as_ref();
-    let mapped = ostp_client::config::ClientConfig {
-        mode: "proxy".to_string(),
-        debug: client_cfg.debug.unwrap_or(false),
-        ostp: ostp_client::config::OstpConfig {
-            server_addr: client_cfg.server.clone(),
-            local_bind_addr: "0.0.0.0:0".to_string(),
-            access_key: client_cfg.access_key.clone(),
-            handshake_timeout_ms: 5000,
-            io_timeout_ms: 5000,
-        },
-        local_proxy: ostp_client::config::LocalProxyConfig {
-            bind_addr: client_cfg.socks5_bind.clone().unwrap_or_else(|| "127.0.0.1:1088".to_string()),
-            connect_timeout_ms: 5000,
-        },
-        turn: ostp_client::config::TurnConfig {
-            enabled: turn_cfg.map(|t| t.enabled).unwrap_or(false),
-            server_addr: turn_cfg.and_then(|t| Some(t.server_addr.clone())).unwrap_or_default(),
-            username: turn_cfg.and_then(|t| t.username.clone()).unwrap_or_default(),
-            access_key: turn_cfg.and_then(|t| t.access_key.clone()).unwrap_or_default(),
-        },
-        exclusions: ostp_client::config::ExclusionConfig {
-            domains: client_cfg.exclude.as_ref().and_then(|e| e.domains.clone()).unwrap_or_default(),
-            ips: client_cfg.exclude.as_ref().and_then(|e| e.ips.clone()).unwrap_or_default(),
-            processes: client_cfg.exclude.as_ref().and_then(|e| e.processes.clone()).unwrap_or_default(),
-        },
-        multiplex: ostp_client::config::MultiplexConfig {
-            enabled: client_cfg.mux.as_ref().and_then(|m| m.enabled).unwrap_or(false),
-            sessions: client_cfg.mux.as_ref().and_then(|m| m.sessions).unwrap_or(1),
-        },
-        dns_server: None,
-    };
-
+    let mapped = map_to_client_config(raw, "proxy");
     let metrics = Arc::new(BridgeMetrics {
         bytes_sent: portable_atomic::AtomicU64::new(0),
         bytes_recv: portable_atomic::AtomicU64::new(0),
@@ -320,114 +328,67 @@ async fn start_proxy_in_process(
     Ok(true)
 }
 
-// ── Privileged TUN helper via named pipe ─────────────────────────────────────
-
-const PIPE_NAME: &str = r"\\.\pipe\ostp-tun-helper";
-
 async fn start_tun_via_helper(
     guard: &mut AppStateInner,
-    _client_cfg: ClientConfigRaw,
-    raw_config_json: String,
+    raw: &ClientConfigRaw,
 ) -> Result<bool, String> {
-    // Find the helper binary next to our exe
-    let helper_exe = find_helper_exe().ok_or_else(|| {
-        "ostp-tun-helper.exe not found next to the application. Please reinstall.".to_string()
-    })?;
-
-    // Launch with UAC elevation via ShellExecuteW("runas")
+    let helper_exe = find_helper_exe().ok_or_else(|| "ostp-tun-helper.exe not found.".to_string())?;
     launch_as_admin(&helper_exe).map_err(|e| format!("Failed to launch helper: {}", e))?;
-
-    // Give the helper time to start and create the pipe
     tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
 
-    // Connect to the helper's named pipe
-    let pipe = tokio::time::timeout(
-        std::time::Duration::from_secs(10),
-        async {
-            loop {
-                match tokio::net::windows::named_pipe::ClientOptions::new().open(PIPE_NAME) {
-                    Ok(p) => return Ok::<_, std::io::Error>(p),
-                    Err(_) => tokio::time::sleep(std::time::Duration::from_millis(200)).await,
-                }
+    let socket = tokio::time::timeout(std::time::Duration::from_secs(60), async {
+        loop {
+            match tokio::net::TcpStream::connect("127.0.0.1:53211").await {
+                Ok(s) => return Ok::<_, std::io::Error>(s),
+                Err(_) => tokio::time::sleep(std::time::Duration::from_millis(200)).await,
             }
         }
-    ).await.map_err(|_| "Timed out connecting to TUN helper. It may have been denied by UAC.".to_string())?
-     .map_err(|e| format!("Pipe connection error: {}", e))?;
+    }).await.map_err(|_| "Timeout connecting to helper.".to_string())?
+     .map_err(|e| e.to_string())?;
 
-    // Build the config JSON and send start command
-    let mut mapped_config = serde_json::from_str::<serde_json::Value>(&raw_config_json)
-        .map_err(|e| e.to_string())?;
-    // Ensure mode is set
-    if let Some(obj) = mapped_config.as_object_mut() {
-        obj.insert("mode".to_string(), serde_json::Value::String("tun".to_string()));
-    }
+    // Send the correctly MAPPED config
+    let mapped = map_to_client_config(raw, "tun");
     let start_cmd = serde_json::json!({
         "cmd": "start",
-        "config": serde_json::to_string(&mapped_config).unwrap_or_default()
+        "config": serde_json::to_string(&mapped).unwrap_or_default()
     }).to_string();
 
-    // Set up channel for sending commands to helper task
     let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::channel::<String>(16);
-
-    // Spawn a task that manages the pipe I/O
-    let pipe_state: Arc<Mutex<HelperPipeState>> = Arc::new(Mutex::new(HelperPipeState {
-        connection_state: 1,
-        bytes_sent: 0,
-        bytes_recv: 0,
-    }));
+    let pipe_state = Arc::new(Mutex::new(HelperPipeState { connection_state: 1, bytes_sent: 0, bytes_recv: 0 }));
     let state_for_task = pipe_state.clone();
 
     tokio::spawn(async move {
-        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-        use tokio::io::split;
-
-        let (reader_half, mut writer_half) = split(pipe);
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, split};
+        let (reader_half, mut writer_half) = split(socket);
         let mut reader = BufReader::new(reader_half);
-
-        // Send the start command
         let _ = writer_half.write_all(format!("{}\n", start_cmd).as_bytes()).await;
 
-        // Concurrently: read from pipe, write commands from channel
         let mut line = String::new();
         loop {
             tokio::select! {
                 result = reader.read_line(&mut line) => {
-                    let n = result.unwrap_or(0);
-                    if n == 0 { break; } // Helper disconnected
+                    if result.unwrap_or(0) == 0 { break; }
                     let trimmed = line.trim().to_string();
                     line.clear();
-                    if trimmed.is_empty() { continue; }
                     if let Ok(msg) = serde_json::from_str::<HelperMsg>(&trimmed) {
                         let mut s = state_for_task.lock().await;
                         match msg {
                             HelperMsg::Status { value } => s.connection_state = value,
-                            HelperMsg::Metrics { bytes_sent, bytes_recv } => {
-                                s.bytes_sent = bytes_sent;
-                                s.bytes_recv = bytes_recv;
-                            }
-                            HelperMsg::Error { .. } => s.connection_state = 0,
-                            HelperMsg::Log { .. } => {}
+                            HelperMsg::Metrics { bytes_sent, bytes_recv } => { s.bytes_sent = bytes_sent; s.bytes_recv = bytes_recv; }
+                            HelperMsg::Error { message } => { s.connection_state = 0; eprintln!("Helper error: {}", message); }
+                            _ => {}
                         }
                     }
                 }
                 cmd = cmd_rx.recv() => {
-                    match cmd {
-                        Some(c) => { let _ = writer_half.write_all(c.as_bytes()).await; }
-                        None => break,
-                    }
+                    if let Some(c) = cmd { let _ = writer_half.write_all(c.as_bytes()).await; } else { break; }
                 }
             }
         }
-        // Mark stopped
-        let mut s = state_for_task.lock().await;
-        s.connection_state = 0;
+        state_for_task.lock().await.connection_state = 0;
     });
 
-    guard.tunnel = Some(TunnelHandle::Helper(HelperState {
-        pipe_state,
-        cmd_tx,
-    }));
-
+    guard.tunnel = Some(TunnelHandle::Helper(HelperState { pipe_state, cmd_tx }));
     Ok(true)
 }
 
@@ -438,16 +399,10 @@ struct HelperPipeState {
 }
 
 fn find_helper_exe() -> Option<PathBuf> {
-    // The helper is always built to the same target dir as the GUI exe.
-    // In dev mode: target/debug/ostp-tun-helper.exe (same dir as ostp-gui.exe)
-    // In release:  target/release/ostp-tun-helper.exe (same dir as ostp-gui.exe)
-    // In installed build: next to ostp-gui.exe
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
             let candidate = dir.join("ostp-tun-helper.exe");
-            if candidate.exists() {
-                return Some(candidate);
-            }
+            if candidate.exists() { return Some(candidate); }
         }
     }
     None
@@ -458,61 +413,25 @@ fn launch_as_admin(exe: &PathBuf) -> Result<()> {
     use std::ffi::OsStr;
     use std::os::windows::ffi::OsStrExt;
     use std::ptr::null_mut;
-
     let exe_wstr: Vec<u16> = exe.as_os_str().encode_wide().chain(Some(0)).collect();
     let verb_wstr: Vec<u16> = OsStr::new("runas").encode_wide().chain(Some(0)).collect();
-
-    #[link(name = "shell32")]
-    extern "system" {
-        fn ShellExecuteW(
-            hwnd: *mut std::ffi::c_void,
-            lpOperation: *const u16,
-            lpFile: *const u16,
-            lpParameters: *const u16,
-            lpDirectory: *const u16,
-            nShowCmd: i32,
-        ) -> isize;
-    }
-
-    let ret = unsafe {
-        ShellExecuteW(
-            null_mut(),
-            verb_wstr.as_ptr(),
-            exe_wstr.as_ptr(),
-            null_mut(),
-            null_mut(),
-            0, // SW_HIDE
-        )
-    };
-
-    if ret <= 32 {
-        anyhow::bail!("ShellExecuteW failed (code {}). UAC was denied or helper not found.", ret);
-    }
+    #[link(name = "shell32")] extern "system" { fn ShellExecuteW(h: *mut std::ffi::c_void, op: *const u16, f: *const u16, p: *const u16, d: *const u16, s: i32) -> isize; }
+    let dir_wstr: Vec<u16> = exe.parent().unwrap_or(Path::new(".")).as_os_str().encode_wide().chain(Some(0)).collect();
+    let ret = unsafe { ShellExecuteW(null_mut(), verb_wstr.as_ptr(), exe_wstr.as_ptr(), null_mut(), dir_wstr.as_ptr(), 0) };
+    if ret <= 32 { anyhow::bail!("UAC denied or helper missing."); }
     Ok(())
 }
 
 #[cfg(not(target_os = "windows"))]
-fn launch_as_admin(_exe: &PathBuf) -> Result<()> {
-    anyhow::bail!("TUN mode via helper is only supported on Windows");
-}
-
-// ── Tauri setup ───────────────────────────────────────────────────────────────
+fn launch_as_admin(_exe: &PathBuf) -> Result<()> { anyhow::bail!("Windows only."); }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let state = AppState(Mutex::new(AppStateInner { tunnel: None }));
-
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .manage(state)
-        .invoke_handler(tauri::generate_handler![
-            start_tunnel,
-            stop_tunnel,
-            get_tunnel_status,
-            get_metrics,
-            get_config,
-            save_config
-        ])
+        .invoke_handler(tauri::generate_handler![start_tunnel, stop_tunnel, get_tunnel_status, get_metrics, get_config, save_config])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

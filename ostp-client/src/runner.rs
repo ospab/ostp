@@ -6,6 +6,14 @@ use crate::bridge::{Bridge, BridgeMetrics};
 use crate::signal::wait_for_shutdown_signal;
 use crate::tunnel;
 use std::sync::Arc;
+use std::fs::OpenOptions;
+use std::io::Write as _;
+
+fn log_to_core_file(msg: &str) {
+    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open("ostp-core.log") {
+        let _ = writeln!(file, "[{}] {}", chrono::Local::now().format("%Y-%m-%d %H:%M:%S"), msg);
+    }
+}
 
 #[cfg(target_os = "windows")]
 #[link(name = "kernel32")]
@@ -139,6 +147,8 @@ pub async fn run_client_core(
         return Err(anyhow::anyhow!("Administrator privileges are required to initialize TUN mode. Please run the application as Administrator."));
     }
 
+    log_to_core_file(&format!("[core] Starting run_client_core in mode: {}", config.mode));
+
     if config.mode == "tun" && !config.exclusions.processes.is_empty() {
         println!("[ostp-client] WARNING: process exclusions are not supported in the current TUN implementation");
     }
@@ -168,6 +178,7 @@ pub async fn run_client_core(
             match msg {
                 crate::app::UiEvent::Log(text) => {
                     if debug_enabled || is_essential_log(&text) {
+                        log_to_core_file(&format!("[client] {text}"));
                         println!("[client] {text}");
                     }
                 }
@@ -227,16 +238,31 @@ pub async fn run_client_core(
         None
     };
 
-    // Wait for external / UI shutdown signal
-    let _ = shutdown_rx_ext.changed().await;
-    
-    let _ = cmd_tx.send(BridgeCommand::Shutdown).await;
-
-    let _ = shutdown_tx.send(true);
-    let _ = bridge_task.await?;
-    let _ = proxy_task.await?;
-    if let Some(task) = wintun_task {
-        let _ = task.await?;
+    // Wait for either external shutdown OR any task to fail
+    tokio::select! {
+        _ = shutdown_rx_ext.changed() => {
+            let _ = cmd_tx.send(BridgeCommand::Shutdown).await;
+            let _ = shutdown_tx.send(true);
+            let _ = bridge_task.await;
+            let _ = proxy_task.await;
+            if let Some(task) = wintun_task {
+                let _ = task.await;
+            }
+        }
+        res = bridge_task => {
+            let _ = shutdown_tx.send(true);
+            res.map_err(|e| anyhow::anyhow!("Bridge task panicked: {}", e))??;
+        }
+        res = proxy_task => {
+            let _ = shutdown_tx.send(true);
+            res.map_err(|e| anyhow::anyhow!("Proxy task panicked: {}", e))??;
+        }
+        res = async {
+            if let Some(t) = wintun_task { t.await } else { std::future::pending().await }
+        } => {
+            let _ = shutdown_tx.send(true);
+            res.map_err(|e| anyhow::anyhow!("TUN task panicked: {}", e))??;
+        }
     }
 
     Ok(())

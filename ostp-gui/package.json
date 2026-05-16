@@ -5,8 +5,9 @@
   "type": "module",
   "scripts": {
     "tauri": "tauri",
-    "dev": "cargo build -p ostp-tun-helper && tauri dev",
-    "build": "cargo build -p ostp-tun-helper --release && tauri build"
+    "dev": "cargo build -p ostp-tun-helper && npx tauri dev",
+    "build": "cargo build -p ostp-tun-helper --release && npx tauri build --no-bundle",
+    "build:installer": "cargo build -p ostp-tun-helper --release && npx tauri build"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2"

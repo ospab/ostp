@@ -103,6 +103,34 @@ struct UnifiedConfig {
     log_level: Option<String>,
 }
 
+impl UnifiedConfig {
+    fn validate(&self) -> Result<()> {
+        match &self.mode {
+            AppMode::Server(cfg) => {
+                if cfg.access_keys.is_empty() {
+                    anyhow::bail!("Server configuration must contain at least one access_key.");
+                }
+                if let Some(outbound) = &cfg.outbound {
+                    if outbound.enabled {
+                        let action = outbound.default_action.as_deref().unwrap_or("direct");
+                        if action == "direct" && outbound.rules.is_empty() {
+                            println!("\n[WARNING] Server outbound proxy is ENABLED, but default_action is 'direct' and there are no rules!");
+                            println!("          This means ALL traffic will bypass the proxy and go out directly from the server IP.");
+                            println!("          If you want all traffic to be proxied, change 'default_action' to 'proxy'.\n");
+                        }
+                    }
+                }
+            }
+            AppMode::Client(cfg) => {
+                if cfg.access_key.is_empty() {
+                    anyhow::bail!("Client configuration must contain an access_key.");
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 struct ServerConfig {
     listen: String,
@@ -284,52 +312,77 @@ async fn run_app() -> Result<()> {
     // Handle explicit configuration initialization
     if let Some(ref mode_str) = args.init {
         let is_server = mode_str == "server";
-        let dummy = if is_server {
-            UnifiedConfig {
-                log_level: Some("info".to_string()),
-                mode: AppMode::Server(ServerConfig {
-                    listen: "0.0.0.0:50000".to_string(),
-                    access_keys: vec![generate_secure_key("hex")],
-                    turn_server: None,
-                    debug: Some(false),
-                    outbound: Some(OutboundConfig {
-                        enabled: false,
-                        protocol: "".to_string(),
-                        address: "".to_string(),
-                        port: 0,
-                        rules: Vec::new(),
-                        default_action: Some("direct".to_string()),
-                    }),
-                }),
-            }
+        let key = generate_secure_key("hex");
+        let content = if is_server {
+            format!(r#"{{
+  "_comment": "OSTP Server Configuration",
+  "mode": "server",
+  "log_level": "info",
+  
+  "_comment_listen": "The address and port the server listens on for incoming OSTP connections.",
+  "listen": "0.0.0.0:50000",
+  
+  "_comment_access_keys": "List of valid keys. Clients must use one of these to connect.",
+  "access_keys": [
+    "{}"
+  ],
+  
+  "_comment_outbound": "Optional proxy for outbound traffic. If enabled, the server routes traffic through this proxy.",
+  "outbound": {{
+    "enabled": false,
+    "protocol": "socks5",
+    "address": "127.0.0.1",
+    "port": 9050,
+    "_comment_default_action": "Can be 'proxy' (route all traffic through proxy by default) or 'direct' (bypass proxy by default).",
+    "default_action": "proxy",
+    "_comment_rules": "Specific routing rules. Action can be 'proxy', 'direct', or 'block'.",
+    "rules": [
+      {{
+        "domain_suffix": [".onion"],
+        "action": "proxy"
+      }}
+    ]
+  }},
+  "debug": false
+}}"#, key)
         } else {
-            UnifiedConfig {
-                log_level: Some("info".to_string()),
-                mode: AppMode::Client(ClientConfig {
-                    server: "127.0.0.1:50000".to_string(),
-                    access_key: generate_secure_key("hex"),
-                    socks5_bind: Some("127.0.0.1:1088".to_string()),
-                    tun: Some(TunConfig {
-                        enable: false,
-                        wintun_path: Some("./wintun.dll".to_string()),
-                        ipv4_address: Some("10.1.0.2/24".to_string()),
-                        dns: None,
-                    }),
-                    turn: None,
-                    debug: Some(false),
-                    exclude: Some(ExcludeConfig {
-                        domains: Some(Vec::new()),
-                        ips: Some(Vec::new()),
-                        processes: Some(Vec::new()),
-                    }),
-                    mux: Some(MuxConfig {
-                        enabled: Some(false),
-                        sessions: Some(1),
-                    }),
-                }),
-            }
+            format!(r#"{{
+  "_comment": "OSTP Client Configuration",
+  "mode": "client",
+  "log_level": "info",
+  
+  "_comment_server": "Address of the remote OSTP server",
+  "server": "127.0.0.1:50000",
+  
+  "_comment_access_key": "Must match one of the access_keys on the server",
+  "access_key": "{}",
+  
+  "_comment_socks5_bind": "The local port where the system/browser should connect (HTTP/SOCKS5)",
+  "socks5_bind": "127.0.0.1:1088",
+  
+  "_comment_tun": "Virtual network adapter settings (requires tun2socks.exe to be present)",
+  "tun": {{
+    "enable": false,
+    "wintun_path": "./wintun.dll",
+    "ipv4_address": "10.1.0.2/24",
+    "dns": "1.1.1.1"
+  }},
+  
+  "_comment_exclude": "Bypass tunnel for these domains/IPs (only works in proxy mode)",
+  "exclude": {{
+    "domains": ["localhost", "127.0.0.1"],
+    "ips": [],
+    "processes": []
+  }},
+  
+  "mux": {{
+    "enabled": false,
+    "sessions": 1
+  }},
+  "debug": false
+}}"#, key)
         };
-        fs::write(&args.config, serde_json::to_string_pretty(&dummy)?)?;
+        fs::write(&args.config, content)?;
         println!("Successfully initialized configuration at {:?}", args.config);
         
         if is_server {
@@ -360,6 +413,8 @@ async fn run_app() -> Result<()> {
     let config_content = fs::read_to_string(&args.config)?;
     let config: UnifiedConfig = serde_json::from_str(&config_content)
         .map_err(|e| anyhow!("Failed to parse config: {}", e))?;
+
+    config.validate()?;
 
     if args.links {
         match config.mode {

@@ -105,7 +105,7 @@ impl Bridge {
         proxy_tx: mpsc::Sender<(u16, ProxyToClientMsg)>,
     ) -> Result<()> {
         let mut metrics_tick = interval(Duration::from_millis(500));
-        let mut keepalive_tick = tokio::time::interval(Duration::from_secs(10));
+        let mut keepalive_tick = tokio::time::interval(Duration::from_secs(5));
         let mut retransmit_tick = tokio::time::interval(Duration::from_millis(50));
         let init_msg = if self.mode == "tun" {
             "Bridge & TUN Tunnel Manager initialized".to_string()
@@ -409,6 +409,18 @@ impl Bridge {
                             // Drop it, not connected
                             if let ProxyEvent::NewStream { stream_id, .. } = ev {
                                 let _ = proxy_tx.send((stream_id, ProxyToClientMsg::Error("tunnel stopped".into()))).await;
+                            }
+                        }
+                    }
+                }
+                _ = keepalive_tick.tick(), if self.running => {
+                    if let Some(sessions) = sessions_opt.as_mut() {
+                        for session in sessions.iter_mut() {
+                            let payload = Bytes::from(RelayMessage::KeepAlive.encode());
+                            // stream_id 0 is reserved for control messages
+                            if let Ok(ProtocolAction::SendDatagram(frame)) = session.machine.on_event(OstpEvent::Outbound(0, payload)) {
+                                let _ = send_datagram(&session.socket, &frame, self.turn_enabled).await;
+                                self.metrics.bytes_sent.fetch_add(frame.len() as u64, Ordering::Relaxed);
                             }
                         }
                     }
