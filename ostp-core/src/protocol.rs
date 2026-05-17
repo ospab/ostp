@@ -744,3 +744,235 @@ fn derive_split_keys(base_key: &[u8; 32], role: NoiseRole) -> ([u8; 32], [u8; 32
         NoiseRole::Responder => (responder_key, initiator_key),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::framing::PaddingStrategy;
+
+    fn test_psk() -> [u8; 32] {
+        let mut psk = [0u8; 32];
+        psk[0] = 0xAB;
+        psk[15] = 0xCD;
+        psk[31] = 0xEF;
+        psk
+    }
+
+    fn make_config(role: NoiseRole) -> ProtocolConfig {
+        ProtocolConfig {
+            role,
+            psk: test_psk(),
+            session_id: 1,
+            handshake_payload: vec![],
+            max_padding: 64,
+            padding_strategy: PaddingStrategy::Adaptive,
+            obfuscation_key: [0u8; 8],
+            max_reorder: 128,
+            max_reorder_buffer: 256,
+            ack_delay_ms: 5,
+            rto_ms: 100,
+            max_retries: 4,
+            max_sent_history: 1024,
+            handshake_pad_min: 8,
+            handshake_pad_max: 32,
+        }
+    }
+
+    /// Full handshake: Initiator -> Responder -> Initiator -> Established
+    fn do_handshake() -> (ProtocolMachine, ProtocolMachine) {
+        let mut client = ProtocolMachine::new(make_config(NoiseRole::Initiator)).unwrap();
+        let mut server = ProtocolMachine::new(make_config(NoiseRole::Responder)).unwrap();
+
+        // Client sends handshake message 1
+        let action = client.on_event(OstpEvent::Start).unwrap();
+        let msg1 = match action {
+            ProtocolAction::SendDatagram(d) => d,
+            _ => panic!("expected SendDatagram from client Start"),
+        };
+        assert_eq!(client.state(), OstpState::Handshaking);
+
+        // Server receives msg1 and responds
+        let action = server.on_event(OstpEvent::Start).unwrap();
+        assert!(matches!(action, ProtocolAction::Noop));
+
+        let action = server.on_event(OstpEvent::Inbound(msg1)).unwrap();
+        let msg2 = match action {
+            ProtocolAction::Multiple(actions) => {
+                actions.into_iter().find_map(|a| match a {
+                    ProtocolAction::SendDatagram(d) => Some(d),
+                    _ => None,
+                }).expect("server should send datagram in handshake response")
+            }
+            ProtocolAction::SendDatagram(d) => d,
+            ProtocolAction::HandshakePayload(_, Some(d)) => d,
+            other => panic!("unexpected server response: {:?}", std::mem::discriminant(&other)),
+        };
+
+        // Client receives msg2 -> Established
+        let action = client.on_event(OstpEvent::Inbound(msg2)).unwrap();
+        match action {
+            ProtocolAction::HandshakePayload(_, _) => {}
+            ProtocolAction::Multiple(_) => {}
+            _ => {}
+        }
+
+        // Both should be Established
+        assert_eq!(client.state(), OstpState::Established);
+        assert_eq!(server.state(), OstpState::Established);
+
+        (client, server)
+    }
+
+    #[test]
+    fn test_full_handshake() {
+        let (client, server) = do_handshake();
+        assert_eq!(client.state(), OstpState::Established);
+        assert_eq!(server.state(), OstpState::Established);
+    }
+
+    #[test]
+    fn test_data_exchange_client_to_server() {
+        let (mut client, mut server) = do_handshake();
+
+        // Client sends data
+        let payload = Bytes::from_static(b"hello from client");
+        let action = client.on_event(OstpEvent::Outbound(1, payload.clone())).unwrap();
+        let datagram = match action {
+            ProtocolAction::SendDatagram(d) => d,
+            _ => panic!("expected SendDatagram"),
+        };
+
+        // Server receives and decrypts
+        let action = server.on_event(OstpEvent::Inbound(datagram)).unwrap();
+        match action {
+            ProtocolAction::DeliverApp(stream_id, data) => {
+                assert_eq!(stream_id, 1);
+                assert_eq!(data.as_ref(), b"hello from client");
+            }
+            ProtocolAction::Multiple(actions) => {
+                let found = actions.iter().any(|a| matches!(a,
+                    ProtocolAction::DeliverApp(1, d) if d.as_ref() == b"hello from client"
+                ));
+                assert!(found, "expected DeliverApp in Multiple");
+            }
+            _ => panic!("expected DeliverApp or Multiple"),
+        }
+    }
+
+    #[test]
+    fn test_data_exchange_server_to_client() {
+        let (mut client, mut server) = do_handshake();
+
+        // Server sends data
+        let payload = Bytes::from_static(b"hello from server");
+        let action = server.on_event(OstpEvent::Outbound(2, payload.clone())).unwrap();
+        let datagram = match action {
+            ProtocolAction::SendDatagram(d) => d,
+            _ => panic!("expected SendDatagram"),
+        };
+
+        // Client receives
+        let action = client.on_event(OstpEvent::Inbound(datagram)).unwrap();
+        match action {
+            ProtocolAction::DeliverApp(stream_id, data) => {
+                assert_eq!(stream_id, 2);
+                assert_eq!(data.as_ref(), b"hello from server");
+            }
+            ProtocolAction::Multiple(actions) => {
+                let found = actions.iter().any(|a| matches!(a,
+                    ProtocolAction::DeliverApp(2, d) if d.as_ref() == b"hello from server"
+                ));
+                assert!(found, "expected DeliverApp in Multiple");
+            }
+            _ => panic!("expected DeliverApp or Multiple"),
+        }
+    }
+
+    #[test]
+    fn test_close_sequence() {
+        let (mut client, mut server) = do_handshake();
+
+        // Client sends Close
+        let action = client.on_event(OstpEvent::Close).unwrap();
+        let close_datagram = match action {
+            ProtocolAction::SendDatagram(d) => d,
+            _ => panic!("expected SendDatagram for Close"),
+        };
+        assert_eq!(client.state(), OstpState::Closing);
+
+        // Server receives Close
+        let _action = server.on_event(OstpEvent::Inbound(close_datagram)).unwrap();
+        assert_eq!(server.state(), OstpState::Closed);
+    }
+
+    #[test]
+    fn test_wrong_psk_handshake_fails() {
+        let mut client = ProtocolMachine::new(make_config(NoiseRole::Initiator)).unwrap();
+
+        let mut bad_psk_config = make_config(NoiseRole::Responder);
+        bad_psk_config.psk = [0xFF; 32]; // Different PSK
+        let mut server = ProtocolMachine::new(bad_psk_config).unwrap();
+
+        let action = client.on_event(OstpEvent::Start).unwrap();
+        let msg1 = match action {
+            ProtocolAction::SendDatagram(d) => d,
+            _ => panic!("expected SendDatagram"),
+        };
+
+        let _ = server.on_event(OstpEvent::Start).unwrap();
+        // Server should fail to process handshake with wrong PSK
+        let result = server.on_event(OstpEvent::Inbound(msg1));
+        // Either an error or the server stays in Handshaking (never reaches Established)
+        assert!(result.is_err() || server.state() != OstpState::Established);
+    }
+
+    #[test]
+    fn test_congestion_controller_after_handshake() {
+        let (client, _server) = do_handshake();
+        // CC should be in SlowStart after handshake
+        let budget = client.cc.retransmit_budget();
+        assert!(budget >= 2, "initial retransmit budget should be >= 2, got {}", budget);
+    }
+
+    #[test]
+    fn test_multiple_data_frames() {
+        let (mut client, mut server) = do_handshake();
+
+        // Send 10 frames
+        for i in 0..10u8 {
+            let payload = Bytes::from(vec![i; 100]);
+            let action = client.on_event(OstpEvent::Outbound(1, payload)).unwrap();
+            let datagram = match action {
+                ProtocolAction::SendDatagram(d) => d,
+                _ => panic!("expected SendDatagram for frame {}", i),
+            };
+
+            let action = server.on_event(OstpEvent::Inbound(datagram)).unwrap();
+            match action {
+                ProtocolAction::DeliverApp(_, data) => {
+                    assert_eq!(data.len(), 100);
+                    assert_eq!(data[0], i);
+                }
+                ProtocolAction::Multiple(actions) => {
+                    let found = actions.iter().any(|a| matches!(a,
+                        ProtocolAction::DeliverApp(_, d) if d.len() == 100 && d[0] == i
+                    ));
+                    assert!(found, "frame {} not found in Multiple", i);
+                }
+                _ => panic!("unexpected action for frame {}", i),
+            }
+        }
+
+        // Verify in-flight state
+        assert!(client.in_flight_count() > 0, "should have in-flight frames");
+    }
+
+    #[test]
+    fn test_tick_no_crash() {
+        let (mut client, mut server) = do_handshake();
+
+        // Tick should not crash on either side
+        let _ = client.on_event(OstpEvent::Tick).unwrap();
+        let _ = server.on_event(OstpEvent::Tick).unwrap();
+    }
+}
