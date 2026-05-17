@@ -1,6 +1,6 @@
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::crypto::obfuscation::*;
 
     /// Verifies that derive_all_secrets is deterministic — same input always
     /// produces the same output.

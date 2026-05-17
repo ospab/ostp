@@ -198,3 +198,7 @@ pub fn deobfuscate_packet_inplace(raw: &mut [u8], key: &[u8; 8], is_handshake: b
         }
     }
 }
+
+#[cfg(test)]
+#[path = "obfuscation_tests.rs"]
+mod obfuscation_tests;
