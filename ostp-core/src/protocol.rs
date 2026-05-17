@@ -214,8 +214,20 @@ impl ProtocolMachine {
         }
 
         if self.state == OstpState::Handshaking {
+            // Wire format: [session_id:4][noise_len:2][noise_payload:N][random_padding:*]
+            // Extract noise_len to pass exactly the right bytes to snow
+            if raw_vec.len() < 6 {
+                return Err(ProtocolError::Framing("handshake too short for length prefix".to_string()));
+            }
+            let noise_len = u16::from_be_bytes([raw_vec[4], raw_vec[5]]) as usize;
+            if raw_vec.len() < 6 + noise_len {
+                return Err(ProtocolError::Framing(format!(
+                    "handshake truncated: expected {} noise bytes, got {}",
+                    noise_len, raw_vec.len() - 6
+                )));
+            }
             let mut read_out = vec![0_u8; 1024];
-            let n = self.noise.read_handshake(&raw_vec[4..], &mut read_out)?;
+            let n = self.noise.read_handshake(&raw_vec[6..6 + noise_len], &mut read_out)?;
 
             let response = match self.role {
                 NoiseRole::Responder => {
@@ -380,15 +392,17 @@ impl ProtocolMachine {
         // Anti-DPI: add random padding after the Noise payload to prevent
         // size fingerprinting. Without this, every handshake is exactly 52 bytes
         // which is trivially detectable by TSPU/DPI systems.
+        //
+        // Wire format: [session_id:4][noise_len:2][noise_payload:N][random_padding:32-128]
         let pad_len: usize = rand::thread_rng().gen_range(32..=128);
         let mut pad = vec![0u8; pad_len];
         rand::thread_rng().fill(&mut pad[..]);
 
-        let mut out = Vec::with_capacity(4 + noise_payload.len() + 2 + pad_len);
+        let noise_len = noise_payload.len() as u16;
+        let mut out = Vec::with_capacity(4 + 2 + noise_payload.len() + pad_len);
         out.extend_from_slice(&self.session_id.to_be_bytes());
+        out.extend_from_slice(&noise_len.to_be_bytes());
         out.extend_from_slice(noise_payload);
-        // 2-byte padding length prefix so receiver can strip it
-        out.extend_from_slice(&(pad_len as u16).to_be_bytes());
         out.extend_from_slice(&pad);
         crate::crypto::obfuscate_packet_inplace(&mut out, &self.obfuscation_key, true);
         Ok(Bytes::from(out))

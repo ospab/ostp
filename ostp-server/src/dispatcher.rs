@@ -158,10 +158,12 @@ impl Dispatcher {
             let psk = ostp_core::crypto::derive_psk(candidate_key.as_bytes());
 
             // Decode the session_id using this key's obfuscation
-            let mut header = [0u8; 4];
-            header.copy_from_slice(&packet[0..4]);
+            // Handshake header is 6 bytes: [session_id:4][noise_len:2]
+            let mut header = [0u8; 6];
+            if packet.len() < 6 { continue; }
+            header.copy_from_slice(&packet[0..6]);
             ostp_core::crypto::deobfuscate_packet_inplace(&mut header, &obf_key, true);
-            let candidate_session_id = u32::from_be_bytes(header);
+            let candidate_session_id = u32::from_be_bytes([header[0], header[1], header[2], header[3]]);
 
             let mut cfg = self.machine_config.clone();
             cfg.session_id = candidate_session_id;

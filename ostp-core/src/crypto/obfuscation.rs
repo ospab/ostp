@@ -23,14 +23,15 @@ pub fn derive_psk(access_key: &[u8]) -> [u8; 32] {
     psk
 }
 
-/// Derives a unique 4-byte session_id mask using HMAC-SHA256(key, nonce).
-/// Used strictly for handshake phase obfuscation.
-fn derive_session_mask(key: &[u8; 8], nonce: u64) -> [u8; 4] {
+/// Derives a 6-byte handshake mask using HMAC-SHA256(key, nonce).
+/// Covers session_id (4 bytes) + noise_len (2 bytes) to prevent
+/// DPI from seeing a constant length field in the handshake header.
+fn derive_handshake_mask(key: &[u8; 8], nonce: u64) -> [u8; 6] {
     let mut mac = HmacSha256::new_from_slice(key).expect("HMAC accepts any key length");
     mac.update(&nonce.to_be_bytes());
     let result = mac.finalize().into_bytes();
-    let mut mask = [0u8; 4];
-    mask.copy_from_slice(&result[..4]);
+    let mut mask = [0u8; 6];
+    mask.copy_from_slice(&result[..6]);
     mask
 }
 
@@ -61,10 +62,10 @@ pub fn obfuscate_packet_inplace(raw: &mut [u8], key: &[u8; 8], is_handshake: boo
                 raw[i] ^= mask_result[i];
             }
         }
-    } else if raw.len() >= 4 {
-        // Handshake packets: mask session_id with a fixed handshake-phase mask
-        let mask = derive_session_mask(key, u64::MAX);
-        for i in 0..4 {
+    } else if raw.len() >= 6 {
+        // Handshake: mask session_id (4 bytes) + noise_len (2 bytes)
+        let mask = derive_handshake_mask(key, u64::MAX);
+        for i in 0..6 {
             raw[i] ^= mask[i];
         }
     }
@@ -90,8 +91,8 @@ pub fn deobfuscate_header_inplace(
             header[i] ^= mask_result[i];
         }
     } else {
-        let mask = derive_session_mask(key, u64::MAX);
-        for i in 0..4 {
+        let mask = derive_handshake_mask(key, u64::MAX);
+        for i in 0..header.len().min(6) {
             header[i] ^= mask[i];
         }
     }
@@ -104,9 +105,9 @@ pub fn deobfuscate_packet_inplace(raw: &mut [u8], key: &[u8; 8], is_handshake: b
         header.copy_from_slice(header_slice);
         deobfuscate_header_inplace(&mut header, ciphertext, key, is_handshake);
         header_slice.copy_from_slice(&header);
-    } else if raw.len() >= 4 {
-        let mask = derive_session_mask(key, u64::MAX);
-        for i in 0..4 {
+    } else if raw.len() >= 6 {
+        let mask = derive_handshake_mask(key, u64::MAX);
+        for i in 0..6 {
             raw[i] ^= mask[i];
         }
     }
