@@ -19,18 +19,25 @@ Write-Output "Synchronizing with origin master..."
 
 # --- Version bump ---
 $CargoToml = Join-Path $ProjectRoot "Cargo.toml"
-$Version = "0.1.0"
+$Version = "0.2.0"
 if (Test-Path $CargoToml) {
     $Content = [System.IO.File]::ReadAllText($CargoToml)
-    if ($Content -match 'version\s*=\s*"(\d+)\.(\d+)\.(\d+)"') {
+    # Match version only in [workspace.package] section (first occurrence)
+    if ($Content -match '\[workspace\.package\][\s\S]*?version\s*=\s*"(\d+)\.(\d+)\.(\d+)"') {
         $Major = [int]$Matches[1]
         $Minor = [int]$Matches[2]
         $Patch = [int]$Matches[3]
         $NewPatch = $Patch + 1
         $Version = "{0}.{1}.{2}" -f $Major, $Minor, $NewPatch
+        # Replace only the workspace version line, not dependency versions
+        $OldVersionStr = 'version = "{0}.{1}.{2}"' -f $Major, $Minor, $Patch
         $NewVersionStr = 'version = "' + $Version + '"'
-        $NewContent = $Content -replace 'version\s*=\s*"\d+\.\d+\.\d+"', $NewVersionStr
-        [System.IO.File]::WriteAllText($CargoToml, $NewContent)
+        # Use .NET Replace to swap only the first occurrence
+        $idx = $Content.IndexOf($OldVersionStr)
+        if ($idx -ge 0) {
+            $NewContent = $Content.Remove($idx, $OldVersionStr.Length).Insert($idx, $NewVersionStr)
+            [System.IO.File]::WriteAllText($CargoToml, $NewContent)
+        }
         Write-Output "[ok] Version: v$Version"
     }
 }

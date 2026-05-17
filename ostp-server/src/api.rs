@@ -15,7 +15,8 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
+use portable_atomic::AtomicU64;
 use std::time::Instant;
 
 use axum::{
