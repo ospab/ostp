@@ -592,23 +592,24 @@ impl Bridge {
         handshake_payload.extend_from_slice(&session_id.to_be_bytes());
         handshake_payload.extend_from_slice(&self.access_key);
 
-        let obf_key = ostp_core::crypto::derive_obfuscation_key(&self.access_key);
-        let psk = ostp_core::crypto::derive_psk(&self.access_key);
+        let secrets = ostp_core::crypto::derive_all_secrets(&self.access_key);
 
         let mut machine = ProtocolMachine::new(ProtocolConfig {
             role: NoiseRole::Initiator,
-            psk,
+            psk: secrets.psk,
             session_id,
             handshake_payload,
             max_padding: 1280, // Safe MTU size to avoid UDP fragmentation on Windows/PPPoE
             padding_strategy: PaddingStrategy::Profile(self.profile),
-            obfuscation_key: obf_key,
+            obfuscation_key: secrets.obfuscation_key,
             max_reorder: 16384,          // Max gap between expected and received nonce
             max_reorder_buffer: 8192,    // Max buffered out-of-order frames
             ack_delay_ms: 5,
             rto_ms: 100,
             max_retries: 8,
             max_sent_history: 32768,     // Reduced: gap recovery handles unrecoverable frames
+            handshake_pad_min: secrets.handshake_pad_min,
+            handshake_pad_max: secrets.handshake_pad_max,
         })?;
 
         let addr = self.local_bind_addr.parse::<std::net::SocketAddr>().map_err(|e| anyhow::anyhow!("invalid bind addr: {}", e))?;

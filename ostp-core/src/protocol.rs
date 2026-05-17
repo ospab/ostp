@@ -33,6 +33,10 @@ pub struct ProtocolConfig {
     pub rto_ms: u64,
     pub max_retries: u8,
     pub max_sent_history: usize,
+    /// Key-derived handshake padding range (Kerckhoffs's principle).
+    /// Different access keys produce different handshake packet sizes.
+    pub handshake_pad_min: usize,
+    pub handshake_pad_max: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -89,6 +93,9 @@ pub struct ProtocolMachine {
     /// evicted from sent_history, this timer detects the deadlock and skips
     /// the gap to restore liveness.
     last_recv_advance: Instant,
+    /// Key-derived handshake padding range
+    handshake_pad_min: usize,
+    handshake_pad_max: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -131,6 +138,8 @@ impl ProtocolMachine {
             last_ack_sent: Instant::now(),
             last_nack_sent: Instant::now() - Duration::from_secs(1),
             last_recv_advance: Instant::now(),
+            handshake_pad_min: config.handshake_pad_min.max(8),
+            handshake_pad_max: config.handshake_pad_max.max(config.handshake_pad_min + 16),
         })
     }
 
@@ -390,11 +399,12 @@ impl ProtocolMachine {
 
     fn wrap_datagram_handshake(&self, noise_payload: &[u8]) -> Result<Bytes, ProtocolError> {
         // Anti-DPI: add random padding after the Noise payload to prevent
-        // size fingerprinting. Without this, every handshake is exactly 52 bytes
-        // which is trivially detectable by TSPU/DPI systems.
+        // size fingerprinting. The padding range is derived from the access key
+        // (Kerckhoffs's principle), so different keys produce different size
+        // distributions — no universal filter can be built from the binary alone.
         //
-        // Wire format: [session_id:4][noise_len:2][noise_payload:N][random_padding:32-128]
-        let pad_len: usize = rand::thread_rng().gen_range(32..=128);
+        // Wire format: [session_id:4][noise_len:2][noise_payload:N][random_padding]
+        let pad_len: usize = rand::thread_rng().gen_range(self.handshake_pad_min..=self.handshake_pad_max);
         let mut pad = vec![0u8; pad_len];
         rand::thread_rng().fill(&mut pad[..]);
 

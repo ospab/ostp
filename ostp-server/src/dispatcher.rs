@@ -154,22 +154,23 @@ impl Dispatcher {
         let keys_snapshot: Vec<String> = self.access_keys.read().unwrap().keys().cloned().collect();
 
         for candidate_key in keys_snapshot {
-            let obf_key = ostp_core::crypto::derive_obfuscation_key(candidate_key.as_bytes());
-            let psk = ostp_core::crypto::derive_psk(candidate_key.as_bytes());
+            let secrets = ostp_core::crypto::derive_all_secrets(candidate_key.as_bytes());
 
             // Decode the session_id using this key's obfuscation
             // The handshake mask is derived from the Noise payload at bytes [6..],
             // so we must deobfuscate the full packet, not just the header.
             if packet.len() < 7 { continue; }
             let mut trial = packet.to_vec();
-            ostp_core::crypto::deobfuscate_packet_inplace(&mut trial, &obf_key, true);
+            ostp_core::crypto::deobfuscate_packet_inplace(&mut trial, &secrets.obfuscation_key, true);
             let candidate_session_id = u32::from_be_bytes([trial[0], trial[1], trial[2], trial[3]]);
 
             let mut cfg = self.machine_config.clone();
             cfg.session_id = candidate_session_id;
-            cfg.psk = psk;
+            cfg.psk = secrets.psk;
             cfg.handshake_payload = vec![];
-            cfg.obfuscation_key = obf_key;
+            cfg.obfuscation_key = secrets.obfuscation_key;
+            cfg.handshake_pad_min = secrets.handshake_pad_min;
+            cfg.handshake_pad_max = secrets.handshake_pad_max;
 
             let mut machine = match ProtocolMachine::new(cfg) {
                 Ok(m) => m,
@@ -227,12 +228,12 @@ impl Dispatcher {
 
                             self.replay_cache.insert(payload.to_vec(), ts);
 
-                            machine.set_session_keys(candidate_session_id, obf_key);
+                            machine.set_session_keys(candidate_session_id, secrets.obfuscation_key);
 
                             self.peer_machines.insert(candidate_session_id, PeerState {
                                 machine,
                                 last_addr: peer,
-                                obfuscation_key: obf_key,
+                                obfuscation_key: secrets.obfuscation_key,
                                 last_seen: std::time::Instant::now(),
                             });
                             self.addr_to_session.insert(peer, candidate_session_id);

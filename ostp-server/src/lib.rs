@@ -141,6 +141,9 @@ pub async fn run_server(
         rto_ms: 100,
         max_retries: 8,
         max_sent_history: 32768,
+        // Defaults — overridden per-session by dispatcher using derive_all_secrets()
+        handshake_pad_min: 32,
+        handshake_pad_max: 128,
     };
 
     let dispatcher = Dispatcher::new(protocol_config, shared_keys.clone());
