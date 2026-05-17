@@ -10,14 +10,16 @@ RED='\033[0;31m'
 CYAN='\033[0;36m'
 NC='\033[0m' # No Color
 
-# Locate target binary
+# Locate target binary (priority: PATH > same dir > dev layout > /opt/ostp)
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 
-# Check if binary is in the same directory (production server layout)
-if [ -f "$SCRIPT_DIR/ostp" ]; then
+if command -v ostp > /dev/null 2>&1; then
+    OSTP_BIN="$(command -v ostp)"
+elif [ -f "$SCRIPT_DIR/ostp" ]; then
     OSTP_BIN="$SCRIPT_DIR/ostp"
+elif [ -f "/opt/ostp/ostp" ]; then
+    OSTP_BIN="/opt/ostp/ostp"
 else
-    # Fallback to workspace development layout
     OSTP_BIN="$SCRIPT_DIR/../dist/linux/ostp"
 fi
 
