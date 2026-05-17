@@ -40,6 +40,10 @@ pub struct ApiState {
     pub user_stats: Arc<RwLock<HashMap<String, Arc<UserStats>>>>,
     pub start_time: Instant,
     pub api_token: String,
+    /// Server address for subscription links (e.g. "example.com")
+    pub server_host: String,
+    /// Server listen port
+    pub server_port: u16,
 }
 
 // ── API configuration ────────────────────────────────────────────────────────
@@ -121,6 +125,7 @@ pub fn create_api_router(state: ApiState) -> Router {
         .route("/api/users/{key}", delete(handle_delete_user))
         .route("/api/users/{key}/limit", put(handle_set_limit))
         .route("/api/users/{key}/reset", post(handle_reset_stats))
+        .route("/api/subscribe/{key}", get(handle_subscribe))
         .layer(cors)
         .with_state(state)
 }
@@ -130,12 +135,16 @@ pub async fn start_api_server(
     config: ApiConfig,
     access_keys: Arc<RwLock<HashMap<String, ()>>>,
     user_stats: Arc<RwLock<HashMap<String, Arc<UserStats>>>>,
+    server_host: String,
+    server_port: u16,
 ) {
     let state = ApiState {
         access_keys,
         user_stats,
         start_time: Instant::now(),
         api_token: config.token.clone(),
+        server_host,
+        server_port,
     };
 
     let app = create_api_router(state);
@@ -376,4 +385,71 @@ async fn handle_reset_stats(
     } else {
         api_error("user not found")
     }
+}
+
+// ── Subscription endpoint ────────────────────────────────────────────────────
+
+/// Returns a ready-to-use client configuration for the given access key.
+/// No Bearer token required -- the access key itself authenticates the request.
+/// Compatible with subscription managers (sub-store, NekoBox, custom panels).
+///
+/// GET /api/subscribe/{key}
+/// Response: JSON client config or ostp:// share link (via Accept header)
+async fn handle_subscribe(
+    State(state): State<ApiState>,
+    Path(key): Path<String>,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    // Validate that the key exists
+    let keys = state.access_keys.read().unwrap();
+    if !keys.contains_key(&key) {
+        return (StatusCode::NOT_FOUND, Json(serde_json::json!({
+            "ok": false,
+            "error": "invalid access key"
+        })));
+    }
+    drop(keys);
+
+    let accept = headers.get("accept")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/json");
+
+    // If client requests plain text, return ostp:// share link
+    if accept.contains("text/plain") {
+        let link = format!("ostp://{}@{}:{}", key, state.server_host, state.server_port);
+        return (StatusCode::OK, Json(serde_json::json!({
+            "ok": true,
+            "data": link
+        })));
+    }
+
+    // Default: return full client config JSON
+    let config = serde_json::json!({
+        "mode": "client",
+        "server": format!("{}:{}", state.server_host, state.server_port),
+        "access_key": key,
+        "socks5_bind": "127.0.0.1:1088",
+        "tun": {
+            "enable": false,
+            "dns": "1.1.1.1"
+        },
+        "exclude": {
+            "domains": [],
+            "ips": [],
+            "processes": []
+        },
+        "turn": {
+            "enabled": false
+        },
+        "mux": {
+            "enabled": false,
+            "sessions": 1
+        },
+        "debug": false
+    });
+
+    (StatusCode::OK, Json(serde_json::json!({
+        "ok": true,
+        "data": config
+    })))
 }

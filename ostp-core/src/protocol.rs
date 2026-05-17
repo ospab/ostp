@@ -328,6 +328,11 @@ impl ProtocolMachine {
                 FrameKind::Data => {
                     ProtocolAction::DeliverApp(packet.header.stream_id, packet.payload)
                 }
+                FrameKind::Resume => {
+                    // 0-RTT: treat early data as application data
+                    tracing::info!("0-RTT Resume frame received, processing early data");
+                    ProtocolAction::DeliverApp(packet.header.stream_id, packet.payload)
+                }
                 FrameKind::Close => {
                     tracing::info!("Received Close frame, terminating session");
                     self.state = OstpState::Closed;
