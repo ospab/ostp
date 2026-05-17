@@ -11,7 +11,7 @@ pub enum NoiseRole {
 }
 
 pub enum NoiseSession {
-    Handshake(HandshakeState),
+    Handshake(Box<HandshakeState>),
     Transport(TransportState),
 }
 
@@ -36,7 +36,7 @@ impl NoiseSession {
                 .map_err(|_| ProtocolError::Crypto("noise-responder".to_string()))?,
         };
 
-        Ok(Self::Handshake(handshake))
+        Ok(Self::Handshake(Box::new(handshake)))
     }
 
     pub fn write_handshake(&mut self, payload: &[u8], out: &mut [u8]) -> Result<usize, ProtocolError> {

@@ -133,7 +133,7 @@ pub async fn run_client(config: crate::config::ClientConfig) -> Result<()> {
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
     tokio::spawn(async move {
-        if let Ok(_) = wait_for_shutdown_signal().await {
+        if wait_for_shutdown_signal().await.is_ok() {
             let _ = shutdown_tx.send(true);
         }
     });

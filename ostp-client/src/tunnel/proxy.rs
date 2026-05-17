@@ -73,11 +73,9 @@ pub async fn run_local_socks5_proxy(
                             && !msg.contains("Connection reset")
                             && !msg.contains("Broken pipe")
                             && !msg.contains("unsupported SOCKS5 command")
-                        {
-                            if debug {
+                            && debug {
                                 tracing::warn!("proxy client error: {err}");
                             }
-                        }
                     }
                 });
             }

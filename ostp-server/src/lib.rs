@@ -396,7 +396,7 @@ async fn run_server_loop(
                 for sid in dropped_sessions {
                     let _ = ui_event_tx.send(UiEvent::Log(format!("Session {sid} expired, releasing resources")));
                     let mut streams_to_cancel = Vec::new();
-                    for (&(session_id, stream_id), _) in &remotes {
+                    for &(session_id, stream_id) in remotes.keys() {
                         if session_id == sid {
                             streams_to_cancel.push((session_id, stream_id));
                         }

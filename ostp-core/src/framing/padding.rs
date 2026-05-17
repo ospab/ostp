@@ -18,7 +18,7 @@ impl TrafficProfile {
 }
 
 fn align_up(v: usize, align: usize) -> usize {
-    ((v + align - 1) / align) * align
+    v.div_ceil(align) * align
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -49,7 +49,7 @@ impl AdaptivePadder {
             PaddingStrategy::Fixed(target) => target.saturating_sub(payload_len),
             PaddingStrategy::Adaptive => {
                 let base_bucket = 64;
-                let bucketized = ((payload_len + base_bucket - 1) / base_bucket) * base_bucket;
+                let bucketized = payload_len.div_ceil(base_bucket) * base_bucket;
                 let mut target = bucketized.clamp(base_bucket, self.mtu_hint);
                 if target < payload_len {
                     target = payload_len;

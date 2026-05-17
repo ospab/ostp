@@ -55,7 +55,7 @@ impl SessionTicket {
         // Derive ticket ID from key material + timestamp
         let mut hasher = Sha256::new();
         hasher.update(transport_key);
-        hasher.update(&now.to_be_bytes());
+        hasher.update(now.to_be_bytes());
         hasher.update(b"ostp-ticket-id");
         let hash = hasher.finalize();
         let mut ticket_id = [0u8; 16];
@@ -64,7 +64,7 @@ impl SessionTicket {
         // Derive cipher key for early data from PSK + ticket
         let mut key_hasher = Sha256::new();
         key_hasher.update(psk);
-        key_hasher.update(&ticket_id);
+        key_hasher.update(ticket_id);
         key_hasher.update(b"ostp-early-data-key");
         let cipher_key_hash = key_hasher.finalize();
         let mut cipher_key = [0u8; 32];

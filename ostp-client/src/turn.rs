@@ -247,7 +247,7 @@ fn stun_attr(attr_type: u16, value: &[u8]) -> Vec<u8> {
     out.extend_from_slice(value);
     // Pad to 4-byte boundary
     let pad = (4 - (value.len() % 4)) % 4;
-    out.extend(std::iter::repeat(0u8).take(pad));
+    out.extend(std::iter::repeat_n(0u8, pad));
     out
 }
 

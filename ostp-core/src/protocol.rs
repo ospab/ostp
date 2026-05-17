@@ -261,7 +261,7 @@ impl ProtocolMachine {
 
             let extracted_payload = read_out[..n].to_vec();
 
-            return Ok(ProtocolAction::HandshakePayload(Bytes::from(extracted_payload), response));
+            Ok(ProtocolAction::HandshakePayload(Bytes::from(extracted_payload), response))
         } else if self.state == OstpState::Established {
             if raw_vec.len() < 12 {
                 return Err(ProtocolError::Framing("data datagram too short".to_string()));
@@ -304,8 +304,8 @@ impl ProtocolMachine {
             let mut outbound_actions = Vec::new();
 
             // Fast path processing for Nacks: act immediately, bypass sequence queue
-            if packet.header.kind == FrameKind::Nack {
-                if packet.payload.len() >= 8 {
+            if packet.header.kind == FrameKind::Nack
+                && packet.payload.len() >= 8 {
                     let req_nonce = u64::from_be_bytes(packet.payload[..8].try_into().unwrap());
                     if let Some(cached_frame) = self.lookup_sent_frame(req_nonce) {
                         tracing::debug!("NACK received: retransmitting nonce={}", req_nonce);
@@ -317,7 +317,6 @@ impl ProtocolMachine {
                         self.cc.on_loss(1200);
                     }
                 }
-            }
 
             if packet.header.kind == FrameKind::Ack {
                 let ranges = parse_ack_ranges(&packet.payload)?;

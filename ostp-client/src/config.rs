@@ -53,6 +53,7 @@ pub struct LocalProxyConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Default)]
 pub struct TurnConfig {
     pub enabled: bool,
     pub server_addr: String,
@@ -81,16 +82,6 @@ impl Default for LocalProxyConfig {
     }
 }
 
-impl Default for TurnConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            server_addr: String::new(),
-            username: String::new(),
-            access_key: String::new(),
-        }
-    }
-}
 
 impl Default for ClientConfig {
     fn default() -> Self {

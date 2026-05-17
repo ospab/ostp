@@ -634,7 +634,7 @@ async fn run_client_directly(client_cfg: ClientConfig) -> Result<()> {
         },
         turn: ostp_client::config::TurnConfig {
             enabled: turn_cfg.map(|t| t.enabled).unwrap_or(false),
-            server_addr: turn_cfg.and_then(|t| Some(t.server_addr.clone())).unwrap_or_default(),
+            server_addr: turn_cfg.map(|t| t.server_addr.clone()).unwrap_or_default(),
             username: turn_cfg.and_then(|t| t.username.clone()).unwrap_or_default(),
             access_key: turn_cfg.and_then(|t| t.access_key.clone()).unwrap_or_default(),
         },
