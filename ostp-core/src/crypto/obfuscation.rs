@@ -23,48 +23,39 @@ pub fn derive_psk(access_key: &[u8]) -> [u8; 32] {
     psk
 }
 
-/// Derives a 6-byte handshake mask using HMAC-SHA256(key, nonce).
-/// Covers session_id (4 bytes) + noise_len (2 bytes) to prevent
-/// DPI from seeing a constant length field in the handshake header.
-fn derive_handshake_mask(key: &[u8; 8], nonce: u64) -> [u8; 6] {
-    let mut mac = HmacSha256::new_from_slice(key).expect("HMAC accepts any key length");
-    mac.update(&nonce.to_be_bytes());
-    let result = mac.finalize().into_bytes();
-    let mut mask = [0u8; 6];
-    mask.copy_from_slice(&result[..6]);
-    mask
-}
-
 /// Wire layout for DATA packets:
-///   [0..4]   = session_id XOR HMAC(obf_key, ciphertext_sample)[0..4]
-///   [4..12]  = nonce XOR HMAC(obf_key, ciphertext_sample)[4..12]
-///   [12..]   = AEAD ciphertext (at least 16 bytes tag)
+///   [0..4]   = session_id XOR mask[0..4]
+///   [4..12]  = nonce XOR mask[4..12]
+///   [12..]   = AEAD ciphertext
+///   mask = HMAC-SHA256(obf_key, ciphertext_sample[0..32])
 ///
-/// Because the ciphertext sample is different for every packet, the derived
-/// mask is cryptographically random and independent for each packet.
-/// Thus, both session_id and nonce are completely masked and indistinguishable
-/// from pure random noise on the wire.
+/// Wire layout for HANDSHAKE packets:
+///   [0..6]   = (session_id || noise_len) XOR mask[0..6]
+///   [6..]    = noise_payload || random_padding
+///   mask = HMAC-SHA256(obf_key, noise_payload_sample[0..32])
+///
+/// In both cases, the mask is derived from the payload that follows the header.
+/// Since the payload contains cryptographically random data (AEAD ciphertext
+/// or Noise ephemeral key), the mask is unique per packet, making the entire
+/// wire output indistinguishable from random noise.
 pub fn obfuscate_packet_inplace(raw: &mut [u8], key: &[u8; 8], is_handshake: bool) {
     if !is_handshake && raw.len() >= 12 {
         let header_len = 12;
         if raw.len() > header_len {
             let ciphertext = &raw[header_len..];
-            let mut sample = [0u8; 32];
-            let take_len = ciphertext.len().min(32);
-            sample[..take_len].copy_from_slice(&ciphertext[..take_len]);
+            let mask = derive_payload_mask(key, ciphertext);
 
-            let mut mac = HmacSha256::new_from_slice(key).expect("HMAC accepts any key length");
-            mac.update(&sample);
-            let mask_result = mac.finalize().into_bytes();
-
-            // Mask the entire 12-byte header (session_id + nonce)
             for i in 0..12 {
-                raw[i] ^= mask_result[i];
+                raw[i] ^= mask[i];
             }
         }
-    } else if raw.len() >= 6 {
-        // Handshake: mask session_id (4 bytes) + noise_len (2 bytes)
-        let mask = derive_handshake_mask(key, u64::MAX);
+    } else if is_handshake && raw.len() > 6 {
+        // Handshake: sample the Noise payload (starts at byte 6) to derive
+        // a per-packet mask. The Noise payload begins with a random ephemeral
+        // key, so the mask will be unique for every handshake.
+        let payload = &raw[6..];
+        let mask = derive_payload_mask(key, payload);
+
         for i in 0..6 {
             raw[i] ^= mask[i];
         }
@@ -78,24 +69,12 @@ pub fn deobfuscate_header_inplace(
     is_handshake: bool,
 ) {
     if !is_handshake {
-        let mut sample = [0u8; 32];
-        let take_len = ciphertext.len().min(32);
-        sample[..take_len].copy_from_slice(&ciphertext[..take_len]);
-
-        let mut mac = HmacSha256::new_from_slice(key).expect("HMAC accepts any key length");
-        mac.update(&sample);
-        let mask_result = mac.finalize().into_bytes();
-
-        // Unmask the entire 12-byte header
+        let mask = derive_payload_mask(key, ciphertext);
         for i in 0..12 {
-            header[i] ^= mask_result[i];
-        }
-    } else {
-        let mask = derive_handshake_mask(key, u64::MAX);
-        for i in 0..header.len().min(6) {
             header[i] ^= mask[i];
         }
     }
+    // Handshake deobfuscation is not done via this function — use deobfuscate_packet_inplace
 }
 
 pub fn deobfuscate_packet_inplace(raw: &mut [u8], key: &[u8; 8], is_handshake: bool) {
@@ -105,10 +84,30 @@ pub fn deobfuscate_packet_inplace(raw: &mut [u8], key: &[u8; 8], is_handshake: b
         header.copy_from_slice(header_slice);
         deobfuscate_header_inplace(&mut header, ciphertext, key, is_handshake);
         header_slice.copy_from_slice(&header);
-    } else if raw.len() >= 6 {
-        let mask = derive_handshake_mask(key, u64::MAX);
+    } else if is_handshake && raw.len() > 6 {
+        // Handshake: the payload (Noise data) starts at byte 6,
+        // and was NOT masked — only the header [0..6] was.
+        // Derive the same mask from the unmasked payload.
+        let payload = &raw[6..];
+        let mask = derive_payload_mask(key, payload);
+
         for i in 0..6 {
             raw[i] ^= mask[i];
         }
     }
+}
+
+/// Derives a 32-byte mask from a payload sample using HMAC-SHA256.
+/// Used by both data and handshake obfuscation to produce per-packet unique masks.
+fn derive_payload_mask(key: &[u8; 8], payload: &[u8]) -> [u8; 32] {
+    let mut sample = [0u8; 32];
+    let take_len = payload.len().min(32);
+    sample[..take_len].copy_from_slice(&payload[..take_len]);
+
+    let mut mac = HmacSha256::new_from_slice(key).expect("HMAC accepts any key length");
+    mac.update(&sample);
+    let result = mac.finalize().into_bytes();
+    let mut mask = [0u8; 32];
+    mask.copy_from_slice(&result);
+    mask
 }
