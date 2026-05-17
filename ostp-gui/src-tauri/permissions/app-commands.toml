@@ -1,0 +1,13 @@
+[[permission]]
+identifier = "allow-app-commands"
+description = "Enables access to core OSTP commands"
+
+[permission.commands]
+allow = [
+  "start_tunnel",
+  "stop_tunnel",
+  "get_tunnel_status",
+  "get_metrics",
+  "get_config",
+  "save_config"
+]
