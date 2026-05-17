@@ -76,7 +76,7 @@ if [ ! -z "$EXT_SERVER" ]; then
     echo -e "2. Awaiting Cryptographic Handshake (Noise_NNpsk0)..."
     HANDSHAKE_OK=0
     for i in {1..10}; do
-        if grep -q "Bridge connection established" cli.log; then
+        if grep -q "Connection established" cli.log; then
             HANDSHAKE_OK=1
             break
         fi
@@ -91,8 +91,8 @@ if [ ! -z "$EXT_SERVER" ]; then
         exit 1
     fi
 
-    RTT=$(grep "rtt_ms=" cli.log | tail -n 1 | awk -F'rtt_ms=' '{print $2}' | awk '{print $1}')
-    echo -e "${GREEN}✓ Handshake Successful!${NC} Estimated Tunnel RTT: \033[0;33m${RTT}ms${NC}\n"
+    RTT=$(grep "rtt=" cli.log | tail -n 1 | sed -E 's/.*rtt=([0-9.]+)ms.*/\1/')
+    echo -e "${GREEN}Handshake successful.${NC} RTT: ${RTT}ms\n"
 
     echo -e "3. Executing End-to-End HTTP Proxy Ping..."
     PING_OUTPUT=$(curl -s -o /dev/null -w "DNS: %{time_namelookup}s | Connect: %{time_connect}s | TTFB: %{time_starttransfer}s | Total: %{time_total}s" -x socks5h://127.0.0.1:$SOCKS_PORT -I $HTTP_TEST_URL)
@@ -224,8 +224,8 @@ else
 fi
 
 # Validate log patterns
-grep -q "Starting in SERVER mode" server_run.log
-print_result "server dynamic mode logging" $? "Expected starting sequence omitted in log"
+grep -q "Starting server" server_run.log
+print_result "server startup log" $? "Expected startup log missing"
 
 # Clean up server
 kill $SRV_PID 2>/dev/null
@@ -255,8 +255,8 @@ else
 fi
 
 # Verify local proxy init logging
-grep -q "Starting in CLIENT mode" client_run.log
-print_result "client local proxy pipeline logging" $? "Starting logs missing"
+grep -q "Starting client" client_run.log
+print_result "client startup log" $? "Expected startup log missing"
 
 # Verify network bindings (checking if SOCKS5 port opened)
 # Try both ss and netstat, or fallback to /proc parsing
@@ -317,8 +317,8 @@ CLI_CONN_PID=$!
 sleep 3
 
 # 4. Validate active handshake in client logs
-grep -q "Bridge connection established" client_conn.log
-print_result "client-server secure handshake completion" $? "Handshake signatures missing in log. Log output: $(cat client_conn.log)"
+grep -q "Connection established" client_conn.log
+print_result "client-server secure handshake" $? "Handshake failed. Log: $(cat client_conn.log)"
 
 # 5. Teardown integration run
 kill $CLI_CONN_PID 2>/dev/null
@@ -391,7 +391,7 @@ SEC_UNAUTH_PID=$!
 sleep 3
 
 # Verify client remained unauthorized
-grep -q "Bridge connection established" client_unauth.log
+grep -q "Connection established" client_unauth.log
 HAS_ESTABLISHED=$?
 
 if [ $HAS_ESTABLISHED -ne 0 ]; then

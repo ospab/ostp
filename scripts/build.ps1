@@ -1,22 +1,23 @@
-# OSTP High-Performance Cross-Platform Build & Release Pipeline
+# OSTP Build & Release Pipeline
+# Usage:
+#   .\scripts\build.ps1                Build locally + trigger CI/CD
+#   .\scripts\build.ps1 -TriggerOnly   Skip local builds, trigger CI/CD only
+#   .\scripts\build.ps1 -Check         Run cargo check only (no build, no release)
+
 param(
-    [switch]$Flatten,      # Consolidate raw uncompressed binaries with arch suffixes under dist/release/
-    [switch]$TriggerOnly   # Bypasses all local builds to instantly execute global cloud CI/CD tag injection
+    [switch]$Flatten,
+    [switch]$TriggerOnly,
+    [switch]$Check
 )
 
 $ProjectRoot = Split-Path -Parent $PSScriptRoot
 Push-Location $ProjectRoot
 
-Write-Output "Synchronizing latest workspace source code from origin master..."
-# Leverage autostash and rebase to pull cleanly even with uncommitted local edits
+# --- Sync ---
+Write-Output "Synchronizing with origin master..."
 & git pull origin master --rebase --autostash | Out-Null
 
-Write-Output "Starting Universal OSTP Build & Release Pipeline in $ProjectRoot"
-
-# Unblock binaries by terminating any existing active instances
-Stop-Process -Name ostp -ErrorAction SilentlyContinue | Out-Null
-
-# 1. Read and automatically bump version inside Cargo.toml PRIOR to compilation
+# --- Version bump ---
 $CargoToml = Join-Path $ProjectRoot "Cargo.toml"
 $Version = "0.1.0"
 if (Test-Path $CargoToml) {
@@ -30,195 +31,205 @@ if (Test-Path $CargoToml) {
         $NewVersionStr = 'version = "' + $Version + '"'
         $NewContent = $Content -replace 'version\s*=\s*"\d+\.\d+\.\d+"', $NewVersionStr
         [System.IO.File]::WriteAllText($CargoToml, $NewContent)
-        Write-Output "[OK] Bounded workspace package to target release version: v$Version"
+        Write-Output "[ok] Version: v$Version"
     }
 }
 
-$DistDir = Join-Path $ProjectRoot "dist"
-$StagingDir = Join-Path $DistDir "staging"
+# --- Pre-flight: cargo check ---
+Write-Output ""
+Write-Output "Running pre-flight cargo check..."
+$checkOutput = & cargo check 2>&1 | Out-String
+$checkErrors = $checkOutput | Select-String "^error\[" -CaseSensitive
 
-# Wipe legacy artifacts to prepare a clean clean slate
-if (Test-Path $DistDir) { Remove-Item -Path $DistDir -Recurse -Force -ErrorAction SilentlyContinue }
-New-Item -ItemType Directory -Force -Path $DistDir | Out-Null
-
-# Collection for dynamically mapping successful build archives
-$ReleaseArchives = @()
-
-# ---------------------------------------------------------------------
-# CONDITIONAL BUILD SUITE execution
-# ---------------------------------------------------------------------
-if (-not $TriggerOnly) {
-
-# ---------------------------------------------------------------------
-# PHASE 1: WINDOWS COMPILATION MATRIX (Native Host)
-# ---------------------------------------------------------------------
-$WindowsTargets = @(
-    @{ Target = "x86_64-pc-windows-msvc"; Arch = "x64"; BinaryName = "ostp.exe" }
-)
-
-Write-Output "========================================================="
-Write-Output " PHASE 1: Compiling Windows Architectures"
-Write-Output "========================================================="
-$TempWinTargetDir = Join-Path $env:TEMP "ostp_target_win"
-
-foreach ($item in $WindowsTargets) {
-    $target = $item.Target
-    $arch = $item.Arch
-    $bin = $item.BinaryName
-    
-    Write-Output "--> Compiling target: Windows $arch [$target]..."
-    
-    # Attempt setup of the rust toolchain for this architecture
-    & rustup target add $target 2>&1 | Out-Null
-    
-    $env:CARGO_TARGET_DIR = $TempWinTargetDir
-    & cargo build --release --target $target --bin ostp
-    
-    if ($LASTEXITCODE -eq 0) {
-        $compiledBin = Join-Path $TempWinTargetDir "$target\release\$bin"
-        if (Test-Path $compiledBin) {
-            $archiveName = "ostp-v$Version-windows-$arch.zip"
-            $targetStaging = Join-Path $StagingDir "windows-$arch"
-            New-Item -ItemType Directory -Force -Path $targetStaging | Out-Null
-            
-            # Stage and package binary natively
-            Copy-Item -Path $compiledBin -Destination $targetStaging -Force
-            
-            $archivePath = Join-Path $DistDir $archiveName
-            Compress-Archive -Path "$targetStaging\*" -DestinationPath $archivePath -Force
-            
-            $ReleaseArchives += $archivePath
-            Write-Output "[OK] SUCCESSFULLY PACKAGED: $archiveName"
-            
-            if ($Flatten) {
-                $RawReleaseDir = Join-Path $DistDir "release"
-                New-Item -ItemType Directory -Force -Path $RawReleaseDir | Out-Null
-                $FlatName = "ostp-windows-$arch.exe"
-                Copy-Item -Path $compiledBin -Destination (Join-Path $RawReleaseDir $FlatName) -Force
-                Write-Output "   -> Flat copied: dist/release/$FlatName"
-            }
-        }
-    } else {
-        Write-Output "[WARN] FAILED compiling Windows $arch ($target). Missing local platform C++ toolchain components."
-    }
-}
-# Restore environment variables
-Remove-Item Env:\CARGO_TARGET_DIR -ErrorAction SilentlyContinue | Out-Null
-
-# ---------------------------------------------------------------------
-# PHASE 2: LINUX CROSS-COMPILATION MATRIX (via WSL + rust-lld)
-# ---------------------------------------------------------------------
-Write-Output "`n========================================================="
-Write-Output " PHASE 2: Compiling Linux Architectures via WSL"
-Write-Output "========================================================="
-
-if (Get-Command wsl -ErrorAction SilentlyContinue) {
-    # Anchor output cache on Windows disk to survive WSL instance cycling
-    $LinuxBuildDir = Join-Path $ProjectRoot "target_linux"
-    New-Item -ItemType Directory -Force -Path $LinuxBuildDir | Out-Null
-    $LinuxBuildUnix = $LinuxBuildDir.Replace("\", "/")
-    $WslBuildDir = & wsl wslpath -u $LinuxBuildUnix
-
-    $LinuxTargets = @(
-        @{ Target = "x86_64-unknown-linux-musl"; Arch = "x64"; BinaryName = "ostp" }
-    )
-
-    foreach ($item in $LinuxTargets) {
-        $target = $item.Target
-        $arch = $item.Arch
-        $bin = $item.BinaryName
-        
-        $osPrefix = "linux"
-        if ($target -match "freebsd") { $osPrefix = "freebsd" }
-        
-        Write-Output "--> Compiling target: $osPrefix $arch [$target] via rust-lld..."
-        
-        & wsl rustup target add $target 2>&1 | Out-Null
-        
-        # Invoke Cargo cross-compiling via toolless rust-lld LLVM backend for Musl targets!
-        & wsl env RUSTFLAGS="-C linker=rust-lld" CARGO_TARGET_DIR=$WslBuildDir cargo build --release --target $target --bin ostp
-        
-        if ($LASTEXITCODE -eq 0) {
-            $compiledBin = Join-Path $LinuxBuildDir "$target\release\$bin"
-            if (Test-Path $compiledBin) {
-                $archiveName = "ostp-v$Version-$osPrefix-$arch.tar.gz"
-                $targetStaging = Join-Path $StagingDir "$osPrefix-$arch"
-                New-Item -ItemType Directory -Force -Path $targetStaging | Out-Null
-                
-                Copy-Item -Path $compiledBin -Destination $targetStaging -Force
-                
-                # Translate staging paths to Linux formats for WSL tar archiving
-                $wslStagingDir = & wsl wslpath -u ($targetStaging.Replace("\", "/"))
-                $wslArchiveFile = & wsl wslpath -u ((Join-Path $DistDir $archiveName).Replace("\", "/"))
-                
-                # Generate clean compressed tarball natively via WSL tar engine
-                & wsl tar -czf $wslArchiveFile -C $wslStagingDir $bin
-                
-                $ReleaseArchives += Join-Path $DistDir $archiveName
-                Write-Output "[OK] SUCCESSFULLY PACKAGED: $archiveName"
-                
-                if ($Flatten) {
-                    $RawReleaseDir = Join-Path $DistDir "release"
-                    New-Item -ItemType Directory -Force -Path $RawReleaseDir | Out-Null
-                    $FlatName = "ostp-$osPrefix-$arch"
-                    Copy-Item -Path $compiledBin -Destination (Join-Path $RawReleaseDir $FlatName) -Force
-                    Write-Output "   -> Flat copied: dist/release/$FlatName"
-                }
-            }
-        } else {
-            Write-Output "[WARN] FAILED compiling Linux $arch ($target)."
-        }
-    }
-} else {
-    Write-Output "[WARN] WSL utility not discovered on host. Skipping Linux binary compilations."
-}
-
-# Dissolve staging buffer directory
-if (Test-Path $StagingDir) { Remove-Item -Path $StagingDir -Recurse -Force -ErrorAction SilentlyContinue }
-
-Write-Output "`n========================================================="
-Write-Output " RELEASE ARTIFACTS SUMMARY"
-Write-Output "========================================================="
-if ($ReleaseArchives.Count -gt 0) {
-    $ReleaseArchives | ForEach-Object { Write-Output " [+] $_" }
-} else {
-    Write-Output "[ERROR] CRITICAL: No architectures compiled successfully."
+if ($checkErrors) {
+    Write-Output ""
+    Write-Output "[error] Compilation check failed. Fix errors before releasing:"
+    Write-Output $checkOutput
+    # Revert version bump
+    [System.IO.File]::WriteAllText($CargoToml, $Content)
     Pop-Location
     exit 1
 }
 
+# Show warnings if any
+$checkWarnings = $checkOutput | Select-String "^warning:" -CaseSensitive
+if ($checkWarnings) {
+    Write-Output "[warn] Compiler warnings detected (non-blocking):"
+    $checkWarnings | ForEach-Object { Write-Output "  $_" }
 } else {
-    Write-Output "`n--> [TRIGGER ONLY MODE] Bypassing all local compilations as requested."
+    Write-Output "[ok] No errors or warnings."
 }
 
-# ---------------------------------------------------------------------
-# PHASE 3: TRIGGER GLOBAL CI/CD RELEASE PIPELINE (Via Git Tag)
-# ---------------------------------------------------------------------
-Write-Output "`n========================================================="
-Write-Output " PHASE 3: Launching Unified Global Cloud Release"
-Write-Output "========================================================="
+if ($Check) {
+    Write-Output ""
+    Write-Output "Check-only mode. Exiting without build or release."
+    # Revert version bump
+    [System.IO.File]::WriteAllText($CargoToml, $Content)
+    Pop-Location
+    exit 0
+}
 
-Write-Output "Synchronizing workspace version metadata to origin master..."
-# Commit current Cargo.toml bump to establish version lineage
-& git add Cargo.toml
+Write-Output ""
+Write-Output "Starting build pipeline for v$Version"
+
+# Kill existing instances
+Stop-Process -Name ostp -ErrorAction SilentlyContinue | Out-Null
+
+$DistDir = Join-Path $ProjectRoot "dist"
+$StagingDir = Join-Path $DistDir "staging"
+
+if (Test-Path $DistDir) { Remove-Item -Path $DistDir -Recurse -Force -ErrorAction SilentlyContinue }
+New-Item -ItemType Directory -Force -Path $DistDir | Out-Null
+
+$ReleaseArchives = @()
+
+# --- Conditional local build ---
+if (-not $TriggerOnly) {
+
+    # Phase 1: Windows
+    $WindowsTargets = @(
+        @{ Target = "x86_64-pc-windows-msvc"; Arch = "x64"; BinaryName = "ostp.exe" }
+    )
+
+    Write-Output ""
+    Write-Output "--- Phase 1: Windows compilation ---"
+    $TempWinTargetDir = Join-Path $env:TEMP "ostp_target_win"
+
+    foreach ($item in $WindowsTargets) {
+        $target = $item.Target
+        $arch = $item.Arch
+        $bin = $item.BinaryName
+
+        Write-Output "  Compiling: Windows $arch ($target)"
+        & rustup target add $target 2>&1 | Out-Null
+
+        $env:CARGO_TARGET_DIR = $TempWinTargetDir
+        & cargo build --release --target $target --bin ostp
+
+        if ($LASTEXITCODE -eq 0) {
+            $compiledBin = Join-Path $TempWinTargetDir "$target\release\$bin"
+            if (Test-Path $compiledBin) {
+                $archiveName = "ostp-v$Version-windows-$arch.zip"
+                $targetStaging = Join-Path $StagingDir "windows-$arch"
+                New-Item -ItemType Directory -Force -Path $targetStaging | Out-Null
+                Copy-Item -Path $compiledBin -Destination $targetStaging -Force
+
+                $archivePath = Join-Path $DistDir $archiveName
+                Compress-Archive -Path "$targetStaging\*" -DestinationPath $archivePath -Force
+                $ReleaseArchives += $archivePath
+                Write-Output "  [ok] $archiveName"
+
+                if ($Flatten) {
+                    $RawReleaseDir = Join-Path $DistDir "release"
+                    New-Item -ItemType Directory -Force -Path $RawReleaseDir | Out-Null
+                    $FlatName = "ostp-windows-$arch.exe"
+                    Copy-Item -Path $compiledBin -Destination (Join-Path $RawReleaseDir $FlatName) -Force
+                    Write-Output "  [ok] Flat: dist/release/$FlatName"
+                }
+            }
+        } else {
+            Write-Output "  [warn] Failed: Windows $arch ($target)"
+        }
+    }
+    Remove-Item Env:\CARGO_TARGET_DIR -ErrorAction SilentlyContinue | Out-Null
+
+    # Phase 2: Linux via WSL
+    Write-Output ""
+    Write-Output "--- Phase 2: Linux compilation via WSL ---"
+
+    if (Get-Command wsl -ErrorAction SilentlyContinue) {
+        $LinuxBuildDir = Join-Path $ProjectRoot "target_linux"
+        New-Item -ItemType Directory -Force -Path $LinuxBuildDir | Out-Null
+        $LinuxBuildUnix = $LinuxBuildDir.Replace("\", "/")
+        $WslBuildDir = & wsl wslpath -u $LinuxBuildUnix
+
+        $LinuxTargets = @(
+            @{ Target = "x86_64-unknown-linux-musl"; Arch = "x64"; BinaryName = "ostp" }
+        )
+
+        foreach ($item in $LinuxTargets) {
+            $target = $item.Target
+            $arch = $item.Arch
+            $bin = $item.BinaryName
+            $osPrefix = "linux"
+            if ($target -match "freebsd") { $osPrefix = "freebsd" }
+
+            Write-Output "  Compiling: $osPrefix $arch ($target)"
+            & wsl rustup target add $target 2>&1 | Out-Null
+            & wsl env RUSTFLAGS="-C linker=rust-lld" CARGO_TARGET_DIR=$WslBuildDir cargo build --release --target $target --bin ostp
+
+            if ($LASTEXITCODE -eq 0) {
+                $compiledBin = Join-Path $LinuxBuildDir "$target\release\$bin"
+                if (Test-Path $compiledBin) {
+                    $archiveName = "ostp-v$Version-$osPrefix-$arch.tar.gz"
+                    $targetStaging = Join-Path $StagingDir "$osPrefix-$arch"
+                    New-Item -ItemType Directory -Force -Path $targetStaging | Out-Null
+                    Copy-Item -Path $compiledBin -Destination $targetStaging -Force
+
+                    $wslStagingDir = & wsl wslpath -u ($targetStaging.Replace("\", "/"))
+                    $wslArchiveFile = & wsl wslpath -u ((Join-Path $DistDir $archiveName).Replace("\", "/"))
+                    & wsl tar -czf $wslArchiveFile -C $wslStagingDir $bin
+
+                    $ReleaseArchives += Join-Path $DistDir $archiveName
+                    Write-Output "  [ok] $archiveName"
+
+                    if ($Flatten) {
+                        $RawReleaseDir = Join-Path $DistDir "release"
+                        New-Item -ItemType Directory -Force -Path $RawReleaseDir | Out-Null
+                        $FlatName = "ostp-$osPrefix-$arch"
+                        Copy-Item -Path $compiledBin -Destination (Join-Path $RawReleaseDir $FlatName) -Force
+                        Write-Output "  [ok] Flat: dist/release/$FlatName"
+                    }
+                }
+            } else {
+                Write-Output "  [warn] Failed: $osPrefix $arch ($target)"
+            }
+        }
+    } else {
+        Write-Output "  [skip] WSL not available."
+    }
+
+    # Cleanup staging
+    if (Test-Path $StagingDir) { Remove-Item -Path $StagingDir -Recurse -Force -ErrorAction SilentlyContinue }
+
+    Write-Output ""
+    Write-Output "--- Build summary ---"
+    if ($ReleaseArchives.Count -gt 0) {
+        $ReleaseArchives | ForEach-Object { Write-Output "  $_" }
+    } else {
+        Write-Output "[error] No architectures compiled successfully."
+        Pop-Location
+        exit 1
+    }
+
+} else {
+    Write-Output ""
+    Write-Output "[info] Trigger-only mode. Skipping local compilation."
+}
+
+# --- Phase 3: CI/CD release trigger ---
+Write-Output ""
+Write-Output "--- Phase 3: CI/CD release ---"
+
+Write-Output "Pushing version metadata..."
+& git add Cargo.toml Cargo.lock
 & git commit -m "CI/CD: release version v$Version" --allow-empty | Out-Null
 & git push origin master | Out-Null
 
-Write-Output "Generating release tracking tag: v$Version"
-# Purge local tracking tag if pre-existing to guarantee clean sync
+Write-Output "Creating release tag: v$Version"
 & git tag -d "v$Version" 2>&1 | Out-Null
 & git tag "v$Version"
 
-Write-Output "Deploying trigger tag to GitHub..."
-# Pushing the tag forces GitHub Actions to instantly spin up the cloud builders
+Write-Output "Pushing tag to GitHub..."
 & git push origin "v$Version" --force
 
 if ($LASTEXITCODE -eq 0) {
-    Write-Output "`n[OK] EXCELLENT! Release trigger successfully synchronized with Cloud runners!"
-    Write-Output "[INFO] GitHub Actions is now compiling all 13 architectures in parallel."
-    Write-Output "[INFO] Live monitoring link: https://github.com/ospab/ostp/actions"
+    Write-Output ""
+    Write-Output "[ok] Release v$Version triggered on GitHub Actions."
+    Write-Output "     Monitor: https://github.com/ospab/ostp/actions"
 } else {
-    Write-Output "`n[ERROR] Failed to deliver release tag to remote origin."
+    Write-Output ""
+    Write-Output "[error] Failed to push release tag."
 }
 
 Pop-Location

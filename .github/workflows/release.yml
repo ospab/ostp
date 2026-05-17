@@ -137,6 +137,13 @@ jobs:
         if: ${{ matrix.os == 'ubuntu-latest' && !matrix.use_cross }}
         run: sudo apt-get update && sudo apt-get install -y musl-tools
 
+      - name: Pre-flight compilation check
+        if: ${{ !matrix.use_cross }}
+        shell: bash
+        run: |
+          cargo check --target ${{ matrix.target }} --bin ostp 2>&1
+          echo "Pre-flight check passed."
+
       - name: Execute Standard Native Compilation (Windows)
         if: ${{ !matrix.use_cross && matrix.os == 'windows-latest' }}
         run: |
