@@ -102,7 +102,7 @@ pub async fn run_linux_tunnel(
     let server_ip_str = server_ip.to_string();
 
     if debug {
-        println!("[ostp-client] Resolved server IP: {}", server_ip_str);
+        println!("[ostp] Resolved server IP: {}", server_ip_str);
     }
 
     // 3. Detect current default gateway and interface
@@ -132,7 +132,7 @@ pub async fn run_linux_tunnel(
     }
 
     if debug {
-        println!("[ostp-client] Default route: gateway={} interface={}", default_gw, default_if);
+        println!("[ostp] Default route: gateway={} interface={}", default_gw, default_if);
     }
 
     // 4. Setup commands (Using standard /1 routing trick for fail-proof overriding)
@@ -150,7 +150,7 @@ pub async fn run_linux_tunnel(
     );
 
     if debug {
-        println!("[ostp-client] Executing Linux network config: {}", setup_script);
+        println!("[ostp] Executing Linux network config: {}", setup_script);
     }
 
     let out = Command::new("sh")
@@ -158,7 +158,7 @@ pub async fn run_linux_tunnel(
         .output()?;
     
     if !out.status.success() && debug {
-        println!("[ostp-client] Warning: Setup routing returned: {}", String::from_utf8_lossy(&out.stderr));
+        println!("[ostp] Warning: Setup routing returned: {}", String::from_utf8_lossy(&out.stderr));
     }
 
     // 5. Prepare and launch tun2socks
@@ -167,7 +167,7 @@ pub async fn run_linux_tunnel(
     let proxy_url = format!("http://{}", config.local_proxy.bind_addr);
     
     if debug {
-        println!("[ostp-client] Spawning {} -device ostp_tun -proxy {}", tun2socks_exe.display(), proxy_url);
+        println!("[ostp] Spawning {} -device ostp_tun -proxy {}", tun2socks_exe.display(), proxy_url);
     }
 
     let mut child = Command::new(&tun2socks_exe)

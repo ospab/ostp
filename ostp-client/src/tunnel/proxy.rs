@@ -23,8 +23,8 @@ pub async fn run_local_socks5_proxy(
         .with_context(|| format!("failed to bind local HTTP/SOCKS5 proxy at {}", cfg.bind_addr))?;
 
     if debug {
-        eprintln!("[ostp-client] local HTTP/SOCKS5 proxy listening at {}", cfg.bind_addr);
-        eprintln!("[ostp-client] Windows system proxy: set HTTP proxy to {}. tun2socks: SOCKS5 on same address.", cfg.bind_addr);
+        eprintln!("[ostp] local HTTP/SOCKS5 proxy listening at {}", cfg.bind_addr);
+        eprintln!("[ostp] Windows system proxy: set HTTP proxy to {}. tun2socks: SOCKS5 on same address.", cfg.bind_addr);
     }
 
     let matcher = ExclusionMatcher::new(&exclusions);
@@ -75,7 +75,7 @@ pub async fn run_local_socks5_proxy(
                             && !msg.contains("unsupported SOCKS5 command")
                         {
                             if debug {
-                                eprintln!("[ostp-client] proxy client error: {err}");
+                                eprintln!("[ostp] proxy client error: {err}");
                             }
                         }
                     }
@@ -85,7 +85,7 @@ pub async fn run_local_socks5_proxy(
                 if stream_id == 0 {
                     if let ProxyToClientMsg::Close = msg {
                         if debug {
-                            eprintln!("[ostp-client] Resetting all active proxy streams on reconnect");
+                            eprintln!("[ostp] Resetting all active proxy streams on reconnect");
                         }
                         for (_, tx) in active_streams.drain() {
                             let _ = tx.send(ProxyToClientMsg::Close);
@@ -200,7 +200,7 @@ async fn handle_proxy_client(
         };
 
         if debug {
-            eprintln!("[ostp-client] proxy CONNECT stream_id={stream_id} target={target}");
+            eprintln!("[ostp] proxy CONNECT stream_id={stream_id} target={target}");
         }
         if matcher.should_bypass(&target, connect_timeout).await {
             return direct_connect_socks5(client, stream_id, &target, close_tx, debug).await;
@@ -277,7 +277,7 @@ async fn handle_proxy_client(
         };
 
         if debug {
-            eprintln!("[ostp-client] proxy CONNECT stream_id={stream_id} target={target}");
+            eprintln!("[ostp] proxy CONNECT stream_id={stream_id} target={target}");
         }
         if matcher.should_bypass(&target, connect_timeout).await {
             return direct_connect_http(
@@ -333,7 +333,7 @@ async fn handle_proxy_client(
                     Ok(0) => {
                         let _ = event_tx.send(ProxyEvent::Close { stream_id }).await;
                         if debug {
-                            eprintln!("[ostp-client] proxy CLOSE stream_id={stream_id}");
+                            eprintln!("[ostp] proxy CLOSE stream_id={stream_id}");
                         }
                         break;
                     }
@@ -346,7 +346,7 @@ async fn handle_proxy_client(
                     Err(_) => {
                         let _ = event_tx.send(ProxyEvent::Close { stream_id }).await;
                         if debug {
-                            eprintln!("[ostp-client] proxy CLOSE stream_id={stream_id}");
+                            eprintln!("[ostp] proxy CLOSE stream_id={stream_id}");
                         }
                         break;
                     }
@@ -513,7 +513,7 @@ async fn direct_connect_socks5(
     debug: bool,
 ) -> Result<()> {
     if debug {
-        eprintln!("[ostp-client] proxy BYPASS stream_id={stream_id} target={target}");
+        eprintln!("[ostp] proxy BYPASS stream_id={stream_id} target={target}");
     }
     let mut remote = TcpStream::connect(target).await
         .with_context(|| format!("direct connect failed: {target}"))?;
@@ -534,7 +534,7 @@ async fn direct_connect_http(
     debug: bool,
 ) -> Result<()> {
     if debug {
-        eprintln!("[ostp-client] proxy BYPASS stream_id={stream_id} target={target}");
+        eprintln!("[ostp] proxy BYPASS stream_id={stream_id} target={target}");
     }
     let mut remote = TcpStream::connect(target).await
         .with_context(|| format!("direct connect failed: {target}"))?;

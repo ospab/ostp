@@ -73,6 +73,7 @@ class OstpClientSdk private constructor(private val context: Context) {
         fun toNativeJson(): String {
             return JSONObject().apply {
                 put("mode", mode)
+                put("debug", false)
                 put("ostp", JSONObject().apply {
                     put("server_addr", server)
                     put("local_bind_addr", "0.0.0.0:0")
@@ -89,6 +90,15 @@ class OstpClientSdk private constructor(private val context: Context) {
                     put("server_addr", turnServer)
                     put("username", turnUsername)
                     put("access_key", turnPassword)
+                })
+                put("exclusions", JSONObject().apply {
+                    put("domains", org.json.JSONArray())
+                    put("ips", org.json.JSONArray())
+                    put("processes", org.json.JSONArray())
+                })
+                put("multiplex", JSONObject().apply {
+                    put("enabled", false)
+                    put("sessions", 1)
                 })
             }.toString()
         }
@@ -223,13 +233,13 @@ class OstpClientSdk private constructor(private val context: Context) {
                     emitLog(line)
                     // Detect state transitions from log content
                     when {
-                        line.contains("Bridge connection established") ||
-                        line.contains("TUN Tunnel established") -> {
+                        line.contains("Connection established") ||
+                        line.contains("TUN tunnel established") -> {
                             wasConnected = true
                         }
                         line.contains("Bridge stopped") ||
-                        line.contains("Tunnel stopped") ||
-                        line.contains("Handshake failed") -> {
+                        line.contains("TUN tunnel stopped") ||
+                        line.contains("Connection failed") -> {
                             wasConnected = false
                         }
                     }

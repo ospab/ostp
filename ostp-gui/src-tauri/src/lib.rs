@@ -206,15 +206,18 @@ async fn get_config() -> Result<String, String> {
   "debug": false
 }"#.into());
     }
-    std::fs::read_to_string(&path).map_err(|e| format!("Read error: {}", e))
+    std::fs::read_to_string(&path)
+        .map_err(|e| format!("Failed to read config: {}", e))
 }
 
 #[tauri::command]
 async fn save_config(json_content: String) -> Result<bool, String> {
-    let _parsed: UnifiedConfig = serde_json::from_str(&json_content)
-        .map_err(|e| format!("Invalid OSTP config JSON: {}", e))?;
+    // Strip JSONC comments before validation
+    let mut stripped = json_comments::StripComments::new(json_content.as_bytes());
+    let _parsed: UnifiedConfig = serde_json::from_reader(&mut stripped)
+        .map_err(|e| format!("Invalid configuration: {}", e))?;
     let path = get_config_path();
-    std::fs::write(path, json_content).map_err(|e| format!("Write error: {}", e))?;
+    std::fs::write(path, json_content).map_err(|e| format!("Failed to write config: {}", e))?;
     Ok(true)
 }
 
@@ -260,7 +263,12 @@ async fn stop_tunnel(state: tauri::State<'_, AppState>) -> Result<bool, String> 
         None => {}
         Some(TunnelHandle::InProcess(mut s)) => {
             if let Some(tx) = s.shutdown_tx.take() { let _ = tx.send(true); }
-            drop(s.handle);
+            s.handle.abort();
+            // Brief wait for cleanup
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                s.handle,
+            ).await;
         }
         Some(TunnelHandle::Helper(h)) => {
             let _ = h.cmd_tx.send("{\"cmd\":\"stop\"}\n".to_string()).await;
@@ -284,7 +292,9 @@ async fn start_tunnel(state: tauri::State<'_, AppState>) -> Result<bool, String>
 
     let path = get_config_path();
     let content = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
-    let unified: UnifiedConfig = serde_json::from_str(&content).map_err(|e| format!("Config parse error: {}", e))?;
+    let mut stripped = json_comments::StripComments::new(content.as_bytes());
+    let unified: UnifiedConfig = serde_json::from_reader(&mut stripped)
+        .map_err(|e| format!("Config parse error: {}", e))?;
 
     let client_cfg = match unified.mode {
         AppMode::Client(c) => c,

@@ -24,7 +24,8 @@ pub async fn run_wintun_tunnel(
                 "$remote_ip = '{}'\n\
                  Remove-NetRoute -DestinationPrefix \"$remote_ip/32\" -Confirm:$false -ErrorAction SilentlyContinue\n\
                  Remove-NetRoute -DestinationPrefix \"1.1.1.1/32\" -Confirm:$false -ErrorAction SilentlyContinue\n\
-                 Remove-NetFirewallRule -DisplayName 'OSTP Tunnel*' -ErrorAction SilentlyContinue\n",
+                 Remove-NetFirewallRule -DisplayName 'OSTP Tunnel*' -ErrorAction SilentlyContinue\n\
+                 netsh interface ipv4 set dnsservers name=\"ostp_tun\" source=dhcp 2>$null\n",
                 self.server_ip_str
             );
             let _ = Command::new("powershell")
@@ -64,12 +65,12 @@ pub async fn run_wintun_tunnel(
     let server_ip_str = server_ip.to_string();
 
     if debug {
-        println!("[ostp-client] Resolved server IP: {}", server_ip_str);
+        println!("[ostp] Resolved server IP: {}", server_ip_str);
     }
 
     // 3. Run PowerShell script to configure system routes
     if debug {
-        println!("[ostp-client] Configuring system routes...");
+        println!("[ostp] Configuring system routes...");
     }
 
     let current_exe = std::env::current_exe()?.to_string_lossy().into_owned();
@@ -102,7 +103,7 @@ pub async fn run_wintun_tunnel(
         .output()?;
     
     if !out.status.success() && debug {
-        println!("[ostp-client] Warning: Setup routing returned: {}", String::from_utf8_lossy(&out.stderr));
+        println!("[ostp] Warning: Setup routing returned: {}", String::from_utf8_lossy(&out.stderr));
     }
 
     // 4. Prepare and launch tun2socks.exe in the background
@@ -111,7 +112,7 @@ pub async fn run_wintun_tunnel(
     let proxy_url = format!("http://{}", config.local_proxy.bind_addr);
     
     if debug {
-        println!("[ostp-client] Starting tun2socks (proxy={})", proxy_url);
+        println!("[ostp] Starting tun2socks (proxy={})", proxy_url);
     }
 
     // Spawning buffer to allow local proxy listener to finish binding to local address
@@ -139,7 +140,7 @@ pub async fn run_wintun_tunnel(
     tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
 
     if debug {
-        println!("[ostp-client] Applying network configuration...");
+        println!("[ostp] Applying network configuration...");
     }
 
     let mut net_setup = String::from("\
@@ -150,7 +151,7 @@ pub async fn run_wintun_tunnel(
     if let Some(ref dns) = config.dns_server {
         if !dns.is_empty() {
             if debug {
-                println!("[ostp-client] DNS server: {}", dns);
+                println!("[ostp] DNS server: {}", dns);
             }
             net_setup.push_str(&format!("netsh interface ipv4 set dnsservers name=\"ostp_tun\" static {} primary\n", dns));
         }

@@ -158,7 +158,7 @@ pub extern "system" fn Java_net_ostp_client_OstpClientSdk_stopClient(
     }
 
     if let Some(rt) = state.runtime.take() {
-        rt.shutdown_background();
+        rt.shutdown_timeout(std::time::Duration::from_secs(3));
     }
 
     state.metrics = None;
@@ -173,16 +173,25 @@ pub extern "system" fn Java_net_ostp_client_OstpClientSdk_getMetrics(
 ) -> jstring {
     let state = match STATE.lock() {
         Ok(s) => s,
-        Err(_) => return env.new_string("{}").unwrap().into_raw(),
+        Err(_) => return match env.new_string("{}") {
+            Ok(s) => s.into_raw(),
+            Err(_) => std::ptr::null_mut(),
+        },
     };
 
     if let Some(m) = &state.metrics {
         let sent = m.bytes_sent.load(Ordering::Relaxed);
         let recv = m.bytes_recv.load(Ordering::Relaxed);
         let json = format!(r#"{{"bytes_sent": {}, "bytes_recv": {}}}"#, sent, recv);
-        env.new_string(json).unwrap().into_raw()
+        match env.new_string(json) {
+            Ok(s) => s.into_raw(),
+            Err(_) => std::ptr::null_mut(),
+        }
     } else {
-        env.new_string(r#"{"bytes_sent": 0, "bytes_recv": 0}"#).unwrap().into_raw()
+        match env.new_string(r#"{"bytes_sent": 0, "bytes_recv": 0}"#) {
+            Ok(s) => s.into_raw(),
+            Err(_) => std::ptr::null_mut(),
+        }
     }
 }
 
@@ -201,5 +210,8 @@ pub extern "system" fn Java_net_ostp_client_OstpClientSdk_getLogs(
         Err(_) => "[]".to_string(),
     };
 
-    env.new_string(json).unwrap().into_raw()
+    match env.new_string(json) {
+        Ok(s) => s.into_raw(),
+        Err(_) => std::ptr::null_mut(),
+    }
 }
