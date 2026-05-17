@@ -66,7 +66,7 @@ impl Default for OstpConfig {
             server_addr: "127.0.0.1:50000".to_string(),
             local_bind_addr: "0.0.0.0:0".to_string(),
             access_key: String::new(),
-            handshake_timeout_ms: 10000,
+            handshake_timeout_ms: 5000,
             io_timeout_ms: 2500,
         }
     }
@@ -194,7 +194,7 @@ impl ClientConfig {
                 server_addr: server,
                 local_bind_addr: "0.0.0.0:0".to_string(),
                 access_key: key,
-                handshake_timeout_ms: 10000,
+                handshake_timeout_ms: 5000,
                 io_timeout_ms: 2500,
             },
             local_proxy: LocalProxyConfig {

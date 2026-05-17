@@ -10,6 +10,9 @@ pub async fn run_wintun_tunnel(
     use std::process::{Command, Stdio, Child};
     use std::os::windows::process::CommandExt;
 
+    const CREATE_NO_WINDOW: u32 = 0x08000000;
+    const TUN_NAME: &str = "ostp_tun";
+
     struct WintunGuard {
         server_ip_str: String,
         child: Option<Child>,
@@ -19,27 +22,26 @@ pub async fn run_wintun_tunnel(
         fn drop(&mut self) {
             if let Some(mut child) = self.child.take() {
                 let _ = child.kill();
+                let _ = child.wait();
             }
             let cleanup_script = format!(
                 "$remote_ip = '{}'\n\
                  Remove-NetRoute -DestinationPrefix \"$remote_ip/32\" -Confirm:$false -ErrorAction SilentlyContinue\n\
                  Remove-NetRoute -DestinationPrefix \"1.1.1.1/32\" -Confirm:$false -ErrorAction SilentlyContinue\n\
                  Remove-NetFirewallRule -DisplayName 'OSTP Tunnel*' -ErrorAction SilentlyContinue\n\
-                 netsh interface ipv4 set dnsservers name=\"ostp_tun\" source=dhcp 2>$null\n",
+                 netsh interface ipv4 set dnsservers name=\"{TUN_NAME}\" source=dhcp 2>$null\n",
                 self.server_ip_str
             );
             let _ = Command::new("powershell")
-                .creation_flags(0x08000000)
-                .args(["-Command", &cleanup_script])
+                .creation_flags(CREATE_NO_WINDOW)
+                .args(["-NoProfile", "-Command", &cleanup_script])
                 .output();
         }
     }
 
     let debug = config.debug;
 
-    if debug {
-        println!("[ostp] Initializing TUN tunnel...");
-    }
+    eprintln!("[ostp] Initializing TUN tunnel...");
 
     let exe = std::env::current_exe()?;
     let dir = exe.parent().ok_or_else(|| anyhow!("failed to get binary directory"))?;
@@ -55,6 +57,20 @@ pub async fn run_wintun_tunnel(
         ));
     }
 
+    // 1. Delete stale TUN adapter if it exists from a previous run.
+    //    This prevents wintun from creating "ostp_tun 2", "ostp_tun 3", etc.
+    eprintln!("[ostp] Cleaning up stale TUN adapter...");
+    let _ = Command::new("powershell")
+        .creation_flags(CREATE_NO_WINDOW)
+        .args(["-NoProfile", "-Command", &format!(
+            "Get-NetAdapter -Name '{TUN_NAME}*' -ErrorAction SilentlyContinue | \
+             Disable-NetAdapter -Confirm:$false -ErrorAction SilentlyContinue; \
+             netsh interface set interface \"{TUN_NAME}\" admin=disable 2>$null"
+        )])
+        .output();
+    // Brief pause to let the driver release the adapter
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
     // 2. Resolve Server IP for routing table exclusion
     let server_ip = config.ostp.server_addr.to_socket_addrs()
         .map_err(|e| anyhow!("Failed to resolve remote server IP: {}", e))?
@@ -63,16 +79,9 @@ pub async fn run_wintun_tunnel(
         .ok_or_else(|| anyhow!("Could not resolve host IP for routing exclusion"))?;
     
     let server_ip_str = server_ip.to_string();
+    eprintln!("[ostp] Resolved server IP: {}", server_ip_str);
 
-    if debug {
-        println!("[ostp] Resolved server IP: {}", server_ip_str);
-    }
-
-    // 3. Run PowerShell script to configure system routes
-    if debug {
-        println!("[ostp] Configuring system routes...");
-    }
-
+    // 3. Prepare routing and firewall setup script
     let current_exe = std::env::current_exe()?.to_string_lossy().into_owned();
 
     let setup_script = format!(
@@ -81,9 +90,7 @@ pub async fn run_wintun_tunnel(
          $route = Get-NetRoute -DestinationPrefix '0.0.0.0/0' | Where-Object {{ $_.InterfaceAlias -notmatch 'tun' -and $_.InterfaceAlias -notmatch 'wintun' }} | Sort-Object RouteMetric | Select-Object -First 1\n\
          $gw = $route.NextHop\n\
          $ifIndex = $route.InterfaceIndex\n\
-         # 1. Bypass route for the proxy server itself\n\
          New-NetRoute -DestinationPrefix \"$remote_ip/32\" -NextHop $gw -InterfaceIndex $ifIndex -RouteMetric 1 -ErrorAction SilentlyContinue\n\
-         # 2. Bypass routes for all current Physical DNS servers to avoid UDP associate deadlocks\n\
          $dns_ips = Get-DnsClientServerAddress -InterfaceIndex $ifIndex | Select-Object -ExpandProperty ServerAddresses\n\
          foreach ($dns in $dns_ips) {{\n\
              if ($dns -match '^\\d+\\.\\d+\\.\\d+\\.\\d+$') {{\n\
@@ -91,37 +98,20 @@ pub async fn run_wintun_tunnel(
              }}\n\
          }}\n\
          New-NetRoute -DestinationPrefix \"1.1.1.1/32\" -NextHop $gw -InterfaceIndex $ifIndex -RouteMetric 1 -ErrorAction SilentlyContinue\n\
-         # 3. Windows Firewall Rules\n\
          New-NetFirewallRule -DisplayName 'OSTP Tunnel In' -Direction Inbound -Program $exe_path -Action Allow -Enabled True -ErrorAction SilentlyContinue\n\
          New-NetFirewallRule -DisplayName 'OSTP Tunnel Out' -Direction Outbound -Program $exe_path -Action Allow -Enabled True -ErrorAction SilentlyContinue\n",
         server_ip_str, current_exe
     );
 
-    let out = Command::new("powershell")
-        .creation_flags(0x08000000)
-        .args(["-Command", &setup_script])
-        .output()?;
-    
-    if !out.status.success() && debug {
-        println!("[ostp] Warning: Setup routing returned: {}", String::from_utf8_lossy(&out.stderr));
-    }
-
-    // 4. Prepare and launch tun2socks.exe in the background
-    // Switch from SOCKS5 to HTTP protocol. This natively forces tun2socks NOT to attempt UDP Associate,
-    // preventing SOCKS5 command 3 unsupported errors while still tunneling 100% of global TCP traffic!
+    // 4. Launch tun2socks + route setup IN PARALLEL to save ~3 seconds
     let proxy_url = format!("http://{}", config.local_proxy.bind_addr);
-    
-    if debug {
-        println!("[ostp] Starting tun2socks (proxy={})", proxy_url);
-    }
+    eprintln!("[ostp] Starting tun2socks (proxy={})", proxy_url);
 
-    // Spawning buffer to allow local proxy listener to finish binding to local address
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-
+    // Spawn tun2socks immediately — it creates the adapter on its own
     let mut child = Command::new(&tun2socks_exe)
-        .creation_flags(0x08000000)
+        .creation_flags(CREATE_NO_WINDOW)
         .args([
-            "-device", "ostp_tun",
+            "-device", TUN_NAME,
             "-proxy", &proxy_url,
             "-loglevel", if debug { "debug" } else { "error" }
         ])
@@ -129,42 +119,79 @@ pub async fn run_wintun_tunnel(
         .stdout(if debug { Stdio::piped() } else { Stdio::null() })
         .stderr(if debug { Stdio::piped() } else { Stdio::null() })
         .spawn()
-        .map_err(|e| anyhow!("Failed to launch tun2socks.exe background process: {}", e))?;
+        .map_err(|e| anyhow!("Failed to launch tun2socks.exe: {}", e))?;
 
     let mut _guard = WintunGuard {
         server_ip_str: server_ip_str.clone(),
-        child: None, // Will set below
+        child: None,
     };
 
-    // 5. Once tun2socks creates the interface, apply network settings (IP, metric, MTU)
-    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+    // Run route setup in parallel while tun2socks creates the adapter.
+    // Also poll for the adapter to appear (typically <1s).
+    let route_handle = {
+        let script = setup_script.clone();
+        tokio::task::spawn_blocking(move || {
+            Command::new("powershell")
+                .creation_flags(CREATE_NO_WINDOW)
+                .args(["-NoProfile", "-Command", &script])
+                .output()
+        })
+    };
 
-    if debug {
-        println!("[ostp] Applying network configuration...");
+    // 5. Wait for TUN adapter to appear (poll with timeout instead of fixed 2s sleep)
+    let adapter_deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(8);
+    let mut adapter_ready = false;
+    while tokio::time::Instant::now() < adapter_deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        let check = Command::new("powershell")
+            .creation_flags(CREATE_NO_WINDOW)
+            .args(["-NoProfile", "-Command",
+                &format!("(Get-NetAdapter -Name '{TUN_NAME}' -ErrorAction SilentlyContinue).Status")])
+            .output();
+        if let Ok(out) = check {
+            let status = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if debug {
+                eprintln!("[ostp] Adapter status: '{}'", status);
+            }
+            if status == "Up" || status == "Disconnected" || !status.is_empty() {
+                adapter_ready = true;
+                break;
+            }
+        }
     }
 
-    let mut net_setup = String::from("\
-        netsh interface ipv4 set address name=\"ostp_tun\" static 10.1.0.2 255.255.255.0 10.1.0.1\n\
-        netsh interface ipv4 set subinterface \"ostp_tun\" mtu=1300 store=persistent\n\
-        netsh interface ipv4 set interface name=\"ostp_tun\" metric=5\n");
+    if !adapter_ready {
+        eprintln!("[ostp] WARNING: TUN adapter did not appear within timeout. Proceeding anyway.");
+    }
+
+    // Wait for route setup to finish (should already be done by now)
+    let _ = route_handle.await;
+
+    // 6. Configure the adapter (IP, metric, MTU, DNS)
+    eprintln!("[ostp] Applying network configuration...");
+    let mut net_setup = format!(
+        "netsh interface ipv4 set address name=\"{TUN_NAME}\" static 10.1.0.2 255.255.255.0 10.1.0.1\n\
+         netsh interface ipv4 set subinterface \"{TUN_NAME}\" mtu=1300 store=persistent\n\
+         netsh interface ipv4 set interface name=\"{TUN_NAME}\" metric=5\n"
+    );
     
     if let Some(ref dns) = config.dns_server {
         if !dns.is_empty() {
-            if debug {
-                println!("[ostp] DNS server: {}", dns);
-            }
-            net_setup.push_str(&format!("netsh interface ipv4 set dnsservers name=\"ostp_tun\" static {} primary\n", dns));
+            eprintln!("[ostp] DNS server: {}", dns);
+            net_setup.push_str(&format!(
+                "netsh interface ipv4 set dnsservers name=\"{TUN_NAME}\" static {} primary\n", dns
+            ));
         }
     }
     
     let _ = Command::new("powershell")
-        .creation_flags(0x08000000)
-        .args(["-Command", &net_setup])
+        .creation_flags(CREATE_NO_WINDOW)
+        .args(["-NoProfile", "-Command", &net_setup])
         .output()?;
 
-    println!("[ostp] TUN tunnel active. All traffic is routed through OSTP.");
+    eprintln!("[ostp] TUN tunnel active. All traffic is routed through OSTP.");
 
-    // 6. Spawn thread to keep logging tun2socks output if in debug mode
+    // 7. Spawn debug log readers for tun2socks output
     let mut stdout = child.stdout.take();
     let mut stderr = child.stderr.take();
     _guard.child = Some(child);
@@ -175,7 +202,7 @@ pub async fn run_wintun_tunnel(
             if let Some(out) = stdout.take() {
                 let reader = BufReader::new(out);
                 for line in reader.lines().map_while(Result::ok) {
-                    println!("[tun2socks] {}", line);
+                    eprintln!("[tun2socks] {}", line);
                 }
             }
         });
@@ -184,22 +211,18 @@ pub async fn run_wintun_tunnel(
             if let Some(err) = stderr.take() {
                 let reader = BufReader::new(err);
                 for line in reader.lines().map_while(Result::ok) {
-                    println!("[tun2socks err] {}", line);
+                    eprintln!("[tun2socks err] {}", line);
                 }
             }
         });
     }
 
-    // 7. Wait for shutdown signal
+    // 8. Wait for shutdown signal
     let _ = shutdown.changed().await;
 
-    println!("[ostp] Deactivating TUN tunnel...");
-
-    // Drop guard runs cleanup automatically
+    eprintln!("[ostp] Deactivating TUN tunnel...");
     drop(_guard);
-
-    println!("[ostp] TUN tunnel stopped.");
+    eprintln!("[ostp] TUN tunnel stopped.");
     
     Ok(())
 }
-

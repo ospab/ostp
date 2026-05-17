@@ -20,9 +20,14 @@
           <div class="logo-icon"></div>
           <h1>OSTP</h1>
         </div>
-        <button id="btn-go-settings" class="icon-btn" aria-label="Settings">
-          <svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"></circle><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"></path></svg>
-        </button>
+        <div class="header-actions">
+          <button id="btn-lang" class="icon-btn lang-btn" aria-label="Language" title="Language">
+            <span id="lang-label">EN</span>
+          </button>
+          <button id="btn-go-settings" class="icon-btn" aria-label="Settings">
+            <svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"></circle><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"></path></svg>
+          </button>
+        </div>
       </header>
 
       <div class="main-content">
@@ -37,8 +42,8 @@
         </div>
 
         <div class="status-display">
-          <span id="status-text" class="status-disconnected">Disconnected</span>
-          <span id="uptime-text" class="subtext">Tap to protect your traffic</span>
+          <span id="status-text" class="status-disconnected" data-i18n="status_disconnected">Disconnected</span>
+          <span id="uptime-text" class="subtext" data-i18n="hint_tap">Tap to protect your traffic</span>
         </div>
 
         <div class="metrics-grid">
@@ -47,7 +52,7 @@
               <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14M19 12l-7 7-7-7"/></svg>
             </div>
             <div class="metric-data">
-              <span class="metric-label">Download</span>
+              <span class="metric-label" data-i18n="download">Download</span>
               <span id="metric-down" class="metric-value">0.0 B</span>
             </div>
           </div>
@@ -56,7 +61,7 @@
               <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19V5M5 12l7-7 7 7"/></svg>
             </div>
             <div class="metric-data">
-              <span class="metric-label">Upload</span>
+              <span class="metric-label" data-i18n="upload">Upload</span>
               <span id="metric-up" class="metric-value">0.0 B</span>
             </div>
           </div>
@@ -70,43 +75,43 @@
         <button id="btn-back" class="icon-btn" aria-label="Back">
           <svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M19 12H5M12 19l-7-7 7-7"/></svg>
         </button>
-        <h2>Configuration</h2>
-        <div style="width: 40px;"></div> <!-- Spacer for balance -->
+        <h2 data-i18n="settings_title">Configuration</h2>
+        <div style="width: 40px;"></div>
       </header>
 
       <div class="settings-content">
         <!-- Import Area -->
         <div class="import-container glass">
-          <input type="text" id="in-import-url" placeholder="Paste ostp:// share link here..." />
-          <button id="btn-import-url" class="small-btn">Import</button>
+          <input type="text" id="in-import-url" data-i18n-placeholder="import_placeholder" placeholder="Paste ostp:// share link here..." />
+          <button id="btn-import-url" class="small-btn" data-i18n="import_btn">Import</button>
         </div>
 
         <!-- Form Settings -->
         <div class="editor-container glass scrollable">
           <div class="form-group">
-            <label for="in-server">Server Address</label>
-            <input type="text" id="in-server" placeholder="127.0.0.1:50000" />
+            <label for="in-server" data-i18n="label_server">Server Address</label>
+            <input type="text" id="in-server" placeholder="host:port" />
           </div>
 
           <div class="form-group">
-            <label for="in-key">Access Key</label>
-            <input type="password" id="in-key" placeholder="Enter secure access key" />
+            <label for="in-key" data-i18n="label_key">Access Key</label>
+            <input type="password" id="in-key" data-i18n-placeholder="ph_key" placeholder="Enter secure access key" />
           </div>
 
           <div class="form-group">
-            <label for="in-socks">SOCKS5 Bind Address</label>
+            <label for="in-socks" data-i18n="label_socks">Local Proxy Address</label>
             <input type="text" id="in-socks" placeholder="127.0.0.1:1088" />
           </div>
 
           <div class="form-group">
-            <label for="in-dns">Custom DNS Server</label>
-            <input type="text" id="in-dns" placeholder="8.8.8.8 (Optional)" />
+            <label for="in-dns" data-i18n="label_dns">Custom DNS Server</label>
+            <input type="text" id="in-dns" placeholder="8.8.8.8" />
           </div>
 
           <div class="form-group row-align">
             <div class="label-stack">
-              <span class="toggle-label">TUN Tunnel Mode</span>
-              <span class="toggle-subtext">Route all system traffic (Admin req.)</span>
+              <span class="toggle-label" data-i18n="label_tun">TUN Tunnel Mode</span>
+              <span class="toggle-subtext" data-i18n="tun_hint">Route all system traffic (Admin req.)</span>
             </div>
             <label class="switch">
               <input type="checkbox" id="in-tun-mode">
@@ -116,8 +121,8 @@
           
           <div class="form-group row-align">
             <div class="label-stack">
-              <span class="toggle-label">Debug Logs</span>
-              <span class="toggle-subtext">Enable verbose internal event outputs</span>
+              <span class="toggle-label" data-i18n="label_debug">Debug Logs</span>
+              <span class="toggle-subtext" data-i18n="debug_hint">Enable verbose internal event outputs</span>
             </div>
             <label class="switch">
               <input type="checkbox" id="in-debug">
@@ -126,28 +131,28 @@
           </div>
 
           <!-- Exclusions Section Divider -->
-          <div class="section-divider">Exclusions <span class="divider-hint">(one per line)</span></div>
+          <div class="section-divider"><span data-i18n="excl_title">Exclusions</span> <span class="divider-hint" data-i18n="excl_hint">(one per line)</span></div>
 
           <div class="form-group">
-            <label for="in-ex-domains">Bypass Domains</label>
-            <textarea id="in-ex-domains" placeholder="example.com" rows="2"></textarea>
+            <label for="in-ex-domains" data-i18n="excl_domains">Bypass Domains</label>
+            <textarea id="in-ex-domains" placeholder="example.com&#10;*.google.com" rows="2"></textarea>
           </div>
 
           <div class="form-group">
-            <label for="in-ex-ips">Bypass IP Ranges</label>
-            <textarea id="in-ex-ips" placeholder="192.168.1.0/24" rows="2"></textarea>
+            <label for="in-ex-ips" data-i18n="excl_ips">Bypass IPs / CIDR Ranges</label>
+            <textarea id="in-ex-ips" placeholder="192.168.1.0/24&#10;10.0.0.1" rows="2"></textarea>
           </div>
 
           <div class="form-group">
-            <label for="in-ex-processes">Bypass Processes (Proxy Mode)</label>
-            <textarea id="in-ex-processes" placeholder="chrome.exe" rows="2"></textarea>
+            <label for="in-ex-processes" data-i18n="excl_processes">Bypass Processes</label>
+            <textarea id="in-ex-processes" placeholder="chrome.exe&#10;firefox.exe" rows="2"></textarea>
           </div>
         </div>
         
         <div class="actions-container">
-          <button id="btn-save-config" class="primary-btn glass">Save & Apply</button>
+          <button id="btn-save-config" class="primary-btn glass" data-i18n="save_btn">Save & Apply</button>
         </div>
-        <div id="config-toast" class="toast">Config saved successfully!</div>
+        <div id="config-toast" class="toast" data-i18n="toast_saved">Configuration saved</div>
       </div>
     </div>
   </div>

@@ -218,3 +218,83 @@ jobs:
           files: ${{ matrix.release_name }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ==========================================
+  # Windows GUI (Tauri) Build
+  # ==========================================
+  publish-gui:
+    name: GUI for Windows ${{ matrix.arch_label }}
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-pc-windows-msvc
+            arch_label: x64
+            tun2socks_arch: windows-amd64
+            wintun_arch: amd64
+          - target: aarch64-pc-windows-msvc
+            arch_label: arm64
+            tun2socks_arch: windows-arm64
+            wintun_arch: arm64
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Activate Rust caching
+        uses: swatinem/rust-cache@v2
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install Tauri CLI
+        run: cargo install tauri-cli --version "^2"
+
+      - name: Build Tauri application
+        shell: pwsh
+        run: |
+          cd ostp-gui
+          cargo tauri build --target ${{ matrix.target }}
+
+      - name: Package GUI release
+        shell: pwsh
+        run: |
+          $ProgressPreference = 'SilentlyContinue'
+          $dist = "ostp-gui-dist"
+          New-Item -ItemType Directory -Force -Path $dist
+
+          # 1. Copy the Tauri executable
+          $exePath = Get-ChildItem -Path "ostp-gui/src-tauri/target/${{ matrix.target }}/release" -Filter "ostp-gui.exe" | Select-Object -First 1
+          Copy-Item $exePath.FullName -Destination "$dist/ostp-gui.exe"
+
+          # 2. Download tun2socks
+          Invoke-WebRequest -Uri "https://github.com/xjasonlyu/tun2socks/releases/download/v2.6.0/tun2socks-${{ matrix.tun2socks_arch }}.zip" -OutFile "tun2socks.zip"
+          Expand-Archive -Path "tun2socks.zip" -DestinationPath "tun_temp" -Force
+          Get-ChildItem -Path "tun_temp" -Filter "*.exe" -Recurse | Copy-Item -Destination "$dist/tun2socks.exe" -Force
+
+          # 3. Download wintun
+          Invoke-WebRequest -Uri "https://www.wintun.net/builds/wintun-0.14.1.zip" -OutFile "wintun.zip"
+          Expand-Archive -Path "wintun.zip" -DestinationPath "wintun_temp" -Force
+          Get-ChildItem -Path "wintun_temp" -Filter "wintun.dll" -Recurse | Where-Object { $_.FullName -match 'bin[\\/]${{ matrix.wintun_arch }}[\\/]' } | Copy-Item -Destination "$dist/wintun.dll" -Force
+
+          # 4. Create zip archive
+          Compress-Archive -Path "$dist/*" -DestinationPath "ostp-windows-gui-${{ matrix.arch_label }}.zip" -Force
+
+          # Cleanup
+          Remove-Item "tun2socks.zip", "tun_temp", "wintun.zip", "wintun_temp", $dist -Recurse -Force
+
+      - name: Upload GUI artifact to release
+        if: ${{ startsWith(github.ref, 'refs/tags/') }}
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ostp-windows-gui-${{ matrix.arch_label }}.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

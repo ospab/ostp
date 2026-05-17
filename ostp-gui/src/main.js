@@ -1,3 +1,5 @@
+import { t, toggleLang, applyTranslations, getLang } from './i18n.js';
+
 const { invoke } = window.__TAURI__.core;
 
 // State management
@@ -5,7 +7,7 @@ let appState = 'disconnected';
 let pollInterval = null;
 let elapsedSeconds = 0;
 let elapsedTimer = null;
-let rawConfigObj = null; // Cache original config object to preserve extra keys
+let rawConfigObj = null;
 
 // DOM Elements
 const btnConnect = document.getElementById('btn-connect');
@@ -21,6 +23,7 @@ const btnGoSettings = document.getElementById('btn-go-settings');
 const btnBack = document.getElementById('btn-back');
 const btnSaveConfig = document.getElementById('btn-save-config');
 const configToast = document.getElementById('config-toast');
+const btnLang = document.getElementById('btn-lang');
 
 // Input Form Elements
 const inImportUrl = document.getElementById('in-import-url');
@@ -62,15 +65,14 @@ function setUIState(state) {
   if (appState === state) return;
   appState = state;
   
-  // Clean up classes
   btnConnect.className = 'power-btn';
   powerContainer.className = 'power-button-container';
   statusText.className = '';
 
   if (state === 'disconnected') {
-    statusText.textContent = 'Disconnected';
+    statusText.textContent = t('status_disconnected');
     statusText.classList.add('status-disconnected');
-    uptimeText.textContent = 'Tap to protect your traffic';
+    uptimeText.textContent = t('hint_tap');
     
     clearInterval(pollInterval);
     clearInterval(elapsedTimer);
@@ -81,9 +83,9 @@ function setUIState(state) {
   } else if (state === 'connecting') {
     btnConnect.classList.add('connecting');
     powerContainer.classList.add('connecting');
-    statusText.textContent = 'Connecting...';
+    statusText.textContent = t('status_connecting');
     statusText.classList.add('status-connecting');
-    uptimeText.textContent = 'Establishing secure tunnel';
+    uptimeText.textContent = t('hint_connecting');
 
     clearInterval(elapsedTimer);
     elapsedTimer = null;
@@ -92,14 +94,14 @@ function setUIState(state) {
   } else if (state === 'connected') {
     btnConnect.classList.add('connected');
     powerContainer.classList.add('connected');
-    statusText.textContent = 'Protected';
+    statusText.textContent = t('status_connected');
     statusText.classList.add('status-connected');
     
     if (!elapsedTimer) {
       elapsedSeconds = 0;
       elapsedTimer = setInterval(() => {
         elapsedSeconds++;
-        uptimeText.textContent = `Uptime: ${formatTime(elapsedSeconds)}`;
+        uptimeText.textContent = `${t('hint_connected')} | ${formatTime(elapsedSeconds)}`;
       }, 1000);
     }
   }
@@ -114,11 +116,10 @@ async function handleToggleConnect() {
       if (success) {
         startGlobalPolling();
       } else {
-        alert('Failed to start tunnel process.');
         setUIState('disconnected');
       }
     } catch (err) {
-      alert('Error starting tunnel: ' + err);
+      console.error('Tunnel start error:', err);
       setUIState('disconnected');
     }
   } else {
@@ -197,8 +198,6 @@ async function loadConfigIntoFields() {
       inExDomains.value = (exc.domains || []).join('\n');
       inExIps.value = (exc.ips || []).join('\n');
       inExProcesses.value = (exc.processes || []).join('\n');
-    } else {
-      alert('Loaded configuration is for OSTP Server. Please adjust manually.');
     }
   } catch (err) {
     console.error('Error loading config', err);
@@ -241,11 +240,9 @@ async function handleSaveConfig() {
 
   // Validation
   if (!rawConfigObj.server) {
-    alert('Server Address is required!');
     return;
   }
   if (!rawConfigObj.access_key) {
-    alert('Access Key is required!');
     return;
   }
 
@@ -253,15 +250,15 @@ async function handleSaveConfig() {
     const finalJson = JSON.stringify(rawConfigObj, null, 2);
     const success = await invoke('save_config', { jsonContent: finalJson });
     if (success) {
-      showToast();
+      showToast(t('toast_saved'));
       setTimeout(() => switchScreen('home'), 800);
     }
   } catch (err) {
-    alert('Saving failed: ' + err);
+    showToast(t('toast_error') + ': ' + err);
   }
 }
 
-// OSTP URI Sharing Parser (Simplified: only extract HOST & KEY)
+// OSTP URI Sharing Parser
 function handleImportUrl() {
   const urlStr = inImportUrl.value.trim();
   if (!urlStr) return;
@@ -276,30 +273,32 @@ function handleImportUrl() {
     const serverHost = url.host; 
 
     if (!accessKey || !serverHost) {
-      throw new Error('Incomplete parameters: missing key or server address.');
+      throw new Error('Incomplete parameters');
     }
 
-    // Update primary connection fields
     inServer.value = serverHost;
     inKey.value = accessKey;
-
     inImportUrl.value = ''; 
-    
-    inImportUrl.placeholder = 'Import successful!';
-    setTimeout(() => { inImportUrl.placeholder = 'Paste ostp:// share link here...'; }, 2000);
-
+    showToast(t('toast_imported'));
   } catch (err) {
-    alert('Failed to parse ostp:// share link: ' + err.message);
+    showToast(t('toast_error') + ': ' + err.message);
   }
 }
 
-function showToast() {
+function showToast(message) {
+  configToast.textContent = message || t('toast_saved');
   configToast.classList.add('show');
   setTimeout(() => configToast.classList.remove('show'), 2000);
 }
 
 // Initialization
 window.addEventListener('DOMContentLoaded', async () => {
+  // Apply translations on load
+  applyTranslations();
+  
+  // Re-apply dynamic status text
+  setUIState(appState);
+
   btnConnect.addEventListener('click', handleToggleConnect);
   btnGoSettings.addEventListener('click', () => switchScreen('settings'));
   btnBack.addEventListener('click', () => switchScreen('home'));
@@ -308,6 +307,15 @@ window.addEventListener('DOMContentLoaded', async () => {
   btnImportUrl.addEventListener('click', handleImportUrl);
   inImportUrl.addEventListener('keydown', (e) => {
     if (e.key === 'Enter') handleImportUrl();
+  });
+
+  // Language toggle
+  btnLang.addEventListener('click', () => {
+    toggleLang();
+    // Re-apply dynamic elements
+    const currentState = appState;
+    appState = ''; // Force refresh
+    setUIState(currentState);
   });
 
   try {

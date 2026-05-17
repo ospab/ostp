@@ -191,6 +191,23 @@ h2 {
   transform: translateY(1px);
 }
 
+.header-actions {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.lang-btn {
+  font-size: 0.7rem;
+  font-weight: 700;
+  letter-spacing: 0.5px;
+  min-width: 40px;
+}
+
+.lang-btn span {
+  font-family: 'Inter', sans-serif;
+}
+
 /* Main Content & Central Power Button */
 .main-content {
   flex: 1;
