@@ -17,8 +17,8 @@ json_comments = "0.2"
 portable-atomic.workspace = true
 chrono = "0.4"
 socket2 = "0.6.3"
-rustls = { version = "0.23.40", features = ["ring", "std"] }
-tokio-rustls = "0.26.0"
+rustls = { version = "0.23.40", default-features = false, features = ["ring", "std"] }
+tokio-rustls = { version = "0.26.0", default-features = false, features = ["ring"] }
 futures-util = "0.3.32"
 hmac = "0.12.1"
 sha2 = "0.10.8"
