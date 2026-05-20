@@ -59,6 +59,7 @@ fn parse_ostp_link(link: &str) -> Result<ClientConfig> {
     Ok(ClientConfig {
         server,
         access_key,
+        mtu: None,
         socks5_bind: Some("127.0.0.1:1088".to_string()), // Fallback to standard SOCKS5 port
         tun: Some(TunConfig {
             enable: false, // Default to proxy, configurable via settings GUI
@@ -188,6 +189,7 @@ struct FallbackCfg {
 struct ClientConfig {
     server: String,
     access_key: String,
+    mtu: Option<usize>,
     socks5_bind: Option<String>,
     tun: Option<TunConfig>,
     turn: Option<TurnConfigRaw>,
@@ -634,6 +636,7 @@ async fn run_client_directly(client_cfg: ClientConfig) -> Result<()> {
             access_key: client_cfg.access_key.clone(),
             handshake_timeout_ms: 5000,
             io_timeout_ms: 5000,
+            mtu: client_cfg.mtu.unwrap_or(1350),
         },
         local_proxy: ostp_client::config::LocalProxyConfig {
             bind_addr: client_cfg.socks5_bind.clone().unwrap_or_else(|| "127.0.0.1:1088".to_string()),

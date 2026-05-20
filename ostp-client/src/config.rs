@@ -46,7 +46,11 @@ pub struct OstpConfig {
     pub access_key: String,
     pub handshake_timeout_ms: u64,
     pub io_timeout_ms: u64,
+    #[serde(default = "default_mtu")]
+    pub mtu: usize,
 }
+
+fn default_mtu() -> usize { 1350 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LocalProxyConfig {
@@ -100,6 +104,7 @@ impl Default for OstpConfig {
             access_key: String::new(),
             handshake_timeout_ms: 5000,
             io_timeout_ms: 2500,
+            mtu: default_mtu(),
         }
     }
 }
@@ -148,6 +153,7 @@ struct RawUnifiedConfig {
     debug: Option<bool>,
     server: Option<String>,
     access_key: Option<String>,
+    mtu: Option<usize>,
     socks5_bind: Option<String>,
     tun: Option<RawTunSection>,
     exclude: Option<RawExcludeSection>,
@@ -199,6 +205,7 @@ impl ClientConfig {
         let is_tun = raw.tun.as_ref().and_then(|t| t.enable).unwrap_or(false);
         let server = raw.server.unwrap_or_else(|| "127.0.0.1:50000".to_string());
         let key = raw.access_key.unwrap_or_default();
+        let mtu = raw.mtu.unwrap_or(default_mtu());
         let socks5 = raw.socks5_bind.unwrap_or_else(|| "127.0.0.1:1088".to_string());
         let exclusions = raw.exclude.unwrap_or(RawExcludeSection {
             domains: None,
@@ -219,6 +226,7 @@ impl ClientConfig {
                 access_key: key,
                 handshake_timeout_ms: 5000,
                 io_timeout_ms: 2500,
+                mtu,
             },
             local_proxy: LocalProxyConfig {
                 bind_addr: socks5,

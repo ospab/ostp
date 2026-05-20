@@ -17,3 +17,6 @@ socket2 = "0.6.3"
 axum = "0.8"
 tower-http = { version = "0.6", features = ["cors"] }
 portable-atomic.workspace = true
+hmac.workspace = true
+sha2.workspace = true
+base64 = "0.22"

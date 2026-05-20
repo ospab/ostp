@@ -77,6 +77,7 @@ pub struct Bridge {
     pub transport_mode: String,
     pub stealth_sni: String,
     pub stealth_port: u16,
+    pub mtu: usize,
 
     metrics: Arc<BridgeMetrics>,
     sample_sent: u64,
@@ -110,6 +111,7 @@ impl Bridge {
             transport_mode: config.transport.mode.clone(),
             stealth_sni: config.transport.stealth_sni.clone(),
             stealth_port: config.transport.stealth_port,
+            mtu: config.ostp.mtu,
 
             metrics,
             sample_sent: 0,
@@ -784,6 +786,7 @@ impl Bridge {
             max_sent_history: 32768,     // Reduced: gap recovery handles unrecoverable frames
             handshake_pad_min: secrets.handshake_pad_min,
             handshake_pad_max: secrets.handshake_pad_max,
+            mtu: self.mtu,
         })?;
 
         let resolved_addrs: Vec<std::net::SocketAddr> = match tokio::net::lookup_host(&self.server_addr).await {

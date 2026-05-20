@@ -38,6 +38,7 @@ pub struct ProtocolConfig {
     /// Different access keys produce different handshake packet sizes.
     pub handshake_pad_min: usize,
     pub handshake_pad_max: usize,
+    pub mtu: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -129,7 +130,7 @@ impl ProtocolMachine {
             sent_history: VecDeque::with_capacity(config.max_sent_history.max(1)),
             session_id: config.session_id,
             handshake_payload: config.handshake_payload,
-            padder: AdaptivePadder::new(1200, config.max_padding, config.padding_strategy),
+            padder: AdaptivePadder::new(config.mtu, config.max_padding, config.padding_strategy),
             obfuscation_key: config.obfuscation_key,
             max_reorder: config.max_reorder.max(1),
             max_reorder_buffer: config.max_reorder_buffer.max(1),
@@ -141,8 +142,8 @@ impl ProtocolMachine {
             last_ack_sent: Instant::now(),
             last_nack_sent: Instant::now() - Duration::from_secs(1),
             last_recv_advance: Instant::now(),
-            cc: CongestionController::new(1200),
-                        handshake_pad_min: config.handshake_pad_min.max(8),
+            cc: CongestionController::new(config.mtu as u64),
+            handshake_pad_min: config.handshake_pad_min.max(8),
             handshake_pad_max: config.handshake_pad_max.max(config.handshake_pad_min + 16),
         })
     }

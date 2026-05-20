@@ -14,6 +14,7 @@ mod dispatcher;
 pub mod outbound;
 pub mod api;
 pub mod fallback;
+pub mod transport;
 mod relay;
 mod signal;
 
@@ -145,6 +146,7 @@ pub async fn run_server(
         // Defaults -- overridden per-session by dispatcher using derive_all_secrets()
         handshake_pad_min: 32,
         handshake_pad_max: 128,
+        mtu: 1350,
     };
 
     let dispatcher = Dispatcher::new(protocol_config, shared_keys.clone());
@@ -212,7 +214,7 @@ pub async fn run_server(
     tracing::info!(listeners = bind_addrs.len(), keys = key_count, "server started");
     tracing::info!("ARQ config: max_reorder=16384, reorder_buf=8192, sent_history=32768, rto=100ms");
     tokio::select! {
-        res = run_server_loop(primary_socket, sockets, dispatcher, ui_cmd_rx, ui_event_tx, shared_keys, outbound, debug) => {
+        res = run_server_loop(bind_addrs.clone(), primary_socket, sockets, dispatcher, ui_cmd_rx, ui_event_tx, shared_keys, outbound, debug) => {
             if let Err(e) = res {
                 tracing::error!("Server error: {e}");
             }
@@ -228,6 +230,7 @@ pub async fn run_server(
 // ── Server main loop ─────────────────────────────────────────────────────────
 
 async fn run_server_loop(
+    bind_addrs: Vec<String>,
     primary_socket: std::sync::Arc<UdpSocket>,
     sockets: Vec<std::sync::Arc<UdpSocket>>,
     mut dispatcher: Dispatcher,
@@ -240,6 +243,8 @@ async fn run_server_loop(
     let mut remotes: HashMap<(u32, u16), RemoteState> = HashMap::new();
     let (stream_tx, mut stream_rx) = mpsc::unbounded_channel::<(u32, u16, Vec<u8>)>();
     let (connect_tx, mut connect_rx) = mpsc::unbounded_channel::<(u32, u16, String, Result<(tokio::net::tcp::OwnedWriteHalf, mpsc::Sender<()>), String>)>();
+
+    let tcp_map = std::sync::Arc::new(tokio::sync::RwLock::new(HashMap::new()));
 
     let socket = primary_socket;
     // Spawn a recv task for each socket, all feeding into the same channel
@@ -262,6 +267,35 @@ async fn run_server_loop(
             }
         });
     }
+
+    // Spawn UoT (TCP) listeners
+    for bind_addr in &bind_addrs {
+        let addr = bind_addr.parse::<std::net::SocketAddr>().unwrap();
+        let tcp_map_clone = tcp_map.clone();
+        let shared_keys_clone = shared_keys.clone();
+        let udp_tx_clone = udp_tx.clone();
+        
+        tokio::spawn(async move {
+            if let Ok(listener) = tokio::net::TcpListener::bind(&addr).await {
+                tracing::info!("TCP (UoT) listener bound to {}", addr);
+                loop {
+                    if let Ok((stream, peer_addr)) = listener.accept().await {
+                        let tm = tcp_map_clone.clone();
+                        let keys = shared_keys_clone.clone();
+                        let tx = udp_tx_clone.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = crate::transport::uot::handle_tcp_connection(stream, peer_addr, keys, tx, tm).await {
+                                tracing::debug!("UoT connection from {} failed: {}", peer_addr, e);
+                            }
+                        });
+                    }
+                }
+            } else {
+                tracing::warn!("Failed to bind TCP (UoT) listener to {}", addr);
+            }
+        });
+    }
+
     drop(udp_tx); // Drop the original sender so the channel closes when all tasks end
 
     if debug {
@@ -317,7 +351,17 @@ async fn run_server_loop(
 
                             for resp in responses {
                                 let resp_len = resp.len();
-                                let _ = socket.send_to(&resp, peer_addr).await?;
+                                let mut sent_tcp = false;
+                                {
+                                    let map = tcp_map.read().await;
+                                    if let Some(tx) = map.get(&peer_addr) {
+                                        let _ = tx.try_send(resp.clone());
+                                        sent_tcp = true;
+                                    }
+                                }
+                                if !sent_tcp {
+                                    let _ = socket.send_to(&resp, peer_addr).await?;
+                                }
                                 let _ = ui_event_tx.send(UiEvent::Tx { peer: peer_ip, bytes: resp_len });
                             }
 
@@ -391,7 +435,17 @@ async fn run_server_loop(
                 }
                 let (frames, dropped_sessions) = dispatcher.on_tick();
                 for (frame, peer_addr) in frames {
-                    let _ = socket.send_to(&frame, peer_addr).await?;
+                    let mut sent_tcp = false;
+                    {
+                        let map = tcp_map.read().await;
+                        if let Some(tx) = map.get(&peer_addr) {
+                            let _ = tx.try_send(frame.clone());
+                            sent_tcp = true;
+                        }
+                    }
+                    if !sent_tcp {
+                        let _ = socket.send_to(&frame, peer_addr).await?;
+                    }
                 }
                 for sid in dropped_sessions {
                     let _ = ui_event_tx.send(UiEvent::Log(format!("Session {sid} expired, releasing resources")));
