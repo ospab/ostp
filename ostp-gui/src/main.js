@@ -42,6 +42,8 @@ const inServer       = $('in-server');
 const inKey          = $('in-key');
 const inSocks        = $('in-socks');
 const inDns          = $('in-dns');
+const inTransport    = $('in-transport');
+const inMtu          = $('in-mtu');
 const inTun          = $('in-tun-mode');
 const inDebug        = $('in-debug');
 const inDomains      = $('in-ex-domains');
@@ -222,6 +224,8 @@ async function loadConfigIntoForm() {
     inServer.value  = c.server        || '';
     inKey.value     = c.access_key    || '';
     inSocks.value   = c.socks5_bind   || '127.0.0.1:1088';
+    inTransport.value = c.transport?.mode || 'udp';
+    inMtu.value     = c.mtu           || '';
     inTun.checked   = !!c.tun?.enable;
     inDns.value     = c.tun?.dns      || '';
     inDebug.checked = !!c.debug;
@@ -250,6 +254,13 @@ async function handleSave() {
   rawConfig.access_key = key;
   rawConfig.socks5_bind = inSocks.value.trim() || null;
   rawConfig.debug      = inDebug.checked;
+
+  rawConfig.transport = rawConfig.transport || {};
+  rawConfig.transport.mode = inTransport.value;
+
+  const mtuStr = inMtu.value.trim();
+  if (mtuStr) rawConfig.mtu = parseInt(mtuStr, 10);
+  else delete rawConfig.mtu;
 
   if (!rawConfig.tun) {
     rawConfig.tun = { wintun_path: './wintun.dll', ipv4_address: '10.1.0.2/24' };

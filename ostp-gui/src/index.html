@@ -182,6 +182,19 @@
             <input id="in-dns" class="field-input" type="text" placeholder="1.1.1.1" />
           </div>
 
+          <div class="field-group">
+            <label class="field-label" for="in-transport" data-i18n="label_transport">Transport Protocol</label>
+            <select id="in-transport" class="field-input">
+              <option value="udp">UDP (Default)</option>
+              <option value="uot">TCP (UoT)</option>
+            </select>
+          </div>
+
+          <div class="field-group">
+            <label class="field-label" for="in-mtu" data-i18n="label_mtu">MTU Size</label>
+            <input id="in-mtu" class="field-input" type="number" placeholder="1350" />
+          </div>
+
           <!-- Toggles -->
           <div class="toggle-row">
             <div class="toggle-text">
