@@ -40,6 +40,9 @@ pub enum BridgeCommand {
     ToggleTunnel,
     NextProfile,
     ReloadConfig,
+    /// Triggered by Android NetworkCallback when the active network changes (WiFi→LTE, etc.).
+    /// Causes an immediate background reconnect without waiting for stall detection.
+    NetworkChanged,
     Shutdown,
 }
 

@@ -36,6 +36,7 @@ class OstpClientSdk private constructor(private val context: Context) {
     private external fun nativeStopClient(): Boolean
     private external fun nativeGetMetrics(): String
     private external fun nativeGetLogs(): String
+    private external fun notifyNetworkChanged()
 
     // ── Public data models ────────────────────────────────────────────────────
 
@@ -263,28 +264,19 @@ class OstpClientSdk private constructor(private val context: Context) {
 
             val callback = object : ConnectivityManager.NetworkCallback() {
                 override fun onAvailable(network: Network) {
-                    // Network came back (e.g. switched from WiFi to LTE)
-                    // If we're not connected, trigger a reconnect by bouncing the native client
-                    if (_state.value !is TunnelState.Connected && started.get()) {
-                        emitLog("Network available — triggering reconnect")
-                        scope.launch {
-                            nativeStopClient()
-                            delay(500L)
-                            val json = config.toNativeJson()
-                            val ok = nativeStartClient(json)
-                            if (!ok) {
-                                _state.value = TunnelState.Failed("Reconnect failed after network change")
-                            } else {
-                                _state.value = TunnelState.Connecting
-                            }
-                        }
-                    }
+                    if (!started.get()) return
+                    // Network became available (WiFi→LTE, tower switch, etc.)
+                    // Send a lightweight BridgeCommand::NetworkChanged to Rust so the bridge
+                    // immediately reconnects on the new interface without a full stop/start.
+                    emitLog("Network available — signalling Rust bridge for immediate reconnect")
+                    _state.value = TunnelState.Connecting
+                    notifyNetworkChanged()
                 }
 
                 override fun onLost(network: Network) {
                     if (_state.value is TunnelState.Connected) {
                         _state.value = TunnelState.Reconnecting("Network lost", 0)
-                        emitLog("Network lost — waiting for reconnect")
+                        emitLog("Network lost — waiting for new network")
                     }
                 }
             }

@@ -353,3 +353,23 @@ pub extern "system" fn Java_net_ostp_client_OstpClientSdk_addLog(
         add_log(text);
     }
 }
+
+/// Called by Android NetworkCallback when the active network changes (WiFi→LTE, etc.).
+/// Sends BridgeCommand::NetworkChanged to trigger an immediate reconnect in the Rust bridge.
+#[no_mangle]
+pub extern "system" fn Java_net_ostp_client_OstpClientSdk_notifyNetworkChanged(
+    _env: JNIEnv,
+    _class: JClass,
+) {
+    let state = match STATE.lock() {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+
+    if let Some(ref cmd_tx) = state.cmd_tx {
+        // Use try_send since we're likely on a background thread from Android's ConnectivityManager
+        let _ = cmd_tx.try_send(ostp_client::app::BridgeCommand::NetworkChanged);
+        add_log("notifyNetworkChanged: BridgeCommand::NetworkChanged sent".to_string());
+    }
+}
+

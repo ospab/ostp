@@ -338,6 +338,73 @@ impl Bridge {
                             tx.send(UiEvent::ProfileChanged(self.profile)).await.ok();
                             tx.send(UiEvent::Log(format!("Obfuscation profile switched to {:?}", self.profile))).await.ok();
                         }
+                        Some(BridgeCommand::NetworkChanged) => {
+                            if self.running {
+                                // Network changed (e.g. WiFi→LTE): IP address changed, existing UDP
+                                // socket is dead. Trigger immediate reconnect without waiting for stall.
+                                let _ = tx.send(UiEvent::Log("Network changed — starting immediate reconnect".to_string())).await;
+                                self.metrics.connection_state.store(1, Ordering::Relaxed);
+                                self.last_valid_recv = Instant::now() - Duration::from_secs(100); // force stall path
+
+                                let session_count = if self.mux_enabled { self.mux_sessions.max(1) } else { 1 };
+                                let (udp_tx, udp_rx) = mpsc::channel(100000);
+                                let mut new_sessions = Vec::with_capacity(session_count);
+                                let mut successful_sessions = 0;
+                                let mut rtt_sum = 0.0;
+
+                                for idx in 0..session_count {
+                                    let session_id: u32 = rand::thread_rng().gen();
+                                    match self.perform_handshake_with_id(&tx, session_id).await {
+                                        Ok((sock, mach, rtt)) => {
+                                            let session_index = new_sessions.len();
+                                            let socket = Arc::new(sock);
+                                            let socket_clone = socket.clone();
+                                            let udp_tx_clone = udp_tx.clone();
+                                            let is_turn = self.turn_enabled;
+                                            tokio::spawn(async move {
+                                                let mut buf = vec![0_u8; 65535];
+                                                loop {
+                                                    match socket_clone.recv(&mut buf).await {
+                                                        Ok(n) => {
+                                                            let inbound = if is_turn && n >= 4 && buf[0] == 0x40 && buf[1] == 0x00 {
+                                                                let len = u16::from_be_bytes([buf[2], buf[3]]) as usize;
+                                                                if 4 + len <= n { Bytes::copy_from_slice(&buf[4..4+len]) } else { Bytes::copy_from_slice(&buf[..n]) }
+                                                            } else {
+                                                                Bytes::copy_from_slice(&buf[..n])
+                                                            };
+                                                            if udp_tx_clone.send((session_index, inbound)).await.is_err() { break; }
+                                                        }
+                                                        Err(e) => {
+                                                            tracing::warn!("UDP recv error (network-change session {}): {}", session_index, e);
+                                                            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                                                        }
+                                                    }
+                                                }
+                                            });
+                                            new_sessions.push(SessionState { socket, machine: mach });
+                                            rtt_sum += rtt;
+                                            successful_sessions += 1;
+                                        }
+                                        Err(err) => {
+                                            let _ = tx.send(UiEvent::Log(format!("NetworkChanged reconnect session {}/{} failed: {}", idx + 1, session_count, err))).await;
+                                        }
+                                    }
+                                }
+
+                                if !new_sessions.is_empty() {
+                                    sessions_opt = Some(new_sessions);
+                                    udp_rx_opt = Some(udp_rx);
+                                    self.last_rtt_ms = rtt_sum / successful_sessions as f64;
+                                    self.last_valid_recv = Instant::now();
+                                    stream_map.clear();
+                                    self.reset_proxy_streams(&tx, &proxy_tx, "network changed");
+                                    self.metrics.connection_state.store(2, Ordering::Relaxed);
+                                    let _ = tx.send(UiEvent::Log("NetworkChanged reconnect successful!".to_string())).await;
+                                } else {
+                                    let _ = tx.send(UiEvent::Log("NetworkChanged reconnect failed — will retry on keepalive tick".to_string())).await;
+                                }
+                            }
+                        }
                         Some(BridgeCommand::ReloadConfig) => {
                             match ClientConfig::reload_from_json_near_binary() {
                                 Ok(cfg) => {
@@ -374,7 +441,7 @@ impl Bridge {
                 _ = keepalive_tick.tick() => {
                     if self.running {
                         // 1. Connection Liveness Check & Silent Background Reconnect
-                        if self.last_valid_recv.elapsed().as_secs() > 25 {
+                        if self.last_valid_recv.elapsed().as_secs() > 8 {
                             let elapsed = self.last_valid_recv.elapsed().as_secs();
                             if elapsed > 180 {
                                 // Hard timeout after 3 minutes of total silence
