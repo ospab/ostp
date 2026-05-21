@@ -131,7 +131,8 @@ pub async fn connect_xhttp(
             anyhow::bail!("xHTTP handshake failed: expected 101 or 200, got: {}", resp.lines().next().unwrap_or(""));
         }
         if !resp.to_ascii_lowercase().contains("x-ostp-server:") {
-            anyhow::bail!("xHTTP handshake failed: endpoint is not an OSTP server (missing X-Ostp-Server header)");
+            let safe_resp = resp.chars().take(200).collect::<String>().replace("\r\n", " | ");
+            anyhow::bail!("xHTTP handshake failed: endpoint is not an OSTP server. Got: {}", safe_resp);
         }
         
         // Extract leftover payload if any
@@ -159,7 +160,8 @@ pub async fn connect_xhttp(
             anyhow::bail!("xHTTP handshake failed: expected 101 or 200, got: {}", resp.lines().next().unwrap_or(""));
         }
         if !resp.to_ascii_lowercase().contains("x-ostp-server:") {
-            anyhow::bail!("xHTTP handshake failed: endpoint is not an OSTP server (missing X-Ostp-Server header)");
+            let safe_resp = resp.chars().take(200).collect::<String>().replace("\r\n", " | ");
+            anyhow::bail!("xHTTP handshake failed: endpoint is not an OSTP server. Got: {}", safe_resp);
         }
         
         let headers_end = buf[..header_len].windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
