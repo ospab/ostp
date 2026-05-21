@@ -5,58 +5,11 @@ use tokio::net::TcpStream;
 use bytes::{Bytes, BytesMut};
 use anyhow::{Result, Context};
 use tokio::sync::mpsc;
-use rustls::pki_types::{ServerName, CertificateDer, UnixTime};
-use rustls::client::danger::{ServerCertVerifier, ServerCertVerified, HandshakeSignatureValid};
-use rustls::DigitallySignedStruct;
-use sha2::{Sha256, Digest};
 use hmac::{Hmac, Mac};
+use sha2::Sha256;
 use base64::Engine;
 
 type HmacSha256 = Hmac<Sha256>;
-
-#[derive(Debug)]
-struct NoAuthVerifier;
-
-impl ServerCertVerifier for NoAuthVerifier {
-    fn verify_server_cert(
-        &self,
-        _end_entity: &CertificateDer<'_>,
-        _intermediates: &[CertificateDer<'_>],
-        _server_name: &ServerName<'_>,
-        _ocsp_response: &[u8],
-        _now: UnixTime,
-    ) -> Result<ServerCertVerified, rustls::Error> {
-        Ok(ServerCertVerified::assertion())
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &DigitallySignedStruct,
-    ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        Ok(HandshakeSignatureValid::assertion())
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &DigitallySignedStruct,
-    ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        Ok(HandshakeSignatureValid::assertion())
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        vec![
-            rustls::SignatureScheme::RSA_PKCS1_SHA256,
-            rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
-            rustls::SignatureScheme::ECDSA_NISTP384_SHA384,
-            rustls::SignatureScheme::ED25519,
-            rustls::SignatureScheme::RSA_PSS_SHA256,
-        ]
-    }
-}
 
 pub async fn connect_xhttp(
     target_ip: IpAddr,
@@ -65,28 +18,28 @@ pub async fn connect_xhttp(
     access_key: &[u8],
 ) -> Result<(mpsc::Sender<Bytes>, Arc<tokio::sync::Mutex<mpsc::Receiver<Bytes>>>)> {
     let addr = std::net::SocketAddr::new(target_ip, port);
-    let tcp_stream = TcpStream::connect(addr).await
+    let mut tcp_stream = TcpStream::connect(addr).await
         .with_context(|| format!("failed to connect to {}", addr))?;
     tcp_stream.set_nodelay(true)?;
 
-    // 1. Generate auth token
+    // 1. Generate auth token: [8-byte timestamp BE] ++ [HMAC-SHA256]
     let timestamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs();
     let ts_bytes = timestamp.to_be_bytes();
     let mut mac = HmacSha256::new_from_slice(access_key).unwrap_or_else(|_| HmacSha256::new_from_slice(b"").unwrap());
     mac.update(&ts_bytes);
     let mac_bytes = mac.finalize().into_bytes();
-    
+
     let mut sig_bytes = Vec::with_capacity(8 + mac_bytes.len());
     sig_bytes.extend_from_slice(&ts_bytes);
     sig_bytes.extend_from_slice(&mac_bytes);
-    
-    let auth_token = base64::Engine::encode(
-        &base64::engine::general_purpose::STANDARD_NO_PAD,
-        &sig_bytes
-    );
+
+    let auth_token = base64::engine::general_purpose::STANDARD_NO_PAD.encode(&sig_bytes);
 
     let http_host = if sni.is_empty() { target_ip.to_string() } else { sni.to_string() };
-    
+
+    // 2. Send fake WebSocket upgrade — looks like a legit browser request to bypass DPI/proxies.
+    //    The server responds with 101 Switching Protocols and we stream raw UoT frames after that.
+    //    NOTE: always plain TCP — TLS is NOT used. Obfuscation comes from the fake WS headers.
     let req = format!(
         "GET /stream HTTP/1.1\r\n\
          Host: {}\r\n\
@@ -99,92 +52,51 @@ pub async fn connect_xhttp(
         http_host, auth_token
     );
 
-    // 2. TLS wrapping (if port 443)
-    if port == 443 {
-        let mut config = rustls::ClientConfig::builder()
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(NoAuthVerifier))
-            .with_no_client_auth();
-        config.alpn_protocols.push(b"http/1.1".to_vec());
-        let tls_connector = tokio_rustls::TlsConnector::from(Arc::new(config));
-        
-        let server_name = ServerName::try_from(http_host.as_str())
-            .unwrap_or_else(|_| ServerName::try_from("localhost").unwrap())
-            .to_owned();
-            
-        let mut tls_stream = tls_connector.connect(server_name, tcp_stream).await?;
-        
-        // HTTP Handshake
-        tls_stream.write_all(req.as_bytes()).await?;
-        tls_stream.flush().await?;
-        
-        let mut buf = vec![0u8; 4096];
-        let mut header_len = 0;
-        loop {
-            let n = tls_stream.read(&mut buf[header_len..]).await?;
-            if n == 0 { anyhow::bail!("connection closed before handshake complete"); }
-            header_len += n;
-            if buf[..header_len].windows(4).any(|w| w == b"\r\n\r\n") { break; }
-        }
-        let resp = String::from_utf8_lossy(&buf[..header_len]);
-        if !resp.starts_with("HTTP/1.1 101 ") && !resp.starts_with("HTTP/1.1 200 ") {
-            anyhow::bail!("xHTTP handshake failed: expected 101 or 200, got: {}", resp.lines().next().unwrap_or(""));
-        }
-        if !resp.to_ascii_lowercase().contains("x-ostp-server:") {
-            let safe_resp = resp.chars().take(200).collect::<String>().replace("\r\n", " | ");
-            anyhow::bail!("xHTTP handshake failed: endpoint is not an OSTP server. Got: {}", safe_resp);
-        }
-        
-        // Extract leftover payload if any
-        let headers_end = buf[..header_len].windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
-        let leftover = buf[headers_end..header_len].to_vec();
-        
-        // Split stream
-        let (rx, tx) = tokio::io::split(tls_stream);
-        start_uot_loops(rx, tx, leftover)
-    } else {
-        let mut tcp_stream = tcp_stream;
-        tcp_stream.write_all(req.as_bytes()).await?;
-        tcp_stream.flush().await?;
-        
-        let mut buf = vec![0u8; 4096];
-        let mut header_len = 0;
-        loop {
-            let n = tcp_stream.read(&mut buf[header_len..]).await?;
-            if n == 0 { anyhow::bail!("connection closed before handshake complete"); }
-            header_len += n;
-            if buf[..header_len].windows(4).any(|w| w == b"\r\n\r\n") { break; }
-        }
-        let resp = String::from_utf8_lossy(&buf[..header_len]);
-        if !resp.starts_with("HTTP/1.1 101 ") && !resp.starts_with("HTTP/1.1 200 ") {
-            anyhow::bail!("xHTTP handshake failed: expected 101 or 200, got: {}", resp.lines().next().unwrap_or(""));
-        }
-        if !resp.to_ascii_lowercase().contains("x-ostp-server:") {
-            let safe_resp = resp.chars().take(200).collect::<String>().replace("\r\n", " | ");
-            anyhow::bail!("xHTTP handshake failed: endpoint is not an OSTP server. Got: {}", safe_resp);
-        }
-        
-        let headers_end = buf[..header_len].windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
-        let leftover = buf[headers_end..header_len].to_vec();
-        
-        let (rx, tx) = tcp_stream.into_split();
-        start_uot_loops(rx, tx, leftover)
+    tcp_stream.write_all(req.as_bytes()).await?;
+    tcp_stream.flush().await?;
+
+    // 3. Read server response headers
+    let mut buf = vec![0u8; 4096];
+    let mut header_len = 0;
+    loop {
+        let n = tcp_stream.read(&mut buf[header_len..]).await?;
+        if n == 0 { anyhow::bail!("connection closed before handshake complete"); }
+        header_len += n;
+        if buf[..header_len].windows(4).any(|w| w == b"\r\n\r\n") { break; }
+        if header_len >= buf.len() { anyhow::bail!("server response headers too large"); }
     }
+
+    let resp = String::from_utf8_lossy(&buf[..header_len]);
+    if !resp.starts_with("HTTP/1.1 101 ") && !resp.starts_with("HTTP/1.1 200 ") {
+        anyhow::bail!("xHTTP handshake failed: expected 101 or 200, got: {}", resp.lines().next().unwrap_or(""));
+    }
+    if !resp.to_ascii_lowercase().contains("x-ostp-server:") {
+        let safe_resp = resp.chars().take(200).collect::<String>().replace("\r\n", " | ");
+        anyhow::bail!("xHTTP handshake failed: endpoint is not an OSTP server. Got: {}", safe_resp);
+    }
+
+    // 4. Extract leftover bytes after headers (data that arrived together with the response)
+    let headers_end = buf[..header_len].windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+    let leftover = buf[headers_end..header_len].to_vec();
+
+    // 5. Split into read/write halves and start UoT loops
+    let (rx, tx) = tcp_stream.into_split();
+    start_uot_loops(rx, tx, leftover)
 }
 
 fn start_uot_loops<R, W>(
-    mut net_rx: R, 
+    mut net_rx: R,
     mut net_tx: W,
     leftover: Vec<u8>
-) -> Result<(mpsc::Sender<Bytes>, Arc<tokio::sync::Mutex<mpsc::Receiver<Bytes>>>)> 
-where 
+) -> Result<(mpsc::Sender<Bytes>, Arc<tokio::sync::Mutex<mpsc::Receiver<Bytes>>>)>
+where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     let (app_tx, bridge_rx) = mpsc::channel::<Bytes>(1024);
     let (bridge_tx, app_rx) = mpsc::channel::<Bytes>(1024);
 
-    // TX Loop (App -> UoT -> Network)
+    // TX Loop (App -> UoT -> Network): prefix each frame with u16 BE length
     tokio::spawn(async move {
         let mut rx = bridge_rx;
         while let Some(frame) = rx.recv().await {
@@ -194,28 +106,27 @@ where
         }
     });
 
-    // RX Loop (Network -> UoT -> App)
+    // RX Loop (Network -> UoT -> App): parse [u16 len][payload] frames
     tokio::spawn(async move {
         let mut buffer = BytesMut::from(&leftover[..]);
         loop {
-            // Read more data if buffer has less than 2 bytes
             while buffer.len() < 2 {
-                let mut temp = [0u8; 1024];
+                let mut temp = [0u8; 4096];
                 match net_rx.read(&mut temp).await {
                     Ok(0) | Err(_) => return,
                     Ok(n) => buffer.extend_from_slice(&temp[..n]),
                 }
             }
             let len = u16::from_be_bytes([buffer[0], buffer[1]]) as usize;
-            
+
             while buffer.len() < 2 + len {
-                let mut temp = [0u8; 1024];
+                let mut temp = [0u8; 4096];
                 match net_rx.read(&mut temp).await {
                     Ok(0) | Err(_) => return,
                     Ok(n) => buffer.extend_from_slice(&temp[..n]),
                 }
             }
-            
+
             let packet = buffer.split_to(2 + len);
             if app_tx.send(Bytes::from(packet[2..].to_vec())).await.is_err() {
                 break;

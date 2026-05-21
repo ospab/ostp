@@ -1,5 +1,5 @@
-use anyhow::{Context, Result};
-use bytes::{Buf, BufMut, Bytes, BytesMut};
+use anyhow::Result;
+use bytes::{BufMut, Bytes, BytesMut};
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use std::collections::HashMap;
@@ -9,7 +9,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, RwLock};
-use tracing::{info, warn};
+use tracing::info;
 
 pub async fn handle_tcp_connection(
     mut stream: TcpStream,
