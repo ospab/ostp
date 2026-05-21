@@ -201,18 +201,20 @@ jobs:
         shell: pwsh
         run: |
           $dir = "target/${{ matrix.target }}/release"
-          $files = @("$dir/ostp.exe")
-          if (Test-Path "$dir/tun2socks.exe") { $files += "$dir/tun2socks.exe" }
-          if (Test-Path "$dir/wintun.dll")    { $files += "$dir/wintun.dll" }
-          Compress-Archive -Path $files -DestinationPath "${{ matrix.release_name }}" -Force
+          $files = @("ostp.exe")
+          if (Test-Path "$dir/tun2socks.exe") { $files += "tun2socks.exe" }
+          if (Test-Path "$dir/wintun.dll")    { $files += "wintun.dll" }
+          Push-Location $dir
+          Compress-Archive -Path $files -DestinationPath "../../../${{ matrix.release_name }}" -Force
+          Pop-Location
 
       - name: Package (Unix)
         if: ${{ matrix.os != 'windows-latest' }}
         run: |
           dir="target/${{ matrix.target }}/release"
-          FILES="$dir/${{ matrix.artifact_name }}"
-          [ -f "$dir/tun2socks" ] && FILES="$FILES $dir/tun2socks"
-          tar -czf "${{ matrix.release_name }}" -C "$dir" $(basename $FILES | tr '\n' ' ')
+          FILES="${{ matrix.artifact_name }}"
+          [ -f "$dir/tun2socks" ] && FILES="$FILES tun2socks"
+          tar -czf "${{ matrix.release_name }}" -C "$dir" $FILES
 
       # ── Upload ─────────────────────────────────────────────────────────────
       - name: Upload to GitHub Release
