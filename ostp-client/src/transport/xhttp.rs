@@ -71,17 +71,27 @@ pub async fn connect_xhttp(
 
     // 1. Generate auth token
     let timestamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs();
+    let ts_bytes = timestamp.to_be_bytes();
     let mut mac = HmacSha256::new_from_slice(access_key).unwrap_or_else(|_| HmacSha256::new_from_slice(b"").unwrap());
-    mac.update(&timestamp.to_be_bytes());
-    let sig = base64::prelude::BASE64_STANDARD.encode(mac.finalize().into_bytes());
-    let auth_token = format!("{}:{}", timestamp, sig);
+    mac.update(&ts_bytes);
+    let mac_bytes = mac.finalize().into_bytes();
+    
+    let mut sig_bytes = Vec::with_capacity(8 + mac_bytes.len());
+    sig_bytes.extend_from_slice(&ts_bytes);
+    sig_bytes.extend_from_slice(&mac_bytes);
+    
+    let auth_token = base64::Engine::encode(
+        &base64::engine::general_purpose::STANDARD_NO_PAD,
+        &sig_bytes
+    );
 
     let http_host = if sni.is_empty() { target_ip.to_string() } else { sni.to_string() };
     
     let req = format!(
-        "GET /stream HTTP/1.1\r\n\
+        "POST /stream HTTP/1.1\r\n\
          Host: {}\r\n\
          Authorization: Bearer {}\r\n\
+         Content-Length: 99999999999\r\n\
          Connection: keep-alive\r\n\
          \r\n",
         http_host, auth_token

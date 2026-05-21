@@ -38,7 +38,7 @@ pub async fn handle_tcp_connection(
     let headers_str = String::from_utf8_lossy(&buf[..header_len]);
 
     // Fast-fail scanner bots
-    if !headers_str.starts_with("GET /stream HTTP/1.1\r\n") {
+    if !headers_str.starts_with("POST /stream HTTP/1.1\r\n") {
         send_404(&mut stream).await?;
         anyhow::bail!("invalid request line");
     }
@@ -108,7 +108,7 @@ pub async fn handle_tcp_connection(
     }
 
     // Reply 200 OK
-    let response = "HTTP/1.1 200 OK\r\nConnection: keep-alive\r\n\r\n";
+    let response = "HTTP/1.1 200 OK\r\nContent-Length: 99999999999\r\nConnection: keep-alive\r\n\r\n";
     stream.write_all(response.as_bytes()).await?;
 
     info!("UoT client authenticated from {}", peer_addr);
