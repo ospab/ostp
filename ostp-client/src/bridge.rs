@@ -886,15 +886,21 @@ impl Bridge {
         let mut size = 0;
         let mut success = false;
 
-        // Retransmit handshake up to 4 times with 1200ms timeout to survive packet loss on mobile
-        for attempt in 0..4 {
+        // For UoT: TCP is reliable so we don't retry on the same connection.
+        // Multiple retries would cause stale Noise responses to queue in the mpsc channel
+        // and break the Noise state machine (noise-read error).
+        // For UDP: retry up to 4x with 1200ms timeout to survive packet loss.
+        let is_uot = matches!(socket, crate::transport::Transport::Uot { .. });
+        let (attempt_limit, attempt_timeout_ms) = if is_uot { (1, 4000) } else { (4, 1200) };
+
+        for attempt in 0..attempt_limit {
             if attempt > 0 {
                 tx.send(UiEvent::Log(format!("Handshake attempt {} lost. Retransmitting...", attempt))).await.ok();
             }
             send_datagram(&socket, &handshake_frame, self.turn_enabled).await?;
             self.metrics.bytes_sent.fetch_add(handshake_frame.len() as u64, Ordering::Relaxed);
 
-            match timeout(Duration::from_millis(1200), socket.recv(&mut buf)).await {
+            match timeout(Duration::from_millis(attempt_timeout_ms), socket.recv(&mut buf)).await {
                 Ok(Ok(n)) => {
                     size = n;
                     success = true;

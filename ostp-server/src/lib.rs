@@ -274,12 +274,41 @@ async fn run_server_loop(
         let tcp_map_clone = tcp_map.clone();
         let shared_keys_clone = shared_keys.clone();
         let udp_tx_clone = udp_tx.clone();
-        
+
         tokio::spawn(async move {
             if let Ok(listener) = tokio::net::TcpListener::bind(&addr).await {
                 tracing::info!("TCP (UoT) listener bound to {}", addr);
+
+                // Rate limiter: track connection attempts per IP
+                // Map<IP, (count, window_start)>
+                let rate_map: std::sync::Arc<tokio::sync::Mutex<std::collections::HashMap<std::net::IpAddr, (u32, std::time::Instant)>>> =
+                    std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+                const RATE_WINDOW_SECS: u64 = 10;
+                const RATE_MAX_CONNS: u32 = 10;
+
                 loop {
                     if let Ok((stream, peer_addr)) = listener.accept().await {
+                        // Rate limit check
+                        let peer_ip = peer_addr.ip();
+                        let allowed = {
+                            let mut map = rate_map.lock().await;
+                            let now = std::time::Instant::now();
+                            let entry = map.entry(peer_ip).or_insert((0, now));
+                            if now.duration_since(entry.1).as_secs() >= RATE_WINDOW_SECS {
+                                // Reset window
+                                *entry = (1, now);
+                                true
+                            } else {
+                                entry.0 += 1;
+                                entry.0 <= RATE_MAX_CONNS
+                            }
+                        };
+
+                        if !allowed {
+                            tracing::debug!("UoT rate limit exceeded for {}, dropping connection", peer_ip);
+                            continue;
+                        }
+
                         let tm = tcp_map_clone.clone();
                         let keys = shared_keys_clone.clone();
                         let tx = udp_tx_clone.clone();
