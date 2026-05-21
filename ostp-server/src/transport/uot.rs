@@ -119,6 +119,9 @@ pub async fn handle_tcp_connection(
         tcp_map.write().await.insert(peer_addr, tx);
     }
 
+    let headers_end = buf[..header_len].windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+    let leftover = &buf[headers_end..header_len];
+
     // Process streams
     let (mut read_half, mut write_half) = stream.into_split();
 
@@ -139,17 +142,36 @@ pub async fn handle_tcp_connection(
     });
 
     // Reader loop
-    let mut len_buf = [0u8; 2];
+    let mut buffer = BytesMut::from(leftover);
     loop {
-        if read_half.read_exact(&mut len_buf).await.is_err() {
-            break;
+        while buffer.len() < 2 {
+            let mut temp = [0u8; 1024];
+            match read_half.read(&mut temp).await {
+                Ok(0) | Err(_) => {
+                    writer_task.abort();
+                    tcp_map.write().await.remove(&peer_addr);
+                    return Ok(());
+                }
+                Ok(n) => buffer.extend_from_slice(&temp[..n]),
+            }
         }
-        let len = u16::from_be_bytes(len_buf) as usize;
-        let mut packet_buf = vec![0u8; len];
-        if read_half.read_exact(&mut packet_buf).await.is_err() {
-            break;
+        
+        let len = u16::from_be_bytes([buffer[0], buffer[1]]) as usize;
+        
+        while buffer.len() < 2 + len {
+            let mut temp = [0u8; 1024];
+            match read_half.read(&mut temp).await {
+                Ok(0) | Err(_) => {
+                    writer_task.abort();
+                    tcp_map.write().await.remove(&peer_addr);
+                    return Ok(());
+                }
+                Ok(n) => buffer.extend_from_slice(&temp[..n]),
+            }
         }
-        if udp_tx.send((Bytes::from(packet_buf), peer_addr)).await.is_err() {
+        
+        let packet = buffer.split_to(2 + len);
+        if udp_tx.send((Bytes::from(packet[2..].to_vec()), peer_addr)).await.is_err() {
             break;
         }
     }
