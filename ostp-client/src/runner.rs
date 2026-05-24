@@ -169,16 +169,19 @@ pub async fn run_client_core(
     #[cfg(target_os = "linux")]
     if config.mode == "proxy" {
         println!("\n[ostp] ===========================================================================");
-        println!("[ostp] Proxy mode initialized on {}:{}", config.local_proxy.bind_host, config.local_proxy.bind_port);
+        println!("[ostp] Proxy mode initialized on {}", config.local_proxy.bind_addr);
         println!("[ostp] To use this proxy in your current terminal session, run:");
-        println!("[ostp]   export http_proxy=\"http://{}:{}\"", config.local_proxy.bind_host, config.local_proxy.bind_port);
-        println!("[ostp]   export https_proxy=\"http://{}:{}\"", config.local_proxy.bind_host, config.local_proxy.bind_port);
-        println!("[ostp]   export all_proxy=\"socks5://{}:{}\"", config.local_proxy.bind_host, config.local_proxy.bind_port);
+        println!("[ostp]   export http_proxy=\"http://{}\"", config.local_proxy.bind_addr);
+        println!("[ostp]   export https_proxy=\"http://{}\"", config.local_proxy.bind_addr);
+        println!("[ostp]   export all_proxy=\"socks5://{}\"", config.local_proxy.bind_addr);
         println!("[ostp] ");
         println!("[ostp] For GNOME desktop system-wide proxy, you can use:");
         println!("[ostp]   gsettings set org.gnome.system.proxy mode 'manual'");
-        println!("[ostp]   gsettings set org.gnome.system.proxy.http host '{}'", config.local_proxy.bind_host);
-        println!("[ostp]   gsettings set org.gnome.system.proxy.http port {}", config.local_proxy.bind_port);
+        let mut parts = config.local_proxy.bind_addr.split(':');
+        let host = parts.next().unwrap_or("127.0.0.1");
+        let port = parts.next().unwrap_or("1088");
+        println!("[ostp]   gsettings set org.gnome.system.proxy.http host '{}'", host);
+        println!("[ostp]   gsettings set org.gnome.system.proxy.http port {}", port);
         println!("[ostp] ===========================================================================\n");
     }
 

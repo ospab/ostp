@@ -145,7 +145,7 @@ pub async fn run_linux_tunnel(
          ip route add 1.1.1.1 via {} dev {}; \
          ip route add 0.0.0.0/1 dev ostp_tun; \
          ip route add 128.0.0.0/1 dev ostp_tun",
-        server_ip_str, default_gw, default_if,
+        config.ostp.mtu, server_ip_str, default_gw, default_if,
         default_gw, default_if
     );
 

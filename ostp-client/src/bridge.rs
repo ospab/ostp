@@ -221,7 +221,7 @@ impl Bridge {
                                                 }
                                             }
                                             ProtocolAction::SendDatagram(frame) => {
-                                                let _ = send_datagram(&session.socket, &frame, (self.transport_mode == "udp")).await;
+                                                let _ = send_datagram(&session.socket, &frame, self.transport_mode == "udp" ).await;
                                                 self.metrics.bytes_sent.fetch_add(frame.len() as u64, Ordering::Relaxed);
                                             }
                                             _ => {}
@@ -274,7 +274,7 @@ impl Bridge {
                                             let session_index = sessions.len();
                                             let socket_clone = sock.clone();
                                             let udp_tx_clone = udp_tx.clone();
-                                            let is_webrtc = (self.transport_mode == "udp");
+                                            let is_webrtc = self.transport_mode == "udp" ;
                                             tokio::spawn(async move {
                                                 let mut buf = vec![0_u8; 65535];
                                                 loop {
@@ -364,7 +364,7 @@ impl Bridge {
                                             let session_index = new_sessions.len();
                                             let socket_clone = sock.clone();
                                             let udp_tx_clone = udp_tx.clone();
-                                            let is_webrtc = (self.transport_mode == "udp");
+                                            let is_webrtc = self.transport_mode == "udp" ;
                                             tokio::spawn(async move {
                                                 let mut buf = vec![0_u8; 65535];
                                                 loop {
@@ -475,7 +475,7 @@ impl Bridge {
                                         let session_index = new_sessions.len();
                                         let socket_clone = sock.clone();
                                         let udp_tx_clone = udp_tx.clone();
-                                        let is_webrtc = (self.transport_mode == "udp");
+                                        let is_webrtc = self.transport_mode == "udp" ;
                                         tokio::spawn(async move {
                                             let mut buf = vec![0_u8; 65535];
                                             loop {
@@ -529,14 +529,14 @@ impl Bridge {
                                 if let Ok(ProtocolAction::SendDatagram(frame)) = session.machine.on_event(OstpEvent::Outbound(0, ping_payload)) {
                                     // Must go through send_datagram() for TURN-mode wrapping;
                                     // raw socket.send() bypasses the ChannelData header and breaks RTT in TURN.
-                                    let _ = send_datagram(&session.socket, &frame, (self.transport_mode == "udp")).await;
+                                    let _ = send_datagram(&session.socket, &frame, self.transport_mode == "udp" ).await;
                                     self.metrics.bytes_sent.fetch_add(frame.len() as u64, Ordering::Relaxed);
                                 }
 
                                 // Send Relay KeepAlive (Force NAT/Server Persistence)
                                 let ka_payload = Bytes::from(RelayMessage::KeepAlive.encode());
                                 if let Ok(ProtocolAction::SendDatagram(frame)) = session.machine.on_event(OstpEvent::Outbound(0, ka_payload)) {
-                                    let _ = send_datagram(&session.socket, &frame, (self.transport_mode == "udp")).await;
+                                    let _ = send_datagram(&session.socket, &frame, self.transport_mode == "udp" ).await;
                                     self.metrics.bytes_sent.fetch_add(frame.len() as u64, Ordering::Relaxed);
                                 }
                             }
@@ -559,7 +559,7 @@ impl Bridge {
                                                     }
                                                 }
                                                 ProtocolAction::SendDatagram(frame) => {
-                                                    let _ = send_datagram(&session.socket, &frame, (self.transport_mode == "udp")).await;
+                                                    let _ = send_datagram(&session.socket, &frame, self.transport_mode == "udp" ).await;
                                                     self.metrics.bytes_sent.fetch_add(frame.len() as u64, Ordering::Relaxed);
                                                 }
                                                 _ => {}
@@ -622,7 +622,7 @@ impl Bridge {
                             let out_payload = Bytes::from(relay_msg.encode());
                             match session.machine.on_event(OstpEvent::Outbound(stream_id, out_payload)) {
                                 Ok(ProtocolAction::SendDatagram(frame)) => {
-                                    if send_datagram(&session.socket, &frame, (self.transport_mode == "udp")).await.is_ok() {
+                                    if send_datagram(&session.socket, &frame, self.transport_mode == "udp" ).await.is_ok() {
                                         self.metrics.bytes_sent.fetch_add(frame.len() as u64, Ordering::Relaxed);
                                         if self.debug {
                                             let _ = tx.send(UiEvent::Log(format!(
@@ -636,7 +636,7 @@ impl Bridge {
                                     let mut sent = 0usize;
                                     for item in list {
                                         if let ProtocolAction::SendDatagram(frame) = item {
-                                            if send_datagram(&session.socket, &frame, (self.transport_mode == "udp")).await.is_ok() {
+                                            if send_datagram(&session.socket, &frame, self.transport_mode == "udp" ).await.is_ok() {
                                                 self.metrics.bytes_sent.fetch_add(frame.len() as u64, Ordering::Relaxed);
                                                 sent += 1;
                                             }
@@ -830,7 +830,7 @@ impl Bridge {
             if attempt > 0 {
                 tx.send(UiEvent::Log(format!("Handshake attempt {} lost. Retransmitting...", attempt))).await.ok();
             }
-            send_datagram(&socket, &handshake_frame, (self.transport_mode == "udp")).await?;
+            send_datagram(&socket, &handshake_frame, self.transport_mode == "udp" ).await?;
             self.metrics.bytes_sent.fetch_add(handshake_frame.len() as u64, Ordering::Relaxed);
 
             match timeout(Duration::from_millis(attempt_timeout_ms), socket.recv(&mut buf)).await {
@@ -856,7 +856,7 @@ impl Bridge {
                             if attempt > 0 {
                                 tx.send(UiEvent::Log(format!("NAT64 handshake attempt {} lost. Retransmitting...", attempt))).await.ok();
                             }
-                            send_datagram(&fallback_socket, &handshake_frame, (self.transport_mode == "udp")).await?;
+                            send_datagram(&fallback_socket, &handshake_frame, self.transport_mode == "udp" ).await?;
                             match timeout(Duration::from_millis(1200), fallback_socket.recv(&mut buf)).await {
                                 Ok(Ok(n)) => {
                                     size = n;

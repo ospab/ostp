@@ -230,3 +230,12 @@ pub async fn run_wintun_tunnel(
     
     Ok(())
 }
+
+#[cfg(not(target_os = "windows"))]
+#[allow(dead_code)]
+pub async fn run_wintun_tunnel(
+    _config: crate::config::ClientConfig,
+    _shutdown: watch::Receiver<bool>,
+) -> Result<()> {
+    Err(anyhow!("Wintun driver executed on a non-Windows host!"))
+}
