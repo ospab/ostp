@@ -12,7 +12,7 @@ resolver = "2"
 [workspace.package]
 edition = "2021"
 license = "BSL 1.1"
-version = "0.2.26"
+version = "0.2.27"
 
 [workspace.dependencies]
 anyhow = "1.0"

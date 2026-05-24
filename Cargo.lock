@@ -1020,7 +1020,7 @@ checksum = "c08d65885ee38876c4f86fa503fb49d7b507c2b62552df7c70b2fce627e06381"
 
 [[package]]
 name = "ostp"
-version = "0.2.26"
+version = "0.2.27"
 dependencies = [
  "anyhow",
  "base64",
@@ -1039,7 +1039,7 @@ dependencies = [
 
 [[package]]
 name = "ostp-client"
-version = "0.2.26"
+version = "0.2.27"
 dependencies = [
  "anyhow",
  "base64",
@@ -1065,7 +1065,7 @@ dependencies = [
 
 [[package]]
 name = "ostp-core"
-version = "0.2.26"
+version = "0.2.27"
 dependencies = [
  "anyhow",
  "bytes",
@@ -1096,7 +1096,7 @@ dependencies = [
 
 [[package]]
 name = "ostp-server"
-version = "0.2.26"
+version = "0.2.27"
 dependencies = [
  "anyhow",
  "axum",
@@ -1120,7 +1120,7 @@ dependencies = [
 
 [[package]]
 name = "ostp-tun-helper"
-version = "0.2.26"
+version = "0.2.27"
 dependencies = [
  "anyhow",
  "chrono",
