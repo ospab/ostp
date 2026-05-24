@@ -8,7 +8,8 @@ use std::path::PathBuf;
 #[command(author, version, about = "OSTP Core - Ospab Stealth Transport Protocol", long_about = None)]
 struct Args {
     /// Path to the JSON configuration file
-    #[arg(long, default_value = "config.json")]
+    #[cfg_attr(unix, arg(long, default_value = "/etc/ostp/config.json"))]
+    #[cfg_attr(windows, arg(long, default_value = "config.json"))]
     config: PathBuf,
 
     /// Optional mode to initialize the config for (client or server)
@@ -174,6 +175,7 @@ struct ServerConfig {
     outbound: Option<OutboundConfig>,
     api: Option<ApiConfig>,
     fallback: Option<FallbackCfg>,
+    transport: Option<TransportConfigRaw>,
 }
 
 /// Supports both single string "0.0.0.0:50000" and array ["0.0.0.0:50000", "[::]:50000"]
@@ -574,6 +576,11 @@ async fn run_app() -> Result<()> {
   "debug": false
 }}"#, key)
         };
+        if let Some(parent) = args.config.parent() {
+            if !parent.as_os_str().is_empty() {
+                fs::create_dir_all(parent)?;
+            }
+        }
         fs::write(&args.config, &content)?;
         println!("[ostp] Configuration written to {:?}", args.config);
         
@@ -584,8 +591,41 @@ async fn run_app() -> Result<()> {
                     let key = &s.access_keys[0];
                     let host = get_or_ask_public_ip(&args.config);
                     let mut link = format!("ostp://{}@{}:50000", key, host);
+                    let mut query_params = Vec::new();
+                    
                     if let Some(r) = &s.reality {
-                        link = format!("{}?security=reality&sni={}&pbk={}&sid={}&type=udp", link, r.sni_list.first().unwrap_or(&String::new()), r.pbk, r.sid);
+                        if r.enabled {
+                            query_params.push("security=reality".to_string());
+                            query_params.push(format!("sni={}", r.sni_list.first().unwrap_or(&String::new())));
+                            query_params.push(format!("pbk={}", r.pbk));
+                            if !r.sid.is_empty() {
+                                query_params.push(format!("sid={}", r.sid));
+                            }
+                        }
+                    }
+                    
+                    if let Some(t) = &s.transport {
+                        if let Some(mode) = &t.mode {
+                            if mode == "uot" {
+                                query_params.push("type=tcp".to_string());
+                            } else {
+                                query_params.push("type=udp".to_string());
+                            }
+                        }
+                        if let Some(sni) = &t.stealth_sni {
+                            // If reality is not enabled, add stealth_sni to link so client configures it
+                            let reality_enabled = s.reality.as_ref().map(|r| r.enabled).unwrap_or(false);
+                            if !reality_enabled && !sni.is_empty() {
+                                query_params.push(format!("sni={}", sni));
+                            }
+                        }
+                    } else {
+                        query_params.push("type=udp".to_string());
+                    }
+
+                    if !query_params.is_empty() {
+                        link.push('?');
+                        link.push_str(&query_params.join("&"));
                     }
                     println!("\n  Share link for client distribution:");
                     println!("  {}", link);
