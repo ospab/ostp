@@ -461,6 +461,8 @@ fn find_helper_exe() -> Option<PathBuf> {
         cwd.join("target").join("release").join("ostp-tun-helper.exe"),
         cwd.join("..").join("target").join("debug").join("ostp-tun-helper.exe"),
         cwd.join("..").join("target").join("release").join("ostp-tun-helper.exe"),
+        cwd.join("..").join("..").join("target").join("debug").join("ostp-tun-helper.exe"),
+        cwd.join("..").join("..").join("target").join("release").join("ostp-tun-helper.exe"),
     ];
     for path in &candidates {
         if path.exists() { return Some(path.clone()); }
