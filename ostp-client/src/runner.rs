@@ -128,6 +128,7 @@ pub async fn run_client(config: crate::config::ClientConfig) -> Result<()> {
         bytes_sent: portable_atomic::AtomicU64::new(0),
         bytes_recv: portable_atomic::AtomicU64::new(0),
         connection_state: portable_atomic::AtomicU8::new(0),
+        rtt_ms: portable_atomic::AtomicU32::new(0),
     });
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);

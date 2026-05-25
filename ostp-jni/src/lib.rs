@@ -142,6 +142,7 @@ pub extern "system" fn Java_net_ostp_client_OstpClientSdk_startClient(
         bytes_sent: portable_atomic::AtomicU64::new(0),
         bytes_recv: portable_atomic::AtomicU64::new(0),
         connection_state: portable_atomic::AtomicU8::new(0),
+        rtt_ms: portable_atomic::AtomicU32::new(0),
     });
 
     let bridge = match Bridge::new(&config, Arc::clone(&metrics)) {
@@ -310,16 +311,17 @@ pub extern "system" fn Java_net_ostp_client_OstpClientSdk_getMetrics(
         let sent = m.bytes_sent.load(Ordering::Relaxed);
         let recv = m.bytes_recv.load(Ordering::Relaxed);
         let conn_state = m.connection_state.load(Ordering::Relaxed);
+        let rtt = m.rtt_ms.load(Ordering::Relaxed);
         let json = format!(
-            r#"{{"bytes_sent": {}, "bytes_recv": {}, "connection_state": {}}}"#,
-            sent, recv, conn_state
+            r#"{{"bytes_sent": {}, "bytes_recv": {}, "connection_state": {}, "rtt_ms": {}}}"#,
+            sent, recv, conn_state, rtt
         );
         match env.new_string(json) {
             Ok(s) => s.into_raw(),
             Err(_) => std::ptr::null_mut(),
         }
     } else {
-        match env.new_string(r#"{"bytes_sent": 0, "bytes_recv": 0, "connection_state": 0}"#) {
+        match env.new_string(r#"{"bytes_sent": 0, "bytes_recv": 0, "connection_state": 0, "rtt_ms": 0}"#) {
             Ok(s) => s.into_raw(),
             Err(_) => std::ptr::null_mut(),
         }

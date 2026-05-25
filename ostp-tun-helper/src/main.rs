@@ -37,7 +37,7 @@ enum GuiCmd {
 enum HelperMsg {
     Status { value: u8 },
     Log { message: String },
-    Metrics { bytes_sent: u64, bytes_recv: u64 },
+    Metrics { bytes_sent: u64, bytes_recv: u64, rtt_ms: u32 },
     Error { message: String },
 }
 
@@ -144,6 +144,7 @@ async fn run_server() -> Result<()> {
                     bytes_sent: portable_atomic::AtomicU64::new(0),
                     bytes_recv: portable_atomic::AtomicU64::new(0),
                     connection_state: portable_atomic::AtomicU8::new(0),
+                    rtt_ms: portable_atomic::AtomicU32::new(0),
                 });
 
                 let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -179,13 +180,15 @@ async fn run_server() -> Result<()> {
                         let sent = metrics_tick.bytes_sent.load(Ordering::Relaxed);
                         let recv = metrics_tick.bytes_recv.load(Ordering::Relaxed);
 
+                        let rtt = metrics_tick.rtt_ms.load(Ordering::Relaxed);
+
                         let mut w = writer_tick.lock().await;
                         if cs != last_state {
                             last_state = cs;
                             let json = serde_json::to_string(&HelperMsg::Status { value: cs }).unwrap_or_default();
                             if w.write_all(format!("{}\n", json).as_bytes()).await.is_err() { break; }
                         }
-                        let json = serde_json::to_string(&HelperMsg::Metrics { bytes_sent: sent, bytes_recv: recv }).unwrap_or_default();
+                        let json = serde_json::to_string(&HelperMsg::Metrics { bytes_sent: sent, bytes_recv: recv, rtt_ms: rtt }).unwrap_or_default();
                         if w.write_all(format!("{}\n", json).as_bytes()).await.is_err() { break; }
                         drop(w);
                     }

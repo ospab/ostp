@@ -159,6 +159,11 @@ async function poll() {
     if (metrics) {
       metricDown.textContent = fmtBytes(metrics.bytes_recv);
       metricUp.textContent   = fmtBytes(metrics.bytes_sent);
+      
+      const isTun = rawConfig?.tun?.enable;
+      const modeStr = isTun ? 'TUN' : 'SOCKS5';
+      const pingStr = metrics.rtt_ms > 0 ? ` (${metrics.rtt_ms} ms)` : '';
+      metricMode.textContent = modeStr + pingStr;
     }
   } catch {
     setState('disconnected');

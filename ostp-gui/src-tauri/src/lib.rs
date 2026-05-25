@@ -78,6 +78,7 @@ struct MuxConfig {
 struct UIMetrics {
     bytes_sent: u64,
     bytes_recv: u64,
+    rtt_ms: u32,
 }
 
 // ── Messages exchanged with the privileged helper ────────────────────────────
@@ -87,7 +88,7 @@ struct UIMetrics {
 enum HelperMsg {
     Status { value: u8 },
     Log { message: String },
-    Metrics { bytes_sent: u64, bytes_recv: u64 },
+    Metrics { bytes_sent: u64, bytes_recv: u64, rtt_ms: u32 },
     Error { message: String },
 }
 
@@ -262,12 +263,14 @@ async fn get_metrics(state: tauri::State<'_, AppState>) -> Result<Option<UIMetri
         Some(TunnelHandle::InProcess(s)) => Ok(Some(UIMetrics {
             bytes_sent: s.metrics.bytes_sent.load(Ordering::Relaxed),
             bytes_recv: s.metrics.bytes_recv.load(Ordering::Relaxed),
+            rtt_ms: s.metrics.rtt_ms.load(Ordering::Relaxed),
         })),
         Some(TunnelHandle::Helper(h)) => {
             let ps = h.pipe_state.lock().await;
             Ok(Some(UIMetrics {
                 bytes_sent: ps.bytes_sent,
                 bytes_recv: ps.bytes_recv,
+                rtt_ms: ps.rtt_ms,
             }))
         }
     }
@@ -338,6 +341,7 @@ async fn start_proxy_in_process(
         // Start at 1 (connecting) so UI polling doesn't see 0 and flip back to disconnected
         // before the handshake task has had a chance to begin.
         connection_state: portable_atomic::AtomicU8::new(1),
+        rtt_ms: portable_atomic::AtomicU32::new(0),
     });
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -383,7 +387,7 @@ async fn start_tun_via_helper(
     }).to_string();
 
     let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::channel::<String>(16);
-    let pipe_state = Arc::new(Mutex::new(HelperPipeState { connection_state: 1, bytes_sent: 0, bytes_recv: 0 }));
+    let pipe_state = Arc::new(Mutex::new(HelperPipeState { connection_state: 1, bytes_sent: 0, bytes_recv: 0, rtt_ms: 0 }));
     let state_for_task = pipe_state.clone();
 
     tokio::spawn(async move {
@@ -403,7 +407,7 @@ async fn start_tun_via_helper(
                         let mut s = state_for_task.lock().await;
                         match msg {
                             HelperMsg::Status { value } => s.connection_state = value,
-                            HelperMsg::Metrics { bytes_sent, bytes_recv } => { s.bytes_sent = bytes_sent; s.bytes_recv = bytes_recv; }
+                            HelperMsg::Metrics { bytes_sent, bytes_recv, rtt_ms } => { s.bytes_sent = bytes_sent; s.bytes_recv = bytes_recv; s.rtt_ms = rtt_ms; }
                             HelperMsg::Error { message } => { s.connection_state = 0; eprintln!("Helper error: {}", message); }
                             _ => {}
                         }
@@ -425,6 +429,7 @@ struct HelperPipeState {
     connection_state: u8,
     bytes_sent: u64,
     bytes_recv: u64,
+    rtt_ms: u32,
 }
 
 fn find_helper_exe() -> Option<PathBuf> {

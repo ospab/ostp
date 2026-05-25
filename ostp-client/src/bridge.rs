@@ -36,6 +36,7 @@ pub struct BridgeMetrics {
     pub bytes_sent: AtomicU64,
     pub bytes_recv: AtomicU64,
     pub connection_state: AtomicU8,
+    pub rtt_ms: portable_atomic::AtomicU32,
 }
 
 async fn send_datagram(socket: &crate::transport::Transport, frame: &Bytes, webrtc_masquerade: bool) -> std::io::Result<usize> {
@@ -210,6 +211,7 @@ impl Bridge {
                                                             RelayMessage::Pong(ts) => {
                                                                 let now = SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
                                                                 self.last_rtt_ms = now.saturating_sub(ts) as f64;
+                                                                self.metrics.rtt_ms.store(self.last_rtt_ms as u32, Ordering::Relaxed);
                                                             }
                                                             RelayMessage::KeepAlive | RelayMessage::Ping(_) | RelayMessage::Connect(_) => {}
                                                         }
