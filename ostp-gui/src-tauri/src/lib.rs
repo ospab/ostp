@@ -29,7 +29,8 @@ struct ClientConfigRaw {
     access_key: String,
     socks5_bind: Option<String>,
     tun: Option<TunConfig>,
-    turn: Option<TurnConfigRaw>,
+    reality: Option<RealityConfigRaw>,
+    transport: Option<TransportConfigRaw>,
     debug: Option<bool>,
     exclude: Option<ExcludeConfig>,
     mux: Option<MuxConfig>,
@@ -44,11 +45,20 @@ struct TunConfig {
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
-struct TurnConfigRaw {
-    enabled: bool,
-    server_addr: String,
-    username: Option<String>,
-    access_key: Option<String>,
+struct RealityConfigRaw {
+    enabled: Option<bool>,
+    sni: Option<String>,
+    fp: Option<String>,
+    pbk: Option<String>,
+    sid: Option<String>,
+    spx: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+struct TransportConfigRaw {
+    mode: Option<String>,
+    stealth_sni: Option<String>,
+    stealth_port: Option<u16>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -130,7 +140,6 @@ fn get_config_path() -> PathBuf {
 }
 
 fn map_to_client_config(raw: &ClientConfigRaw, mode: &str) -> ostp_client::config::ClientConfig {
-    let turn_cfg = raw.turn.as_ref();
     ostp_client::config::ClientConfig {
         mode: mode.to_string(),
         debug: raw.debug.unwrap_or(false),
@@ -140,16 +149,24 @@ fn map_to_client_config(raw: &ClientConfigRaw, mode: &str) -> ostp_client::confi
             access_key: raw.access_key.clone(),
             handshake_timeout_ms: 5000,
             io_timeout_ms: 5000,
+            mtu: 1350,
+            keepalive_interval_sec: 5,
         },
         local_proxy: ostp_client::config::LocalProxyConfig {
             bind_addr: raw.socks5_bind.clone().unwrap_or_else(|| "127.0.0.1:1088".to_string()),
             connect_timeout_ms: 5000,
         },
-        turn: ostp_client::config::TurnConfig {
-            enabled: turn_cfg.map(|t| t.enabled).unwrap_or(false),
-            server_addr: turn_cfg.and_then(|t| Some(t.server_addr.clone())).unwrap_or_default(),
-            username: turn_cfg.and_then(|t| t.username.clone()).unwrap_or_default(),
-            access_key: turn_cfg.and_then(|t| t.access_key.clone()).unwrap_or_default(),
+        reality: ostp_client::config::RealityConfig {
+            sni: raw.reality.as_ref().and_then(|t| t.sni.clone()).unwrap_or_default(),
+            fp: raw.reality.as_ref().and_then(|t| t.fp.clone()).unwrap_or_default(),
+            pbk: raw.reality.as_ref().and_then(|t| t.pbk.clone()).unwrap_or_default(),
+            sid: raw.reality.as_ref().and_then(|t| t.sid.clone()).unwrap_or_default(),
+            spx: raw.reality.as_ref().and_then(|t| t.spx.clone()).unwrap_or_default(),
+        },
+        transport: ostp_client::config::TransportConfig {
+            mode: raw.transport.as_ref().and_then(|t| t.mode.clone()).unwrap_or_else(|| "udp".to_string()),
+            stealth_sni: raw.transport.as_ref().and_then(|t| t.stealth_sni.clone()).unwrap_or_else(|| "microsoft.com".to_string()),
+            stealth_port: raw.transport.as_ref().and_then(|t| t.stealth_port).unwrap_or(443),
         },
         exclusions: ostp_client::config::ExclusionConfig {
             domains: raw.exclude.as_ref().and_then(|e| e.domains.clone()).unwrap_or_default(),
