@@ -225,6 +225,72 @@ EOF
         fi
     fi
 
+    # ── Panel setup prompt (if not yet configured) ──
+    PANEL_USERNAME=$(python3 -c "
+import json
+with open('$CONFIG_FILE') as f:
+    raw = f.read()
+lines = [l for l in raw.split('\n') if not l.strip().startswith('//')]
+cfg = json.loads('\n'.join(lines))
+print(cfg.get('api', {}).get('username', ''))
+" 2>/dev/null)
+
+    if [ -z "$PANEL_USERNAME" ] && python3 -c "
+import json
+with open('$CONFIG_FILE') as f:
+    raw = f.read()
+lines = [l for l in raw.split('\n') if not l.strip().startswith('//')]
+cfg = json.loads('\n'.join(lines))
+exit(0 if cfg.get('mode') == 'server' else 1)
+" 2>/dev/null; then
+        echo ""
+        echo "Web panel is not configured."
+        read -p "Set up web panel now? [y/N]: " SETUP_PANEL
+        if [[ "$SETUP_PANEL" =~ ^[Yy]$ ]]; then
+            read -p "Panel port [default: 9090]: " PANEL_PORT
+            PANEL_PORT=${PANEL_PORT:-9090}
+
+            RANDOM_PATH=$(tr -dc 'a-zA-Z0-9' < /dev/urandom | head -c 8)
+            read -p "WebPath [leave empty for random: $RANDOM_PATH]: " WEBPATH
+            WEBPATH=${WEBPATH:-$RANDOM_PATH}
+
+            read -p "Username [default: admin]: " USERNAME
+            USERNAME=${USERNAME:-admin}
+
+            RANDOM_PASS=$(tr -dc 'a-zA-Z0-9' < /dev/urandom | head -c 12)
+            read -p "Password [leave empty for random: $RANDOM_PASS]: " PASSWORD
+            PASSWORD=${PASSWORD:-$RANDOM_PASS}
+
+            PASS_HASH=$(python3 -c "import hashlib; print(hashlib.sha256('$PASSWORD'.encode()).hexdigest())")
+
+            python3 << PYEOF
+import json
+with open('$CONFIG_FILE') as f:
+    raw = f.read()
+lines = [l for l in raw.split('\n') if not l.strip().startswith('//')]
+cfg = json.loads('\n'.join(lines))
+if 'api' not in cfg:
+    cfg['api'] = {}
+cfg['api']['enabled'] = True
+cfg['api']['bind'] = '0.0.0.0:$PANEL_PORT'
+cfg['api']['webpath'] = '$WEBPATH'
+cfg['api']['username'] = '$USERNAME'
+cfg['api']['password_hash'] = '$PASS_HASH'
+with open('$CONFIG_FILE', 'w') as f:
+    json.dump(cfg, f, indent=2, ensure_ascii=False)
+print('[ok] Panel configured.')
+PYEOF
+
+            echo ""
+            echo "========================================================"
+            echo "Panel configured!"
+            echo "URL:      http://<your_server_ip>:$PANEL_PORT/$WEBPATH/"
+            echo "Username: $USERNAME"
+            echo "Password: $PASSWORD"
+            echo "========================================================"
+        fi
+    fi
+
     if systemctl is-active --quiet ostp.service 2>/dev/null; then
         echo "Restarting ostp service..."
         systemctl restart ostp.service
