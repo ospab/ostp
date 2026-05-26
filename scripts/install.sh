@@ -198,8 +198,9 @@ echo "--------------------------------------------------------"
 echo "Select mode:"
 echo "  1) Server"
 echo "  2) Client"
+echo "  3) Relay"
 echo "--------------------------------------------------------"
-read -p "Choice [1-2]: " NODE_MODE
+read -p "Choice [1-3]: " NODE_MODE
 
 cd "$INSTALL_DIR"
 
@@ -264,6 +265,32 @@ elif [ "$NODE_MODE" == "2" ]; then
         sed -i "s/\"socks5_bind\": \"127.0.0.1:1088\"/\"socks5_bind\": \"$SOCKS_BIND\"/g" "$CONFIG_FILE"
     fi
     echo "Client configuration saved: $CONFIG_FILE"
+
+elif [ "$NODE_MODE" == "3" ]; then
+    echo "Initializing relay configuration..."
+    ./ostp --init relay --config "$CONFIG_FILE"
+
+    read -p "Listen address [default: 0.0.0.0:50000]: " LISTEN_ADDR
+    if [ -n "$LISTEN_ADDR" ]; then
+        sed -i "s/\"listen\": \".*\"/\"listen\": \"$LISTEN_ADDR\"/g" "$CONFIG_FILE"
+    fi
+
+    read -p "Upstream server IP/port (e.g. 1.2.3.4:50000): " UPSTREAM_ADDR
+    if [ -n "$UPSTREAM_ADDR" ]; then
+        sed -i "s/\"upstream_tcp\": \".*\"/\"upstream_tcp\": \"$UPSTREAM_ADDR\"/g" "$CONFIG_FILE"
+        sed -i "s/\"upstream_udp\": \".*\"/\"upstream_udp\": \"$UPSTREAM_ADDR\"/g" "$CONFIG_FILE"
+    fi
+
+    read -p "Upstream API URL (e.g. http://1.2.3.4:9090): " UPSTREAM_API
+    if [ -n "$UPSTREAM_API" ]; then
+        sed -i "s|\"upstream_api_url\": \".*\"|\"upstream_api_url\": \"$UPSTREAM_API\"|g" "$CONFIG_FILE"
+    fi
+
+    read -p "Upstream API token: " UPSTREAM_TOKEN
+    if [ -n "$UPSTREAM_TOKEN" ]; then
+        sed -i "s/\"upstream_api_token\": \".*\"/\"upstream_api_token\": \"$UPSTREAM_TOKEN\"/g" "$CONFIG_FILE"
+    fi
+    echo "Relay configuration saved: $CONFIG_FILE"
 
 else
     echo "[error] Invalid selection."
