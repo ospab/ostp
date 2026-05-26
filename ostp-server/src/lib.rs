@@ -15,12 +15,14 @@ pub mod outbound;
 pub mod api;
 pub mod fallback;
 pub mod transport;
+pub mod relay_node;
 mod relay;
 mod signal;
 
 pub use outbound::{OutboundAction, OutboundConfig, OutboundRule};
 pub use api::ApiConfig;
 pub use fallback::FallbackConfig;
+pub use relay_node::RelayConfig;
 
 #[derive(Debug, Clone)]
 pub struct RealityServerConfig {

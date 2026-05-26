@@ -145,6 +145,7 @@ fn parse_outbound_action(value: Option<String>) -> ostp_server::OutboundAction {
 enum AppMode {
     Server(ServerConfig),
     Client(ClientConfig),
+    Relay(RelayServerConfig),
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -177,6 +178,14 @@ impl UnifiedConfig {
                     anyhow::bail!("Client configuration must contain an access_key.");
                 }
             }
+            AppMode::Relay(cfg) => {
+                if cfg.upstream_tcp.is_empty() {
+                    anyhow::bail!("Relay configuration must specify upstream_tcp address.");
+                }
+                if cfg.upstream_api_url.is_empty() {
+                    anyhow::bail!("Relay configuration must specify upstream_api_url.");
+                }
+            }
         }
         Ok(())
     }
@@ -193,6 +202,28 @@ struct ServerConfig {
     fallback: Option<FallbackCfg>,
     transport: Option<TransportConfigRaw>,
 }
+
+/// Конфигурация Relay-узла в config.json
+#[derive(Debug, Deserialize, Serialize)]
+struct RelayServerConfig {
+    /// Адрес(а) прослушивания (UDP + TCP UoT)
+    listen: ListenConfig,
+    /// Адрес upstream для TCP (UoT) трафика
+    upstream_tcp: String,
+    /// Адрес upstream для UDP трафика
+    upstream_udp: String,
+    /// URL API целевого сервера для синхронизации ключей
+    upstream_api_url: String,
+    /// Bearer-токен для API целевого сервера
+    #[serde(default)]
+    upstream_api_token: String,
+    /// Интервал синхронизации ключей в секундах (по умолчанию 30)
+    #[serde(default = "default_sync_interval")]
+    sync_interval_secs: u64,
+    debug: Option<bool>,
+}
+
+fn default_sync_interval() -> u64 { 30 }
 
 /// Supports both single string "0.0.0.0:50000" and array ["0.0.0.0:50000", "[::]:50000"]
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -469,6 +500,13 @@ async fn run_app() -> Result<()> {
                         println!("  Server: {}", c.server);
                         println!("  Key: {}...", &c.access_key[..8.min(c.access_key.len())]);
                     }
+                    AppMode::Relay(r) => {
+                        println!("[ostp] Config OK: relay mode");
+                        println!("  Listen: {:?}", r.listen.primary());
+                        println!("  Upstream TCP: {}", r.upstream_tcp);
+                        println!("  Upstream UDP: {}", r.upstream_udp);
+                        println!("  API sync: {}", r.upstream_api_url);
+                    }
                 }
             }
             Err(e) => {
@@ -698,6 +736,9 @@ async fn run_app() -> Result<()> {
             AppMode::Client(_) => {
                 anyhow::bail!("The configuration file is in Client mode. The --links flag can only extract keys from a Server configuration.");
             }
+            AppMode::Relay(_) => {
+                anyhow::bail!("The configuration file is in Relay mode. The --links flag only works with Server configuration.");
+            }
         }
     }
 
@@ -757,7 +798,22 @@ async fn run_app() -> Result<()> {
         AppMode::Client(client_cfg) => {
             run_client_directly(client_cfg).await?;
         }
-
+        AppMode::Relay(relay_cfg) => {
+            let listen_addrs = relay_cfg.listen.addresses();
+            println!("[ostp] Starting relay node on {:?}", listen_addrs);
+            println!("[ostp] Upstream TCP: {}", relay_cfg.upstream_tcp);
+            println!("[ostp] Upstream UDP: {}", relay_cfg.upstream_udp);
+            println!("[ostp] Key sync API: {}", relay_cfg.upstream_api_url);
+            let relay_config = ostp_server::RelayConfig {
+                listen_addrs,
+                upstream_tcp: relay_cfg.upstream_tcp,
+                upstream_udp: relay_cfg.upstream_udp,
+                upstream_api_url: relay_cfg.upstream_api_url,
+                upstream_api_token: relay_cfg.upstream_api_token,
+                sync_interval_secs: relay_cfg.sync_interval_secs,
+            };
+            ostp_server::relay_node::run_relay_node(relay_config).await?;
+        }
     }
 
     Ok(())
