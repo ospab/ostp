@@ -21,8 +21,6 @@ export interface ApiResponse<T> {
   error?: string;
 }
 
-// Helpers for localStorage state
-const API_URL_KEY = 'ostp_api_url';
 const API_TOKEN_KEY = 'ostp_api_token';
 
 export function getApiSettings() {

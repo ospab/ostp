@@ -1,23 +1,17 @@
 import { useState, useEffect } from 'react';
 import { 
-  Settings as SettingsIcon, Globe, Key, CheckCircle, XCircle, 
+  Settings as SettingsIcon, Globe, CheckCircle, XCircle, 
   RefreshCw, Save, Sliders, Code2, AlertTriangle
 } from 'lucide-react';
-import { getApiSettings, saveApiSettings, api } from '../lib/api';
+import { api } from '../lib/api';
 import { useLanguage } from '../lib/LanguageContext';
 import { addAuditLog } from '../lib/audit';
 
 export default function Settings() {
   const { t, language } = useLanguage();
 
-  // Tabs: 'connection' | 'interactive' | 'raw'
-  const [activeTab, setActiveTab] = useState<'connection' | 'interactive' | 'raw'>('interactive');
-
-  // Connection settings state
-  const [panelApiUrl, setPanelApiUrl] = useState('');
-  const [panelApiToken, setPanelApiToken] = useState('');
-  const [isTestingConnection, setIsTestingConnection] = useState(false);
-  const [connectionTestResult, setConnectionTestResult] = useState<{ success: boolean; message: string } | null>(null);
+  // Tabs: 'interactive' | 'raw'
+  const [activeTab, setActiveTab] = useState<'interactive' | 'raw'>('interactive');
 
   // Full Server Config JSON state
   const [config, setConfig] = useState<any>(null);
@@ -28,9 +22,6 @@ export default function Settings() {
 
   // Initial load
   useEffect(() => {
-    const { url, token } = getApiSettings();
-    setPanelApiUrl(url);
-    setPanelApiToken(token);
     fetchServerConfig();
   }, []);
 
@@ -50,53 +41,7 @@ export default function Settings() {
     }
   };
 
-  const handleTestConnection = async () => {
-    setIsTestingConnection(true);
-    setConnectionTestResult(null);
-    const oldUrl = localStorage.getItem('ostp_api_url');
-    const oldToken = localStorage.getItem('ostp_api_token');
-    
-    try {
-      saveApiSettings(panelApiUrl, panelApiToken);
-      const status = await api.getServerStatus();
-      setConnectionTestResult({
-        success: true,
-        message: t('st_conn_success', { version: status.version, users: status.active_users }),
-      });
-      addAuditLog(
-        `Tested connection to Management API at ${panelApiUrl} (Success)`,
-        `Успешно протестировано подключение к API по адресу ${panelApiUrl}`,
-        true
-      );
-    } catch (err: any) {
-      if (oldUrl) localStorage.setItem('ostp_api_url', oldUrl);
-      if (oldToken !== null) localStorage.setItem('ostp_api_token', oldToken);
-      
-      const errorMsgStr = err.message || err;
-      setConnectionTestResult({
-        success: false,
-        message: t('st_conn_error', { error: errorMsgStr }),
-      });
-      addAuditLog(
-        `Tested connection to Management API at ${panelApiUrl} (Failed: ${errorMsgStr})`,
-        `Ошибка при тесте подключения к API по адресу ${panelApiUrl} (${errorMsgStr})`,
-        false
-      );
-    } finally {
-      setIsTestingConnection(false);
-    }
-  };
 
-  const handleSaveConnection = () => {
-    saveApiSettings(panelApiUrl, panelApiToken);
-    alert(language === 'ru' ? 'Настройки подключения сохранены!' : 'Connection settings saved!');
-    addAuditLog(
-      `Saved API connection settings: ${panelApiUrl}`,
-      `Сохранены настройки подключения к API: ${panelApiUrl}`,
-      true
-    );
-    window.location.reload();
-  };
 
   // Save Config to Server
   const handleSaveConfig = async (configToSave: any) => {
@@ -205,14 +150,6 @@ export default function Settings() {
         >
           <Code2 className="w-4 h-4" /> {t('st_tab_json')}
         </button>
-        <button
-          onClick={() => setActiveTab('connection')}
-          className={`flex items-center gap-2 px-5 py-3 font-medium transition-colors border-b-2 text-sm ${
-            activeTab === 'connection' ? 'border-primary text-white' : 'border-transparent text-text-muted hover:text-white'
-          }`}
-        >
-          <Globe className="w-4 h-4" /> {t('st_tab_conn')}
-        </button>
       </div>
 
       {/* Global save notifications */}
@@ -235,75 +172,7 @@ export default function Settings() {
         </div>
       )}
 
-      {/* ── TAB: CONNECTION SETTINGS ── */}
-      {activeTab === 'connection' && (
-        <div className="glass-panel rounded-2xl p-6 space-y-6">
-          <div>
-            <h2 className="text-xl font-semibold mb-2">{t('st_conn_title')}</h2>
-            <p className="text-sm text-text-muted">
-              {t('st_conn_desc')}
-            </p>
-          </div>
 
-          <div className="space-y-4">
-            <div className="space-y-2">
-              <label className="text-sm font-medium flex items-center gap-2">
-                <Globe className="w-4 h-4 text-primary" /> {t('st_conn_url')}
-              </label>
-              <input
-                type="text"
-                className="w-full bg-white/5 border border-white/10 rounded-xl px-4 py-3 text-white placeholder-text-muted focus:outline-none focus:border-primary transition-colors font-mono"
-                placeholder="e.g. http://localhost:9090"
-                value={panelApiUrl}
-                onChange={(e) => setPanelApiUrl(e.target.value)}
-              />
-            </div>
-
-            <div className="space-y-2">
-              <label className="text-sm font-medium flex items-center gap-2">
-                <Key className="w-4 h-4 text-primary" /> {t('st_conn_token')}
-              </label>
-              <input
-                type="password"
-                className="w-full bg-white/5 border border-white/10 rounded-xl px-4 py-3 text-white placeholder-text-muted focus:outline-none focus:border-primary transition-colors font-mono"
-                placeholder={t('st_conn_token_sub')}
-                value={panelApiToken}
-                onChange={(e) => setPanelApiToken(e.target.value)}
-              />
-            </div>
-          </div>
-
-          <div className="flex gap-4 pt-4 border-t border-white/5">
-            <button
-              onClick={handleTestConnection}
-              disabled={isTestingConnection || !panelApiUrl}
-              className="flex items-center gap-2 bg-white/5 hover:bg-white/10 text-white px-5 py-2.5 rounded-xl font-medium transition-colors border border-white/10"
-            >
-              <RefreshCw className={`w-5 h-5 ${isTestingConnection ? 'animate-spin text-primary' : ''}`} /> {t('st_conn_test')}
-            </button>
-            
-            <button
-              onClick={handleSaveConnection}
-              disabled={!panelApiUrl}
-              className="flex items-center gap-2 bg-primary hover:bg-primary/90 text-white px-6 py-2.5 rounded-xl font-medium transition-colors shadow-[0_0_15px_rgba(108,114,255,0.3)]"
-            >
-              <Save className="w-5 h-5" /> {t('st_conn_save')}
-            </button>
-          </div>
-
-          {connectionTestResult && (
-            <div className={`mt-4 p-4 rounded-xl flex items-start gap-3 border ${
-              connectionTestResult.success ? 'bg-secondary/10 border-secondary/20 text-secondary' : 'bg-red-500/10 border-red-500/20 text-red-400'
-            }`}>
-              {connectionTestResult.success ? <CheckCircle className="w-5 h-5 shrink-0 mt-0.5" /> : <XCircle className="w-5 h-5 shrink-0 mt-0.5" />}
-              <div>
-                <p className="font-semibold text-sm">{connectionTestResult.success ? 'Success' : 'Failed'}</p>
-                <p className="text-xs mt-1 opacity-90 font-mono break-all">{connectionTestResult.message}</p>
-              </div>
-            </div>
-          )}
-        </div>
-      )}
 
       {/* ── TAB: RAW JSON EDITOR ── */}
       {activeTab === 'raw' && config && (

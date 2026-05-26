@@ -1,6 +1,7 @@
 import { HashRouter as Router, Routes, Route, Link, Navigate, useLocation } from 'react-router-dom';
 import { Activity, Users, Settings, Shield, MoreVertical, RefreshCw, BookOpen, Wrench, History, Globe, LogOut } from 'lucide-react';
-import { useState, useEffect, ReactNode } from 'react';
+import { useState, useEffect } from 'react';
+import type { ReactNode } from 'react';
 
 // Components
 import Dashboard from './pages/Dashboard';
