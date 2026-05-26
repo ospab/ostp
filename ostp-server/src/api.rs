@@ -20,10 +20,9 @@ use portable_atomic::AtomicU64;
 use std::time::Instant;
 
 use axum::{
-    body::Body,
     extract::{Path, State},
-    http::{header, Request, StatusCode, Uri},
-    response::{IntoResponse, Response},
+    http::{header, StatusCode, Uri},
+    response::IntoResponse,
     routing::{get, post, put},
     Json, Router,
 };

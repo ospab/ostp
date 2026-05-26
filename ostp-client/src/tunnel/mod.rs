@@ -1,25 +1,31 @@
 mod proxy;
 mod wintun_handler;
 mod linux_handler;
+mod tun_device;
+mod smoltcp_stack;
 
 pub async fn run_tun_tunnel(
     config: crate::config::ClientConfig,
+    proxy_events_tx: mpsc::Sender<ProxyEvent>,
+    client_msgs_rx: mpsc::UnboundedReceiver<(u16, ProxyToClientMsg)>,
     shutdown: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
     #[cfg(target_os = "windows")]
     {
-        wintun_handler::run_wintun_tunnel(config, shutdown).await
+        wintun_handler::run_wintun_tunnel(config, proxy_events_tx, client_msgs_rx, shutdown).await
     }
 
     #[cfg(target_os = "linux")]
     {
-        linux_handler::run_linux_tunnel(config, shutdown).await
+        linux_handler::run_linux_tunnel(config, proxy_events_tx, client_msgs_rx, shutdown).await
     }
 
     #[cfg(not(any(target_os = "windows", target_os = "linux")))]
     {
         let _ = shutdown;
         let _ = config;
+        let _ = proxy_events_tx;
+        let _ = client_msgs_rx;
         anyhow::bail!("Operating system unsupported, text an issue at github.");
     }
 }
@@ -65,5 +71,8 @@ pub async fn run_local_proxy(
 ) -> anyhow::Result<()> {
     run_local_socks5_proxy(cfg, ostp, exclusions, debug, shutdown, proxy_events_tx, client_msgs_rx).await
 }
+
+pub use tun_device::create_tun_device_from_fd;
+pub use smoltcp_stack::run_smoltcp_stack;
 
 
