@@ -356,7 +356,7 @@ async fn run_server_loop(
 
     let socket = primary_socket;
     // Spawn a recv task for each socket, all feeding into the same channel
-    let (udp_tx, mut udp_rx) = mpsc::channel(10000);
+    let (udp_tx, mut udp_rx) = mpsc::channel(100000);
     for sock in &sockets {
         let sock_clone = sock.clone();
         let tx = udp_tx.clone();
@@ -460,7 +460,7 @@ async fn run_server_loop(
         let _ = ui_event_tx.send(UiEvent::KeyCount(shared_keys.read().unwrap().len()));
     }
 
-    let mut retransmit_tick = interval(Duration::from_millis(50));
+    let mut retransmit_tick = interval(Duration::from_millis(10));
     let mut last_empty_app_log = Instant::now() - Duration::from_secs(10);
     let mut peer_last_seen: HashMap<IpAddr, Instant> = HashMap::new();
     let mut peer_available: HashMap<IpAddr, bool> = HashMap::new();

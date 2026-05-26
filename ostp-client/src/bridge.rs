@@ -134,7 +134,7 @@ impl Bridge {
     ) -> Result<()> {
         let mut metrics_tick = interval(Duration::from_millis(500));
         let mut keepalive_tick = tokio::time::interval(Duration::from_secs(self.keepalive_interval_sec.max(1)));
-        let mut retransmit_tick = tokio::time::interval(Duration::from_millis(50));
+        let mut retransmit_tick = tokio::time::interval(Duration::from_millis(10));
         let init_msg = if self.mode == "tun" {
             "Bridge initialized (TUN mode)".to_string()
         } else {
@@ -591,7 +591,7 @@ impl Bridge {
                 }
                 proxy_ev = proxy_rx.recv(), if self.running && sessions_opt.as_ref().map(|s| {
                     // Backpressure: suspend proxy reads when ARQ window is saturated
-                    s.iter().all(|ses| ses.machine.in_flight_count() < ses.machine.cwnd_packets().clamp(16, 256))
+                    s.iter().all(|ses| ses.machine.in_flight_count() < ses.machine.cwnd_packets().clamp(16, 16384))
                 }).unwrap_or(true) => {
                     if let Some(ev) = proxy_ev {
                         if let Some(sessions) = sessions_opt.as_mut() {
