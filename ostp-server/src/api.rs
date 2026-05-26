@@ -23,7 +23,7 @@ use axum::{
     extract::{Path, State},
     http::StatusCode,
     response::IntoResponse,
-    routing::{delete, get, post, put},
+    routing::{get, post, put},
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
@@ -134,12 +134,17 @@ pub fn create_api_router(state: ApiState) -> Router {
     Router::new()
         .route("/api/server/status", get(handle_status))
         .route("/api/server/config", get(handle_get_config).put(handle_put_config))
-        .route("/api/users", get(handle_list_users))
-        .route("/api/users", post(handle_create_user))
-        .route("/api/users/:key", get(handle_get_user))
-        .route("/api/users/:key", delete(delete_user))
-        .route("/api/users/:key", put(update_user))
-        .route("/api/users/:key/limit", put(handle_set_limit))
+        .route(
+            "/api/users",
+            get(handle_list_users).post(handle_create_user),
+        )
+        .route(
+            "/api/users/{key}",
+            get(handle_get_user)
+                .put(update_user)
+                .delete(delete_user),
+        )
+        .route("/api/users/{key}/limit", put(handle_set_limit))
         .route("/api/users/{key}/reset", post(handle_reset_stats))
         .route("/api/subscribe/{key}", get(handle_subscribe))
         .layer(cors)
