@@ -141,6 +141,13 @@ ln -sf "$INSTALL_DIR/ostp" "$BIN_LINK"
 echo "Symlink created: $BIN_LINK -> $INSTALL_DIR/ostp"
 echo "You can now run 'ostp' from anywhere."
 
+# ── Detect public IP ─────────────────────────────────────────────────
+
+SERVER_IP=$(curl -4s https://ifconfig.me 2>/dev/null \
+    || curl -4s https://api.ipify.org 2>/dev/null \
+    || curl -4s https://icanhazip.com 2>/dev/null \
+    || hostname -I | awk '{print $1}')
+
 # ── Update detection ─────────────────────────────────────────────────
 
 if [ -f "$CONFIG_FILE" ]; then
@@ -284,7 +291,7 @@ PYEOF
             echo ""
             echo "========================================================"
             echo "Panel configured!"
-            echo "URL:      http://<your_server_ip>:$PANEL_PORT/$WEBPATH/"
+            echo "URL:      http://$SERVER_IP:$PANEL_PORT/$WEBPATH/"
             echo "Username: $USERNAME"
             echo "Password: $PASSWORD"
             echo "========================================================"
@@ -404,7 +411,7 @@ with open('$CONFIG_FILE', 'w') as f:
     echo ""
     echo "========================================================"
     echo "Panel installed successfully!"
-    echo "URL: http://<your_server_ip>:$PANEL_PORT/$WEBPATH/"
+    echo "URL: http://$SERVER_IP:$PANEL_PORT/$WEBPATH/"
     echo "Username: $USERNAME"
     echo "Password: $PASSWORD"
     echo "========================================================"
