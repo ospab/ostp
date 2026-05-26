@@ -601,7 +601,6 @@ async fn run_app() -> Result<()> {
         let key = generate_secure_key("hex");
         let content = if is_server {
             let (priv_key, pub_key, sid) = generate_reality_keys();
-            let api_token = generate_secure_key("hex");
             format!(r#"{{
   // OSTP Server Configuration
   "mode": "server",
@@ -631,12 +630,15 @@ async fn run_app() -> Result<()> {
     ]
   }},
   
-  // Management REST API for third-party panels.
+  // Web control panel
   "api": {{
     "enabled": false,
-    "bind": "127.0.0.1:9090",
-    // Set a strong token for authentication. Leave empty to disable auth.
-    "token": "{}"
+    "bind": "0.0.0.0:9090",
+    // Secret URL path to hide panel from scanners (e.g. "mySecret123")
+    "webpath": "",
+    // Login credentials for web panel (password stored as SHA256 hash)
+    "username": "",
+    "password_hash": ""
   }},
   
   // Fallback TCP proxy: unrecognized connections are proxied to a web server (anti-DPI).
@@ -657,7 +659,7 @@ async fn run_app() -> Result<()> {
     "sni_list": ["www.microsoft.com"]
   }},
   "debug": false
-}}"#, key, api_token, priv_key, pub_key, sid)
+}}"#, key, priv_key, pub_key, sid)
         } else if mode_str == "relay" {
             r#"{
   // OSTP Relay Node Configuration

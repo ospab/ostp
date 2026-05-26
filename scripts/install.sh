@@ -150,62 +150,50 @@ if [ -f "$CONFIG_FILE" ]; then
 
     # ── Config migration: add new fields, preserve existing values ──
     echo "Checking for new config fields..."
-    CURRENT_MODE=$(python3 -c "
-import json, sys
-with open('$CONFIG_FILE') as f:
-    raw = f.read()
-# strip // comments
-lines = [l for l in raw.split('\n') if not l.strip().startswith('//')]
-try:
-    d = json.loads('\n'.join(lines))
-    print(d.get('mode',''))
-except:
-    print('')
-" 2>/dev/null)
-
-    if [ -n "$CURRENT_MODE" ]; then
-        TEMP_TEMPLATE="/tmp/ostp_template_$$.json"
-        "$INSTALL_DIR/ostp" --init "$CURRENT_MODE" --config "$TEMP_TEMPLATE" 2>/dev/null
-
-        if [ -f "$TEMP_TEMPLATE" ]; then
-            python3 << PYEOF
+    python3 << 'PYEOF'
 import json, sys
 
-def deep_merge(template, existing):
-    """Merge: existing wins for all present keys; template adds missing keys."""
-    if not isinstance(template, dict) or not isinstance(existing, dict):
-        return existing
-    result = dict(template)  # start with template defaults
-    for k, v in existing.items():
-        if k in result and isinstance(result[k], dict) and isinstance(v, dict):
-            result[k] = deep_merge(result[k], v)
-        else:
-            result[k] = v  # existing value always wins
-    return result
+CONFIG = '/etc/ostp/config.json'
 
-with open('$CONFIG_FILE') as f:
+with open(CONFIG) as f:
     raw = f.read()
 lines = [l for l in raw.split('\n') if not l.strip().startswith('//')]
-existing = json.loads('\n'.join(lines))
+cfg = json.loads('\n'.join(lines))
 
-with open('$TEMP_TEMPLATE') as f:
-    raw2 = f.read()
-lines2 = [l for l in raw2.split('\n') if not l.strip().startswith('//')]
-template = json.loads('\n'.join(lines2))
+changed = False
 
-merged = deep_merge(template, existing)
+# Ensure api section has all modern fields
+if cfg.get('mode') == 'server':
+    if 'api' not in cfg:
+        cfg['api'] = {}
+        changed = True
 
-with open('$CONFIG_FILE', 'w') as f:
-    json.dump(merged, f, indent=2, ensure_ascii=False)
-print("[ok] Config migrated: new fields added, existing data preserved.")
+    api_defaults = {
+        'enabled': False,
+        'bind': '0.0.0.0:9090',
+        'webpath': '',
+        'username': '',
+        'password_hash': '',
+    }
+    for k, v in api_defaults.items():
+        if k not in cfg['api']:
+            cfg['api'][k] = v
+            changed = True
+            print(f'[migration] Added api.{k} = {json.dumps(v)}')
+
+    # Remove legacy "token" field if present
+    if 'token' in cfg['api']:
+        del cfg['api']['token']
+        changed = True
+        print('[migration] Removed legacy api.token field')
+
+if changed:
+    with open(CONFIG, 'w') as f:
+        json.dump(cfg, f, indent=2, ensure_ascii=False)
+    print('[ok] Config migrated: new fields added, existing data preserved.')
+else:
+    print('[ok] Config is up to date, no migration needed.')
 PYEOF
-            rm -f "$TEMP_TEMPLATE"
-        else
-            echo "[warn] Could not generate template for migration. Config unchanged."
-        fi
-    else
-        echo "[warn] Could not detect config mode. Config unchanged."
-    fi
 
     # Update systemd service to use new paths
     if [ -f "/etc/systemd/system/ostp.service" ]; then
