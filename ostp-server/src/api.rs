@@ -231,7 +231,7 @@ pub fn create_api_router(state: ApiState) -> Router {
         }))
         // /{webpath}/ and /{webpath}/** → serve embedded static files
         .route(&format!("{}/", base_route), get(static_handler.clone()))
-        .route(&format!("{}/*path", base_route), get(static_handler))
+        .route(&format!("{}/{{*path}}", base_route), get(static_handler))
         // /{webpath}/api/* → API handlers
         .nest(&format!("{}/api", base_route), api_router)
         .layer(cors)
@@ -777,3 +777,47 @@ async fn handle_subscribe(
         "data": config
     })))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_router_creation() {
+        let state = ApiState {
+            access_keys: Arc::new(RwLock::new(HashMap::new())),
+            user_stats: Arc::new(RwLock::new(HashMap::new())),
+            start_time: std::time::Instant::now(),
+            session_token: Arc::new(RwLock::new(None)),
+            webpath: "bNAzr8Ss".to_string(),
+            username: "admin".to_string(),
+            password_hash: "hash".to_string(),
+            server_host: "127.0.0.1".to_string(),
+            server_port: 50000,
+            reality_query: "".to_string(),
+            config_path: None,
+        };
+        // This should not panic
+        let _router = create_api_router(state);
+    }
+
+    #[test]
+    fn test_router_creation_empty_webpath() {
+        let state = ApiState {
+            access_keys: Arc::new(RwLock::new(HashMap::new())),
+            user_stats: Arc::new(RwLock::new(HashMap::new())),
+            start_time: std::time::Instant::now(),
+            session_token: Arc::new(RwLock::new(None)),
+            webpath: "".to_string(),
+            username: "admin".to_string(),
+            password_hash: "hash".to_string(),
+            server_host: "127.0.0.1".to_string(),
+            server_port: 50000,
+            reality_query: "".to_string(),
+            config_path: None,
+        };
+        // This should not panic
+        let _router = create_api_router(state);
+    }
+}
+
