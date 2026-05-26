@@ -153,7 +153,14 @@ struct Assets;
 
 async fn static_handler(State(state): State<ApiState>, uri: Uri) -> impl IntoResponse {
     let mut path = uri.path();
-    let prefix = format!("/{}", state.webpath);
+    
+    let webpath = state.webpath.trim_matches('/');
+    let prefix = if webpath.is_empty() {
+        "/panel".to_string()
+    } else {
+        format!("/{}", webpath)
+    };
+    
     if path.starts_with(&prefix) {
         path = &path[prefix.len()..];
     }
@@ -206,17 +213,27 @@ pub fn create_api_router(state: ApiState) -> Router {
 
     let webpath = state.webpath.clone();
     let webpath = webpath.trim_matches('/');
-    
-    // If no webpath is provided, default to random path to hide panel
+
     let base_route = if webpath.is_empty() {
         "/panel".to_string()
     } else {
         format!("/{}", webpath)
     };
 
+    let redirect_target = format!("{}/", base_route);
+    let redirect_route = base_route.clone();
+
     Router::new()
+        // Exact /{webpath} → redirect to /{webpath}/ (so relative asset paths work)
+        .route(&redirect_route, get(move || {
+            let target = redirect_target.clone();
+            async move { axum::response::Redirect::permanent(&target) }
+        }))
+        // /{webpath}/ and /{webpath}/** → serve embedded static files
+        .route(&format!("{}/", base_route), get(static_handler.clone()))
+        .route(&format!("{}/*path", base_route), get(static_handler))
+        // /{webpath}/api/* → API handlers
         .nest(&format!("{}/api", base_route), api_router)
-        .nest(&base_route, Router::new().fallback(get(static_handler)))
         .layer(cors)
         .with_state(state)
 }
