@@ -154,6 +154,10 @@ impl ProtocolMachine {
         self.sent_history.iter().filter(|f| f.is_retransmittable).count()
     }
 
+    pub fn cwnd_packets(&self) -> usize {
+        self.cc.cwnd_packets() as usize
+    }
+
     pub fn state(&self) -> OstpState {
         self.state
     }

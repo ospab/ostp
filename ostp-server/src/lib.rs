@@ -464,7 +464,7 @@ async fn run_server_loop(
     let mut last_empty_app_log = Instant::now() - Duration::from_secs(10);
     let mut peer_last_seen: HashMap<IpAddr, Instant> = HashMap::new();
     let mut peer_available: HashMap<IpAddr, bool> = HashMap::new();
-    let peer_timeout = Duration::from_secs(15);
+    let peer_timeout = Duration::from_secs(45);
 
     loop {
         tokio::select! {

@@ -446,7 +446,7 @@ impl Bridge {
                 _ = keepalive_tick.tick() => {
                     if self.running {
                         // 1. Connection Liveness Check & Silent Background Reconnect
-                        if self.last_valid_recv.elapsed().as_secs() > 8 {
+                        if self.last_valid_recv.elapsed().as_secs() > 25 {
                             let elapsed = self.last_valid_recv.elapsed().as_secs();
                             if elapsed > 180 {
                                 // Hard timeout after 3 minutes of total silence
@@ -591,7 +591,7 @@ impl Bridge {
                 }
                 proxy_ev = proxy_rx.recv(), if self.running && sessions_opt.as_ref().map(|s| {
                     // Backpressure: suspend proxy reads when ARQ window is saturated
-                    s.iter().all(|ses| ses.machine.in_flight_count() < 256)
+                    s.iter().all(|ses| ses.machine.in_flight_count() < ses.machine.cwnd_packets().clamp(16, 256))
                 }).unwrap_or(true) => {
                     if let Some(ev) = proxy_ev {
                         if let Some(sessions) = sessions_opt.as_mut() {
