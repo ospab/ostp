@@ -32,5 +32,4 @@ wintun.dll
 # Dev notes (not for repo)
 .ai-rules.md
 turn-harvesting-idea.md
-ostp-control/
 ostp-flutter/
