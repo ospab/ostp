@@ -38,6 +38,14 @@ struct Args {
 
     /// Optional client connection share link (ostp://ACCESS_KEY@HOST:PORT) to run instantly
     url: Option<String>,
+
+    /// Uninstall OSTP: stop service, remove binary and configuration files
+    #[arg(long)]
+    uninstall: bool,
+
+    /// Update OSTP: re-run the install script to fetch and install the latest version
+    #[arg(long)]
+    update: bool,
 }
 
 fn parse_ostp_link(link: &str) -> Result<ClientConfig> {
@@ -480,7 +488,15 @@ fn get_or_ask_public_ip(config_path: &std::path::Path) -> String {
 
 async fn run_app() -> Result<()> {
     let args = Args::parse();
-    
+
+    if args.uninstall {
+        return cmd_uninstall();
+    }
+
+    if args.update {
+        return cmd_update();
+    }
+
     if args.generate_key {
         let mut new_keys = Vec::new();
         for _ in 0..args.count {
@@ -897,6 +913,113 @@ async fn run_app() -> Result<()> {
     }
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Uninstall command
+// ---------------------------------------------------------------------------
+#[cfg(unix)]
+fn cmd_uninstall() -> Result<()> {
+    use std::process::Command;
+
+    println!("[ostp] Uninstalling OSTP...");
+
+    // 1. Stop and disable systemd service (best-effort)
+    for action in &["stop", "disable"] {
+        let _ = Command::new("systemctl")
+            .args([action, "ostp"])
+            .status();
+    }
+
+    // 2. Remove the systemd unit file
+    let unit_path = std::path::Path::new("/etc/systemd/system/ostp.service");
+    if unit_path.exists() {
+        fs::remove_file(unit_path)?;
+        println!("[ostp] Removed {}", unit_path.display());
+        let _ = Command::new("systemctl")
+            .args(["daemon-reload"])
+            .status();
+    }
+
+    // 3. Remove binary
+    let bin_path = std::path::Path::new("/opt/ostp/ostp");
+    if bin_path.exists() {
+        fs::remove_file(bin_path)?;
+        println!("[ostp] Removed {}", bin_path.display());
+    }
+
+    // 4. Remove install directory
+    let install_dir = std::path::Path::new("/opt/ostp");
+    if install_dir.exists() {
+        fs::remove_dir_all(install_dir)?;
+        println!("[ostp] Removed {}", install_dir.display());
+    }
+
+    // 5. Remove configuration directory
+    let config_dir = std::path::Path::new("/etc/ostp");
+    if config_dir.exists() {
+        fs::remove_dir_all(config_dir)?;
+        println!("[ostp] Removed {}", config_dir.display());
+    }
+
+    println!("[ostp] Uninstall complete.");
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn cmd_uninstall() -> Result<()> {
+    anyhow::bail!("The 'uninstall' command is only supported on Linux/Unix systems.");
+}
+
+// ---------------------------------------------------------------------------
+// Update command
+// ---------------------------------------------------------------------------
+#[cfg(unix)]
+fn cmd_update() -> Result<()> {
+    use std::process::Command;
+
+    // Prefer the install script next to the binary, then the well-known path.
+    let script_candidates = [
+        "/opt/ostp/install.sh",
+        "/tmp/ostp_install.sh",
+    ];
+
+    let script_path = script_candidates
+        .iter()
+        .find(|p| std::path::Path::new(p).exists())
+        .copied();
+
+    if let Some(path) = script_path {
+        println!("[ostp] Running update script: {}", path);
+        let status = Command::new("bash")
+            .arg(path)
+            .status()
+            .map_err(|e| anyhow!("Failed to execute install script: {e}"))?;
+
+        if !status.success() {
+            anyhow::bail!("Install script exited with status: {}", status);
+        }
+        println!("[ostp] Update complete.");
+    } else {
+        // Download and run the script on the fly
+        println!("[ostp] install.sh not found locally – downloading from GitHub...");
+        let status = Command::new("bash")
+            .args(["-c", "curl -fsSL https://raw.githubusercontent.com/ospab/ostp/main/scripts/install.sh | bash"])
+            .status()
+            .map_err(|e| anyhow!("Failed to download/run install script: {e}"))?;
+
+        if !status.success() {
+            anyhow::bail!("Update script exited with status: {}", status);
+        }
+        println!("[ostp] Update complete.");
+    }
+
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn cmd_update() -> Result<()> {
+    anyhow::bail!("The 'update' command is only supported on Linux/Unix systems.");
 }
 
 async fn run_client_directly(client_cfg: ClientConfig) -> Result<()> {
