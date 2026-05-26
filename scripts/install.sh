@@ -148,9 +148,67 @@ if [ -f "$CONFIG_FILE" ]; then
     echo "Existing configuration found at $CONFIG_FILE."
     echo "Binary updated to ${LATEST_RELEASE:-latest}."
 
+    # ── Config migration: add new fields, preserve existing values ──
+    echo "Checking for new config fields..."
+    CURRENT_MODE=$(python3 -c "
+import json, sys
+with open('$CONFIG_FILE') as f:
+    raw = f.read()
+# strip // comments
+lines = [l for l in raw.split('\n') if not l.strip().startswith('//')]
+try:
+    d = json.loads('\n'.join(lines))
+    print(d.get('mode',''))
+except:
+    print('')
+" 2>/dev/null)
+
+    if [ -n "$CURRENT_MODE" ]; then
+        TEMP_TEMPLATE="/tmp/ostp_template_$$.json"
+        "$INSTALL_DIR/ostp" --init "$CURRENT_MODE" --config "$TEMP_TEMPLATE" 2>/dev/null
+
+        if [ -f "$TEMP_TEMPLATE" ]; then
+            python3 << PYEOF
+import json, sys
+
+def deep_merge(template, existing):
+    """Merge: existing wins for all present keys; template adds missing keys."""
+    if not isinstance(template, dict) or not isinstance(existing, dict):
+        return existing
+    result = dict(template)  # start with template defaults
+    for k, v in existing.items():
+        if k in result and isinstance(result[k], dict) and isinstance(v, dict):
+            result[k] = deep_merge(result[k], v)
+        else:
+            result[k] = v  # existing value always wins
+    return result
+
+with open('$CONFIG_FILE') as f:
+    raw = f.read()
+lines = [l for l in raw.split('\n') if not l.strip().startswith('//')]
+existing = json.loads('\n'.join(lines))
+
+with open('$TEMP_TEMPLATE') as f:
+    raw2 = f.read()
+lines2 = [l for l in raw2.split('\n') if not l.strip().startswith('//')]
+template = json.loads('\n'.join(lines2))
+
+merged = deep_merge(template, existing)
+
+with open('$CONFIG_FILE', 'w') as f:
+    json.dump(merged, f, indent=2, ensure_ascii=False)
+print("[ok] Config migrated: new fields added, existing data preserved.")
+PYEOF
+            rm -f "$TEMP_TEMPLATE"
+        else
+            echo "[warn] Could not generate template for migration. Config unchanged."
+        fi
+    else
+        echo "[warn] Could not detect config mode. Config unchanged."
+    fi
+
     # Update systemd service to use new paths
     if [ -f "/etc/systemd/system/ostp.service" ]; then
-        # Check if service points to old path
         if grep -q "WorkingDirectory=$INSTALL_DIR" /etc/systemd/system/ostp.service && \
            grep -q "$CONFIG_FILE" /etc/systemd/system/ostp.service; then
             : # Service already uses correct paths
@@ -191,6 +249,7 @@ EOF
     echo "Update complete."
     exit 0
 fi
+
 
 # ── Interactive setup (first install) ────────────────────────────────
 
