@@ -821,8 +821,46 @@ async fn run_app() -> Result<()> {
                 println!("\n  Client share links from {:?}:", args.config);
                 for (idx, key) in server_cfg.access_keys.iter().enumerate() {
                     let mut link = format!("ostp://{}@{}:{}", key.key(), host, port);
+                    let mut query_params = Vec::new();
+                    
                     if let Some(r) = &server_cfg.reality {
-                        link = format!("{}?security=reality&sni={}&pbk={}&sid={}&type=udp", link, r.sni_list.first().unwrap_or(&String::new()), r.pbk, r.sid);
+                        if r.enabled {
+                            query_params.push("security=reality".to_string());
+                            query_params.push(format!("sni={}", r.sni_list.first().unwrap_or(&String::new())));
+                            query_params.push(format!("pbk={}", r.pbk));
+                            if !r.sid.is_empty() {
+                                query_params.push(format!("sid={}", r.sid));
+                            }
+                        }
+                    }
+                    
+                    if let Some(t) = &server_cfg.transport {
+                        if let Some(mode) = &t.mode {
+                            if mode == "uot" {
+                                query_params.push("type=tcp".to_string());
+                            } else {
+                                query_params.push("type=udp".to_string());
+                            }
+                        }
+                        if let Some(sni) = &t.stealth_sni {
+                            let reality_enabled = server_cfg.reality.as_ref().map(|r| r.enabled).unwrap_or(false);
+                            if !reality_enabled && !sni.is_empty() {
+                                query_params.push(format!("sni={}", sni));
+                            }
+                        }
+                    } else {
+                        query_params.push("type=udp".to_string());
+                    }
+
+                    if let Some(dns) = &server_cfg.dns {
+                        if dns.enabled {
+                            query_params.push("owndns=true".to_string());
+                        }
+                    }
+
+                    if !query_params.is_empty() {
+                        link.push('?');
+                        link.push_str(&query_params.join("&"));
                     }
                     println!("  [{}] {}", idx + 1, link);
                 }
