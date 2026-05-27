@@ -198,6 +198,7 @@ pub async fn run_client_core(
     let (ui_tx, mut ui_rx) = mpsc::channel(512);
     let (cmd_tx, cmd_rx) = mpsc::channel(128);
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let proxy_shutdown_rx = shutdown_tx.subscribe();
 
 
     // Auto-connect on startup
@@ -247,29 +248,26 @@ pub async fn run_client_core(
     });
 
     let config_clone = config.clone();
-    let (mut proxy_task, mut wintun_task) = if config.mode == "proxy" {
-        let proxy_shutdown_rx = shutdown_tx.subscribe();
-        let t = tokio::spawn(async move {
-            tunnel::run_local_proxy(
-                config.local_proxy,
-                config.ostp,
-                config.exclusions,
-                config.debug,
-                proxy_shutdown_rx,
-                proxy_events_tx,
-                client_msgs_rx,
-            )
-            .await
-        });
-        (Some(t), None)
-    } else if config.mode == "tun" {
-        let wintun_shutdown_rx = shutdown_tx.subscribe();
-        let t = tokio::spawn(async move {
-            tunnel::run_tun_tunnel(config_clone, proxy_events_tx, client_msgs_rx, wintun_shutdown_rx).await
-        });
-        (None, Some(t))
+    let mut proxy_task = tokio::spawn(async move {
+        tunnel::run_local_proxy(
+            config.local_proxy,
+            config.ostp,
+            config.exclusions,
+            config.debug,
+            proxy_shutdown_rx,
+            proxy_events_tx,
+            client_msgs_rx,
+        )
+        .await
+    });
+
+    let wintun_shutdown_rx = shutdown_tx.subscribe();
+    let mut wintun_task = if config_clone.mode == "tun" {
+        Some(tokio::spawn(async move {
+            tunnel::run_tun_tunnel(config_clone, wintun_shutdown_rx).await
+        }))
     } else {
-        (None, None)
+        None
     };
 
     // Wait for either external shutdown OR any task to fail
@@ -282,9 +280,7 @@ pub async fn run_client_core(
             let _ = shutdown_tx.send(true);
             res.map_err(|e| anyhow::anyhow!("Bridge task panicked: {}", e))??;
         }
-        res = async {
-            if let Some(ref mut t) = proxy_task { t.await } else { std::future::pending().await }
-        } => {
+        res = &mut proxy_task => {
             let _ = shutdown_tx.send(true);
             res.map_err(|e| anyhow::anyhow!("Proxy task panicked: {}", e))??;
         }
@@ -298,9 +294,7 @@ pub async fn run_client_core(
 
     // Final cleanup: wait for tasks to finish
     let _ = bridge_task.await;
-    if let Some(task) = proxy_task {
-        let _ = task.await;
-    }
+    let _ = proxy_task.await;
     if let Some(task) = wintun_task {
         let _ = task.await;
     }

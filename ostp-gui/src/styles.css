@@ -84,33 +84,24 @@ input, textarea { font-family: inherit; }
 .blob {
   position: absolute;
   border-radius: 50%;
-  filter: blur(80px);
+  filter: blur(100px);
   will-change: transform;
 }
 
 .blob-1 {
-  width: 360px; height: 360px;
+  width: 400px; height: 400px;
   background: var(--c-accent);
-  opacity: 0.055;
-  top: -140px; right: -80px;
+  opacity: 0.15;
+  top: -150px; right: -100px;
   animation: blob-drift 28s infinite alternate ease-in-out;
 }
 
 .blob-2 {
-  width: 280px; height: 280px;
+  width: 350px; height: 350px;
   background: var(--c-green);
-  opacity: 0.04;
-  bottom: -100px; left: -60px;
+  opacity: 0.10;
+  bottom: -100px; left: -100px;
   animation: blob-drift 22s infinite alternate-reverse ease-in-out;
-}
-
-.blob-3 {
-  width: 200px; height: 200px;
-  background: var(--c-accent-2);
-  opacity: 0.035;
-  top: 50%; left: 50%;
-  transform: translate(-50%, -50%);
-  animation: blob-drift 35s infinite alternate ease-in-out;
 }
 
 @keyframes blob-drift {
@@ -379,38 +370,100 @@ input, textarea { font-family: inherit; }
   opacity: 0.7;
 }
 
-/* ── Server badge ─────────────────────────────────────────────────────────── */
+/* ── Connection info ──────────────────────────────────────────────────────── */
+.connection-info {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 16px;
+  width: 100%;
+  transition: all var(--t-med);
+}
+
+.connection-info.hidden {
+  opacity: 0; pointer-events: none; transform: translateY(4px);
+}
+
 .server-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  padding: 12px 20px;
+  border-radius: 30px;
+  background: rgba(255,255,255,0.08);
+  border: 1px solid rgba(255,255,255,0.15);
+  font-size: 0.95rem;
+  color: rgba(255,255,255,0.7);
+  font-family: 'JetBrains Mono', monospace;
+  font-weight: 600;
+  backdrop-filter: blur(8px);
+}
+
+.ping-test-box {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  width: calc(100% - 64px);
+  max-width: 400px;
+  padding: 12px 16px;
+  background: rgba(255,255,255,0.03);
+  border-radius: 20px;
+  border: 1px solid rgba(255,255,255,0.06);
+}
+
+.ping-test-left {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.ping-test-title {
+  font-size: 0.62rem;
+  font-weight: 700;
+  color: rgba(255,255,255,0.38);
+  letter-spacing: 0.8px;
+}
+
+.ping-test-value {
+  font-size: 0.9rem;
+  font-weight: 700;
+  color: rgba(255,255,255,0.7);
+  transition: color var(--t-fast);
+}
+
+.ping-test-value.good { color: var(--c-green); }
+.ping-test-value.warn { color: var(--c-amber); }
+.ping-test-value.bad  { color: var(--c-red); }
+
+.ping-btn {
   display: flex;
   align-items: center;
   gap: 6px;
-  padding: 5px 12px;
-  border-radius: var(--r-full);
-  background: var(--c-card);
-  border: 1px solid var(--c-card-border);
-  font-size: 0.7rem;
-  color: var(--c-txt-2);
-  font-family: 'JetBrains Mono', monospace;
-  backdrop-filter: blur(8px);
-  transition: all var(--t-med);
-  max-width: 200px;
-  overflow: hidden;
-  white-space: nowrap;
-  text-overflow: ellipsis;
+  background: var(--c-accent-dim);
+  border: none;
+  padding: 8px 12px;
+  border-radius: 12px;
+  color: var(--c-accent);
+  font-size: 0.8rem;
+  font-weight: 700;
+  transition: all var(--t-fast);
 }
 
-.server-badge.hidden { opacity: 0; pointer-events: none; transform: translateY(4px); }
+.ping-btn:hover {
+  background: rgba(108,114,255,0.2);
+  transform: scale(1.03);
+}
+.ping-btn:active { transform: scale(0.96); }
 
 /* ── Metrics bar ──────────────────────────────────────────────────────────── */
 .metrics-bar {
   display: flex;
   align-items: center;
   gap: 0;
-  padding: 12px 4px 16px;
+  padding: 24px 20px;
   flex-shrink: 0;
-  background: rgba(255,255,255,0.02);
-  border-top: 1px solid var(--c-card-border);
-  border-radius: var(--r-lg) var(--r-lg) 0 0;
+  background: rgba(255,255,255,0.04);
+  border-top: 1px solid rgba(255,255,255,0.08);
   margin: 0 -18px;
   padding-inline: 18px;
 }
@@ -419,27 +472,27 @@ input, textarea { font-family: inherit; }
   flex: 1;
   display: flex;
   align-items: center;
-  gap: 8px;
+  justify-content: center;
+  gap: 12px;
 }
 
 .metric-sep {
   width: 1px;
-  height: 28px;
-  background: var(--c-card-border);
+  height: 40px;
+  background: rgba(255,255,255,0.15);
   flex-shrink: 0;
   margin: 0 4px;
 }
 
 .metric-icon {
-  width: 26px; height: 26px;
-  border-radius: var(--r-xs);
+  width: 36px; height: 36px;
+  border-radius: 10px;
   display: flex; align-items: center; justify-content: center;
   flex-shrink: 0;
 }
 
 .down-icon { background: var(--c-green-dim); color: var(--c-green); }
 .up-icon   { background: var(--c-accent-dim); color: var(--c-accent); }
-.ping-icon { background: rgba(245,158,11,0.10); color: var(--c-amber); }
 
 .metric-body {
   display: flex;
@@ -449,16 +502,16 @@ input, textarea { font-family: inherit; }
 }
 
 .metric-label {
-  font-size: 0.58rem;
-  color: var(--c-txt-3);
+  font-size: 0.75rem;
+  color: rgba(255,255,255,0.54);
   text-transform: uppercase;
-  letter-spacing: 0.6px;
-  font-weight: 600;
+  letter-spacing: 0.8px;
+  font-weight: 700;
 }
 
 .metric-value {
-  font-size: 0.76rem;
-  font-weight: 600;
+  font-size: 1rem;
+  font-weight: 700;
   font-variant-numeric: tabular-nums;
   color: var(--c-txt-1);
   font-family: 'JetBrains Mono', monospace;
@@ -694,29 +747,7 @@ input, textarea { font-family: inherit; }
   text-transform: none;
 }
 
-/* ── Save button ──────────────────────────────────────────────────────────── */
-.save-btn {
-  width: 100%;
-  height: 44px;
-  border-radius: var(--r-md);
-  border: 1px solid var(--c-accent);
-  background: var(--c-accent-dim);
-  color: var(--c-accent);
-  font-size: 0.82rem;
-  font-weight: 600;
-  letter-spacing: 0.3px;
-  transition: all var(--t-fast);
-  flex-shrink: 0;
-  backdrop-filter: blur(8px);
-}
 
-.save-btn:hover {
-  background: var(--c-accent);
-  color: #fff;
-  box-shadow: 0 4px 20px var(--c-accent-glow);
-}
-
-.save-btn:active { transform: scale(0.98); }
 
 /* ── Toast ────────────────────────────────────────────────────────────────── */
 .toast {

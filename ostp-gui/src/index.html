@@ -16,7 +16,6 @@
     <div class="ambient" aria-hidden="true">
       <div class="blob blob-1"></div>
       <div class="blob blob-2"></div>
-      <div class="blob blob-3"></div>
     </div>
 
     <!-- ── HOME SCREEN ──────────────────────────────────────────── -->
@@ -29,9 +28,6 @@
           <span class="brand-name">OSTP</span>
         </div>
         <div class="topbar-right">
-          <button id="btn-lang" class="pill-btn" title="Language">
-            <span id="lang-label">EN</span>
-          </button>
           <button id="btn-go-settings" class="icon-btn" aria-label="Settings">
             <!-- Gear icon -->
             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -49,7 +45,6 @@
         <div class="orbit-wrap" id="orbit-wrap">
           <div class="orbit orbit-1"></div>
           <div class="orbit orbit-2"></div>
-          <div class="orbit orbit-3"></div>
 
           <!-- Power button -->
           <button id="btn-connect" class="power-btn" aria-label="Connect">
@@ -68,15 +63,30 @@
           <div id="uptime-text" class="status-sub" data-i18n="hint_tap">Tap to protect your traffic</div>
         </div>
 
-        <!-- Server badge (shown when connected) -->
-        <div id="server-badge" class="server-badge hidden">
-          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
-            <rect x="2" y="2" width="20" height="8" rx="2"/>
-            <rect x="2" y="14" width="20" height="8" rx="2"/>
-            <line x1="6" y1="6" x2="6.01" y2="6"/>
-            <line x1="6" y1="18" x2="6.01" y2="18"/>
-          </svg>
-          <span id="server-badge-text">—</span>
+        <!-- Connection info (shown when connected) -->
+        <div id="connection-info" class="connection-info hidden">
+          <div class="server-badge">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <rect x="2" y="2" width="20" height="8" rx="2"/>
+              <rect x="2" y="14" width="20" height="8" rx="2"/>
+              <line x1="6" y1="6" x2="6.01" y2="6"/>
+              <line x1="6" y1="18" x2="6.01" y2="18"/>
+            </svg>
+            <span id="server-badge-text">—</span>
+          </div>
+
+          <div class="ping-test-box">
+            <div class="ping-test-left">
+              <span class="ping-test-title">CONNECTION TEST</span>
+              <span id="ping-text-value" class="ping-test-value">Target Ping: -- ms</span>
+            </div>
+            <button id="btn-test-ping" class="ping-btn">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M22 12h-4l-3 9L9 3l-3 9H2"/>
+              </svg>
+              <span>Test Ping</span>
+            </button>
+          </div>
         </div>
 
       </main>
@@ -106,35 +116,6 @@
           <div class="metric-body">
             <span class="metric-label" data-i18n="upload">Upload</span>
             <span id="metric-up" class="metric-value">0 B</span>
-          </div>
-        </div>
-
-        <div class="metric-sep"></div>
-
-        <div class="metric">
-          <div class="metric-icon ping-icon" id="ping-icon-block">
-            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
-              <path d="M22 12h-4l-3 9L9 3l-3 9H2"/>
-            </svg>
-          </div>
-          <div class="metric-body">
-            <span class="metric-label">Ping</span>
-            <span id="metric-ping" class="metric-value">— ms</span>
-          </div>
-        </div>
-
-        <div class="metric-sep"></div>
-
-        <div class="metric">
-          <div class="metric-icon mode-icon">
-            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
-              <rect x="2" y="3" width="20" height="14" rx="2"/>
-              <path d="M8 21h8M12 17v4"/>
-            </svg>
-          </div>
-          <div class="metric-body">
-            <span class="metric-label">Mode</span>
-            <span id="metric-mode" class="metric-value">—</span>
           </div>
         </div>
       </footer>
@@ -243,6 +224,14 @@
             </label>
           </div>
 
+          <div class="field-group" id="group-tun-stack">
+            <label class="field-label" for="in-tun-stack" data-i18n="label_tun_stack">TUN Stack</label>
+            <select id="in-tun-stack" class="field-input">
+              <option value="system">System (tun2socks)</option>
+              <option value="ostp">OSTP (Native)</option>
+            </select>
+          </div>
+
           <div class="toggle-row">
             <div class="toggle-text">
               <span class="toggle-name" data-i18n="label_mux">Multiplexing (Mux)</span>
@@ -291,8 +280,7 @@
           </div>
         </div>
 
-        <!-- Save -->
-        <button id="btn-save-config" class="save-btn" data-i18n="save_btn">Save &amp; Apply</button>
+
 
       </div>
     </div>

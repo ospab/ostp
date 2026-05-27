@@ -894,8 +894,9 @@ async fn run_app() -> Result<()> {
                     limit_bytes: uc.limit(),
                 })
             }).collect::<Vec<_>>();
+            let host = get_or_ask_public_ip(&args.config);
             // Pass all listen addresses for multi-listener support
-            ostp_server::run_server(listen_addrs, access_keys_meta, outbound, api_config, fallback_config, debug, rq, rc, Some(args.config)).await?;
+            ostp_server::run_server(listen_addrs, Some(host), access_keys_meta, outbound, api_config, fallback_config, debug, rq, rc, Some(args.config)).await?;
         }
         AppMode::Client(client_cfg) => {
             run_client_directly(client_cfg).await?;
@@ -1008,6 +1009,7 @@ async fn run_client_directly(client_cfg: ClientConfig) -> Result<()> {
     let reality_cfg = client_cfg.reality.as_ref();
     let client_conf = ostp_client::config::ClientConfig {
         mode: if is_tun_enabled { "tun".to_string() } else { "proxy".to_string() },
+        tun_stack: "native".to_string(),
         debug: client_cfg.debug.unwrap_or(false),
         ostp: ostp_client::config::OstpConfig {
             server_addr: client_cfg.server.clone(),

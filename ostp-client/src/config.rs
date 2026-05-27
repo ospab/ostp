@@ -20,7 +20,11 @@ pub struct ClientConfig {
     #[serde(default)]
     pub multiplex: MultiplexConfig,
     pub dns_server: Option<String>,
+    #[serde(default = "default_tun_stack")]
+    pub tun_stack: String,
 }
+
+fn default_tun_stack() -> String { "system".to_string() }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ExclusionConfig {
@@ -142,6 +146,7 @@ impl Default for ClientConfig {
             exclusions: ExclusionConfig::default(),
             multiplex: MultiplexConfig::default(),
             dns_server: None,
+            tun_stack: "system".to_string(),
         }
     }
 }
@@ -184,6 +189,7 @@ struct RawTransportSection {
 struct RawTunSection {
     enable: Option<bool>,
     dns: Option<String>,
+    stack: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -275,6 +281,7 @@ impl ClientConfig {
                 sessions: mux.sessions.unwrap_or(1),
             },
             dns_server: raw.tun.as_ref().and_then(|t| t.dns.clone()),
+            tun_stack: raw.tun.as_ref().and_then(|t| t.stack.clone()).unwrap_or_else(|| "system".to_string()),
         })
 
     }

@@ -32,7 +32,7 @@ class OstpClientSdk private constructor(private val context: Context) {
 
     // ── Native JNI bindings ───────────────────────────────────────────────────
 
-    private external fun nativeStartClient(configJson: String, fd: Int): Boolean
+    private external fun nativeStartClient(configJson: String): Boolean
     private external fun nativeStopClient(): Boolean
     private external fun nativeGetMetrics(): String
     private external fun nativeGetLogs(): String
@@ -165,7 +165,7 @@ class OstpClientSdk private constructor(private val context: Context) {
      *
      * @return `true` if the native layer accepted the start command.
      */
-    fun start(config: Config, fd: Int = -1): Boolean {
+    fun start(config: Config): Boolean {
         if (started.getAndSet(true)) {
             emitLog("SDK already started; call stop() first to change config")
             return false
@@ -175,7 +175,7 @@ class OstpClientSdk private constructor(private val context: Context) {
         _state.value = TunnelState.Connecting
 
         val json = config.toNativeJson()
-        val ok = nativeStartClient(json, fd)
+        val ok = nativeStartClient(json)
         if (!ok) {
             _state.value = TunnelState.Failed("Native layer rejected config")
             started.set(false)

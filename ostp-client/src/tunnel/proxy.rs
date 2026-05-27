@@ -10,7 +10,7 @@ use crate::tunnel::{ProxyEvent, ProxyToClientMsg};
 
 pub async fn run_local_socks5_proxy(
     cfg: LocalProxyConfig,
-    _ostp: OstpConfig,
+    ostp: OstpConfig,
     exclusions: ExclusionConfig,
     debug: bool,
     mut shutdown: watch::Receiver<bool>,
@@ -29,6 +29,7 @@ pub async fn run_local_socks5_proxy(
 
     let matcher = ExclusionMatcher::new(&exclusions);
     let (connect_tx, mut connect_rx) = mpsc::channel(128);
+    let max_chunk = ostp.mtu.saturating_sub(150).max(512);
 
     let mut next_stream_id: u16 = 1;
     let mut active_streams: HashMap<u16, mpsc::UnboundedSender<ProxyToClientMsg>> = HashMap::new();
@@ -66,6 +67,7 @@ pub async fn run_local_socks5_proxy(
                         connect_timeout,
                         debug,
                         matcher_clone,
+                        max_chunk,
                     ).await {
                         let msg = err.to_string();
                         // Suppress routine disconnects and unsupported SOCKS5 command attempts (like UDP) from spam logs
@@ -147,6 +149,7 @@ async fn handle_proxy_client(
     connect_timeout: Duration,
     debug: bool,
     matcher: ExclusionMatcher,
+    max_chunk: usize,
 ) -> Result<()> {
     let _guard = StreamGuard { stream_id, close_tx: close_tx.clone() };
 
@@ -340,7 +343,7 @@ async fn handle_proxy_client(
     }
 
     // ── Bidirectional raw data forwarding ─────────────────────────────
-    let mut tcp_buf = vec![0_u8; 1024];
+    let mut tcp_buf = vec![0_u8; 65536];
     loop {
         tokio::select! {
             read_res = client.read(&mut tcp_buf) => {
@@ -353,10 +356,15 @@ async fn handle_proxy_client(
                         break;
                     }
                     Ok(n) => {
-                        let _ = event_tx.send(ProxyEvent::Data {
-                            stream_id,
-                            payload: bytes::Bytes::copy_from_slice(&tcp_buf[..n]),
-                        }).await;
+                        let mut offset = 0;
+                        while offset < n {
+                            let end = (offset + max_chunk).min(n);
+                            let _ = event_tx.send(ProxyEvent::Data {
+                                stream_id,
+                                payload: bytes::Bytes::copy_from_slice(&tcp_buf[offset..end]),
+                            }).await;
+                            offset = end;
+                        }
                     }
                     Err(_) => {
                         let _ = event_tx.send(ProxyEvent::Close { stream_id }).await;

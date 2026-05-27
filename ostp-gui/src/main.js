@@ -24,21 +24,18 @@ const orbitWrap      = $('orbit-wrap');
 const brandDot       = $('brand-dot');
 const statusLabel    = $('status-text');
 const statusSub      = $('uptime-text');
-const serverBadge    = $('server-badge');
+const connInfo       = $('connection-info');
 const serverBadgeTxt = $('server-badge-text');
 const metricDown     = $('metric-down');
 const metricUp       = $('metric-up');
-const metricMode     = $('metric-mode');
-const metricPing     = $('metric-ping');
-const pingIconBlock  = $('ping-icon-block');
+const pingValueTxt   = $('ping-text-value');
+const btnTestPing    = $('btn-test-ping');
 const toast          = $('toast');
 
 const btnGoSettings  = $('btn-go-settings');
 const btnBack        = $('btn-back');
-const btnLang        = $('btn-lang');
 const btnImport      = $('btn-import-url');
 const btnPeekKey     = $('btn-peek-key');
-const btnSave        = $('btn-save-config');
 const importInput    = $('in-import-url');
 const inServer       = $('in-server');
 const inKey          = $('in-key');
@@ -50,6 +47,8 @@ const inPbk          = $('in-pbk');
 const inSid          = $('in-sid');
 const inMtu          = $('in-mtu');
 const inTun          = $('in-tun-mode');
+const inTunStack     = $('in-tun-stack');
+const groupTunStack  = $('group-tun-stack');
 const inMux          = $('in-mux-mode');
 const inMuxSessions  = $('in-mux-sessions');
 const inDebug        = $('in-debug');
@@ -105,10 +104,11 @@ function setState(next) {
     statusLabel.textContent = t('status_disconnected');
     statusSub.textContent   = t('hint_tap');
     statusLabel.classList.add('');
-    serverBadge.classList.add('hidden');
+    connInfo.classList.add('hidden');
     metricDown.textContent  = '0 B';
     metricUp.textContent    = '0 B';
-    metricMode.textContent  = '—';
+    pingValueTxt.textContent = 'Target Ping: -- ms';
+    pingValueTxt.className = 'ping-test-value';
     clearInterval(pollTimer);
     clearInterval(uptimeTimer);
     pollTimer = uptimeTimer = null;
@@ -121,7 +121,7 @@ function setState(next) {
     statusLabel.classList.add('is-connecting');
     statusLabel.textContent = t('status_connecting');
     statusSub.textContent   = t('hint_connecting');
-    serverBadge.classList.add('hidden');
+    connInfo.classList.add('hidden');
     clearInterval(uptimeTimer);
     uptimeSecs = 0;
 
@@ -132,10 +132,10 @@ function setState(next) {
     statusLabel.classList.add('is-connected');
     statusLabel.textContent = t('status_connected');
 
-    // Show server badge
+    // Show connection info
     if (serverAddr) {
       serverBadgeTxt.textContent = serverAddr;
-      serverBadge.classList.remove('hidden');
+      connInfo.classList.remove('hidden');
     }
 
     // Start uptime counter
@@ -161,29 +161,6 @@ async function poll() {
     if (metrics) {
       metricDown.textContent = fmtBytes(metrics.bytes_recv);
       metricUp.textContent   = fmtBytes(metrics.bytes_sent);
-
-      const isTun = rawConfig?.tun?.enable;
-      metricMode.textContent = isTun ? 'TUN' : 'SOCKS5';
-
-      const rtt = metrics.rtt_ms || 0;
-      if (rtt > 0) {
-        metricPing.textContent = rtt + ' ms';
-        // Color code: green < 80ms, yellow < 200ms, red >= 200ms
-        if (rtt < 80) {
-          metricPing.style.color = 'var(--ping-good, #4ade80)';
-          pingIconBlock.style.color = 'var(--ping-good, #4ade80)';
-        } else if (rtt < 200) {
-          metricPing.style.color = 'var(--ping-mid, #facc15)';
-          pingIconBlock.style.color = 'var(--ping-mid, #facc15)';
-        } else {
-          metricPing.style.color = 'var(--ping-bad, #f87171)';
-          pingIconBlock.style.color = 'var(--ping-bad, #f87171)';
-        }
-      } else {
-        metricPing.textContent = '— ms';
-        metricPing.style.color = '';
-        pingIconBlock.style.color = '';
-      }
     }
   } catch {
     setState('disconnected');
@@ -199,15 +176,10 @@ function startPolling() {
 // ── Connect / Disconnect ─────────────────────────────────────────────────────
 async function handleToggle() {
   if (appState === 'disconnected') {
-    // Read server address for badge before connecting
     try {
       const raw = await invoke('get_config');
       const cfg = JSON.parse(raw);
       serverAddr = cfg.server || '';
-
-      // Determine mode label
-      const isTun = cfg.tun?.enable;
-      metricMode.textContent = isTun ? 'TUN' : 'SOCKS5';
     } catch { serverAddr = ''; }
 
     setState('connecting');
@@ -260,8 +232,11 @@ async function loadConfigIntoForm() {
     inSid.value     = c.reality?.sid           || '';
     inMtu.value     = c.mtu           || '';
     inTun.checked   = !!c.tun?.enable;
+    inTunStack.value = c.tun?.stack   || 'system';
     inMux.checked   = !!c.mux?.enabled;
     inMuxSessions.value = c.mux?.sessions || '';
+    
+    groupTunStack.style.display = inTun.checked ? 'block' : 'none';
     inDns.value     = c.tun?.dns      || '';
     inDebug.checked = !!c.debug;
 
@@ -275,14 +250,20 @@ async function loadConfigIntoForm() {
 }
 
 // ── Config — save ─────────────────────────────────────────────────────────────
-async function handleSave() {
+let autoSaveTimer = null;
+function scheduleAutoSave() {
+  clearTimeout(autoSaveTimer);
+  autoSaveTimer = setTimeout(() => handleSave(true), 600);
+}
+
+async function handleSave(silent = false) {
   if (!rawConfig) rawConfig = { mode: 'client', log_level: 'info' };
 
   const server = inServer.value.trim();
   const key    = inKey.value.trim();
 
-  if (!server) { showToast(t('err_server_req') || 'Server address required', 'error'); return; }
-  if (!key)    { showToast(t('err_key_req')    || 'Access key required',     'error'); return; }
+  if (!server) { if (!silent) showToast(t('err_server_req') || 'Server address required', 'error'); return; }
+  if (!key)    { if (!silent) showToast(t('err_key_req')    || 'Access key required',     'error'); return; }
 
   rawConfig.mode       = 'client';
   rawConfig.server     = server;
@@ -324,6 +305,7 @@ async function handleSave() {
   }
   rawConfig.tun.enable = inTun.checked;
   rawConfig.tun.dns    = inDns.value.trim() || null;
+  rawConfig.tun.stack  = inTunStack.value;
 
   rawConfig.exclude = {
     domains:   splitLines(inDomains.value),
@@ -333,14 +315,11 @@ async function handleSave() {
 
   try {
     const ok = await invoke('save_config', { jsonContent: JSON.stringify(rawConfig, null, 2) });
-    if (ok) {
-      showToast(t('toast_saved'), 'ok');
-      setTimeout(() => showScreen('home'), 700);
-    } else {
+    if (!ok && !silent) {
       showToast(t('toast_error'), 'error');
     }
   } catch (err) {
-    showToast(String(err), 'error');
+    if (!silent) showToast(String(err), 'error');
   }
 }
 
@@ -366,6 +345,7 @@ function handleImport() {
     
     importInput.value = '';
     showToast(t('toast_imported'), 'ok');
+    handleSave(false);
   } catch (err) {
     showToast(err.message, 'error');
   }
@@ -390,19 +370,35 @@ window.addEventListener('DOMContentLoaded', async () => {
   btnConnect.addEventListener('click',       handleToggle);
   btnGoSettings.addEventListener('click',    () => showScreen('settings'));
   btnBack.addEventListener('click',          () => showScreen('home'));
-  btnSave.addEventListener('click',          handleSave);
   btnImport.addEventListener('click',        handleImport);
   btnPeekKey.addEventListener('click',       togglePeek);
+  inTun.addEventListener('change',           () => { groupTunStack.style.display = inTun.checked ? 'block' : 'none'; });
   importInput.addEventListener('keydown', e => { if (e.key === 'Enter') handleImport(); });
 
-  btnLang.addEventListener('click', () => {
-    toggleLang();
-    // Refresh dynamic text without losing state
-    const cur = appState;
-    appState = '';
-    setState(cur);
-    document.getElementById('lang-label').textContent =
-      localStorage.getItem('ostp_lang') === 'ru' ? 'RU' : 'EN';
+  // Auto-save wiring
+  const formInputs = document.querySelectorAll('#settings-screen input:not(#in-import-url), #settings-screen textarea, #settings-screen select');
+  formInputs.forEach(el => {
+    el.addEventListener('input', scheduleAutoSave);
+    el.addEventListener('change', scheduleAutoSave);
+  });
+
+  btnTestPing.addEventListener('click', async () => {
+    pingValueTxt.textContent = 'Testing...';
+    pingValueTxt.className = 'ping-test-value';
+    try {
+      const metrics = await invoke('get_metrics');
+      if (metrics && metrics.rtt_ms > 0) {
+        const rtt = metrics.rtt_ms;
+        pingValueTxt.textContent = `Target Ping: ${rtt} ms`;
+        if (rtt < 80) pingValueTxt.classList.add('good');
+        else if (rtt < 200) pingValueTxt.classList.add('warn');
+        else pingValueTxt.classList.add('bad');
+      } else {
+        pingValueTxt.textContent = 'Target Ping: -- ms';
+      }
+    } catch {
+      pingValueTxt.textContent = 'Target Ping: Error';
+    }
   });
 
   // Restore status on app open

@@ -100,6 +100,7 @@ pub struct ProtocolMachine {
         /// Key-derived handshake padding range
     handshake_pad_min: usize,
     handshake_pad_max: usize,
+    mtu: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -145,6 +146,7 @@ impl ProtocolMachine {
             cc: CongestionController::new(config.mtu as u64),
             handshake_pad_min: config.handshake_pad_min.max(8),
             handshake_pad_max: config.handshake_pad_max.max(config.handshake_pad_min + 16),
+            mtu: config.mtu,
         })
     }
 

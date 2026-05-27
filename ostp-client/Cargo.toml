@@ -25,11 +25,7 @@ sha2 = "0.10.8"
 base64 = "0.22.1"
 webpki-roots = "0.26"
 rustls-pki-types = "1.7"
-smoltcp = { version = "0.11", default-features = false, features = ["std", "medium-ip", "proto-ipv4", "socket-tcp", "socket-udp"] }
-
-[target.'cfg(target_os = "windows")'.dependencies]
-wintun = "0.4"
-
-[target.'cfg(target_os = "linux")'.dependencies]
-tun = { version = "0.6", features = ["async"] }
-
+tun = { version = "0.8.9", features = ["async"] }
+netstack-smoltcp = "0.2.2"
+futures = "0.3.32"
+libc = "0.2.186"

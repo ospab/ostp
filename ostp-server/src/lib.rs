@@ -65,6 +65,7 @@ pub(crate) struct RemoteState {
 
 pub async fn run_server(
     bind_addrs: Vec<String>,
+    server_public_ip: Option<String>,
     access_keys: Vec<(String, crate::api::UserMeta)>,
     outbound: Option<OutboundConfig>,
     api_config: Option<ApiConfig>,
@@ -248,7 +249,7 @@ pub async fn run_server(
             let primary = bind_addrs.first().cloned().unwrap_or_else(|| "0.0.0.0:50000".to_string());
             let parts: Vec<&str> = primary.rsplitn(2, ':').collect();
             let server_port: u16 = parts.first().and_then(|p| p.parse().ok()).unwrap_or(50000);
-            let server_host = parts.get(1).unwrap_or(&"0.0.0.0").to_string();
+            let server_host = server_public_ip.unwrap_or_else(|| parts.get(1).unwrap_or(&"0.0.0.0").to_string());
             let rq = reality_query.clone().unwrap_or_default();
             let config_path_api = config_path.clone();
             tokio::spawn(async move {

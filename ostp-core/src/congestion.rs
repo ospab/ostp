@@ -165,16 +165,8 @@ impl CongestionController {
                 }
             }
             Phase::ProbeBandwidth => {
-                // BBR-style: target cwnd = BDP * gain
-                let bdp = self.bandwidth_delay_product();
-                // Apply gain of 1.25 during probe bandwidth
-                let target = (bdp * 5 / 4).max(MIN_CWND_PACKETS * self.mtu);
-                // Smooth transition
-                if self.cwnd < target {
-                    self.cwnd = self.cwnd.saturating_add(bytes * self.mtu / self.cwnd.max(1));
-                } else {
-                    self.cwnd = target;
-                }
+                // TCP Reno Additive Increase: increase cwnd by ~1 MTU per RTT
+                self.cwnd = self.cwnd.saturating_add(bytes * self.mtu / self.cwnd.max(1));
             }
             Phase::ProbeRtt => {
                 // Drain down to 4 packets to measure true min RTT
@@ -184,20 +176,21 @@ impl CongestionController {
                         // ProbeRTT complete, return to ProbeBandwidth
                         self.phase = Phase::ProbeBandwidth;
                         self.probe_rtt_timer = None;
-                        let bdp = self.bandwidth_delay_product();
-                        self.cwnd = bdp.max(MIN_CWND_PACKETS * self.mtu);
+                        self.cwnd = (MIN_CWND_PACKETS * self.mtu * 4).max(self.cwnd);
                         tracing::debug!(cwnd = self.cwnd, min_rtt = ?self.min_rtt, "congestion: probe RTT complete");
                     }
                 }
             }
         }
 
+        /*
         // Periodically enter ProbeRTT to refresh min_rtt
         if now.duration_since(self.min_rtt_stamp) >= MIN_RTT_EXPIRY && self.phase != Phase::ProbeRtt {
             self.phase = Phase::ProbeRtt;
             self.probe_rtt_timer = Some(now);
             tracing::debug!("congestion: entering probe RTT phase");
         }
+        */
 
         self.update_pacing_rate();
         self.last_ack_time = now;

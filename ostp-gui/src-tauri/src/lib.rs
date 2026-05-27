@@ -42,6 +42,7 @@ struct TunConfig {
     wintun_path: Option<String>,
     ipv4_address: Option<String>,
     dns: Option<String>,
+    stack: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -179,6 +180,7 @@ fn map_to_client_config(raw: &ClientConfigRaw, mode: &str) -> ostp_client::confi
             sessions: raw.mux.as_ref().and_then(|m| m.sessions).unwrap_or(1),
         },
         dns_server: raw.tun.as_ref().and_then(|t| t.dns.clone()),
+        tun_stack: raw.tun.as_ref().and_then(|t| t.stack.clone()).unwrap_or_else(|| "system".to_string()),
     }
 }
 
