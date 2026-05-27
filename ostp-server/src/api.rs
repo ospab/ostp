@@ -384,6 +384,39 @@ fn save_config_keys(state: &ApiState) -> Result<(), String> {
     Ok(())
 }
 
+fn save_dns_config(state: &ApiState, cfg: &crate::dns::DnsConfig) -> Result<(), String> {
+    let Some(ref path) = state.config_path else {
+        return Ok(());
+    };
+
+    let content = std::fs::read_to_string(path)
+        .map_err(|e| format!("failed to read config file: {}", e))?;
+
+    let mut stripped = json_comments::StripComments::new(content.as_bytes());
+    let mut content_str = String::new();
+    use std::io::Read;
+    stripped.read_to_string(&mut content_str)
+        .map_err(|e| format!("failed to strip comments: {}", e))?;
+
+    let mut json_val: serde_json::Value = serde_json::from_str(&content_str)
+        .map_err(|e| format!("failed to parse config JSON: {}", e))?;
+
+    if let Some(obj) = json_val.as_object_mut() {
+        let dns_val = serde_json::to_value(cfg).map_err(|e| e.to_string())?;
+        obj.insert("dns".to_string(), dns_val);
+    } else {
+        return Err("config root is not an object".to_string());
+    }
+
+    let new_content = serde_json::to_string_pretty(&json_val)
+        .map_err(|e| format!("failed to serialize config JSON: {}", e))?;
+
+    std::fs::write(path, new_content)
+        .map_err(|e| format!("failed to write config file: {}", e))?;
+
+    Ok(())
+}
+
 // ── Handlers ─────────────────────────────────────────────────────────────────
 
 async fn handle_get_config(
@@ -817,7 +850,11 @@ async fn handle_post_dns_config(
     let should_refresh = body.enabled && !body.adblock_urls.is_empty();
     {
         let mut cfg = state.dns_server.config.write().await;
-        *cfg = body;
+        *cfg = body.clone();
+    }
+    // Save to disk
+    if let Err(e) = save_dns_config(&state, &body) {
+        tracing::error!("Failed to save DNS config: {}", e);
     }
     // Reload blocklists if enabled
     if should_refresh {
