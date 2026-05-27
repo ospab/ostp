@@ -143,7 +143,7 @@ pub async fn run_client(config: crate::config::ClientConfig) -> Result<()> {
 }
 
 pub async fn run_client_core(
-    config: crate::config::ClientConfig,
+    mut config: crate::config::ClientConfig,
     metrics: Arc<BridgeMetrics>,
     mut shutdown_rx_ext: watch::Receiver<bool>,
 ) -> Result<()> {
@@ -153,6 +153,21 @@ pub async fn run_client_core(
     }
 
     log_to_core_file(&format!("[core] Starting run_client_core in mode: {}", config.mode));
+
+    // Resolve the server IP before we override system routing and DNS.
+    // This prevents DNS deadlock if the VPN disconnects and tries to reconnect,
+    // and also ensures we add the direct route to the exact IP the bridge connects to.
+    let resolved_addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host(&config.ostp.server_addr)
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to resolve server address {}: {}", config.ostp.server_addr, e))?
+        .collect();
+        
+    let target_addr = resolved_addrs.first()
+        .ok_or_else(|| anyhow::anyhow!("No IP addresses resolved for {}", config.ostp.server_addr))?;
+        
+    log_to_core_file(&format!("[core] Resolved server address to {}", target_addr));
+    config.ostp.server_addr = target_addr.to_string();
+
 
     #[cfg(target_os = "linux")]
     if config.mode == "tun" {
