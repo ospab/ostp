@@ -11,6 +11,7 @@ import Wiki from './pages/Wiki';
 import Tools from './pages/Tools';
 import AuditLogs from './pages/AuditLogs';
 import Login from './pages/Login';
+import Dns from './pages/Dns';
 
 // State and Context
 import { api } from './lib/api';
@@ -76,6 +77,10 @@ function MainLayout() {
             <Link to="/wiki" className="flex items-center gap-3 px-3 py-3 rounded-xl hover:bg-white/5 transition-colors text-text-muted hover:text-white">
               <BookOpen className="w-5 h-5 text-blue-400" />
               {isSidebarOpen && <span>{t('sidebar_wiki')}</span>}
+            </Link>
+            <Link to="/dns" className="flex items-center gap-3 px-3 py-3 rounded-xl hover:bg-white/5 transition-colors text-text-muted hover:text-white">
+              <Globe className="w-5 h-5 text-emerald-400" />
+              {isSidebarOpen && <span>{t('sidebar_dns')}</span>}
             </Link>
             <Link to="/logs" className="flex items-center gap-3 px-3 py-3 rounded-xl hover:bg-white/5 transition-colors text-text-muted hover:text-white">
               <History className="w-5 h-5 text-yellow-400" />
@@ -143,6 +148,7 @@ function MainLayout() {
               <Route path="/settings" element={<SettingsPage />} />
               <Route path="/wiki" element={<Wiki />} />
               <Route path="/tools" element={<Tools />} />
+              <Route path="/dns" element={<Dns />} />
               <Route path="/logs" element={<AuditLogs />} />
             </Routes>
           </div>

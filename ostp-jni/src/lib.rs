@@ -355,7 +355,7 @@ pub extern "system" fn Java_net_ostp_client_OstpClientSdk_stopClient(
     }
 
     if let Some(rt) = runtime {
-        rt.shutdown_timeout(std::time::Duration::from_secs(3));
+        rt.shutdown_background();
     }
 
     add_log("OSTP SDK: Client successfully stopped".to_string());

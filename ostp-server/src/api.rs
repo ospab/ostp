@@ -20,10 +20,9 @@ use portable_atomic::AtomicU64;
 use std::time::Instant;
 
 use axum::{
-    body::Body,
     extract::{Path, State},
-    http::{header, Request, StatusCode, Uri},
-    response::{IntoResponse, Response},
+    http::{header, StatusCode, Uri},
+    response::{IntoResponse},
     routing::{get, post, put},
     Json, Router,
 };
@@ -51,6 +50,7 @@ pub struct ApiState {
     pub server_port: u16,
     pub reality_query: String,
     pub config_path: Option<std::path::PathBuf>,
+    pub dns_server: std::sync::Arc<crate::dns::DnsServer>,
 }
 
 // ── API configuration ────────────────────────────────────────────────────────
@@ -209,7 +209,10 @@ pub fn create_api_router(state: ApiState) -> Router {
         .route("/users/{key}/limit", put(handle_set_limit))
         .route("/users/{key}/reset", post(handle_reset_stats))
         .route("/subscribe/{key}", get(handle_subscribe))
-        .route("/login", post(handle_login));
+        .route("/login", post(handle_login))
+        .route("/dns/config", get(handle_get_dns_config).post(handle_post_dns_config))
+        .route("/dns/queries", get(handle_get_dns_queries))
+        .route("/dns/blocklists/refresh", post(handle_refresh_blocklists));
 
     let webpath = state.webpath.clone();
     let webpath = webpath.trim_matches('/');
@@ -247,6 +250,7 @@ pub async fn start_api_server(
     server_port: u16,
     reality_query: String,
     config_path: Option<std::path::PathBuf>,
+    dns_server: std::sync::Arc<crate::dns::DnsServer>,
 ) {
     let state = ApiState {
         access_keys,
@@ -260,6 +264,7 @@ pub async fn start_api_server(
         server_port,
         reality_query,
         config_path,
+        dns_server,
     };
 
     let app = create_api_router(state);
@@ -740,7 +745,16 @@ async fn handle_subscribe(
 
     // If client requests plain text, return ostp:// share link
     if accept.contains("text/plain") {
-        let link = format!("ostp://{}@{}:{}{}", key, state.server_host, state.server_port, state.reality_query);
+        let dns_enabled = state.dns_server.config.read().await.enabled;
+        let mut rq = state.reality_query.clone();
+        if dns_enabled {
+            if rq.is_empty() {
+                rq = "?owndns=true".to_string();
+            } else {
+                rq = format!("{}&owndns=true", rq);
+            }
+        }
+        let link = format!("ostp://{}@{}:{}{}", key, state.server_host, state.server_port, rq);
         return (StatusCode::OK, Json(serde_json::json!({
             "ok": true,
             "data": link
@@ -778,45 +792,95 @@ async fn handle_subscribe(
     })))
 }
 
+// ── DNS API Handlers ──────────────────────────────────────────────────────────
+
+async fn handle_get_dns_config(
+    State(state): State<ApiState>,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    if !check_token(&state, &headers) {
+        return api_unauthorized::<serde_json::Value>();
+    }
+    let cfg = state.dns_server.config.read().await.clone();
+    (StatusCode::OK, ApiResponse::success(serde_json::to_value(cfg).unwrap_or_default()))
+}
+
+async fn handle_post_dns_config(
+    State(state): State<ApiState>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<crate::dns::DnsConfig>,
+) -> impl IntoResponse {
+    if !check_token(&state, &headers) {
+        return api_unauthorized::<bool>();
+    }
+    // Update in-memory config
+    let should_refresh = body.enabled && !body.adblock_urls.is_empty();
+    {
+        let mut cfg = state.dns_server.config.write().await;
+        *cfg = body;
+    }
+    // Reload blocklists if enabled
+    if should_refresh {
+        let dns = state.dns_server.clone();
+        tokio::spawn(async move { dns.update_blocklists().await; });
+    }
+    (StatusCode::OK, ApiResponse::success(true))
+}
+
+async fn handle_get_dns_queries(
+    State(state): State<ApiState>,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    if !check_token(&state, &headers) {
+        return api_unauthorized::<Vec<serde_json::Value>>();
+    }
+    let queries = state.dns_server.get_queries().await;
+    let data: Vec<serde_json::Value> = queries.iter().map(|q| serde_json::to_value(q).unwrap_or_default()).collect();
+    (StatusCode::OK, ApiResponse::success(data))
+}
+
+async fn handle_refresh_blocklists(
+    State(state): State<ApiState>,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    if !check_token(&state, &headers) {
+        return api_unauthorized::<bool>();
+    }
+    let dns = state.dns_server.clone();
+    tokio::spawn(async move { dns.update_blocklists().await; });
+    (StatusCode::OK, ApiResponse::success(true))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_router_creation() {
-        let state = ApiState {
+    fn make_test_state(webpath: &str) -> ApiState {
+        ApiState {
             access_keys: Arc::new(RwLock::new(HashMap::new())),
             user_stats: Arc::new(RwLock::new(HashMap::new())),
             start_time: std::time::Instant::now(),
             session_token: Arc::new(RwLock::new(None)),
-            webpath: "bNAzr8Ss".to_string(),
+            webpath: webpath.to_string(),
             username: "admin".to_string(),
             password_hash: "hash".to_string(),
             server_host: "127.0.0.1".to_string(),
             server_port: 50000,
             reality_query: "".to_string(),
             config_path: None,
-        };
-        // This should not panic
+            dns_server: crate::dns::DnsServer::new(Default::default()),
+        }
+    }
+
+    #[test]
+    fn test_router_creation() {
+        let state = make_test_state("bNAzr8Ss");
         let _router = create_api_router(state);
     }
 
     #[test]
     fn test_router_creation_empty_webpath() {
-        let state = ApiState {
-            access_keys: Arc::new(RwLock::new(HashMap::new())),
-            user_stats: Arc::new(RwLock::new(HashMap::new())),
-            start_time: std::time::Instant::now(),
-            session_token: Arc::new(RwLock::new(None)),
-            webpath: "".to_string(),
-            username: "admin".to_string(),
-            password_hash: "hash".to_string(),
-            server_host: "127.0.0.1".to_string(),
-            server_port: 50000,
-            reality_query: "".to_string(),
-            config_path: None,
-        };
-        // This should not panic
+        let state = make_test_state("");
         let _router = create_api_router(state);
     }
 }

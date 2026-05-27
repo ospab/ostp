@@ -18,6 +18,7 @@ pub mod transport;
 pub mod relay_node;
 mod relay;
 mod signal;
+pub mod dns;
 
 pub use outbound::{OutboundAction, OutboundConfig, OutboundRule};
 pub use api::ApiConfig;
@@ -59,6 +60,8 @@ pub(crate) enum UiEvent {
 pub(crate) struct RemoteState {
     pub data_tx: mpsc::UnboundedSender<Bytes>,
     pub cancel_tx: mpsc::Sender<()>,
+    #[allow(dead_code)]
+    pub is_dns: bool,
 }
 
 // ── Public API ───────────────────────────────────────────────────────────────
@@ -73,6 +76,7 @@ pub async fn run_server(
     debug: bool,
     reality_query: Option<String>,
     reality_config: Option<RealityServerConfig>,
+    dns_config: Option<dns::DnsConfig>,
     config_path: Option<std::path::PathBuf>,
 ) -> Result<()> {
     let mut keys_map = HashMap::new();
@@ -240,6 +244,9 @@ pub async fn run_server(
         }
     });
 
+    // Initialize DNS server
+    let dns_server = dns::DnsServer::new(dns_config.unwrap_or_default());
+
     // Spawn Management API if configured
     if let Some(api_cfg) = api_config {
         if api_cfg.enabled {
@@ -252,8 +259,9 @@ pub async fn run_server(
             let server_host = server_public_ip.unwrap_or_else(|| parts.get(1).unwrap_or(&"0.0.0.0").to_string());
             let rq = reality_query.clone().unwrap_or_default();
             let config_path_api = config_path.clone();
+            let dns_server_api = dns_server.clone();
             tokio::spawn(async move {
-                api::start_api_server(api_cfg, api_keys, api_stats, server_host, server_port, rq, config_path_api).await;
+                api::start_api_server(api_cfg, api_keys, api_stats, server_host, server_port, rq, config_path_api, dns_server_api).await;
             });
         }
     }
@@ -322,7 +330,7 @@ pub async fn run_server(
     };
 
     tokio::select! {
-        res = run_server_loop(bind_addrs.clone(), primary_socket, sockets, dispatcher, ui_cmd_rx, ui_event_tx, shared_keys, outbound, debug, tls_config) => {
+        res = run_server_loop(bind_addrs.clone(), primary_socket, sockets, dispatcher, ui_cmd_rx, ui_event_tx, shared_keys, outbound, debug, tls_config, dns_server) => {
             if let Err(e) = res {
                 tracing::error!("Server error: {e}");
             }
@@ -348,6 +356,7 @@ async fn run_server_loop(
     outbound: Option<OutboundConfig>,
     debug: bool,
     tls_config: Option<std::sync::Arc<rustls::ServerConfig>>,
+    dns_server: std::sync::Arc<dns::DnsServer>,
 ) -> Result<()> {
     let mut remotes: HashMap<(u32, u16), RemoteState> = HashMap::new();
     let (stream_tx, mut stream_rx) = mpsc::unbounded_channel::<(u32, u16, Vec<u8>)>();
@@ -545,6 +554,7 @@ async fn run_server_loop(
                                     stream_tx.clone(),
                                     connect_tx.clone(),
                                     outbound.clone(),
+                                    dns_server.clone(),
                                     debug,
                                 ).await?;
                             }
@@ -577,7 +587,7 @@ async fn run_server_loop(
                                 }
                             }
                         });
-                        remotes.insert((session_id, stream_id), RemoteState { data_tx, cancel_tx });
+                        remotes.insert((session_id, stream_id), RemoteState { data_tx, cancel_tx, is_dns: false });
                         let _ = relay::send_relay_to_stream(session_id, stream_id, RelayMessage::ConnectOk, &mut dispatcher, &socket, &ui_event_tx).await;
                         let _ = ui_event_tx.send(UiEvent::Log(format!("Relay CONNECT ok for [{session_id}:{stream_id}] -> {target}")));
                     }

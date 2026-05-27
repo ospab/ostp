@@ -21,6 +21,20 @@ export interface ApiResponse<T> {
   error?: string;
 }
 
+export interface DnsConfig {
+  enabled: boolean;
+  doh_upstream: string;
+  adblock_urls: string[];
+  custom_domains: Record<string, string>;
+}
+
+export interface DnsQueryLog {
+  timestamp: number;
+  domain: string;
+  client_ip: string;
+  blocked: boolean;
+}
+
 const API_TOKEN_KEY = 'ostp_api_token';
 
 export function getApiSettings() {
@@ -126,5 +140,18 @@ export const api = {
       return json.data;
     }
     throw new Error(json.error || 'Failed to fetch subscription link');
-  }
+  },
+
+  getDnsConfig: () => request<DnsConfig>('/api/dns/config'),
+  
+  updateDnsConfig: (config: DnsConfig) => request<boolean>('/api/dns/config', {
+    method: 'POST',
+    body: JSON.stringify(config),
+  }),
+
+  getDnsQueries: () => request<DnsQueryLog[]>('/api/dns/queries'),
+
+  refreshDnsBlocklists: () => request<boolean>('/api/dns/blocklists/refresh', {
+    method: 'POST',
+  }),
 };

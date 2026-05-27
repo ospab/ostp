@@ -241,6 +241,7 @@ struct ServerConfig {
     api: Option<ApiConfig>,
     fallback: Option<FallbackCfg>,
     transport: Option<TransportConfigRaw>,
+    dns: Option<ostp_server::dns::DnsConfig>,
 }
 
 /// Конфигурация Relay-узла в config.json
@@ -895,8 +896,10 @@ async fn run_app() -> Result<()> {
                 })
             }).collect::<Vec<_>>();
             let host = get_or_ask_public_ip(&args.config);
+            // Build DNS config and set owndns flag in subscribe links if DNS enabled
+            let dns_cfg = server_cfg.dns;
             // Pass all listen addresses for multi-listener support
-            ostp_server::run_server(listen_addrs, Some(host), access_keys_meta, outbound, api_config, fallback_config, debug, rq, rc, Some(args.config)).await?;
+            ostp_server::run_server(listen_addrs, Some(host), access_keys_meta, outbound, api_config, fallback_config, debug, rq, rc, dns_cfg, Some(args.config)).await?;
         }
         AppMode::Client(client_cfg) => {
             run_client_directly(client_cfg).await?;
