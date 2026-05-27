@@ -294,6 +294,7 @@ impl ListenConfig {
 struct ApiConfig {
     enabled: Option<bool>,
     bind: Option<String>,
+    token: Option<String>,
     webpath: Option<String>,
     username: Option<String>,
     password_hash: Option<String>,
@@ -631,10 +632,12 @@ async fn run_app() -> Result<()> {
     ]
   }},
   
-  // Web control panel
+  // Web control panel & Management API
   "api": {{
     "enabled": false,
     "bind": "0.0.0.0:9090",
+    // Static API token for Relay servers (optional)
+    "token": "",
     // Secret URL path to hide panel from scanners (e.g. "mySecret123")
     "webpath": "",
     // Login credentials for web panel (password stored as SHA256 hash)
@@ -904,6 +907,7 @@ async fn run_app() -> Result<()> {
             let api_config = server_cfg.api.map(|a| ostp_server::ApiConfig {
                 enabled: a.enabled.unwrap_or(false),
                 bind: a.bind.unwrap_or_else(|| "127.0.0.1:9090".to_string()),
+                token: a.token.clone(),
                 webpath: a.webpath.unwrap_or_default(),
                 username: a.username.unwrap_or_default(),
                 password_hash: a.password_hash.unwrap_or_default(),

@@ -42,6 +42,7 @@ pub struct ApiState {
     pub user_stats: Arc<RwLock<HashMap<String, Arc<UserStats>>>>,
     pub start_time: Instant,
     pub session_token: Arc<RwLock<Option<String>>>,
+    pub api_token: Option<String>,
     pub webpath: String,
     pub username: String,
     pub password_hash: String,
@@ -59,6 +60,7 @@ pub struct ApiState {
 pub struct ApiConfig {
     pub enabled: bool,
     pub bind: String,
+    pub token: Option<String>,
     #[serde(default)]
     pub webpath: String,
     #[serde(default)]
@@ -72,6 +74,7 @@ impl Default for ApiConfig {
         Self {
             enabled: false,
             bind: "127.0.0.1:9090".to_string(),
+            token: None,
             webpath: String::new(),
             username: String::new(),
             password_hash: String::new(),
@@ -257,6 +260,7 @@ pub async fn start_api_server(
         user_stats,
         start_time: Instant::now(),
         session_token: Arc::new(RwLock::new(None)),
+        api_token: config.token.clone(),
         webpath: config.webpath.clone(),
         username: config.username.clone(),
         password_hash: config.password_hash.clone(),
@@ -287,26 +291,40 @@ pub async fn start_api_server(
 // ── Middleware: token check ──────────────────────────────────────────────────
 
 fn check_token(state: &ApiState, headers: &axum::http::HeaderMap) -> bool {
+    // Both session token (for web UI) and static API token (for relays) are checked
+    let mut allowed = false;
+
     // If no credentials configured, panel is open (unsafe but possible)
-    if state.username.is_empty() && state.password_hash.is_empty() {
+    if state.username.is_empty() && state.password_hash.is_empty() && state.api_token.is_none() {
         return true;
     }
-    
-    match headers.get("authorization") {
-        Some(value) => {
-            let val = value.to_str().unwrap_or("");
+
+    if let Some(value) = headers.get("authorization") {
+        if let Ok(val) = value.to_str() {
             if let Some(token) = val.strip_prefix("Bearer ") {
                 let current_session = state.session_token.read().unwrap().clone();
                 if let Some(session) = current_session {
                     if token == session {
-                        return true;
+                        allowed = true;
+                    }
+                }
+                
+                if let Some(ref api_tok) = state.api_token {
+                    if token == api_tok {
+                        allowed = true;
+                    }
+                }
+            } else {
+                if let Some(ref api_tok) = state.api_token {
+                    if val == api_tok {
+                        allowed = true;
                     }
                 }
             }
-            false
         }
-        None => false,
     }
+
+    allowed
 }
 
 async fn handle_login(
@@ -904,6 +922,7 @@ mod tests {
             user_stats: Arc::new(RwLock::new(HashMap::new())),
             start_time: std::time::Instant::now(),
             session_token: Arc::new(RwLock::new(None)),
+            api_token: Some("test-token".to_string()),
             webpath: webpath.to_string(),
             username: "admin".to_string(),
             password_hash: "hash".to_string(),
