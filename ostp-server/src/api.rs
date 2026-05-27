@@ -757,20 +757,26 @@ async fn handle_reset_stats(
 ///
 /// GET /api/subscribe/{key}
 /// Response: JSON client config or ostp:// share link (via Accept header)
+
 async fn handle_subscribe(
     State(state): State<ApiState>,
     Path(key): Path<String>,
     headers: axum::http::HeaderMap,
-) -> impl IntoResponse {
-    // Validate that the key exists
-    let keys = state.access_keys.read().unwrap();
-    if !keys.contains_key(&key) {
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+
+    // Validate that the key exists in a tightly scoped block to drop the guard
+    let key_exists = {
+        let keys = state.access_keys.read().unwrap();
+        keys.contains_key(&key)
+    };
+
+    if !key_exists {
         return (StatusCode::NOT_FOUND, Json(serde_json::json!({
             "ok": false,
             "error": "invalid access key"
-        })));
+        }))).into_response();
     }
-    drop(keys);
 
     let accept = headers.get("accept")
         .and_then(|v| v.to_str().ok())
@@ -791,7 +797,7 @@ async fn handle_subscribe(
         return (StatusCode::OK, Json(serde_json::json!({
             "ok": true,
             "data": link
-        })));
+        }))).into_response();
     }
 
     // Default: return full client config JSON
@@ -822,7 +828,7 @@ async fn handle_subscribe(
     (StatusCode::OK, Json(serde_json::json!({
         "ok": true,
         "data": config
-    })))
+    }))).into_response()
 }
 
 // ── DNS API Handlers ──────────────────────────────────────────────────────────
