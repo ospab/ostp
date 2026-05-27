@@ -95,7 +95,7 @@ pub async fn run_native_tunnel(
         let _ = Command::new("ip").args(["route", "add", &format!("{}/32", server_ip_str), "via", "10.1.0.1"]).output();
     }
 
-    let (stack, tcp_runner, _udp_socket, tcp_listener) = StackBuilder::default()
+    let (stack, tcp_runner, udp_socket, tcp_listener) = StackBuilder::default()
         .enable_tcp(true)
         .enable_udp(true)
         .mtu(config.ostp.mtu)
@@ -130,6 +130,50 @@ pub async fn run_native_tunnel(
         while let Some(Ok(frame)) = stack_stream.next().await {
             if tun_write.write_all(frame.as_slice()).await.is_err() {
                 break;
+            }
+        }
+    });
+
+    let udp_proxy_addr = config.local_proxy.bind_addr.clone();
+    let debug_udp = config.debug;
+    let mut udp_proxy_task = tokio::spawn(async move {
+        if let Some(udp_sock) = udp_socket {
+            let (mut rx, tx) = udp_sock.split();
+            let tx = std::sync::Arc::new(tokio::sync::Mutex::new(tx));
+            while let Some((payload, src, dst)) = rx.next().await {
+                if payload.is_empty() { continue; }
+                if dst.port() == 53 {
+                    let tx_clone = tx.clone();
+                    let proxy_addr = udp_proxy_addr.clone();
+                    tokio::spawn(async move {
+                        if debug_udp { tracing::info!("Native TUN intercepted UDP DNS to {}", dst); }
+                        if let Ok(mut socks) = tokio::net::TcpStream::connect(&proxy_addr).await {
+                            if socks.write_all(&[5, 1, 0]).await.is_err() { return; }
+                            let mut buf = [0u8; 2];
+                            if socks.read_exact(&mut buf).await.is_err() || buf[0] != 5 || buf[1] != 0 { return; }
+                            
+                            let mut req = vec![5, 1, 0];
+                            match dst.ip() {
+                                std::net::IpAddr::V4(v4) => { req.push(1); req.extend_from_slice(&v4.octets()); }
+                                std::net::IpAddr::V6(v6) => { req.push(4); req.extend_from_slice(&v6.octets()); }
+                            }
+                            req.extend_from_slice(&dst.port().to_be_bytes());
+                            if socks.write_all(&req).await.is_err() { return; }
+                            
+                            let mut rep = [0u8; 10];
+                            if socks.read_exact(&mut rep).await.is_err() || rep[1] != 0 { return; }
+
+                            if socks.write_all(&payload).await.is_ok() {
+                                let mut response_buf = [0u8; 4096];
+                                if let Ok(n) = socks.read(&mut response_buf).await {
+                                    if n > 0 {
+                                        let _ = tx_clone.lock().await.send((response_buf[..n].to_vec(), dst, src)).await;
+                                    }
+                                }
+                            }
+                        }
+                    });
+                }
             }
         }
     });
@@ -180,6 +224,7 @@ pub async fn run_native_tunnel(
         _ = &mut runner_task => {}
         _ = &mut tun_to_stack => {}
         _ = &mut stack_to_tun => {}
+        _ = &mut udp_proxy_task => {}
         _ = &mut tcp_accept_task => {}
     }
 
@@ -237,7 +282,7 @@ pub async fn run_native_tunnel_from_fd(
     let file = unsafe { std::fs::File::from_raw_fd(fd) };
     let tun_stream = tokio::io::unix::AsyncFd::new(file)?;
 
-    let (stack, tcp_runner, _udp_socket, tcp_listener) = StackBuilder::default()
+    let (stack, tcp_runner, udp_socket, tcp_listener) = StackBuilder::default()
         .enable_tcp(true)
         .enable_udp(true)
         .mtu(config.ostp.mtu)
@@ -331,6 +376,50 @@ pub async fn run_native_tunnel_from_fd(
         }
     });
 
+    let udp_proxy_addr = config.local_proxy.bind_addr.clone();
+    let debug_udp = config.debug;
+    let mut udp_proxy_task = tokio::spawn(async move {
+        if let Some(udp_sock) = udp_socket {
+            let (mut rx, tx) = udp_sock.split();
+            let tx = std::sync::Arc::new(tokio::sync::Mutex::new(tx));
+            while let Some((payload, src, dst)) = rx.next().await {
+                if payload.is_empty() { continue; }
+                if dst.port() == 53 {
+                    let tx_clone = tx.clone();
+                    let proxy_addr = udp_proxy_addr.clone();
+                    tokio::spawn(async move {
+                        if debug_udp { tracing::info!("Native TUN intercepted UDP DNS to {}", dst); }
+                        if let Ok(mut socks) = tokio::net::TcpStream::connect(&proxy_addr).await {
+                            if socks.write_all(&[5, 1, 0]).await.is_err() { return; }
+                            let mut buf = [0u8; 2];
+                            if socks.read_exact(&mut buf).await.is_err() || buf[0] != 5 || buf[1] != 0 { return; }
+                            
+                            let mut req = vec![5, 1, 0];
+                            match dst.ip() {
+                                std::net::IpAddr::V4(v4) => { req.push(1); req.extend_from_slice(&v4.octets()); }
+                                std::net::IpAddr::V6(v6) => { req.push(4); req.extend_from_slice(&v6.octets()); }
+                            }
+                            req.extend_from_slice(&dst.port().to_be_bytes());
+                            if socks.write_all(&req).await.is_err() { return; }
+                            
+                            let mut rep = [0u8; 10];
+                            if socks.read_exact(&mut rep).await.is_err() || rep[1] != 0 { return; }
+
+                            if socks.write_all(&payload).await.is_ok() {
+                                let mut response_buf = [0u8; 4096];
+                                if let Ok(n) = socks.read(&mut response_buf).await {
+                                    if n > 0 {
+                                        let _ = tx_clone.lock().await.send((response_buf[..n].to_vec(), dst, src)).await;
+                                    }
+                                }
+                            }
+                        }
+                    });
+                }
+            }
+        }
+    });
+
     let proxy_addr = config.local_proxy.bind_addr.clone();
     let mut tcp_accept_task = tokio::spawn(async move {
         if let Some(mut listener) = tcp_listener {
@@ -376,6 +465,7 @@ pub async fn run_native_tunnel_from_fd(
         _ = &mut runner_task => {}
         _ = &mut tun_to_stack => {}
         _ = &mut stack_to_tun => {}
+        _ = &mut udp_proxy_task => {}
         _ = &mut tcp_accept_task => {}
     }
 
@@ -391,3 +481,4 @@ pub async fn run_native_tunnel_from_fd(
 ) -> Result<()> {
     Err(anyhow!("Native TUN from FD is only supported on Android"))
 }
+
