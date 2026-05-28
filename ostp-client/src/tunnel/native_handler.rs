@@ -126,7 +126,7 @@ pub async fn run_native_tunnel(
         .build()?;
 
     let mut runner_task = tokio::spawn(async move {
-        if let Some(mut runner) = tcp_runner {
+        if let Some(runner) = tcp_runner {
             let _ = runner.await;
         }
     });

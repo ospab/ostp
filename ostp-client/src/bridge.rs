@@ -200,6 +200,12 @@ impl Bridge {
                                                                 self.last_rtt_ms = now.saturating_sub(ts) as f64;
                                                                 self.metrics.rtt_ms.store(self.last_rtt_ms as u32, Ordering::Relaxed);
                                                             }
+                                                            RelayMessage::UdpAssociate => {
+                                                                // Should not be received by client, ignore
+                                                            }
+                                                            RelayMessage::UdpData(target, data) => {
+                                                                let _ = proxy_tx.send((stream_id, ProxyToClientMsg::UdpData(target, Bytes::from(data))));
+                                                            }
                                                             RelayMessage::KeepAlive | RelayMessage::Ping(_) | RelayMessage::Connect(_) => {}
                                                         }
                                                     }
@@ -580,6 +586,13 @@ impl Bridge {
                                 ProxyEvent::NewStream { stream_id, target } => {
                                     let _ = tx.send(UiEvent::Log(format!("Proxy CONNECT stream_id={stream_id} target={target}"))).await;
                                     (stream_id, RelayMessage::Connect(target), false)
+                                }
+                                ProxyEvent::UdpAssociate { stream_id } => {
+                                    let _ = tx.send(UiEvent::Log(format!("Proxy UDP ASSOCIATE stream_id={stream_id}"))).await;
+                                    (stream_id, RelayMessage::UdpAssociate, false)
+                                }
+                                ProxyEvent::UdpData { stream_id, target, payload } => {
+                                    (stream_id, RelayMessage::UdpData(target, payload.to_vec()), false)
                                 }
                                 ProxyEvent::Data { stream_id, payload } => (stream_id, RelayMessage::Data(payload.to_vec()), false),
                                 ProxyEvent::Close { stream_id } => {

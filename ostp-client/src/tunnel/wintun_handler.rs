@@ -45,7 +45,16 @@ pub async fn run_wintun_tunnel(
 
     let exe = std::env::current_exe()?;
     let dir = exe.parent().ok_or_else(|| anyhow!("failed to get binary directory"))?;
-    let tun2socks_exe = dir.join("tun2socks.exe");
+    
+    let mut tun2socks_exe = dir.join("tun2socks.exe");
+    if !tun2socks_exe.exists() {
+        if let Ok(cwd) = std::env::current_dir() {
+            let cwd_candidate = cwd.join("tun2socks.exe");
+            if cwd_candidate.exists() {
+                tun2socks_exe = cwd_candidate;
+            }
+        }
+    }
 
     if !tun2socks_exe.exists() {
         return Err(anyhow!(
@@ -59,14 +68,15 @@ pub async fn run_wintun_tunnel(
 
     // 1. Delete stale TUN adapter if it exists from a previous run.
     //    This prevents wintun from creating "ostp_tun 2", "ostp_tun 3", etc.
+    //    Actually, tun2socks can reuse the existing adapter if we just leave it alone.
+    //    We only clear old IP addresses and routes on it.
     tracing::info!("Cleaning up stale TUN adapter...");
     let _ = tokio::task::spawn_blocking(move || {
         Command::new("powershell")
             .creation_flags(CREATE_NO_WINDOW)
             .args(["-NoProfile", "-Command", &format!(
-                "Get-NetAdapter -Name '{TUN_NAME}*' -ErrorAction SilentlyContinue | \
-                 Disable-NetAdapter -Confirm:$false -ErrorAction SilentlyContinue; \
-                 netsh interface set interface \"{TUN_NAME}\" admin=disable 2>$null"
+                "Remove-NetIPAddress -InterfaceAlias '{TUN_NAME}' -Confirm:$false -ErrorAction SilentlyContinue; \
+                 Remove-NetRoute -InterfaceAlias '{TUN_NAME}' -Confirm:$false -ErrorAction SilentlyContinue"
             )])
             .output()
     }).await;
@@ -173,10 +183,11 @@ pub async fn run_wintun_tunnel(
     // 6. Configure the adapter (IP, metric, MTU, DNS)
     tracing::info!("Applying network configuration...");
     let mut net_setup = format!(
-        "netsh interface ipv4 set address name=\"{TUN_NAME}\" static 10.1.0.2 255.255.255.0 10.1.0.1\n\
+        "netsh interface ipv4 set address name=\"{TUN_NAME}\" static 10.1.0.2 255.255.255.0\n\
          netsh interface ipv4 set subinterface \"{TUN_NAME}\" mtu={} store=persistent\n\
          netsh interface ipv4 set interface name=\"{TUN_NAME}\" metric=1\n\
-         New-NetRoute -DestinationPrefix '0.0.0.0/0' -InterfaceAlias '{TUN_NAME}' -NextHop '10.1.0.1' -RouteMetric 1 -ErrorAction SilentlyContinue\n",
+         New-NetRoute -DestinationPrefix '0.0.0.0/1' -InterfaceAlias '{TUN_NAME}' -RouteMetric 1 -ErrorAction SilentlyContinue\n\
+         New-NetRoute -DestinationPrefix '128.0.0.0/1' -InterfaceAlias '{TUN_NAME}' -RouteMetric 1 -ErrorAction SilentlyContinue\n",
          config.ostp.mtu
     );
     

@@ -10,6 +10,8 @@ pub enum RelayMessage {
     Error(String),
     Ping(u64),
     Pong(u64),
+    UdpAssociate,
+    UdpData(String, Vec<u8>),
 }
 
 impl RelayMessage {
@@ -23,6 +25,17 @@ impl RelayMessage {
             RelayMessage::Error(msg) => encode_with_len(6, msg.as_bytes()),
             RelayMessage::Ping(ts) => encode_with_len(7, &ts.to_be_bytes()),
             RelayMessage::Pong(ts) => encode_with_len(8, &ts.to_be_bytes()),
+            RelayMessage::UdpAssociate => vec![9],
+            RelayMessage::UdpData(addr, data) => {
+                let addr_bytes = addr.as_bytes();
+                let mut buf = Vec::with_capacity(1 + 2 + addr_bytes.len() + 2 + data.len());
+                buf.push(10);
+                buf.extend_from_slice(&(addr_bytes.len() as u16).to_be_bytes());
+                buf.extend_from_slice(addr_bytes);
+                buf.extend_from_slice(&(data.len() as u16).to_be_bytes());
+                buf.extend_from_slice(data);
+                buf
+            }
         }
     }
 
@@ -56,11 +69,29 @@ impl RelayMessage {
             }
             8 => {
                 let payload = decode_with_len(&input[1..])?;
-                if payload.len() != 8 { return Err(anyhow!("invalid pong payload len")); }
-                let ts = u64::from_be_bytes(payload.try_into().unwrap());
-                Ok(RelayMessage::Pong(ts))
+                if payload.len() != 8 {
+                    return Err(anyhow!("invalid pong payload"));
+                }
+                let mut ts = [0u8; 8];
+                ts.copy_from_slice(payload);
+                Ok(RelayMessage::Pong(u64::from_be_bytes(ts)))
             }
-            t => Err(anyhow!("unknown relay message type {t}")),
+            9 => Ok(RelayMessage::UdpAssociate),
+            10 => {
+                if input.len() < 3 { return Err(anyhow!("invalid udp data")); }
+                let addr_len = u16::from_be_bytes([input[1], input[2]]) as usize;
+                if input.len() < 3 + addr_len + 2 { return Err(anyhow!("invalid udp data")); }
+                let addr = String::from_utf8(input[3..3+addr_len].to_vec())
+                    .map_err(|_| anyhow!("invalid utf8 in udp addr"))?;
+                
+                let data_offset = 3 + addr_len;
+                let data_len = u16::from_be_bytes([input[data_offset], input[data_offset+1]]) as usize;
+                if input.len() < data_offset + 2 + data_len { return Err(anyhow!("invalid udp data")); }
+                
+                let data = input[data_offset+2..data_offset+2+data_len].to_vec();
+                Ok(RelayMessage::UdpData(addr, data))
+            }
+            _ => Err(anyhow!("unknown relay message type {}", input[0])),
         }
     }
 }

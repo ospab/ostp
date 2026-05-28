@@ -41,6 +41,14 @@ pub enum ProxyEvent {
         stream_id: u16,
         target: String,
     },
+    UdpAssociate {
+        stream_id: u16,
+    },
+    UdpData {
+        stream_id: u16,
+        target: String,
+        payload: bytes::Bytes,
+    },
     Data {
         stream_id: u16,
         payload: bytes::Bytes,
@@ -54,6 +62,7 @@ pub enum ProxyEvent {
 pub enum ProxyToClientMsg {
     ConnectOk,
     Data(bytes::Bytes),
+    UdpData(String, bytes::Bytes),
     Close,
     Error(String),
 }

@@ -484,14 +484,19 @@ fn find_helper_exe() -> Option<PathBuf> {
 }
 
 #[cfg(target_os = "windows")]
-fn launch_as_admin(exe: &PathBuf) -> Result<()> {
+fn launch_as_admin(exe: &std::path::PathBuf) -> anyhow::Result<()> {
     use std::ffi::OsStr;
     use std::os::windows::ffi::OsStrExt;
     use std::ptr::null_mut;
+    use std::path::Path;
     let exe_wstr: Vec<u16> = exe.as_os_str().encode_wide().chain(Some(0)).collect();
     let verb_wstr: Vec<u16> = OsStr::new("runas").encode_wide().chain(Some(0)).collect();
     #[link(name = "shell32")] extern "system" { fn ShellExecuteW(h: *mut std::ffi::c_void, op: *const u16, f: *const u16, p: *const u16, d: *const u16, s: i32) -> isize; }
-    let dir_wstr: Vec<u16> = exe.parent().unwrap_or(Path::new(".")).as_os_str().encode_wide().chain(Some(0)).collect();
+    
+    // Use the GUI executable's directory as the working directory so dependencies are found
+    let cwd_path = std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let dir_wstr: Vec<u16> = cwd_path.parent().unwrap_or(Path::new(".")).as_os_str().encode_wide().chain(Some(0)).collect();
+    
     let ret = unsafe { ShellExecuteW(null_mut(), verb_wstr.as_ptr(), exe_wstr.as_ptr(), null_mut(), dir_wstr.as_ptr(), 0) };
     if ret <= 32 { anyhow::bail!("UAC denied or helper missing."); }
     Ok(())

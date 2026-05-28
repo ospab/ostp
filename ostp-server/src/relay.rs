@@ -21,6 +21,7 @@ pub async fn handle_relay_message(
     remotes: &mut HashMap<(u32, u16), RemoteState>,
     ui_event_tx: &mpsc::UnboundedSender<UiEvent>,
     stream_tx: mpsc::UnboundedSender<(u32, u16, Vec<u8>)>,
+    udp_reply_tx: mpsc::UnboundedSender<(u32, u16, String, Vec<u8>)>,
     connect_tx: mpsc::UnboundedSender<(u32, u16, String, Result<(tokio::net::tcp::OwnedWriteHalf, mpsc::Sender<()>), String>)>,
     outbound_cfg: Option<OutboundConfig>,
     dns_server: std::sync::Arc<crate::dns::DnsServer>,
@@ -52,6 +53,7 @@ pub async fn handle_relay_message(
 
                 remotes.insert((session_id, stream_id), RemoteState {
                     data_tx: dns_query_tx,
+                    udp_tx: None,
                     cancel_tx,
                     is_dns: true,
                 });
@@ -121,11 +123,81 @@ pub async fn handle_relay_message(
             send_relay_to_stream(session_id, stream_id, RelayMessage::Pong(ts), dispatcher, socket, ui_event_tx).await?;
         }
         RelayMessage::Pong(_) => {}
+        RelayMessage::UdpAssociate => {
+            if debug {
+                let _ = ui_event_tx.send(UiEvent::Log(format!("Relay UDP ASSOCIATE stream_id={stream_id}")));
+            }
+            let server_udp = match UdpSocket::bind("0.0.0.0:0").await {
+                Ok(s) => std::sync::Arc::new(s),
+                Err(e) => {
+                    let _ = ui_event_tx.send(UiEvent::Log(format!("UDP bind failed: {e}")));
+                    return Ok(());
+                }
+            };
+            
+            let (udp_tx, mut udp_rx) = mpsc::unbounded_channel::<(String, Bytes)>();
+            let (cancel_tx, mut cancel_rx) = mpsc::channel::<()>(1);
+            let (dummy_data_tx, _) = mpsc::unbounded_channel::<Bytes>();
+
+            // Outbound UDP loop (tunnel -> target)
+            let tx_sock = server_udp.clone();
+            let dns_srv = dns_server.clone();
+            let udp_reply_clone_dns = udp_reply_tx.clone();
+            let client_ip = peer_addr.ip();
+            tokio::spawn(async move {
+                while let Some((target, data)) = udp_rx.recv().await {
+                    let is_internal_dns = target == "10.1.0.1:53" && dns_srv.config.read().await.enabled;
+                    if is_internal_dns {
+                        if let Some(resp_bytes) = dns_srv.resolve(&data, client_ip).await {
+                            let _ = udp_reply_clone_dns.send((session_id, stream_id, target, resp_bytes));
+                        }
+                    } else {
+                        let _ = tx_sock.send_to(&data, &target).await;
+                    }
+                }
+            });
+
+            // Inbound UDP loop (target -> tunnel)
+            let rx_sock = server_udp.clone();
+            let udp_reply_clone = udp_reply_tx.clone();
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 65536];
+                loop {
+                    tokio::select! {
+                        _ = cancel_rx.recv() => break,
+                        res = rx_sock.recv_from(&mut buf) => {
+                            match res {
+                                Ok((len, addr)) => {
+                                    let _ = udp_reply_clone.send((session_id, stream_id, addr.to_string(), buf[..len].to_vec()));
+                                }
+                                Err(_) => break,
+                            }
+                        }
+                    }
+                }
+            });
+
+            remotes.insert((session_id, stream_id), RemoteState {
+                data_tx: dummy_data_tx,
+                udp_tx: Some(udp_tx),
+                cancel_tx,
+                is_dns: false,
+            });
+
+            send_relay_to_stream(session_id, stream_id, RelayMessage::ConnectOk, dispatcher, socket, ui_event_tx).await?;
+        }
+        RelayMessage::UdpData(target, data) => {
+            if let Some(remote) = remotes.get_mut(&(session_id, stream_id)) {
+                if let Some(ref udp_tx) = remote.udp_tx {
+                    let _ = udp_tx.send((target, Bytes::from(data)));
+                }
+            } else {
+                let _ = ui_event_tx.send(UiEvent::Log(format!("Relay UDP DATA for unknown stream [{session_id}:{stream_id}]")));
+            }
+        }
     }
     Ok(())
 }
-
-
 
 pub async fn send_relay_to_stream(
     session_id: u32,

@@ -2632,7 +2632,7 @@ dependencies = [
 
 [[package]]
 name = "ostp-client"
-version = "0.2.60"
+version = "0.2.61"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -2662,7 +2662,7 @@ dependencies = [
 
 [[package]]
 name = "ostp-core"
-version = "0.2.60"
+version = "0.2.61"
 dependencies = [
  "anyhow",
  "bytes",

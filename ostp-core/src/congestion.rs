@@ -49,6 +49,7 @@ enum Phase {
     /// Probe bandwidth: cycle through pacing gains
     ProbeBandwidth,
     /// Periodically drain the queue to measure true min RTT
+    #[allow(dead_code)]
     ProbeRtt,
 }
 
@@ -257,6 +258,7 @@ impl CongestionController {
         }
     }
 
+    #[allow(dead_code)]
     fn bandwidth_delay_product(&self) -> u64 {
         // BDP = max_bandwidth * min_rtt
         let bw = if self.max_bandwidth > 0 {

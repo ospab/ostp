@@ -1,7 +1,8 @@
 use std::collections::HashMap;
 use anyhow::{anyhow, Context, Result};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
+use std::sync::Arc;
 use tokio::sync::{mpsc, watch};
 use tokio::time::{timeout, Duration};
 
@@ -140,6 +141,104 @@ impl Drop for StreamGuard {
     }
 }
 
+async fn handle_udp_associate(
+    mut client_tcp: TcpStream,
+    udp_socket: tokio::net::UdpSocket,
+    stream_id: u16,
+    event_tx: mpsc::Sender<ProxyEvent>,
+    mut rx: mpsc::UnboundedReceiver<ProxyToClientMsg>,
+    close_tx: mpsc::Sender<u16>,
+    _debug: bool,
+) -> Result<()> {
+    let mut client_udp_addr = None;
+    let mut buf = vec![0u8; 65536];
+    
+    let udp_socket = Arc::new(udp_socket);
+    let sock_rx = udp_socket.clone();
+    let sock_tx = udp_socket;
+
+    let mut tcp_buf = [0u8; 1];
+    loop {
+        tokio::select! {
+            res = client_tcp.read(&mut tcp_buf) => {
+                let n = res?;
+                if n == 0 { break; }
+            }
+            res = sock_rx.recv_from(&mut buf) => {
+                let (len, addr) = res?;
+                if client_udp_addr.is_none() {
+                    client_udp_addr = Some(addr);
+                }
+                if len < 4 { continue; }
+                let frag = buf[2];
+                if frag != 0 { continue; } // Fragmented UDP not supported
+                let atyp = buf[3];
+                let (header_len, target) = match atyp {
+                    0x01 => {
+                        if len < 10 { continue; }
+                        let ip = std::net::Ipv4Addr::new(buf[4], buf[5], buf[6], buf[7]);
+                        let port = u16::from_be_bytes([buf[8], buf[9]]);
+                        (10, format!("{}:{}", ip, port))
+                    }
+                    0x03 => {
+                        if len < 5 { continue; }
+                        let domain_len = buf[4] as usize;
+                        if len < 5 + domain_len + 2 { continue; }
+                        let domain = String::from_utf8_lossy(&buf[5..5+domain_len]);
+                        let port = u16::from_be_bytes([buf[5+domain_len], buf[5+domain_len+1]]);
+                        (5 + domain_len + 2, format!("{}:{}", domain, port))
+                    }
+                    0x04 => {
+                        if len < 22 { continue; }
+                        let mut octets = [0u8; 16];
+                        octets.copy_from_slice(&buf[4..20]);
+                        let ip = std::net::Ipv6Addr::from(octets);
+                        let port = u16::from_be_bytes([buf[20], buf[21]]);
+                        (22, format!("[{}]:{}", ip, port))
+                    }
+                    _ => continue,
+                };
+                let payload = bytes::Bytes::copy_from_slice(&buf[header_len..len]);
+                let _ = event_tx.send(ProxyEvent::UdpData { stream_id, target, payload }).await;
+            }
+            msg = rx.recv() => {
+                match msg {
+                    Some(ProxyToClientMsg::UdpData(target, data)) => {
+                        if let Some(client_addr) = client_udp_addr {
+                            let mut packet = vec![0x00, 0x00, 0x00];
+                            let mut parts = target.rsplitn(2, ':');
+                            let port_str = parts.next().unwrap_or("0");
+                            let host_str = parts.next().unwrap_or(&target);
+                            let host_str = host_str.trim_start_matches('[').trim_end_matches(']');
+                            let port = port_str.parse::<u16>().unwrap_or(0);
+                            
+                            if let Ok(ipv4) = host_str.parse::<std::net::Ipv4Addr>() {
+                                packet.push(0x01);
+                                packet.extend_from_slice(&ipv4.octets());
+                            } else if let Ok(ipv6) = host_str.parse::<std::net::Ipv6Addr>() {
+                                packet.push(0x04);
+                                packet.extend_from_slice(&ipv6.octets());
+                            } else {
+                                packet.push(0x03);
+                                let bytes = host_str.as_bytes();
+                                packet.push(bytes.len() as u8);
+                                packet.extend_from_slice(bytes);
+                            }
+                            packet.extend_from_slice(&port.to_be_bytes());
+                            packet.extend_from_slice(&data);
+                            let _ = sock_tx.send_to(&packet, client_addr).await;
+                        }
+                    }
+                    Some(ProxyToClientMsg::Close) | Some(ProxyToClientMsg::Error(_)) | None => break,
+                    _ => {}
+                }
+            }
+        }
+    }
+    let _ = close_tx.send(stream_id).await;
+    Ok(())
+}
+
 async fn handle_proxy_client(
     mut client: TcpStream,
     stream_id: u16,
@@ -178,8 +277,10 @@ async fn handle_proxy_client(
         if req[0] != 0x05 {
             return Err(anyhow!("SOCKS5 request version mismatch"));
         }
-        if req[1] != 0x01 {
-            // Not CONNECT — send COMMAND NOT SUPPORTED
+        
+        let is_udp = req[1] == 0x03;
+        if req[1] != 0x01 && !is_udp {
+            // Not CONNECT and Not UDP ASSOCIATE — send COMMAND NOT SUPPORTED
             client.write_all(&[0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await?;
             return Err(anyhow!("unsupported SOCKS5 command {}", req[1]));
         }
@@ -216,6 +317,18 @@ async fn handle_proxy_client(
                 return Err(anyhow!("unsupported SOCKS5 address type: {}", atyp));
             }
         };
+
+        if is_udp {
+            if debug { tracing::info!("proxy UDP ASSOCIATE stream_id={stream_id}"); }
+            let udp_socket = UdpSocket::bind("127.0.0.1:0").await?;
+            let port = udp_socket.local_addr()?.port();
+            let mut reply = vec![0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1];
+            reply.extend_from_slice(&port.to_be_bytes());
+            client.write_all(&reply).await?;
+            
+            event_tx.send(ProxyEvent::UdpAssociate { stream_id }).await?;
+            return handle_udp_associate(client, udp_socket, stream_id, event_tx, rx, close_tx, debug).await;
+        }
 
         if debug {
             tracing::info!("proxy CONNECT stream_id={stream_id} target={target}");
@@ -386,7 +499,7 @@ async fn handle_proxy_client(
                     Some(ProxyToClientMsg::Close) | Some(ProxyToClientMsg::Error(_)) | None => {
                         break;
                     }
-                    Some(ProxyToClientMsg::ConnectOk) => {} // ignored after connect phase
+                    Some(ProxyToClientMsg::ConnectOk) | Some(ProxyToClientMsg::UdpData(_, _)) => {} // ignored after connect phase
                 }
             }
         }

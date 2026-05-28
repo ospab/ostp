@@ -123,6 +123,7 @@ function setState(next) {
     statusSub.textContent   = t('hint_connecting');
     connInfo.classList.add('hidden');
     clearInterval(uptimeTimer);
+    uptimeTimer = null;
     uptimeSecs = 0;
 
   } else if (next === 'connected') {
@@ -141,6 +142,7 @@ function setState(next) {
     // Start uptime counter
     if (!uptimeTimer) {
       uptimeSecs = 0;
+      statusSub.textContent = fmtTime(uptimeSecs);
       uptimeTimer = setInterval(() => {
         uptimeSecs++;
         statusSub.textContent = fmtTime(uptimeSecs);

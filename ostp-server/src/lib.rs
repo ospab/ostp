@@ -59,6 +59,7 @@ pub(crate) enum UiEvent {
 
 pub(crate) struct RemoteState {
     pub data_tx: mpsc::UnboundedSender<Bytes>,
+    pub udp_tx: Option<mpsc::UnboundedSender<(String, Bytes)>>,
     pub cancel_tx: mpsc::Sender<()>,
     #[allow(dead_code)]
     pub is_dns: bool,
@@ -360,6 +361,7 @@ async fn run_server_loop(
 ) -> Result<()> {
     let mut remotes: HashMap<(u32, u16), RemoteState> = HashMap::new();
     let (stream_tx, mut stream_rx) = mpsc::unbounded_channel::<(u32, u16, Vec<u8>)>();
+    let (udp_reply_tx, mut udp_reply_rx) = mpsc::unbounded_channel::<(u32, u16, String, Vec<u8>)>();
     let (connect_tx, mut connect_rx) = mpsc::unbounded_channel::<(u32, u16, String, Result<(tokio::net::tcp::OwnedWriteHalf, mpsc::Sender<()>), String>)>();
 
     let tcp_map = std::sync::Arc::new(tokio::sync::RwLock::new(HashMap::new()));
@@ -545,6 +547,7 @@ async fn run_server_loop(
                                     &mut remotes,
                                     &ui_event_tx,
                                     stream_tx.clone(),
+                                    udp_reply_tx.clone(),
                                     connect_tx.clone(),
                                     outbound.clone(),
                                     dns_server.clone(),
@@ -568,6 +571,9 @@ async fn run_server_loop(
                     let _ = relay::send_relay_to_stream(session_id, stream_id, RelayMessage::Data(data), &mut dispatcher, &socket, &ui_event_tx).await;
                 }
             }
+            Some((session_id, stream_id, target, data)) = udp_reply_rx.recv() => {
+                let _ = relay::send_relay_to_stream(session_id, stream_id, RelayMessage::UdpData(target, data), &mut dispatcher, &socket, &ui_event_tx).await;
+            }
             Some((session_id, stream_id, target, res)) = connect_rx.recv() => {
                 match res {
                     Ok((writer, cancel_tx)) => {
@@ -580,7 +586,7 @@ async fn run_server_loop(
                                 }
                             }
                         });
-                        remotes.insert((session_id, stream_id), RemoteState { data_tx, cancel_tx, is_dns: false });
+                        remotes.insert((session_id, stream_id), RemoteState { data_tx, udp_tx: None, cancel_tx, is_dns: false });
                         let _ = relay::send_relay_to_stream(session_id, stream_id, RelayMessage::ConnectOk, &mut dispatcher, &socket, &ui_event_tx).await;
                         let _ = ui_event_tx.send(UiEvent::Log(format!("Relay CONNECT ok for [{session_id}:{stream_id}] -> {target}")));
                     }

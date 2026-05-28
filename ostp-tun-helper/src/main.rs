@@ -48,6 +48,12 @@ struct TunnelState {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let _ = std::env::set_current_dir(dir);
+        }
+    }
+
     log_to_file("Helper started (TCP mode)");
     if let Err(e) = run_server().await {
         log_to_file(&format!("Fatal error: {}", e));
