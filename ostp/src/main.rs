@@ -70,6 +70,8 @@ fn parse_ostp_link(link: &str) -> Result<ClientConfig> {
     let mut sid = String::new();
     let mut spx = String::new();
     let mut transport_mode = String::from("udp");
+    let mut tun_enabled = false;
+    let mut tun_dns = None;
 
     for (k, v) in parsed.query_pairs() {
         match k.as_ref() {
@@ -79,6 +81,8 @@ fn parse_ostp_link(link: &str) -> Result<ClientConfig> {
             "sid" => sid = v.into_owned(),
             "spx" => spx = v.into_owned(),
             "type" => transport_mode = v.into_owned(),
+            "tun" => tun_enabled = v == "true",
+            "dns" => tun_dns = Some(v.into_owned()),
             _ => {}
         }
     }
@@ -94,12 +98,13 @@ fn parse_ostp_link(link: &str) -> Result<ClientConfig> {
         }),
         socks5_bind: Some("127.0.0.1:1088".to_string()),
         tun: Some(TunConfig {
-            enable: false,
+            enable: tun_enabled,
             wintun_path: Some("./wintun.dll".to_string()),
             ipv4_address: Some("10.1.0.2/24".to_string()),
-            dns: None,
+            dns: tun_dns,
         }),
         reality: Some(RealityConfigRaw {
+            enabled: true,
             sni,
             fp,
             pbk,
@@ -338,6 +343,8 @@ struct TunConfig {
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 struct RealityConfigRaw {
+    #[serde(default)]
+    enabled: bool,
     sni: String,
     fp: String,
     pbk: String,
@@ -601,8 +608,8 @@ async fn run_app() -> Result<()> {
     if let Some(ref mode_str) = args.init {
         let is_server = mode_str == "server";
         let key = generate_secure_key("hex");
+        let (priv_key, pub_key, sid) = generate_reality_keys();
         let content = if is_server {
-            let (priv_key, pub_key, sid) = generate_reality_keys();
             format!(r#"{{
   // OSTP Server Configuration
   "mode": "server",
@@ -708,11 +715,12 @@ async fn run_app() -> Result<()> {
   
   // Reality (XTLS) / WebRTC Masquerade parameters
   "reality": {{
-    "dest": "www.microsoft.com:443",
-    "private_key": "",
-    "pbk": "",
-    "sid": "",
-    "sni_list": ["www.microsoft.com"]
+    "enabled": false,
+    "sni": "www.microsoft.com",
+    "fp": "chrome",
+    "pbk": "{}",
+    "sid": "{}",
+    "spx": "/"
   }},
   
   // Transport Mode: "udp" (default WebRTC masquerade) or "uot" (TCP XTLS-Reality)
@@ -727,7 +735,7 @@ async fn run_app() -> Result<()> {
     "sessions": 1
   }},
   "debug": false
-}}"#, key)
+}}"#, key, pub_key, sid)
         };
         if let Some(parent) = args.config.parent() {
             if !parent.as_os_str().is_empty() {
@@ -1070,6 +1078,7 @@ async fn run_client_directly(client_cfg: ClientConfig) -> Result<()> {
             connect_timeout_ms: 5000,
         },
         reality: ostp_client::config::RealityConfig {
+            enabled: reality_cfg.map(|t| t.enabled).unwrap_or(false),
             sni: reality_cfg.map(|t| t.sni.clone()).unwrap_or_default(),
             fp: reality_cfg.map(|t| t.fp.clone()).unwrap_or_default(),
             pbk: reality_cfg.map(|t| t.pbk.clone()).unwrap_or_default(),

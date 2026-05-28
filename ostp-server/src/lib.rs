@@ -375,11 +375,7 @@ async fn run_server_loop(
             loop {
                 match sock_clone.recv_from(&mut buf).await {
                     Ok((size, peer)) => {
-                        let packet = if size >= 12 && buf[0] == 0x80 {
-                            Bytes::copy_from_slice(&buf[12..size])
-                        } else {
-                            Bytes::copy_from_slice(&buf[..size])
-                        };
+                        let packet = Bytes::copy_from_slice(&buf[..size]);
                         if tx.send((packet, peer)).await.is_err() {
                             break;
                         }
@@ -529,10 +525,7 @@ async fn run_server_loop(
                                     }
                                 }
                                 if !sent_tcp {
-                                    let mut out = bytes::BytesMut::with_capacity(12 + resp.len());
-                                    out.extend_from_slice(&[0x80, 0x60, 0x12, 0x34, 0x00, 0x00, 0x00, 0x00, 0x11, 0x22, 0x33, 0x44]);
-                                    out.extend_from_slice(&resp);
-                                    let _ = socket.send_to(&out.freeze(), peer_addr).await?;
+                                    let _ = socket.send_to(&resp, peer_addr).await?;
                                 }
                                 let _ = ui_event_tx.send(UiEvent::Tx { peer: peer_ip, bytes: resp_len });
                             }
@@ -617,10 +610,7 @@ async fn run_server_loop(
                         }
                     }
                     if !sent_tcp {
-                        let mut out = bytes::BytesMut::with_capacity(12 + frame.len());
-                        out.extend_from_slice(&[0x80, 0x60, 0x12, 0x34, 0x00, 0x00, 0x00, 0x00, 0x11, 0x22, 0x33, 0x44]);
-                        out.extend_from_slice(&frame);
-                        let _ = socket.send_to(&out.freeze(), peer_addr).await?;
+                        let _ = socket.send_to(&frame, peer_addr).await?;
                     }
                 }
                 for sid in dropped_sessions {

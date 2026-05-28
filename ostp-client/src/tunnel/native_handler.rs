@@ -180,11 +180,18 @@ pub async fn run_native_tunnel(
                             let mut rep = [0u8; 10];
                             if socks.read_exact(&mut rep).await.is_err() || rep[1] != 0 { return; }
 
-                            if socks.write_all(&payload).await.is_ok() {
-                                let mut response_buf = [0u8; 4096];
-                                if let Ok(n) = socks.read(&mut response_buf).await {
-                                    if n > 0 {
-                                        let _ = tx_clone.lock().await.send((response_buf[..n].to_vec(), dst, src)).await;
+                            let len = payload.len() as u16;
+                            let mut dns_req = Vec::with_capacity(2 + payload.len());
+                            dns_req.extend_from_slice(&len.to_be_bytes());
+                            dns_req.extend_from_slice(&payload);
+
+                            if socks.write_all(&dns_req).await.is_ok() {
+                                let mut len_buf = [0u8; 2];
+                                if socks.read_exact(&mut len_buf).await.is_ok() {
+                                    let resp_len = u16::from_be_bytes(len_buf) as usize;
+                                    let mut response_buf = vec![0u8; resp_len];
+                                    if socks.read_exact(&mut response_buf).await.is_ok() {
+                                        let _ = tx_clone.lock().await.send((response_buf, dst, src)).await;
                                     }
                                 }
                             }
@@ -428,11 +435,18 @@ pub async fn run_native_tunnel_from_fd(
                             let mut rep = [0u8; 10];
                             if socks.read_exact(&mut rep).await.is_err() || rep[1] != 0 { return; }
 
-                            if socks.write_all(&payload).await.is_ok() {
-                                let mut response_buf = [0u8; 4096];
-                                if let Ok(n) = socks.read(&mut response_buf).await {
-                                    if n > 0 {
-                                        let _ = tx_clone.lock().await.send((response_buf[..n].to_vec(), dst, src)).await;
+                            let len = payload.len() as u16;
+                            let mut dns_req = Vec::with_capacity(2 + payload.len());
+                            dns_req.extend_from_slice(&len.to_be_bytes());
+                            dns_req.extend_from_slice(&payload);
+
+                            if socks.write_all(&dns_req).await.is_ok() {
+                                let mut len_buf = [0u8; 2];
+                                if socks.read_exact(&mut len_buf).await.is_ok() {
+                                    let resp_len = u16::from_be_bytes(len_buf) as usize;
+                                    let mut response_buf = vec![0u8; resp_len];
+                                    if socks.read_exact(&mut response_buf).await.is_ok() {
+                                        let _ = tx_clone.lock().await.send((response_buf, dst, src)).await;
                                     }
                                 }
                             }

@@ -39,21 +39,8 @@ pub struct BridgeMetrics {
     pub rtt_ms: portable_atomic::AtomicU32,
 }
 
-async fn send_datagram(socket: &crate::transport::Transport, frame: &Bytes, webrtc_masquerade: bool) -> std::io::Result<usize> {
-    if webrtc_masquerade {
-        let mut out = bytes::BytesMut::with_capacity(12 + frame.len());
-        // Fake SRTP Header:
-        // [0] 0x80 (Version 2)
-        // [1] 0x60 (Payload Type 96 - dynamic video)
-        // [2..3] Sequence number (dummy 0x1234)
-        // [4..7] Timestamp (dummy)
-        // [8..11] SSRC (dummy)
-        out.extend_from_slice(&[0x80, 0x60, 0x12, 0x34, 0x00, 0x00, 0x00, 0x00, 0x11, 0x22, 0x33, 0x44]);
-        out.extend_from_slice(frame);
-        socket.send(&out.freeze()).await
-    } else {
-        socket.send(frame).await
-    }
+async fn send_datagram(socket: &crate::transport::Transport, frame: &Bytes, _webrtc_masquerade: bool) -> std::io::Result<usize> {
+    socket.send(frame).await
 }
 
 struct SessionState {
@@ -276,17 +263,13 @@ impl Bridge {
                                             let session_index = sessions.len();
                                             let socket_clone = sock.clone();
                                             let udp_tx_clone = udp_tx.clone();
-                                            let is_webrtc = self.transport_mode == "udp" ;
+
                                             tokio::spawn(async move {
                                                 let mut buf = vec![0_u8; 65535];
                                                 loop {
                                                      match socket_clone.recv(&mut buf).await {
                                                          Ok(n) => {
-                                                             let inbound = if is_webrtc && n >= 12 && buf[0] == 0x80 {
-                                                                 Bytes::copy_from_slice(&buf[12..n])
-                                                             } else {
-                                                                 Bytes::copy_from_slice(&buf[..n])
-                                                             };
+                                                             let inbound = Bytes::copy_from_slice(&buf[..n]);
                                                              if udp_tx_clone.send((session_index, inbound)).await.is_err() {
                                                                  break;
                                                              }
@@ -366,17 +349,13 @@ impl Bridge {
                                             let session_index = new_sessions.len();
                                             let socket_clone = sock.clone();
                                             let udp_tx_clone = udp_tx.clone();
-                                            let is_webrtc = self.transport_mode == "udp" ;
+
                                             tokio::spawn(async move {
                                                 let mut buf = vec![0_u8; 65535];
                                                 loop {
                                                     match socket_clone.recv(&mut buf).await {
                                                         Ok(n) => {
-                                                            let inbound = if is_webrtc && n >= 12 && buf[0] == 0x80 {
-                                                                Bytes::copy_from_slice(&buf[12..n])
-                                                            } else {
-                                                                Bytes::copy_from_slice(&buf[..n])
-                                                            };
+                                                            let inbound = Bytes::copy_from_slice(&buf[..n]);
                                                             if udp_tx_clone.send((session_index, inbound)).await.is_err() { break; }
                                                         }
                                                         Err(e) => {
@@ -477,17 +456,13 @@ impl Bridge {
                                         let session_index = new_sessions.len();
                                         let socket_clone = sock.clone();
                                         let udp_tx_clone = udp_tx.clone();
-                                        let is_webrtc = self.transport_mode == "udp" ;
+
                                         tokio::spawn(async move {
                                             let mut buf = vec![0_u8; 65535];
                                             loop {
                                                 match socket_clone.recv(&mut buf).await {
                                                     Ok(n) => {
-                                                        let inbound = if is_webrtc && n >= 12 && buf[0] == 0x80 {
-                                                            Bytes::copy_from_slice(&buf[12..n])
-                                                        } else {
-                                                            Bytes::copy_from_slice(&buf[..n])
-                                                        };
+                                                        let inbound = Bytes::copy_from_slice(&buf[..n]);
                                                         if udp_tx_clone.send((session_index, inbound)).await.is_err() {
                                                             break;
                                                         }
@@ -885,11 +860,7 @@ impl Bridge {
         self.metrics.bytes_recv.fetch_add(size as u64, Ordering::Relaxed);
         tracing::info!("Handshake response received: {} bytes", size);
 
-        let inbound = if (self.transport_mode == "udp") && size >= 12 && buf[0] == 0x80 {
-            Bytes::copy_from_slice(&buf[12..size])
-        } else {
-            Bytes::copy_from_slice(&buf[..size])
-        };
+        let inbound = Bytes::copy_from_slice(&buf[..size]);
         machine.on_event(OstpEvent::Inbound(inbound))?;
         let rtt_ms = start.elapsed().as_secs_f64() * 1000.0;
         tracing::info!("Handshake complete: session={:#010x} rtt={:.1}ms", session_id, rtt_ms);
@@ -910,7 +881,7 @@ impl Bridge {
         self.transport_mode = cfg.transport.mode.clone();
         self.stealth_sni = cfg.transport.stealth_sni.clone();
         self.stealth_port = cfg.transport.stealth_port;
-        self.reality_enabled = !cfg.reality.pbk.is_empty();
+        self.reality_enabled = cfg.reality.enabled;
     }
 
     async fn try_connect_transport(

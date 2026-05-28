@@ -98,6 +98,8 @@ impl Default for TransportConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct RealityConfig {
     #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
     pub sni: String,
     #[serde(default)]
     pub fp: String,
@@ -207,6 +209,7 @@ struct RawMuxSection {
 
 #[derive(Debug, Deserialize)]
 struct RawRealitySection {
+    enabled: Option<bool>,
     sni: Option<String>,
     fp: Option<String>,
     pbk: Option<String>,
@@ -260,6 +263,7 @@ impl ClientConfig {
                 connect_timeout_ms: 15000,
             },
             reality: RealityConfig {
+                enabled: raw.reality.as_ref().and_then(|t| t.enabled).unwrap_or(false),
                 sni: raw.reality.as_ref().and_then(|t| t.sni.clone()).unwrap_or_default(),
                 fp: raw.reality.as_ref().and_then(|t| t.fp.clone()).unwrap_or_default(),
                 pbk: raw.reality.as_ref().and_then(|t| t.pbk.clone()).unwrap_or_default(),

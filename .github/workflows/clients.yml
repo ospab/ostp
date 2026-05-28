@@ -1,0 +1,110 @@
+name: Build GUI Clients
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ "main" ]
+    paths:
+      - "ostp-gui/**"
+      - "ostp-flutter/**"
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows-gui:
+    name: Build Windows Client (Tauri)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: cargo-windows-gui-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Download wintun and tun2socks
+        shell: pwsh
+        run: |
+          $ProgressPreference = 'SilentlyContinue'
+          
+          # Download tun2socks
+          New-Item -ItemType Directory -Force -Path "t2s_tmp"
+          Invoke-WebRequest -Uri "https://github.com/xjasonlyu/tun2socks/releases/download/v2.6.0/tun2socks-windows-amd64.zip" -OutFile "t2s_tmp/t2s.zip"
+          Expand-Archive "t2s_tmp/t2s.zip" -DestinationPath "t2s_tmp/ext" -Force
+          Get-ChildItem "t2s_tmp/ext" -Filter "*.exe" -Recurse | Select-Object -First 1 | Copy-Item -Destination "t2s_tmp/tun2socks-windows-amd64.exe" -Force
+          
+          # Download wintun
+          New-Item -ItemType Directory -Force -Path "target/release"
+          Invoke-WebRequest -Uri "https://www.wintun.net/builds/wintun-0.14.1.zip" -OutFile "target/release/wt.zip"
+          Expand-Archive "target/release/wt.zip" -DestinationPath "target/release/wt_tmp" -Force
+          Get-ChildItem "target/release/wt_tmp" -Filter "wintun.dll" -Recurse | Where-Object { $_.FullName -match 'bin[\\/]amd64[\\/]' } | Copy-Item -Destination "target/release/wintun.dll" -Force
+
+      - name: Build Tauri App
+        working-directory: ostp-gui
+        run: |
+          npm install
+          npm run build:installer
+
+      - name: Upload Windows Installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: ostp-windows-installer
+          path: ostp-gui/src-tauri/target/release/bundle/nsis/*.exe
+
+  build-android:
+    name: Build Android Client (Flutter)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Java
+        uses: actions/setup-java@v3
+        with:
+          distribution: 'zulu'
+          java-version: '17'
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.19.0'
+          channel: 'stable'
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - name: Setup Android NDK
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r26b
+
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk
+
+      - name: Build Android APK
+        shell: pwsh
+        working-directory: ostp-flutter
+        run: ./build.ps1
+
+      - name: Upload Android APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: ostp-android-apk
+          path: ostp-flutter/ostp-client-release.apk
