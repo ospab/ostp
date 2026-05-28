@@ -381,6 +381,14 @@ window.addEventListener('DOMContentLoaded', async () => {
   btnBack.addEventListener('click',          () => showScreen('home'));
   btnImport.addEventListener('click',        handleImport);
   btnPeekKey.addEventListener('click',       togglePeek);
+  const btnUseBuiltinDns = $('btn-use-builtin-dns');
+  if (btnUseBuiltinDns) {
+    btnUseBuiltinDns.addEventListener('click', () => {
+      inDns.value = '10.1.0.1';
+      saveConfig();
+      showToast('DNS set to built-in server (10.1.0.1)', 'success');
+    });
+  }
   inTun.addEventListener('change',           () => { groupTunStack.style.display = inTun.checked ? 'block' : 'none'; });
   importInput.addEventListener('keydown', e => { if (e.key === 'Enter') handleImport(); });
 

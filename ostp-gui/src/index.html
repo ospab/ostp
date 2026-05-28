@@ -174,7 +174,10 @@
 
           <div class="field-group">
             <label class="field-label" for="in-dns" data-i18n="label_dns">DNS Server</label>
-            <input id="in-dns" class="field-input" type="text" placeholder="1.1.1.1" />
+            <div style="display: flex; gap: 8px;">
+              <input id="in-dns" class="field-input" type="text" placeholder="1.1.1.1" style="flex: 1;" />
+              <button id="btn-use-builtin-dns" class="btn" style="padding: 0 12px; white-space: nowrap; cursor: pointer;" data-i18n="btn_use_builtin_dns">Use Built-in</button>
+            </div>
           </div>
 
           <div class="field-group">
