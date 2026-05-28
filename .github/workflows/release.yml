@@ -109,12 +109,7 @@ jobs:
             tun2socks_arch: linux-riscv64
             use_cross: true
 
-          - os: ubuntu-latest
-            target: aarch64-linux-android
-            artifact_name: ostp
-            release_name: ostp-android-arm64.tar.gz
-            tun2socks_arch: linux-arm64
-            use_cross: true
+
 
     steps:
       - name: Checkout code
@@ -233,6 +228,119 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: ${{ matrix.release_name }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  build-windows-gui:
+    name: Build Windows GUI (Tauri)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Install Tauri CLI
+        run: npm install -g @tauri-apps/cli
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: cargo-windows-gui-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Download wintun and tun2socks
+        shell: pwsh
+        run: |
+          $ProgressPreference = 'SilentlyContinue'
+          
+          # Download tun2socks
+          New-Item -ItemType Directory -Force -Path "t2s_tmp"
+          Invoke-WebRequest -Uri "https://github.com/xjasonlyu/tun2socks/releases/download/v2.6.0/tun2socks-windows-amd64.zip" -OutFile "t2s_tmp/t2s.zip"
+          Expand-Archive "t2s_tmp/t2s.zip" -DestinationPath "t2s_tmp/ext" -Force
+          Get-ChildItem "t2s_tmp/ext" -Filter "*.exe" -Recurse | Select-Object -First 1 | Copy-Item -Destination "t2s_tmp/tun2socks-windows-amd64.exe" -Force
+          
+          # Download wintun
+          New-Item -ItemType Directory -Force -Path "target/release"
+          Invoke-WebRequest -Uri "https://www.wintun.net/builds/wintun-0.14.1.zip" -OutFile "target/release/wt.zip"
+          Expand-Archive "target/release/wt.zip" -DestinationPath "target/release/wt_tmp" -Force
+          Get-ChildItem "target/release/wt_tmp" -Filter "wintun.dll" -Recurse | Where-Object { $_.FullName -match 'bin[\\/]amd64[\\/]' } | Copy-Item -Destination "target/release/wintun.dll" -Force
+
+      - name: Build Tauri App
+        working-directory: ostp-gui
+        run: |
+          npm install
+          npm run build:installer
+
+      - name: Rename Installer
+        shell: pwsh
+        run: |
+          $installer = Get-ChildItem "ostp-gui/src-tauri/target/release/bundle/nsis/*.exe" | Select-Object -First 1
+          if ($installer) {
+            Rename-Item -Path $installer.FullName -NewName "ostp-windows-installer.exe"
+            Write-Host "Renamed installer to ostp-windows-installer.exe"
+          }
+
+      - name: Upload to GitHub Release
+        if: ${{ startsWith(github.ref, 'refs/tags/') }}
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ostp-gui/src-tauri/target/release/bundle/nsis/ostp-windows-installer.exe
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  build-android:
+    name: Build Android Client (Flutter)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Java
+        uses: actions/setup-java@v3
+        with:
+          distribution: 'zulu'
+          java-version: '17'
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.19.0'
+          channel: 'stable'
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - name: Setup Android NDK
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r26b
+
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk
+
+      - name: Build Android APK
+        shell: pwsh
+        working-directory: ostp-flutter
+        run: ./build.ps1
+
+      - name: Upload to GitHub Release
+        if: ${{ startsWith(github.ref, 'refs/tags/') }}
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ostp-flutter/ostp-client-release.apk
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
