@@ -162,50 +162,7 @@ pub async fn run_native_tunnel(
     let debug_udp = config.debug;
     let mut udp_proxy_task = tokio::spawn(async move {
         if let Some(udp_sock) = udp_socket {
-            let (mut rx, tx) = udp_sock.split();
-            let tx = std::sync::Arc::new(tokio::sync::Mutex::new(tx));
-            while let Some((payload, src, dst)) = rx.next().await {
-                if payload.is_empty() { continue; }
-                if dst.port() == 53 {
-                    let tx_clone = tx.clone();
-                    let proxy_addr = udp_proxy_addr.clone();
-                    tokio::spawn(async move {
-                        if debug_udp { tracing::info!("Native TUN intercepted UDP DNS to {}", dst); }
-                        if let Ok(mut socks) = tokio::net::TcpStream::connect(&proxy_addr).await {
-                            if socks.write_all(&[5, 1, 0]).await.is_err() { return; }
-                            let mut buf = [0u8; 2];
-                            if socks.read_exact(&mut buf).await.is_err() || buf[0] != 5 || buf[1] != 0 { return; }
-                            
-                            let mut req = vec![5, 1, 0];
-                            match dst.ip() {
-                                std::net::IpAddr::V4(v4) => { req.push(1); req.extend_from_slice(&v4.octets()); }
-                                std::net::IpAddr::V6(v6) => { req.push(4); req.extend_from_slice(&v6.octets()); }
-                            }
-                            req.extend_from_slice(&dst.port().to_be_bytes());
-                            if socks.write_all(&req).await.is_err() { return; }
-                            
-                            let mut rep = [0u8; 10];
-                            if socks.read_exact(&mut rep).await.is_err() || rep[1] != 0 { return; }
-
-                            let len = payload.len() as u16;
-                            let mut dns_req = Vec::with_capacity(2 + payload.len());
-                            dns_req.extend_from_slice(&len.to_be_bytes());
-                            dns_req.extend_from_slice(&payload);
-
-                            if socks.write_all(&dns_req).await.is_ok() {
-                                let mut len_buf = [0u8; 2];
-                                if socks.read_exact(&mut len_buf).await.is_ok() {
-                                    let resp_len = u16::from_be_bytes(len_buf) as usize;
-                                    let mut response_buf = vec![0u8; resp_len];
-                                    if socks.read_exact(&mut response_buf).await.is_ok() {
-                                        let _ = tx_clone.lock().await.send((response_buf, dst, src)).await;
-                                    }
-                                }
-                            }
-                        }
-                    });
-                }
-            }
+            super::udp_nat::run_udp_nat(udp_sock, udp_proxy_addr, debug_udp).await;
         }
     });
 
@@ -413,54 +370,13 @@ pub async fn run_native_tunnel_from_fd(
         }
     });
 
+
+
     let udp_proxy_addr = config.local_proxy.bind_addr.clone();
     let debug_udp = config.debug;
     let mut udp_proxy_task = tokio::spawn(async move {
         if let Some(udp_sock) = udp_socket {
-            let (mut rx, tx) = udp_sock.split();
-            let tx = std::sync::Arc::new(tokio::sync::Mutex::new(tx));
-            while let Some((payload, src, dst)) = rx.next().await {
-                if payload.is_empty() { continue; }
-                if dst.port() == 53 {
-                    let tx_clone = tx.clone();
-                    let proxy_addr = udp_proxy_addr.clone();
-                    tokio::spawn(async move {
-                        if debug_udp { tracing::info!("Native TUN intercepted UDP DNS to {}", dst); }
-                        if let Ok(mut socks) = tokio::net::TcpStream::connect(&proxy_addr).await {
-                            if socks.write_all(&[5, 1, 0]).await.is_err() { return; }
-                            let mut buf = [0u8; 2];
-                            if socks.read_exact(&mut buf).await.is_err() || buf[0] != 5 || buf[1] != 0 { return; }
-                            
-                            let mut req = vec![5, 1, 0];
-                            match dst.ip() {
-                                std::net::IpAddr::V4(v4) => { req.push(1); req.extend_from_slice(&v4.octets()); }
-                                std::net::IpAddr::V6(v6) => { req.push(4); req.extend_from_slice(&v6.octets()); }
-                            }
-                            req.extend_from_slice(&dst.port().to_be_bytes());
-                            if socks.write_all(&req).await.is_err() { return; }
-                            
-                            let mut rep = [0u8; 10];
-                            if socks.read_exact(&mut rep).await.is_err() || rep[1] != 0 { return; }
-
-                            let len = payload.len() as u16;
-                            let mut dns_req = Vec::with_capacity(2 + payload.len());
-                            dns_req.extend_from_slice(&len.to_be_bytes());
-                            dns_req.extend_from_slice(&payload);
-
-                            if socks.write_all(&dns_req).await.is_ok() {
-                                let mut len_buf = [0u8; 2];
-                                if socks.read_exact(&mut len_buf).await.is_ok() {
-                                    let resp_len = u16::from_be_bytes(len_buf) as usize;
-                                    let mut response_buf = vec![0u8; resp_len];
-                                    if socks.read_exact(&mut response_buf).await.is_ok() {
-                                        let _ = tx_clone.lock().await.send((response_buf, dst, src)).await;
-                                    }
-                                }
-                            }
-                        }
-                    });
-                }
-            }
+            super::udp_nat::run_udp_nat(udp_sock, udp_proxy_addr, debug_udp).await;
         }
     });
 

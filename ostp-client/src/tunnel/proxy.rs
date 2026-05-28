@@ -9,6 +9,199 @@ use tokio::time::{timeout, Duration};
 use crate::config::{ExclusionConfig, LocalProxyConfig, OstpConfig};
 use crate::tunnel::{ProxyEvent, ProxyToClientMsg};
 
+#[cfg(target_os = "windows")]
+use std::os::windows::io::AsRawSocket;
+
+#[cfg(target_os = "linux")]
+use std::os::fd::AsRawFd;
+
+#[cfg(target_os = "windows")]
+#[link(name = "ws2_32")]
+extern "system" {
+    fn setsockopt(
+        s: usize,
+        level: i32,
+        optname: i32,
+        optval: *const u8,
+        optlen: i32,
+    ) -> i32;
+}
+
+#[cfg(target_os = "windows")]
+fn bind_socket_to_interface(socket: &impl AsRawSocket, is_ipv6: bool, if_index: u32) -> std::io::Result<()> {
+    let s = socket.as_raw_socket() as usize;
+    if is_ipv6 {
+        let optval = if_index;
+        let ret = unsafe {
+            setsockopt(
+                s,
+                41, // IPPROTO_IPV6
+                31, // IPV6_UNICAST_IF
+                &optval as *const u32 as *const u8,
+                4,
+            )
+        };
+        if ret != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    } else {
+        let optval = if_index.to_be();
+        let ret = unsafe {
+            setsockopt(
+                s,
+                0, // IPPROTO_IP
+                31, // IP_UNICAST_IF
+                &optval as *const u32 as *const u8,
+                4,
+            )
+        };
+        if ret != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn bind_socket_to_interface(socket: &impl AsRawFd, if_name: &str) -> std::io::Result<()> {
+    let fd = socket.as_raw_fd();
+    let mut if_name_bytes = if_name.as_bytes().to_vec();
+    if_name_bytes.push(0);
+    let ret = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_BINDTODEVICE,
+            if_name_bytes.as_ptr() as *const std::ffi::c_void,
+            if_name_bytes.len() as libc::socklen_t,
+        )
+    };
+    if ret != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+fn get_windows_physical_if_index() -> Option<u32> {
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        let output = std::process::Command::new("powershell")
+            .creation_flags(CREATE_NO_WINDOW)
+            .args([
+                "-NoProfile",
+                "-Command",
+                "Get-NetRoute -DestinationPrefix '0.0.0.0/0' | Where-Object { $_.InterfaceAlias -notmatch 'ostp' -and $_.InterfaceAlias -notmatch 'tun' -and $_.InterfaceAlias -notmatch 'wintun' } | Sort-Object RouteMetric | Select-Object -ExpandProperty InterfaceIndex -First 1"
+            ])
+            .output()
+            .ok()?;
+        if output.status.success() {
+            let s = String::from_utf8_lossy(&output.stdout);
+            if let Ok(index) = s.trim().parse::<u32>() {
+                return Some(index);
+            }
+        }
+    }
+    None
+}
+
+fn get_linux_physical_if_name() -> Option<String> {
+    #[cfg(target_os = "linux")]
+    {
+        let output = std::process::Command::new("ip")
+            .args(["route", "show", "default"])
+            .output()
+            .ok()?;
+        if output.status.success() {
+            let s = String::from_utf8_lossy(&output.stdout);
+            if let Some(dev_part) = s.split_whitespace().skip_while(|w| *w != "dev").nth(1) {
+                return Some(dev_part.to_string());
+            }
+        }
+    }
+    None
+}
+
+async fn connect_bypassing_tun(
+    target: &str,
+    physical_if_index: Option<u32>,
+    _physical_if_name: &Option<String>,
+) -> Result<TcpStream> {
+    let resolved = tokio::net::lookup_host(target).await
+        .with_context(|| format!("failed to resolve host for bypass connect: {target}"))?;
+
+    let mut last_err = None;
+    for addr in resolved {
+        let socket = if addr.is_ipv6() {
+            let s = tokio::net::TcpSocket::new_v6()?;
+            let _ = s.bind("[::]:0".parse().unwrap());
+            s
+        } else {
+            let s = tokio::net::TcpSocket::new_v4()?;
+            let _ = s.bind("0.0.0.0:0".parse().unwrap());
+            s
+        };
+
+        #[cfg(target_os = "windows")]
+        if let Some(if_index) = physical_if_index {
+            if let Err(e) = bind_socket_to_interface(&socket, addr.is_ipv6(), if_index) {
+                tracing::warn!("Failed to bind TCP socket to interface {}: {}", if_index, e);
+            }
+        }
+
+        #[cfg(target_os = "linux")]
+        if let Some(ref if_name) = _physical_if_name {
+            if let Err(e) = bind_socket_to_interface(&socket, if_name) {
+                tracing::warn!("Failed to bind TCP socket to interface {}: {}", if_name, e);
+            }
+        }
+
+        match socket.connect(addr).await {
+            Ok(stream) => return Ok(stream),
+            Err(e) => {
+                last_err = Some(e);
+            }
+        }
+    }
+
+    Err(anyhow!(
+        "direct connect failed: {:?}",
+        last_err.map(|e| e.to_string()).unwrap_or_else(|| "no addresses resolved".to_string())
+    ))
+}
+
+async fn create_udp_socket_bypassing_tun(
+    is_ipv6: bool,
+    physical_if_index: Option<u32>,
+    _physical_if_name: &Option<String>,
+) -> Result<UdpSocket> {
+    let addr: std::net::SocketAddr = if is_ipv6 {
+        "[::]:0".parse().unwrap()
+    } else {
+        "0.0.0.0:0".parse().unwrap()
+    };
+    
+    let socket = UdpSocket::bind(addr).await
+        .with_context(|| format!("failed to bind direct UdpSocket to wildcard {}", addr))?;
+
+    #[cfg(target_os = "windows")]
+    if let Some(if_index) = physical_if_index {
+        if let Err(e) = bind_socket_to_interface(&socket, is_ipv6, if_index) {
+            tracing::warn!("Failed to bind UDP socket to interface index {}: {}", if_index, e);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    if let Some(ref if_name) = _physical_if_name {
+        if let Err(e) = bind_socket_to_interface(&socket, if_name) {
+            tracing::warn!("Failed to bind UDP socket to interface {}: {}", if_name, e);
+        }
+    }
+
+    Ok(socket)
+}
+
 pub async fn run_local_socks5_proxy(
     cfg: LocalProxyConfig,
     ostp: OstpConfig,
@@ -28,7 +221,17 @@ pub async fn run_local_socks5_proxy(
         tracing::info!("Windows system proxy: set HTTP proxy to {}. tun2socks: SOCKS5 on same address.", cfg.bind_addr);
     }
 
-    let matcher = ExclusionMatcher::new(&exclusions);
+    let physical_if_index = tokio::task::spawn_blocking(get_windows_physical_if_index).await.unwrap_or(None);
+    let physical_if_name = tokio::task::spawn_blocking(get_linux_physical_if_name).await.unwrap_or(None);
+
+    if physical_if_index.is_some() {
+        tracing::info!("Local proxy physical interface index: {:?}", physical_if_index);
+    }
+    if physical_if_name.is_some() {
+        tracing::info!("Local proxy physical interface name: {:?}", physical_if_name);
+    }
+
+    let matcher = ExclusionMatcher::new(&exclusions, physical_if_index, physical_if_name.clone());
     let (connect_tx, mut connect_rx) = mpsc::channel(128);
     let max_chunk = ostp.mtu.saturating_sub(150).max(512);
 
@@ -148,14 +351,19 @@ async fn handle_udp_associate(
     event_tx: mpsc::Sender<ProxyEvent>,
     mut rx: mpsc::UnboundedReceiver<ProxyToClientMsg>,
     close_tx: mpsc::Sender<u16>,
-    _debug: bool,
+    debug: bool,
+    matcher: ExclusionMatcher,
+    connect_timeout: Duration,
 ) -> Result<()> {
-    let mut client_udp_addr = None;
+    let client_udp_addr = Arc::new(std::sync::Mutex::new(None));
     let mut buf = vec![0u8; 65536];
     
     let udp_socket = Arc::new(udp_socket);
     let sock_rx = udp_socket.clone();
     let sock_tx = udp_socket;
+
+    let mut direct_udp_v4: Option<Arc<UdpSocket>> = None;
+    let mut direct_udp_v6: Option<Arc<UdpSocket>> = None;
 
     let mut tcp_buf = [0u8; 1];
     loop {
@@ -166,8 +374,11 @@ async fn handle_udp_associate(
             }
             res = sock_rx.recv_from(&mut buf) => {
                 let (len, addr) = res?;
-                if client_udp_addr.is_none() {
-                    client_udp_addr = Some(addr);
+                {
+                    let mut guard = client_udp_addr.lock().unwrap();
+                    if guard.is_none() {
+                        *guard = Some(addr);
+                    }
                 }
                 if len < 4 { continue; }
                 let frag = buf[2];
@@ -199,12 +410,66 @@ async fn handle_udp_associate(
                     _ => continue,
                 };
                 let payload = bytes::Bytes::copy_from_slice(&buf[header_len..len]);
-                let _ = event_tx.send(ProxyEvent::UdpData { stream_id, target, payload }).await;
+
+                // Check if target should bypass the tunnel
+                if matcher.should_bypass(&target, connect_timeout).await {
+                    if debug {
+                        tracing::info!("proxy UDP BYPASS target={}", target);
+                    }
+                    // Resolve target to find if it is IPv4 or IPv6
+                    if let Ok(resolved_addrs) = tokio::net::lookup_host(&target).await {
+                        if let Some(target_addr) = resolved_addrs.into_iter().next() {
+                            let is_ipv6 = target_addr.is_ipv6();
+                            let direct_socket = if is_ipv6 {
+                                if direct_udp_v6.is_none() {
+                                    match create_udp_socket_bypassing_tun(true, matcher.physical_if_index, &matcher.physical_if_name).await {
+                                        Ok(s) => {
+                                            let s_arc = Arc::new(s);
+                                            spawn_direct_udp_reader(s_arc.clone(), sock_tx.clone(), client_udp_addr.clone(), debug);
+                                            direct_udp_v6 = Some(s_arc);
+                                        }
+                                        Err(e) => {
+                                            tracing::error!("Failed to create bypass UDP v6 socket: {}", e);
+                                        }
+                                    }
+                                }
+                                &direct_udp_v6
+                            } else {
+                                if direct_udp_v4.is_none() {
+                                    match create_udp_socket_bypassing_tun(false, matcher.physical_if_index, &matcher.physical_if_name).await {
+                                        Ok(s) => {
+                                            let s_arc = Arc::new(s);
+                                            spawn_direct_udp_reader(s_arc.clone(), sock_tx.clone(), client_udp_addr.clone(), debug);
+                                            direct_udp_v4 = Some(s_arc);
+                                        }
+                                        Err(e) => {
+                                            tracing::error!("Failed to create bypass UDP v4 socket: {}", e);
+                                        }
+                                    }
+                                }
+                                &direct_udp_v4
+                            };
+
+                            if let Some(s) = direct_socket {
+                                if let Err(e) = s.send_to(&payload, target_addr).await {
+                                    if debug {
+                                        tracing::warn!("failed to send bypass UDP packet to {}: {}", target_addr, e);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    let _ = event_tx.send(ProxyEvent::UdpData { stream_id, target, payload }).await;
+                }
             }
             msg = rx.recv() => {
                 match msg {
                     Some(ProxyToClientMsg::UdpData(target, data)) => {
-                        if let Some(client_addr) = client_udp_addr {
+                        if let Some(client_addr) = {
+                            let guard = client_udp_addr.lock().unwrap();
+                            *guard
+                        } {
                             let mut packet = vec![0x00, 0x00, 0x00];
                             let mut parts = target.rsplitn(2, ':');
                             let port_str = parts.next().unwrap_or("0");
@@ -237,6 +502,52 @@ async fn handle_udp_associate(
     }
     let _ = close_tx.send(stream_id).await;
     Ok(())
+}
+
+fn spawn_direct_udp_reader(
+    direct_socket: Arc<UdpSocket>,
+    sock_tx: Arc<UdpSocket>,
+    client_udp_addr: Arc<std::sync::Mutex<Option<std::net::SocketAddr>>>,
+    debug: bool,
+) {
+    tokio::spawn(async move {
+        let mut buf = vec![0u8; 65536];
+        loop {
+            match direct_socket.recv_from(&mut buf).await {
+                Ok((len, target_addr)) => {
+                    let client_addr = {
+                        let guard = client_udp_addr.lock().unwrap();
+                        *guard
+                    };
+                    if let Some(client_addr) = client_addr {
+                        let mut packet = vec![0x00, 0x00, 0x00];
+                        if let Ok(ipv4) = target_addr.ip().to_string().parse::<std::net::Ipv4Addr>() {
+                            packet.push(0x01);
+                            packet.extend_from_slice(&ipv4.octets());
+                        } else if let Ok(ipv6) = target_addr.ip().to_string().parse::<std::net::Ipv6Addr>() {
+                            packet.push(0x04);
+                            packet.extend_from_slice(&ipv6.octets());
+                        } else {
+                            continue;
+                        }
+                        packet.extend_from_slice(&target_addr.port().to_be_bytes());
+                        packet.extend_from_slice(&buf[..len]);
+                        if let Err(e) = sock_tx.send_to(&packet, client_addr).await {
+                            if debug {
+                                tracing::warn!("failed to send direct UDP response to client: {e}");
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    if debug {
+                        tracing::debug!("direct UDP socket read loop exiting: {e}");
+                    }
+                    break;
+                }
+            }
+        }
+    });
 }
 
 async fn handle_proxy_client(
@@ -327,14 +638,32 @@ async fn handle_proxy_client(
             client.write_all(&reply).await?;
             
             event_tx.send(ProxyEvent::UdpAssociate { stream_id }).await?;
-            return handle_udp_associate(client, udp_socket, stream_id, event_tx, rx, close_tx, debug).await;
+            return handle_udp_associate(
+                client,
+                udp_socket,
+                stream_id,
+                event_tx,
+                rx,
+                close_tx,
+                debug,
+                matcher,
+                connect_timeout,
+            ).await;
         }
 
         if debug {
             tracing::info!("proxy CONNECT stream_id={stream_id} target={target}");
         }
         if matcher.should_bypass(&target, connect_timeout).await {
-            return direct_connect_socks5(client, stream_id, &target, close_tx, debug).await;
+            return direct_connect_socks5(
+                client,
+                stream_id,
+                &target,
+                matcher.physical_if_index,
+                &matcher.physical_if_name,
+                close_tx,
+                debug,
+            ).await;
         }
         event_tx.send(ProxyEvent::NewStream { stream_id, target: target.clone() }).await?;
 
@@ -417,6 +746,8 @@ async fn handle_proxy_client(
                 &target,
                 method.as_str(),
                 header_bytes,
+                matcher.physical_if_index,
+                &matcher.physical_if_name,
                 close_tx,
                 debug,
             ).await;
@@ -513,10 +844,16 @@ async fn handle_proxy_client(
 struct ExclusionMatcher {
     domain_suffix: Vec<String>,
     cidrs: Vec<Cidr>,
+    physical_if_index: Option<u32>,
+    physical_if_name: Option<String>,
 }
 
 impl ExclusionMatcher {
-    fn new(exclusions: &ExclusionConfig) -> Self {
+    fn new(
+        exclusions: &ExclusionConfig,
+        physical_if_index: Option<u32>,
+        physical_if_name: Option<String>,
+    ) -> Self {
         let mut cidrs = Vec::new();
         for ip in &exclusions.ips {
             if let Some(cidr) = parse_cidr(ip) {
@@ -532,6 +869,8 @@ impl ExclusionMatcher {
                 .filter(|d| !d.is_empty())
                 .collect(),
             cidrs,
+            physical_if_index,
+            physical_if_name,
         }
     }
 
@@ -645,14 +984,15 @@ async fn direct_connect_socks5(
     mut client: TcpStream,
     stream_id: u16,
     target: &str,
+    physical_if_index: Option<u32>,
+    physical_if_name: &Option<String>,
     close_tx: mpsc::Sender<u16>,
     debug: bool,
 ) -> Result<()> {
     if debug {
         tracing::info!("proxy BYPASS stream_id={stream_id} target={target}");
     }
-    let mut remote = TcpStream::connect(target).await
-        .with_context(|| format!("direct connect failed: {target}"))?;
+    let mut remote = connect_bypassing_tun(target, physical_if_index, physical_if_name).await?;
 
     client.write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await?;
     let _ = tokio::io::copy_bidirectional(&mut client, &mut remote).await;
@@ -666,14 +1006,15 @@ async fn direct_connect_http(
     target: &str,
     method: &str,
     header_bytes: Vec<u8>,
+    physical_if_index: Option<u32>,
+    physical_if_name: &Option<String>,
     close_tx: mpsc::Sender<u16>,
     debug: bool,
 ) -> Result<()> {
     if debug {
         tracing::info!("proxy BYPASS stream_id={stream_id} target={target}");
     }
-    let mut remote = TcpStream::connect(target).await
-        .with_context(|| format!("direct connect failed: {target}"))?;
+    let mut remote = connect_bypassing_tun(target, physical_if_index, physical_if_name).await?;
 
     if method == "CONNECT" {
         client.write_all(b"HTTP/1.1 200 Connection Established\r\nProxy-Agent: ostp/1.0\r\n\r\n").await?;

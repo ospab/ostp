@@ -41,6 +41,8 @@ const inServer       = $('in-server');
 const inKey          = $('in-key');
 const inSocks        = $('in-socks');
 const inDns          = $('in-dns');
+const inOwndns       = $('in-owndns');
+const groupCustomDns = $('group-custom-dns');
 const inTransport    = $('in-transport');
 const inSni          = $('in-stealth-sni');
 const inPbk          = $('in-pbk');
@@ -88,6 +90,13 @@ function showToast(msg, variant = '') {
     toast.classList.remove('show');
   }, 2400);
 }
+
+// ── DNS visibility ────────────────────────────────────────────────────────────
+function updateDnsVisibility() {
+  if (!groupCustomDns || !inOwndns) return;
+  groupCustomDns.style.display = inOwndns.checked ? 'none' : 'block';
+}
+
 
 // ── State machine ────────────────────────────────────────────────────────────
 function setState(next) {
@@ -239,7 +248,14 @@ async function loadConfigIntoForm() {
     inMuxSessions.value = c.mux?.sessions || '';
     
     groupTunStack.style.display = inTun.checked ? 'block' : 'none';
-    inDns.value     = c.tun?.dns      || '';
+
+    // owndns: detect if saved dns is 10.1.0.1
+    const savedDns = c.tun?.dns || '';
+    const isOwndns = savedDns === '10.1.0.1';
+    inOwndns.checked = isOwndns;
+    inDns.value = isOwndns ? '' : savedDns;
+    updateDnsVisibility();
+
     inDebug.checked = !!c.debug;
 
     const ex = c.exclude || {};
@@ -306,7 +322,8 @@ async function handleSave(silent = false) {
     rawConfig.tun = { wintun_path: './wintun.dll', ipv4_address: '10.1.0.2/24' };
   }
   rawConfig.tun.enable = inTun.checked;
-  rawConfig.tun.dns    = inDns.value.trim() || null;
+  // owndns: if toggle is on, always write 10.1.0.1; otherwise use the custom field
+  rawConfig.tun.dns    = inOwndns.checked ? '10.1.0.1' : (inDns.value.trim() || null);
   rawConfig.tun.stack  = inTunStack.value;
 
   rawConfig.exclude = {
@@ -367,6 +384,7 @@ function togglePeek() {
 window.addEventListener('DOMContentLoaded', async () => {
   applyTranslations();
   setState('disconnected');
+  updateDnsVisibility(); // initialise field visibility from current checkbox state
 
   // Event wiring
   if (window.__TAURI__ && window.__TAURI__.event) {
@@ -381,15 +399,11 @@ window.addEventListener('DOMContentLoaded', async () => {
   btnBack.addEventListener('click',          () => showScreen('home'));
   btnImport.addEventListener('click',        handleImport);
   btnPeekKey.addEventListener('click',       togglePeek);
-  const btnUseBuiltinDns = $('btn-use-builtin-dns');
-  if (btnUseBuiltinDns) {
-    btnUseBuiltinDns.addEventListener('click', () => {
-      inDns.value = '10.1.0.1';
-      saveConfig();
-      showToast('DNS set to built-in server (10.1.0.1)', 'success');
-    });
-  }
-  inTun.addEventListener('change',           () => { groupTunStack.style.display = inTun.checked ? 'block' : 'none'; });
+  inOwndns.addEventListener('change', () => {
+    updateDnsVisibility();
+    scheduleAutoSave();
+  });
+  inTun.addEventListener('change', () => { groupTunStack.style.display = inTun.checked ? 'block' : 'none'; });
   importInput.addEventListener('keydown', e => { if (e.key === 'Enter') handleImport(); });
 
   // Auto-save wiring

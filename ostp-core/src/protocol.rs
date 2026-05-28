@@ -500,12 +500,12 @@ impl ProtocolMachine {
         let mut actions = Vec::new();
 
         // ── Gap Recovery ──────────────────────────────────────────────
-        // If expected_recv_nonce hasn't advanced for 5+ seconds and there
+        // If expected_recv_nonce hasn't advanced for 500ms+ and there
         // are buffered frames waiting, the sender likely evicted the lost
         // frame from sent_history. Skip the gap to restore data flow.
         // This trades a small amount of data loss for connection liveness.
         if !self.reorder_buffer.is_empty()
-            && self.last_recv_advance.elapsed() > Duration::from_secs(5)
+            && self.last_recv_advance.elapsed() > Duration::from_millis(500)
         {
             if let Some(&first_buffered) = self.reorder_buffer.keys().next() {
                 let skipped = first_buffered.saturating_sub(self.expected_recv_nonce);

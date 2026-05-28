@@ -1,6 +1,7 @@
 use anyhow::{anyhow, Result};
 use tokio::sync::watch;
 
+
 #[cfg(target_os = "windows")]
 pub async fn run_wintun_tunnel(
     config: crate::config::ClientConfig,
@@ -115,7 +116,7 @@ pub async fn run_wintun_tunnel(
     );
 
     // 4. Launch tun2socks + route setup IN PARALLEL to save ~3 seconds
-    let proxy_url = format!("http://{}", config.local_proxy.bind_addr);
+    let proxy_url = format!("socks5://{}", config.local_proxy.bind_addr);
     tracing::info!("Starting tun2socks (proxy={})", proxy_url);
 
     // Spawn tun2socks immediately — it creates the adapter on its own
@@ -191,6 +192,7 @@ pub async fn run_wintun_tunnel(
          config.ostp.mtu
     );
     
+
     if let Some(ref dns) = config.dns_server {
         if !dns.is_empty() {
             tracing::info!("DNS server: {}", dns);
@@ -199,7 +201,7 @@ pub async fn run_wintun_tunnel(
             ));
         }
     }
-    
+
     let _ = tokio::task::spawn_blocking(move || {
         Command::new("powershell")
             .creation_flags(CREATE_NO_WINDOW)
@@ -238,10 +240,12 @@ pub async fn run_wintun_tunnel(
     // 8. Wait for shutdown signal
     let _ = shutdown.changed().await;
 
+
+
     tracing::info!("Deactivating TUN tunnel...");
     drop(_guard);
     tracing::info!("TUN tunnel stopped.");
-    
+
     Ok(())
 }
 

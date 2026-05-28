@@ -2,6 +2,7 @@ mod proxy;
 mod wintun_handler;
 mod linux_handler;
 pub mod native_handler;
+mod udp_nat;
 
 pub async fn run_tun_tunnel(
     config: crate::config::ClientConfig,

@@ -172,12 +172,24 @@
             <input id="in-socks" class="field-input" type="text" placeholder="127.0.0.1:1088" />
           </div>
 
-          <div class="field-group">
-            <label class="field-label" for="in-dns" data-i18n="label_dns">DNS Server</label>
-            <div style="display: flex; gap: 8px;">
-              <input id="in-dns" class="field-input" type="text" placeholder="1.1.1.1" style="flex: 1;" />
-              <button id="btn-use-builtin-dns" class="btn" style="padding: 0 12px; white-space: nowrap; cursor: pointer;" data-i18n="btn_use_builtin_dns">Use Built-in</button>
+          <!-- Built-in DNS toggle -->
+          <div class="toggle-row">
+            <div class="toggle-text">
+              <span class="toggle-name" data-i18n="label_owndns">Built-in Server DNS</span>
+              <span class="toggle-hint" data-i18n="owndns_hint">Route DNS through the VPN server (10.1.0.1)</span>
             </div>
+            <label class="toggle">
+              <input type="checkbox" id="in-owndns" />
+              <span class="toggle-track">
+                <span class="toggle-thumb"></span>
+              </span>
+            </label>
+          </div>
+
+          <!-- Custom DNS (hidden when built-in is ON) -->
+          <div class="field-group" id="group-custom-dns">
+            <label class="field-label" for="in-dns" data-i18n="label_dns">Custom DNS Server</label>
+            <input id="in-dns" class="field-input" type="text" placeholder="1.1.1.1" />
           </div>
 
           <div class="field-group">
