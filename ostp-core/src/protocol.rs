@@ -230,6 +230,7 @@ impl ProtocolMachine {
 
         let session_id = u32::from_be_bytes([raw_vec[0], raw_vec[1], raw_vec[2], raw_vec[3]]);
         if session_id != self.session_id {
+            tracing::error!("session id mismatch! expected={:#010x}, got={:#010x}, is_handshake={}, raw_len={}", self.session_id, session_id, is_handshake, raw_vec.len());
             return Err(ProtocolError::State("session id mismatch".to_string()));
         }
 
