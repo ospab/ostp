@@ -116,7 +116,7 @@ where
     info!("UoT client authenticated from {}", peer_addr);
 
     // Register this connection in the map
-    let (tx, mut rx) = mpsc::channel::<Bytes>(1024);
+    let (tx, mut rx) = mpsc::channel::<Bytes>(16384);
     {
         tcp_map.write().await.insert(peer_addr, tx);
     }

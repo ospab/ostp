@@ -180,8 +180,8 @@ where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    let (app_tx, mut tx_rx) = mpsc::channel::<Bytes>(1024);
-    let (rx_tx, app_rx) = mpsc::channel::<Bytes>(1024);
+    let (app_tx, mut tx_rx) = mpsc::channel::<Bytes>(16384);
+    let (rx_tx, app_rx) = mpsc::channel::<Bytes>(16384);
 
     // TX Loop (App -> UoT -> Network): prefix each frame with u16 BE length
     tokio::spawn(async move {
