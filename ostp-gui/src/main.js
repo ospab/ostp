@@ -367,6 +367,13 @@ window.addEventListener('DOMContentLoaded', async () => {
   setState('disconnected');
 
   // Event wiring
+  if (window.__TAURI__ && window.__TAURI__.event) {
+    window.__TAURI__.event.listen('tunnel-error', (evt) => {
+      setState('disconnected');
+      showToast(String(evt.payload), 'error');
+    });
+  }
+
   btnConnect.addEventListener('click',       handleToggle);
   btnGoSettings.addEventListener('click',    () => showScreen('settings'));
   btnBack.addEventListener('click',          () => showScreen('home'));

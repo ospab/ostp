@@ -70,18 +70,22 @@ pub async fn run_native_tunnel(
             New-NetRoute -DestinationPrefix '0.0.0.0/0' -InterfaceAlias 'ostp_tun' -NextHop '10.1.0.1' -RouteMetric 1 -ErrorAction SilentlyContinue\n",
             server_ip_str, current_exe
         );
-        let _ = Command::new("powershell")
-            .creation_flags(CREATE_NO_WINDOW)
-            .args(["-NoProfile", "-Command", &setup_script])
-            .output()?;
+        let _ = tokio::task::spawn_blocking(move || {
+            Command::new("powershell")
+                .creation_flags(CREATE_NO_WINDOW)
+                .args(["-NoProfile", "-Command", &setup_script])
+                .output()
+        }).await.unwrap()?;
         
         if let Some(ref dns) = config.dns_server {
             if !dns.is_empty() {
                 let net_setup = format!("netsh interface ipv4 set dnsservers name=\"ostp_tun\" static {} primary\n", dns);
-                let _ = Command::new("powershell")
-                    .creation_flags(CREATE_NO_WINDOW)
-                    .args(["-NoProfile", "-Command", &net_setup])
-                    .output()?;
+                let _ = tokio::task::spawn_blocking(move || {
+                    Command::new("powershell")
+                        .creation_flags(CREATE_NO_WINDOW)
+                        .args(["-NoProfile", "-Command", &net_setup])
+                        .output()
+                }).await.unwrap()?;
             }
         }
     }

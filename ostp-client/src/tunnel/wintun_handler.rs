@@ -60,14 +60,16 @@ pub async fn run_wintun_tunnel(
     // 1. Delete stale TUN adapter if it exists from a previous run.
     //    This prevents wintun from creating "ostp_tun 2", "ostp_tun 3", etc.
     tracing::info!("Cleaning up stale TUN adapter...");
-    let _ = Command::new("powershell")
-        .creation_flags(CREATE_NO_WINDOW)
-        .args(["-NoProfile", "-Command", &format!(
-            "Get-NetAdapter -Name '{TUN_NAME}*' -ErrorAction SilentlyContinue | \
-             Disable-NetAdapter -Confirm:$false -ErrorAction SilentlyContinue; \
-             netsh interface set interface \"{TUN_NAME}\" admin=disable 2>$null"
-        )])
-        .output();
+    let _ = tokio::task::spawn_blocking(move || {
+        Command::new("powershell")
+            .creation_flags(CREATE_NO_WINDOW)
+            .args(["-NoProfile", "-Command", &format!(
+                "Get-NetAdapter -Name '{TUN_NAME}*' -ErrorAction SilentlyContinue | \
+                 Disable-NetAdapter -Confirm:$false -ErrorAction SilentlyContinue; \
+                 netsh interface set interface \"{TUN_NAME}\" admin=disable 2>$null"
+            )])
+            .output()
+    }).await;
     // Brief pause to let the driver release the adapter
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
@@ -138,11 +140,13 @@ pub async fn run_wintun_tunnel(
     let mut adapter_ready = false;
     while tokio::time::Instant::now() < adapter_deadline {
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-        let check = Command::new("powershell")
-            .creation_flags(CREATE_NO_WINDOW)
-            .args(["-NoProfile", "-Command",
-                &format!("(Get-NetAdapter -Name '{TUN_NAME}' -ErrorAction SilentlyContinue).Status")])
-            .output();
+        let check = tokio::task::spawn_blocking(move || {
+            Command::new("powershell")
+                .creation_flags(CREATE_NO_WINDOW)
+                .args(["-NoProfile", "-Command",
+                    &format!("(Get-NetAdapter -Name '{TUN_NAME}' -ErrorAction SilentlyContinue).Status")])
+                .output()
+        }).await.unwrap();
         if let Ok(out) = check {
             let status = String::from_utf8_lossy(&out.stdout).trim().to_string();
             if debug {
@@ -181,10 +185,12 @@ pub async fn run_wintun_tunnel(
         }
     }
     
-    let _ = Command::new("powershell")
-        .creation_flags(CREATE_NO_WINDOW)
-        .args(["-NoProfile", "-Command", &net_setup])
-        .output()?;
+    let _ = tokio::task::spawn_blocking(move || {
+        Command::new("powershell")
+            .creation_flags(CREATE_NO_WINDOW)
+            .args(["-NoProfile", "-Command", &net_setup])
+            .output()
+    }).await.unwrap()?;
 
     tracing::info!("TUN tunnel active. All traffic is routed through OSTP.");
 
