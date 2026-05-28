@@ -133,7 +133,11 @@ pub async fn handle_relay_message(
             if debug {
                 let _ = ui_event_tx.send(UiEvent::Log(format!("Relay UDP ASSOCIATE stream_id={stream_id}")));
             }
-            let server_udp = match UdpSocket::bind("[::]:0").await.or_else(|_| UdpSocket::bind("0.0.0.0:0").await) {
+            let udp_bind_result = match UdpSocket::bind("[::]:0").await {
+                Ok(s) => Ok(s),
+                Err(_) => UdpSocket::bind("0.0.0.0:0").await,
+            };
+            let server_udp = match udp_bind_result {
                 Ok(s) => std::sync::Arc::new(s),
                 Err(e) => {
                     let _ = ui_event_tx.send(UiEvent::Log(format!("UDP bind failed: {e}")));
