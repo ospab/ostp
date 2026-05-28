@@ -552,6 +552,7 @@ async fn run_server_loop(
                                     outbound.clone(),
                                     dns_server.clone(),
                                     debug,
+                                    &tcp_map,
                                 ).await?;
                             }
                         }
@@ -563,16 +564,16 @@ async fn run_server_loop(
             }
             Some((session_id, stream_id, data)) = stream_rx.recv() => {
                 if data.is_empty() {
-                    let _ = relay::send_relay_to_stream(session_id, stream_id, RelayMessage::Close, &mut dispatcher, &socket, &ui_event_tx).await;
+                    let _ = relay::send_relay_to_stream(session_id, stream_id, RelayMessage::Close, &mut dispatcher, &socket, &ui_event_tx, &tcp_map).await;
                     if let Some(state) = remotes.remove(&(session_id, stream_id)) {
                         let _ = state.cancel_tx.try_send(());
                     }
                 } else {
-                    let _ = relay::send_relay_to_stream(session_id, stream_id, RelayMessage::Data(data), &mut dispatcher, &socket, &ui_event_tx).await;
+                    let _ = relay::send_relay_to_stream(session_id, stream_id, RelayMessage::Data(data), &mut dispatcher, &socket, &ui_event_tx, &tcp_map).await;
                 }
             }
             Some((session_id, stream_id, target, data)) = udp_reply_rx.recv() => {
-                let _ = relay::send_relay_to_stream(session_id, stream_id, RelayMessage::UdpData(target, data), &mut dispatcher, &socket, &ui_event_tx).await;
+                let _ = relay::send_relay_to_stream(session_id, stream_id, RelayMessage::UdpData(target, data), &mut dispatcher, &socket, &ui_event_tx, &tcp_map).await;
             }
             Some((session_id, stream_id, target, res)) = connect_rx.recv() => {
                 match res {
@@ -587,12 +588,12 @@ async fn run_server_loop(
                             }
                         });
                         remotes.insert((session_id, stream_id), RemoteState { data_tx, udp_tx: None, cancel_tx, is_dns: false });
-                        let _ = relay::send_relay_to_stream(session_id, stream_id, RelayMessage::ConnectOk, &mut dispatcher, &socket, &ui_event_tx).await;
+                        let _ = relay::send_relay_to_stream(session_id, stream_id, RelayMessage::ConnectOk, &mut dispatcher, &socket, &ui_event_tx, &tcp_map).await;
                         let _ = ui_event_tx.send(UiEvent::Log(format!("Relay CONNECT ok for [{session_id}:{stream_id}] -> {target}")));
                     }
                     Err(err) => {
                         let _ = ui_event_tx.send(UiEvent::Log(format!("Relay CONNECT failed for [{session_id}:{stream_id}] -> {target}: {err}")));
-                        let _ = relay::send_relay_to_stream(session_id, stream_id, RelayMessage::Error(format!("connect failed: {err}")), &mut dispatcher, &socket, &ui_event_tx).await;
+                        let _ = relay::send_relay_to_stream(session_id, stream_id, RelayMessage::Error(format!("connect failed: {err}")), &mut dispatcher, &socket, &ui_event_tx, &tcp_map).await;
                     }
                 }
             }

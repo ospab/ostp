@@ -26,6 +26,7 @@ pub async fn handle_relay_message(
     outbound_cfg: Option<OutboundConfig>,
     dns_server: std::sync::Arc<crate::dns::DnsServer>,
     debug: bool,
+    tcp_map: &std::sync::Arc<tokio::sync::RwLock<HashMap<std::net::SocketAddr, tokio::sync::mpsc::Sender<Bytes>>>>,
 ) -> Result<()> {
     match RelayMessage::decode(&payload)? {
         RelayMessage::Connect(target) => {
@@ -58,11 +59,16 @@ pub async fn handle_relay_message(
                     is_dns: true,
                 });
 
-                send_relay_to_stream(session_id, stream_id, RelayMessage::ConnectOk, dispatcher, socket, ui_event_tx).await?;
+                send_relay_to_stream(session_id, stream_id, RelayMessage::ConnectOk, dispatcher, socket, ui_event_tx, tcp_map).await?;
                 return Ok(());
             }
 
-            let target_clone = target.clone();
+            let mut connect_target = target.clone();
+            if connect_target.starts_with("10.1.0.1:") {
+                connect_target = connect_target.replace("10.1.0.1:", "127.0.0.1:");
+            }
+
+            let target_clone = connect_target.clone();
             let connect_tx_clone = connect_tx.clone();
             let stream_tx_clone = stream_tx.clone();
             let outbound_clone = outbound_cfg.clone();
@@ -120,7 +126,7 @@ pub async fn handle_relay_message(
             let _ = ui_event_tx.send(UiEvent::Log(format!("Relay error from [{session_id}:{stream_id}]: {msg}")));
         }
         RelayMessage::Ping(ts) => {
-            send_relay_to_stream(session_id, stream_id, RelayMessage::Pong(ts), dispatcher, socket, ui_event_tx).await?;
+            send_relay_to_stream(session_id, stream_id, RelayMessage::Pong(ts), dispatcher, socket, ui_event_tx, tcp_map).await?;
         }
         RelayMessage::Pong(_) => {}
         RelayMessage::UdpAssociate => {
@@ -152,7 +158,11 @@ pub async fn handle_relay_message(
                             let _ = udp_reply_clone_dns.send((session_id, stream_id, target, resp_bytes));
                         }
                     } else {
-                        let _ = tx_sock.send_to(&data, &target).await;
+                        let mut forward_target = target.clone();
+                        if forward_target.starts_with("10.1.0.1:") {
+                            forward_target = forward_target.replace("10.1.0.1:", "127.0.0.1:");
+                        }
+                        let _ = tx_sock.send_to(&data, &forward_target).await;
                     }
                 }
             });
@@ -184,7 +194,7 @@ pub async fn handle_relay_message(
                 is_dns: false,
             });
 
-            send_relay_to_stream(session_id, stream_id, RelayMessage::ConnectOk, dispatcher, socket, ui_event_tx).await?;
+            send_relay_to_stream(session_id, stream_id, RelayMessage::ConnectOk, dispatcher, socket, ui_event_tx, tcp_map).await?;
         }
         RelayMessage::UdpData(target, data) => {
             if let Some(remote) = remotes.get_mut(&(session_id, stream_id)) {
@@ -206,11 +216,22 @@ pub async fn send_relay_to_stream(
     dispatcher: &mut Dispatcher,
     socket: &UdpSocket,
     ui_event_tx: &mpsc::UnboundedSender<UiEvent>,
+    tcp_map: &std::sync::Arc<tokio::sync::RwLock<HashMap<std::net::SocketAddr, tokio::sync::mpsc::Sender<Bytes>>>>,
 ) -> Result<()> {
     let payload = Bytes::from(msg.encode());
     if let Some((frame, peer_addr)) = dispatcher.outbound_to_session(session_id, stream_id, payload)? {
         let response_len = frame.len();
-        let _ = socket.send_to(&frame, peer_addr).await?;
+        let mut sent_tcp = false;
+        {
+            let map = tcp_map.read().await;
+            if let Some(tx) = map.get(&peer_addr) {
+                let _ = tx.try_send(frame.clone());
+                sent_tcp = true;
+            }
+        }
+        if !sent_tcp {
+            let _ = socket.send_to(&frame, peer_addr).await?;
+        }
         let _ = ui_event_tx.send(UiEvent::Tx {
             peer: peer_addr.ip(),
             bytes: response_len,

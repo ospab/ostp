@@ -1096,8 +1096,13 @@ class _SettingsScreenState extends State<SettingsScreen> {
                 _buildTextField('Server Address', _serverCtrl, hint: 'host:port'),
                 _buildTextField('Local Proxy Bind', _localBindCtrl, hint: '127.0.0.1:1088'),
                 _buildTextField('Access Key', _keyCtrl, hint: 'Secure access key', isPassword: true),
+                _buildToggle('Built-in Server DNS', 'Route DNS queries to the VPN server', _owndns, (val) {
+                  setState(() {
+                    _owndns = val;
+                  });
+                }),
                 if (!_owndns) ...[
-                  _buildTextField('DNS Server', _dnsCtrl, hint: '1.1.1.1'),
+                  _buildTextField('Custom DNS Server', _dnsCtrl, hint: '1.1.1.1 (e.g. 8.8.8.8)'),
                 ],
                 _buildTextField('MTU (Packet Size)', _mtuCtrl, hint: '1350 (decrease if connection drops)'),
 
