@@ -318,9 +318,11 @@ jobs:
       matrix:
         include:
           - arch: arm64-v8a
+            rust_target: aarch64-linux-android
             flutter_target: android-arm64
             tun2socks_arch: linux-arm64
           - arch: armeabi-v7a
+            rust_target: armv7-linux-androideabi
             flutter_target: android-arm
             tun2socks_arch: linux-armv7
     steps:
@@ -341,7 +343,7 @@ jobs:
       - name: Setup Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: aarch64-linux-android
+          targets: ${{ matrix.rust_target }}
 
       - name: Setup Android NDK
         uses: nttld/setup-ndk@v1
