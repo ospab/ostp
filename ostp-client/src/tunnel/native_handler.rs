@@ -58,8 +58,11 @@ pub async fn run_native_tunnel(
             if ($route) {{\n\
                 $gw = $route.NextHop\n\
                 $ifIndex = $route.InterfaceIndex\n\
-                # Route server IP and gateway directly via real interface (bypass TUN)\n\
-                New-NetRoute -DestinationPrefix \"$remote_ip/32\" -NextHop $gw -InterfaceIndex $ifIndex -RouteMetric 1 -ErrorAction SilentlyContinue\n\
+                if ($gw -eq '0.0.0.0' -or $gw -eq '::') {{\n\
+                    New-NetRoute -DestinationPrefix \"$remote_ip/32\" -InterfaceIndex $ifIndex -RouteMetric 1 -ErrorAction SilentlyContinue\n\
+                }} else {{\n\
+                    New-NetRoute -DestinationPrefix \"$remote_ip/32\" -NextHop $gw -InterfaceIndex $ifIndex -RouteMetric 1 -ErrorAction SilentlyContinue\n\
+                }}\n\
                 if ($gw -ne '0.0.0.0') {{\n\
                     New-NetRoute -DestinationPrefix \"$gw/32\" -NextHop '0.0.0.0' -InterfaceIndex $ifIndex -RouteMetric 1 -ErrorAction SilentlyContinue\n\
                 }}\n\

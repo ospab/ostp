@@ -93,7 +93,11 @@ pub async fn run_wintun_tunnel(
          if ($route) {{\n\
              $gw = $route.NextHop\n\
              $ifIndex = $route.InterfaceIndex\n\
-             New-NetRoute -DestinationPrefix \"$remote_ip/32\" -NextHop $gw -InterfaceIndex $ifIndex -RouteMetric 1 -ErrorAction SilentlyContinue\n\
+             if ($gw -eq '0.0.0.0' -or $gw -eq '::') {{\n\
+                 New-NetRoute -DestinationPrefix \"$remote_ip/32\" -InterfaceIndex $ifIndex -RouteMetric 1 -ErrorAction SilentlyContinue\n\
+             }} else {{\n\
+                 New-NetRoute -DestinationPrefix \"$remote_ip/32\" -NextHop $gw -InterfaceIndex $ifIndex -RouteMetric 1 -ErrorAction SilentlyContinue\n\
+             }}\n\
          }}\n\
          New-NetFirewallRule -DisplayName 'OSTP Tunnel In' -Direction Inbound -Program $exe_path -Action Allow -Enabled True -ErrorAction SilentlyContinue\n\
          New-NetFirewallRule -DisplayName 'OSTP Tunnel Out' -Direction Outbound -Program $exe_path -Action Allow -Enabled True -ErrorAction SilentlyContinue\n",
