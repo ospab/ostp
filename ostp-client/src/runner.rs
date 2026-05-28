@@ -157,10 +157,14 @@ pub async fn run_client_core(
     // Resolve the server IP before we override system routing and DNS.
     // This prevents DNS deadlock if the VPN disconnects and tries to reconnect,
     // and also ensures we add the direct route to the exact IP the bridge connects to.
-    let resolved_addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host(&config.ostp.server_addr)
+    #[allow(unused_mut)]
+    let mut resolved_addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host(&config.ostp.server_addr)
         .await
         .map_err(|e| anyhow::anyhow!("Failed to resolve server address {}: {}", config.ostp.server_addr, e))?
         .collect();
+        
+    #[cfg(target_os = "android")]
+    resolved_addrs.sort_by_key(|addr| if addr.is_ipv6() { 0 } else { 1 });
         
     let target_addr = resolved_addrs.first()
         .ok_or_else(|| anyhow::anyhow!("No IP addresses resolved for {}", config.ostp.server_addr))?;
