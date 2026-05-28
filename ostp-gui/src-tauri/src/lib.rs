@@ -159,6 +159,7 @@ fn map_to_client_config(raw: &ClientConfigRaw, mode: &str) -> ostp_client::confi
             connect_timeout_ms: 5000,
         },
         reality: ostp_client::config::RealityConfig {
+            enabled: raw.reality.as_ref().and_then(|t| t.enabled).unwrap_or(false),
             sni: raw.reality.as_ref().and_then(|t| t.sni.clone()).unwrap_or_default(),
             fp: raw.reality.as_ref().and_then(|t| t.fp.clone()).unwrap_or_default(),
             pbk: raw.reality.as_ref().and_then(|t| t.pbk.clone()).unwrap_or_default(),
