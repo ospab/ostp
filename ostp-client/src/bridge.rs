@@ -614,12 +614,10 @@ impl Bridge {
                                 Ok(ProtocolAction::SendDatagram(frame)) => {
                                     if send_datagram(&session.socket, &frame, self.transport_mode == "udp" ).await.is_ok() {
                                         self.metrics.bytes_sent.fetch_add(frame.len() as u64, Ordering::Relaxed);
-                                        if self.debug {
-                                            let _ = tx.send(UiEvent::Log(format!(
-                                                "Outbound datagram sent stream_id={stream_id} bytes={}",
-                                                frame.len()
-                                            ))).await;
-                                        }
+                                        tracing::trace!(
+                                            "Outbound datagram sent stream_id={stream_id} bytes={}",
+                                            frame.len()
+                                        );
                                     }
                                 }
                                 Ok(ProtocolAction::Multiple(list)) => {
@@ -632,25 +630,19 @@ impl Bridge {
                                             }
                                         }
                                     }
-                                    if self.debug {
-                                        let _ = tx.send(UiEvent::Log(format!(
-                                            "Outbound datagram batch stream_id={stream_id} sent={sent}"
-                                        ))).await;
-                                    }
+                                    tracing::trace!(
+                                        "Outbound datagram batch stream_id={stream_id} sent={sent}"
+                                    );
                                 }
                                 Ok(ProtocolAction::Noop) => {
-                                    if self.debug {
-                                        let _ = tx.send(UiEvent::Log(format!(
-                                            "Outbound datagram noop stream_id={stream_id}"
-                                        ))).await;
-                                    }
+                                    tracing::trace!(
+                                        "Outbound datagram noop stream_id={stream_id}"
+                                    );
                                 }
                                 Ok(_) => {
-                                    if self.debug {
-                                        let _ = tx.send(UiEvent::Log(format!(
-                                            "Outbound datagram unexpected action stream_id={stream_id}"
-                                        ))).await;
-                                    }
+                                    tracing::trace!(
+                                        "Outbound datagram unexpected action stream_id={stream_id}"
+                                    );
                                 }
                                 Err(e) => {
                                     tracing::warn!("Protocol error packing outbound stream_id={}: {}", stream_id, e);

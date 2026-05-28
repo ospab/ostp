@@ -289,8 +289,6 @@ pub async fn run_server(
                         || msg.starts_with("Listening")
                         || msg.starts_with("Shutdown")
                         || msg.starts_with("Session ")
-                        || msg.starts_with("Relay CONNECT")
-                        || msg.starts_with("Relay CLOSE")
                         || msg.starts_with("Relay error");
                     if debug || is_essential {
                         tracing::info!("{msg}");
@@ -592,7 +590,7 @@ async fn run_server_loop(
                         let _ = ui_event_tx.send(UiEvent::Log(format!("Relay CONNECT ok for [{session_id}:{stream_id}] -> {target}")));
                     }
                     Err(err) => {
-                        let _ = ui_event_tx.send(UiEvent::Log(format!("Relay CONNECT failed for [{session_id}:{stream_id}] -> {target}: {err}")));
+                        let _ = ui_event_tx.send(UiEvent::Log(format!("Relay error: CONNECT failed for [{session_id}:{stream_id}] -> {target}: {err}")));
                         let _ = relay::send_relay_to_stream(session_id, stream_id, RelayMessage::Error(format!("connect failed: {err}")), &mut dispatcher, &socket, &ui_event_tx, &tcp_map).await;
                     }
                 }
