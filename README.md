@@ -1,6 +1,6 @@
 # OSTP — Ospab Stealth Transport Protocol
 
-[Русский язык](README.ru.md) · [Wiki](https://github.com/ospab/ostp/wiki) · [Releases](https://github.com/ospab/ostp/releases)
+[Русский язык](README.ru.md) · [Wiki](https://github.com/ospab/ostp/wiki) · [Contributing](CONTRIBUTING.md) · [Releases](https://github.com/ospab/ostp/releases)
 
 ![GitHub Release](https://img.shields.io/github/v/release/ospab/ostp?style=flat-square&color=blue)
 ![License: BSL 1.1](https://img.shields.io/badge/License-BSL%201.1-orange.svg?style=flat-square)
