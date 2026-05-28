@@ -8,7 +8,6 @@ use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 
 use crate::dispatcher::Dispatcher;
-use crate::dns::DnsServer;
 use crate::outbound::{self, OutboundConfig};
 use crate::{RemoteState, UiEvent};
 
@@ -24,53 +23,11 @@ pub async fn handle_relay_message(
     stream_tx: mpsc::UnboundedSender<(u32, u16, Vec<u8>)>,
     connect_tx: mpsc::UnboundedSender<(u32, u16, String, Result<(tokio::net::tcp::OwnedWriteHalf, mpsc::Sender<()>), String>)>,
     outbound_cfg: Option<OutboundConfig>,
-    dns_server: std::sync::Arc<DnsServer>,
     debug: bool,
 ) -> Result<()> {
     match RelayMessage::decode(&payload)? {
         RelayMessage::Connect(target) => {
             let _ = ui_event_tx.send(UiEvent::Log(format!("Relay CONNECT start for [{session_id}:{stream_id}] -> {target}")));
-
-            // ── DNS Interception ────────────────────────────────────────────────
-            // If client is connecting to port 53 (DNS), we handle it locally
-            // instead of opening a real UDP/TCP socket to the destination.
-            //
-            // Protocol flow:
-            //   1. Client sends Connect("8.8.8.8:53")   → we reply ConnectOk
-            //   2. Client sends Data(<dns_query_bytes>)  → we resolve & reply Data(<dns_response>) + Close
-            if is_dns_target(&target) {
-                let client_ip = peer_addr.ip();
-                let dns_srv = dns_server.clone();
-                let stream_tx_dns = stream_tx.clone();
-                let (cancel_tx, _) = mpsc::channel::<()>(1);
-
-                // Channel: relay.rs Data handler → DNS resolution task
-                let (dns_query_tx, mut dns_query_rx) = mpsc::unbounded_channel::<Bytes>();
-
-                // Spawn task that waits for the DNS query payload and resolves it
-                tokio::spawn(async move {
-                    if let Some(query_bytes) = dns_query_rx.recv().await {
-                        if let Some(resp_bytes) = dns_srv.resolve(&query_bytes, client_ip).await {
-                            let _ = stream_tx_dns.send((session_id, stream_id, resp_bytes));
-                        }
-                    }
-                    // Always close the stream after responding
-                    let _ = stream_tx_dns.send((session_id, stream_id, Vec::new()));
-                });
-
-                // Store as a RemoteState — Data messages will be forwarded to dns_query_tx
-                remotes.insert((session_id, stream_id), RemoteState {
-                    data_tx: dns_query_tx,
-                    cancel_tx,
-                    is_dns: true,
-                });
-
-                // Tell the client we are ready to receive its DNS query
-                send_relay_to_stream(session_id, stream_id, RelayMessage::ConnectOk, dispatcher, socket, ui_event_tx).await?;
-                return Ok(());
-            }
-
-            // ── Normal TCP Connect ──────────────────────────────────────────────
             let target_clone = target.clone();
             let connect_tx_clone = connect_tx.clone();
             let stream_tx_clone = stream_tx.clone();
@@ -136,10 +93,7 @@ pub async fn handle_relay_message(
     Ok(())
 }
 
-/// Returns true if the target address is a DNS server (port 53)
-fn is_dns_target(target: &str) -> bool {
-    target.ends_with(":53")
-}
+
 
 pub async fn send_relay_to_stream(
     session_id: u32,

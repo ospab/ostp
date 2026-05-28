@@ -54,18 +54,15 @@ pub async fn run_native_tunnel(
         let setup_script = format!(
             "$remote_ip = '{}'\n\
             $exe_path = '{}'\n\
-            $route = Get-NetRoute -DestinationPrefix '0.0.0.0/0' | Where-Object {{ $_.InterfaceAlias -notmatch 'tun' -and $_.InterfaceAlias -notmatch 'wintun' }} | Sort-Object RouteMetric | Select-Object -First 1\n\
+            $route = Get-NetRoute -DestinationPrefix '0.0.0.0/0' | Where-Object {{ $_.InterfaceAlias -notmatch 'ostp' -and $_.InterfaceAlias -notmatch 'tun' -and $_.InterfaceAlias -notmatch 'wintun' }} | Sort-Object RouteMetric | Select-Object -First 1\n\
             if ($route) {{\n\
                 $gw = $route.NextHop\n\
                 $ifIndex = $route.InterfaceIndex\n\
+                # Route server IP and gateway directly via real interface (bypass TUN)\n\
                 New-NetRoute -DestinationPrefix \"$remote_ip/32\" -NextHop $gw -InterfaceIndex $ifIndex -RouteMetric 1 -ErrorAction SilentlyContinue\n\
-                $dns_ips = Get-DnsClientServerAddress -InterfaceIndex $ifIndex | Select-Object -ExpandProperty ServerAddresses\n\
-                foreach ($dns in $dns_ips) {{\n\
-                    if ($dns -match '^\\d+\\.\\d+\\.\\d+\\.\\d+$') {{\n\
-                        New-NetRoute -DestinationPrefix \"$dns/32\" -NextHop $gw -InterfaceIndex $ifIndex -RouteMetric 1 -ErrorAction SilentlyContinue\n\
-                    }}\n\
+                if ($gw -ne '0.0.0.0') {{\n\
+                    New-NetRoute -DestinationPrefix \"$gw/32\" -NextHop '0.0.0.0' -InterfaceIndex $ifIndex -RouteMetric 1 -ErrorAction SilentlyContinue\n\
                 }}\n\
-                New-NetRoute -DestinationPrefix \"1.1.1.1/32\" -NextHop $gw -InterfaceIndex $ifIndex -RouteMetric 1 -ErrorAction SilentlyContinue\n\
             }}\n\
             New-NetFirewallRule -DisplayName 'OSTP Tunnel In' -Direction Inbound -Program $exe_path -Action Allow -Enabled True -ErrorAction SilentlyContinue\n\
             New-NetFirewallRule -DisplayName 'OSTP Tunnel Out' -Direction Outbound -Program $exe_path -Action Allow -Enabled True -ErrorAction SilentlyContinue\n\
@@ -91,8 +88,28 @@ pub async fn run_native_tunnel(
 
     #[cfg(target_os = "linux")]
     {
-        // Add default route to tun, bypassing server IP
-        let _ = Command::new("ip").args(["route", "add", &format!("{}/32", server_ip_str), "via", "10.1.0.1"]).output();
+        // Get real gateway before routing through TUN
+        let gw_out = Command::new("ip")
+            .args(["route", "show", "default"])
+            .output()
+            .ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok());
+        
+        let real_gw = gw_out.as_deref().and_then(|s| {
+            // "default via 192.168.1.1 dev eth0" -> "192.168.1.1"
+            s.split_whitespace().skip_while(|w| *w != "via").nth(1).map(|s| s.to_string())
+        });
+        let real_dev = gw_out.as_deref().and_then(|s| {
+            s.split_whitespace().skip_while(|w| *w != "dev").nth(1).map(|s| s.to_string())
+        });
+
+        // Add exclusion route for server IP via real gateway (bypass TUN)
+        if let (Some(ref gw), Some(ref dev)) = (&real_gw, &real_dev) {
+            let _ = Command::new("ip").args(["route", "add", &format!("{}/32", server_ip_str), "via", gw, "dev", dev]).output();
+        }
+
+        // Add default route through TUN (lower metric to take priority)
+        let _ = Command::new("ip").args(["route", "add", "default", "via", "10.1.0.1", "dev", "ostp_tun", "metric", "10"]).output();
     }
 
     let (stack, tcp_runner, udp_socket, tcp_listener) = StackBuilder::default()
@@ -236,7 +253,6 @@ pub async fn run_native_tunnel(
         let cleanup_script = format!(
             "$remote_ip = '{}'\n\
              Remove-NetRoute -DestinationPrefix \"$remote_ip/32\" -Confirm:$false -ErrorAction SilentlyContinue\n\
-             Remove-NetRoute -DestinationPrefix \"1.1.1.1/32\" -Confirm:$false -ErrorAction SilentlyContinue\n\
              Remove-NetFirewallRule -DisplayName 'OSTP Tunnel*' -ErrorAction SilentlyContinue\n\
              netsh interface ipv4 set dnsservers name=\"ostp_tun\" source=dhcp 2>$null\n",
             server_ip_str
@@ -245,6 +261,13 @@ pub async fn run_native_tunnel(
             .creation_flags(CREATE_NO_WINDOW)
             .args(["-NoProfile", "-Command", &cleanup_script])
             .output();
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        // Remove default route via TUN and server exclusion route
+        let _ = Command::new("ip").args(["route", "del", "default", "dev", "ostp_tun"]).output();
+        let _ = Command::new("ip").args(["route", "del", &format!("{}/32", server_ip_str)]).output();
     }
 
     Ok(())
