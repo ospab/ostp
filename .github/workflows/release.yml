@@ -289,7 +289,7 @@ jobs:
         run: |
           npm install
           cargo build -p ostp-tun-helper --release --target ${{ matrix.target }}
-          npm run build -- --no-bundle --target ${{ matrix.target }}
+          npx tauri build --no-bundle --target ${{ matrix.target }}
 
       - name: Package Portable ZIP
         shell: pwsh
@@ -312,8 +312,17 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   build-android:
-    name: Build Android Client (Flutter)
+    name: Build Android Client (Flutter) - ${{ matrix.arch }}
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - arch: arm64-v8a
+            flutter_target: android-arm64
+            tun2socks_arch: linux-arm64
+          - arch: armeabi-v7a
+            flutter_target: android-arm
+            tun2socks_arch: linux-armv7
     steps:
       - uses: actions/checkout@v4
 
@@ -347,42 +356,31 @@ jobs:
         working-directory: ostp-flutter
         run: |
           # 1. Compile JNI
-          mkdir -p android/app/src/main/jniLibs/arm64-v8a
-          mkdir -p android/app/src/main/jniLibs/armeabi-v7a
+          mkdir -p android/app/src/main/jniLibs/${{ matrix.arch }}
           
           cd ../ostp-jni
-          cargo ndk -t arm64-v8a -t armeabi-v7a -o "../ostp-flutter/android/app/src/main/jniLibs" build --release
+          cargo ndk -t ${{ matrix.arch }} -o "../ostp-flutter/android/app/src/main/jniLibs" build --release
           cd ../ostp-flutter
           
           # 2. Download tun2socks
-          if [ ! -f "android/app/src/main/jniLibs/arm64-v8a/libtun2socks.so" ]; then
-            curl -fsSL "https://github.com/xjasonlyu/tun2socks/releases/download/v2.6.0/tun2socks-linux-arm64.zip" -o "t2s64.zip"
-            unzip -o t2s64.zip -d t2s64_tmp
-            cp t2s64_tmp/tun2socks-linux-arm64 android/app/src/main/jniLibs/arm64-v8a/libtun2socks.so
-            rm -rf t2s64.zip t2s64_tmp
-          fi
-          
-          if [ ! -f "android/app/src/main/jniLibs/armeabi-v7a/libtun2socks.so" ]; then
-            curl -fsSL "https://github.com/xjasonlyu/tun2socks/releases/download/v2.6.0/tun2socks-linux-armv7.zip" -o "t2s32.zip"
-            unzip -o t2s32.zip -d t2s32_tmp
-            cp t2s32_tmp/tun2socks-linux-armv7 android/app/src/main/jniLibs/armeabi-v7a/libtun2socks.so
-            rm -rf t2s32.zip t2s32_tmp
+          if [ ! -f "android/app/src/main/jniLibs/${{ matrix.arch }}/libtun2socks.so" ]; then
+            curl -fsSL "https://github.com/xjasonlyu/tun2socks/releases/download/v2.6.0/tun2socks-${{ matrix.tun2socks_arch }}.zip" -o "t2s.zip"
+            unzip -o t2s.zip -d t2s_tmp
+            cp t2s_tmp/tun2socks-${{ matrix.tun2socks_arch }} android/app/src/main/jniLibs/${{ matrix.arch }}/libtun2socks.so
+            rm -rf t2s.zip t2s_tmp
           fi
           
           # 3. Build Flutter APK
-          flutter build apk --release --split-per-abi
+          flutter build apk --release --target-platform ${{ matrix.flutter_target }}
           
           # 4. Copy to output
-          cp build/app/outputs/flutter-apk/app-armeabi-v7a-release.apk ostp-android-armv7.apk
-          cp build/app/outputs/flutter-apk/app-arm64-v8a-release.apk ostp-android-arm64.apk
+          cp build/app/outputs/flutter-apk/app-release.apk ostp-android-${{ matrix.arch }}.apk
 
       - name: Upload to GitHub Release
         if: ${{ startsWith(github.ref, 'refs/tags/') }}
         uses: softprops/action-gh-release@v2
         with:
-          files: |
-            ostp-flutter/ostp-android-armv7.apk
-            ostp-flutter/ostp-android-arm64.apk
+          files: ostp-flutter/ostp-android-${{ matrix.arch }}.apk
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 

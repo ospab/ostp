@@ -1,7 +1,6 @@
 /target/
 /target_build/
 /target_linux/
-/ostp-gui/
 /dist/
 **/*.rs.bk
 .idea/
@@ -32,4 +31,4 @@ wintun.dll
 # Dev notes (not for repo)
 .ai-rules.md
 turn-harvesting-idea.md
-ostp-flutter/
+

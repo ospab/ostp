@@ -139,8 +139,9 @@ Download pre-built binaries for your platform from [GitHub Releases](https://git
 
 ### 4. Connect via share link (one-liner)
 ```bash
-./ostp ostp://ACCESS_KEY@server.com:50000
+./ostp "ostp://ACCESS_KEY@server.com:50000?..."
 ```
+> **Note**: Always wrap the `ostp://...` link in quotes (`"`) so your terminal doesn't misinterpret special characters like `&` or `?`.
 
 ---
 
@@ -230,3 +231,10 @@ cargo test -p ostp-core -p ostp-server
 
 Business Source License 1.1. Free for personal and non-commercial use.  
 Converts to MIT License on May 14, 2030.
+
+---
+
+## Contact
+
+- **Telegram**: [@ospab0](https://t.me/ospab0)
+- **Email**: gvoprgrg@gmail.com
