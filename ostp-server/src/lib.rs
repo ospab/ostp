@@ -554,6 +554,7 @@ async fn run_server_loop(
                                     stream_tx.clone(),
                                     connect_tx.clone(),
                                     outbound.clone(),
+                                    dns_server.clone(),
                                     debug,
                                 ).await?;
                             }
