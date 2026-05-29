@@ -5,15 +5,15 @@ use tokio::net::TcpStream;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use anyhow::{Result, Context};
 use tokio::sync::mpsc;
-use hmac::{Hmac, Mac};
+use hmac::Hmac;
 use sha2::Sha256;
 use base64::Engine;
 use std::pin::Pin;
 use std::task::{Context as TaskContext, Poll};
 use x25519_dalek::PublicKey;
-use chacha20poly1305::{aead::{Aead, KeyInit, Payload}, ChaCha20Poly1305, Nonce};
+use chacha20poly1305::{aead::Aead, ChaCha20Poly1305, Nonce};
 
-use ostp_core::crypto::reality::{build_client_hello, derive_keys, generate_session_id, generate_x25519_keypair};
+use ostp_core::crypto::reality::{build_client_hello, derive_keys, generate_session_id, generate_x25519_keypair, REALITY_SERVER_HANDSHAKE_RECORDS};
 use ostp_core::framing::wss::{encode_wss_frame, decode_wss_frame, WssFrameResult};
 
 type HmacSha256 = Hmac<Sha256>;
@@ -56,15 +56,24 @@ pub async fn connect_xhttp(
         
         tcp_stream.write_all(&client_hello).await?;
         
-        // Read fake ServerHello (just read until the end of the handshake, we assume server sends exactly 1 record for ServerHello)
-        let mut head = [0u8; 5];
-        tcp_stream.read_exact(&mut head).await?;
-        if head[0] != 0x16 {
-            anyhow::bail!("expected Handshake record from Reality Server");
+        // Drain all server handshake records (ServerHello, CCS, fake encrypted records).
+        // The server sends exactly REALITY_SERVER_HANDSHAKE_RECORDS records before data starts.
+        // Reading them explicitly prevents RealityStream from seeing non-AppData bytes.
+        for i in 0..REALITY_SERVER_HANDSHAKE_RECORDS {
+            let mut head = [0u8; 5];
+            tcp_stream.read_exact(&mut head).await
+                .with_context(|| format!("reality handshake: failed reading record {} header", i))?;
+            if i == 0 && head[0] != 0x16 {
+                anyhow::bail!("expected ServerHello (0x16), got 0x{:02x}", head[0]);
+            }
+            let record_len = u16::from_be_bytes([head[3], head[4]]) as usize;
+            if record_len > 16384 {
+                anyhow::bail!("reality handshake: record {} too large: {} bytes", i, record_len);
+            }
+            let mut _payload = vec![0u8; record_len];
+            tcp_stream.read_exact(&mut _payload).await
+                .with_context(|| format!("reality handshake: failed reading record {} payload", i))?;
         }
-        let record_len = u16::from_be_bytes([head[3], head[4]]) as usize;
-        let mut server_hello_payload = vec![0u8; record_len];
-        tcp_stream.read_exact(&mut server_hello_payload).await?;
 
         let reality_stream = RealityStream::new(tcp_stream, data_key);
         xhttp_handshake_and_loop(reality_stream, target_ip, sni, access_key, wss).await

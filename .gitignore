@@ -32,3 +32,6 @@ wintun.dll
 .ai-rules.md
 turn-harvesting-idea.md
 
+# Private tooling (closed-source)
+ostp-prober/
+

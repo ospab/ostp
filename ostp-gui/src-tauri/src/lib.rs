@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::{watch, Mutex};
 use tokio::task::JoinHandle;
@@ -60,6 +60,7 @@ struct TransportConfigRaw {
     mode: Option<String>,
     stealth_sni: Option<String>,
     stealth_port: Option<u16>,
+    wss: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -171,6 +172,7 @@ fn map_to_client_config(raw: &ClientConfigRaw, mode: &str) -> ostp_client::confi
             mode: raw.transport.as_ref().and_then(|t| t.mode.clone()).unwrap_or_else(|| "udp".to_string()),
             stealth_sni: raw.transport.as_ref().and_then(|t| t.stealth_sni.clone()).unwrap_or_else(|| "microsoft.com".to_string()),
             stealth_port: raw.transport.as_ref().and_then(|t| t.stealth_port).unwrap_or(443),
+            wss: raw.transport.as_ref().and_then(|t| t.wss).unwrap_or(false),
         },
         exclusions: ostp_client::config::ExclusionConfig {
             domains: raw.exclude.as_ref().and_then(|e| e.domains.clone()).unwrap_or_default(),
@@ -504,7 +506,7 @@ fn launch_as_admin(exe: &std::path::PathBuf, token: &str) -> anyhow::Result<()> 
     
     // Use the GUI executable's directory as the working directory so dependencies are found
     let cwd_path = std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("."));
-    let dir_wstr: Vec<u16> = cwd_path.parent().unwrap_or(Path::new(".")).as_os_str().encode_wide().chain(Some(0)).collect();
+    let dir_wstr: Vec<u16> = cwd_path.parent().unwrap_or(std::path::Path::new(".")).as_os_str().encode_wide().chain(Some(0)).collect();
     
     let ret = unsafe { ShellExecuteW(null_mut(), verb_wstr.as_ptr(), exe_wstr.as_ptr(), params_wstr.as_ptr(), dir_wstr.as_ptr(), 0) };
     if ret <= 32 { anyhow::bail!("UAC denied or helper missing."); }

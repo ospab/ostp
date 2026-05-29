@@ -1,5 +1,5 @@
 use bytes::{Buf, BufMut, Bytes, BytesMut};
-use chacha20poly1305::{aead::{Aead, KeyInit, Payload}, ChaCha20Poly1305, Nonce};
+use chacha20poly1305::{aead::{Aead, KeyInit}, ChaCha20Poly1305, Nonce};
 use hkdf::Hkdf;
 use sha2::Sha256;
 use x25519_dalek::{PublicKey, StaticSecret};
@@ -9,6 +9,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 const REALITY_INFO: &[u8] = b"ostp-reality-v1";
 const RECORD_HEADER_LEN: usize = 5;
 const HANDSHAKE_HEADER_LEN: usize = 4;
+
+/// Number of TLS records sent by the server during the fake handshake phase.
+/// Client must read and discard this many records before starting RealityStream.
+/// Layout: 1× ServerHello (0x16) + 1× CCS (0x14) + 3× fake encrypted records (0x17)
+pub const REALITY_SERVER_HANDSHAKE_RECORDS: usize = 5;
 
 /// Generates an X25519 keypair
 pub fn generate_x25519_keypair() -> (StaticSecret, PublicKey) {
@@ -156,8 +161,14 @@ pub fn build_client_hello(sni: &str, session_id: &[u8; 32], c_pub: &PublicKey) -
     record.put_u8((handshake_len >> 8) as u8);
     record.put_u8(handshake_len as u8);
     record.put_slice(&handshake);
-    
-    record.freeze()
+
+    // Append ChangeCipherSpec for TLS 1.3 middlebox compatibility (RFC 8446 §D.4)
+    // This makes the flow look like: ClientHello → ServerHello → CCS → AppData
+    // instead of the DPI-suspicious: ClientHello → AppData directly.
+    let mut out = BytesMut::new();
+    out.put_slice(&record);
+    out.put_slice(&[0x14, 0x03, 0x03, 0x00, 0x01, 0x01]);
+    out.freeze()
 }
 
 pub struct ParsedClientHello {

@@ -13,11 +13,11 @@ use tokio::net::TcpStream;
 use base64::Engine;
 use std::pin::Pin;
 use std::task::{Context as TaskContext, Poll};
-use chacha20poly1305::{aead::{Aead, KeyInit, Payload}, ChaCha20Poly1305, Nonce};
-use x25519_dalek::{StaticSecret, PublicKey};
+use chacha20poly1305::{aead::Aead, ChaCha20Poly1305, Nonce};
+use x25519_dalek::StaticSecret;
 
 use ostp_core::framing::wss::{encode_wss_frame, decode_wss_frame, WssFrameResult};
-use ostp_core::crypto::reality::{parse_client_hello, derive_keys, verify_session_id};
+use ostp_core::crypto::reality::{parse_client_hello, derive_keys, verify_session_id, REALITY_SERVER_HANDSHAKE_RECORDS};
 use crate::RealityServerConfig;
 
 pub async fn handle_tcp_connection<S>(
@@ -204,17 +204,70 @@ where
         let data_key = data_key_opt.unwrap();
         info!("Reality client authenticated from {} (sid matched)", peer_addr);
         
-        // Send a fake ServerHello. For now, a static, valid-looking TLS 1.3 ServerHello.
-        let server_hello = hex::decode("160303007a0200007603030000000000000000000000000000000000000000000000000000000000000000200000000000000000000000000000000000000000000000000000000000000000130100002e002b0002030400330024001d0020e29b191a62d0572e9a30d0fb9d08e50bc78d591dfc1dbafbfa533411db1c8e111403030001011603030030000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000170303001300000000000000000000000000000000000000").unwrap();
-        stream.write_all(&server_hello).await?;
-        
-        // At this point, the Reality tunnel is established. We need to wrap the stream with RealityStream.
+        // Build a fake TLS 1.3 server flight that matches what a real server sends.
+        // Must be exactly REALITY_SERVER_HANDSHAKE_RECORDS (5) TLS records:
+        //   1. ServerHello        (0x16)  - static blob with fake key share
+        //   2. ChangeCipherSpec   (0x14)  - RFC 8446 §D.4 middlebox compat
+        //   3. Fake EE            (0x17)  - simulates EncryptedExtensions
+        //   4. Fake Certificate   (0x17)  - simulates Certificate (big, DPI-realistic)
+        //   5. Fake Finished      (0x17)  - simulates CertificateVerify + Finished
+        let _ = REALITY_SERVER_HANDSHAKE_RECORDS; // assert constant is imported (= 5)
+
+        // Record 1: ServerHello (0x16), same static blob as before (valid structure)
+        let server_hello_rec = hex::decode(
+            "160303007a0200007603030000000000000000000000000000000000000000000000\
+             000000000000000000000000200000000000000000000000000000000000000000\
+             0000000000000000000000000000130100002e002b0002030400330024001d0020\
+             e29b191a62d0572e9a30d0fb9d08e50bc78d591dfc1dbafbfa533411db1c8e11"
+        ).unwrap();
+
+        // Record 2: ChangeCipherSpec (0x14)
+        let ccs_rec: &[u8] = &[0x14, 0x03, 0x03, 0x00, 0x01, 0x01];
+
+        // Record 3: Fake EncryptedExtensions (0x17), 108 zero bytes payload
+        let mut fake_ee = vec![0x17u8, 0x03, 0x03, 0x00, 108];
+        fake_ee.extend_from_slice(&[0u8; 108]);
+
+        // Record 4: Fake Certificate (0x17), 812 zero bytes (realistic cert size for DPI)
+        let cert_payload_len: u16 = 812;
+        let mut fake_cert = vec![0x17u8, 0x03, 0x03,
+            (cert_payload_len >> 8) as u8, (cert_payload_len & 0xff) as u8];
+        fake_cert.extend_from_slice(&vec![0u8; cert_payload_len as usize]);
+
+        // Record 5: Fake Finished (0x17), 52 zero bytes (CertificateVerify + Finished)
+        let mut fake_fin = vec![0x17u8, 0x03, 0x03, 0x00, 52];
+        fake_fin.extend_from_slice(&[0u8; 52]);
+
+        let mut server_flight = Vec::with_capacity(
+            server_hello_rec.len() + ccs_rec.len() +
+            fake_ee.len() + fake_cert.len() + fake_fin.len()
+        );
+        server_flight.extend_from_slice(&server_hello_rec);
+        server_flight.extend_from_slice(ccs_rec);
+        server_flight.extend_from_slice(&fake_ee);
+        server_flight.extend_from_slice(&fake_cert);
+        server_flight.extend_from_slice(&fake_fin);
+
+        stream.write_all(&server_flight).await?;
+
+        // The client now sends ClientHello + CCS (6 bytes) as two separate TLS records.
+        // The ClientHello was already consumed into initial_buf above.
+        // The CCS may arrive as a separate TCP segment - drain it from the raw stream
+        // before wrapping in RealityStream so RealityStream only ever sees 0x17 records.
+        {
+            let mut ccs_head = [0u8; 5];
+            if stream.read_exact(&mut ccs_head).await.is_ok() {
+                // Expected: CCS record 0x14 0x03 0x03 0x00 0x01
+                // If it's something else (unlikely), we still drain its payload to stay in sync.
+                let ccs_payload_len = u16::from_be_bytes([ccs_head[3], ccs_head[4]]) as usize;
+                if ccs_payload_len <= 64 {
+                    let mut _discard = vec![0u8; ccs_payload_len];
+                    let _ = stream.read_exact(&mut _discard).await;
+                }
+            }
+        }
+
         let reality_stream = RealityStream::new(stream, data_key);
-        
-        // But wait! Inside the Reality stream, the client might send an xhttp or wss HTTP request!
-        // Because xhttp_handshake_and_loop does `GET /wss` *inside* the stream.
-        // So we must read the HTTP request *from the Reality stream*!
-        
         return process_inner_reality_stream(reality_stream, peer_addr, tcp_map, udp_tx).await;
         
     } else {
