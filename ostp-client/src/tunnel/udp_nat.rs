@@ -96,13 +96,8 @@ async fn start_udp_session(
         }
     }
 
-    let udp = match relay_addr {
-        SocketAddr::V4(_) => UdpSocket::bind("127.0.0.1:0").await?,
-        SocketAddr::V6(_) => match UdpSocket::bind("[::1]:0").await {
-            Ok(sock) => sock,
-            Err(_) => UdpSocket::bind("[::]:0").await?,
-        },
-    };
+    // Local SOCKS5 proxy always returns 127.0.0.1 (IPv4), so always bind IPv4
+    let udp = UdpSocket::bind("127.0.0.1:0").await?;
     
     let mut buf = vec![0u8; 65536];
     
@@ -128,36 +123,45 @@ async fn start_udp_session(
                 }
             }
             res = udp.recv_from(&mut buf) => {
-                let (len, _peer) = res?;
-                if len < 10 { continue; } // At least 10 bytes for SOCKS5 header
-                let frag = buf[2];
-                if frag != 0 { continue; } // fragment not supported
-                let atyp = buf[3];
-                let (header_len, remote_dst) = match atyp {
-                    1 => {
-                        if len < 10 { continue; }
-                        let ip = std::net::Ipv4Addr::new(buf[4], buf[5], buf[6], buf[7]);
-                        let port = u16::from_be_bytes([buf[8], buf[9]]);
-                        (10, SocketAddr::new(std::net::IpAddr::V4(ip), port))
+                match res {
+                    Err(e) => {
+                        tracing::debug!("udp_nat recv_from error: {}", e);
+                        continue; // transient error, don't kill the session
                     }
-                    4 => {
-                        if len < 22 { continue; }
-                        let mut octets = [0u8; 16];
-                        octets.copy_from_slice(&buf[4..20]);
-                        let ip = std::net::Ipv6Addr::from(octets);
-                        let port = u16::from_be_bytes([buf[20], buf[21]]);
-                        (22, SocketAddr::new(std::net::IpAddr::V6(ip), port))
+                    Ok((len, _peer)) => {
+                        if len < 4 { continue; }
+                        let frag = buf[2];
+                        if frag != 0 { continue; } // fragment not supported
+                        let atyp = buf[3];
+                        let (header_len, remote_dst) = match atyp {
+                            1 => {
+                                if len < 10 { continue; }
+                                let ip = std::net::Ipv4Addr::new(buf[4], buf[5], buf[6], buf[7]);
+                                let port = u16::from_be_bytes([buf[8], buf[9]]);
+                                (10, SocketAddr::new(std::net::IpAddr::V4(ip), port))
+                            }
+                            4 => {
+                                if len < 22 { continue; }
+                                let mut octets = [0u8; 16];
+                                octets.copy_from_slice(&buf[4..20]);
+                                let ip = std::net::Ipv6Addr::from(octets);
+                                let port = u16::from_be_bytes([buf[20], buf[21]]);
+                                (22, SocketAddr::new(std::net::IpAddr::V6(ip), port))
+                            }
+                            _ => continue,
+                        };
+                        let payload = buf[header_len..len].to_vec();
+                        use futures::SinkExt;
+                        let _ = smoltcp_tx.lock().await.send((payload, remote_dst, client_src)).await;
                     }
-                    _ => continue, // Domain name not supported for incoming packets in typical UDP associate
-                };
-                let payload = buf[header_len..len].to_vec();
-                use futures::SinkExt;
-                let _ = smoltcp_tx.lock().await.send((payload, remote_dst, client_src)).await;
+                }
             }
             // If TCP drops, UDP association is over
             res = tcp.read(&mut tcp_buf) => {
-                let n = res?;
-                if n == 0 { break; }
+                match res {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {}
+                }
             }
         }
     }

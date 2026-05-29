@@ -371,11 +371,19 @@ async fn handle_udp_associate(
     loop {
         tokio::select! {
             res = client_tcp.read(&mut tcp_buf) => {
-                let n = res?;
-                if n == 0 { break; }
+                match res {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {}
+                }
             }
             res = sock_rx.recv_from(&mut buf) => {
-                let (len, addr) = res?;
+                let (len, addr) = match res {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::debug!("udp_associate recv_from error: {}", e);
+                        continue; // transient error, don't kill the session
+                    }
+                };
                 {
                     let mut guard = client_udp_addr.lock().unwrap();
                     if guard.is_none() {
