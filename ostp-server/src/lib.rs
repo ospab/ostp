@@ -470,7 +470,6 @@ async fn run_server_loop(
     let mut last_empty_app_log = Instant::now() - Duration::from_secs(10);
     let mut peer_last_seen: HashMap<IpAddr, Instant> = HashMap::new();
     let mut peer_available: HashMap<IpAddr, bool> = HashMap::new();
-    let peer_timeout = Duration::from_secs(45);
 
     loop {
         tokio::select! {
@@ -489,74 +488,13 @@ async fn run_server_loop(
             }
             received = udp_rx.recv() => {
                 if let Some((packet, peer)) = received {
-                    let size = packet.len();
-                    match dispatcher.on_datagram(peer, packet) {
-                        Ok(DispatchOutcome::Unauthorized) => {
-                            let _ = ui_event_tx.send(UiEvent::UnauthorizedProbe { peer: peer.ip(), bytes: size });
-                        }
-                        Ok(DispatchOutcome::Accepted { responses, app_payloads, peer_addr }) => {
-                            let peer_ip = peer_addr.ip();
-                            let now = Instant::now();
-                            peer_last_seen.insert(peer_ip, now);
-                            if !peer_available.get(&peer_ip).copied().unwrap_or(false) {
-                                peer_available.insert(peer_ip, true);
-                                let is_tcp = tcp_map.read().await.contains_key(&peer_addr);
-                                let proto = if is_tcp { "TCP (UoT)" } else { "UDP" };
-                                let _ = ui_event_tx.send(UiEvent::Log(format!("Client {peer_ip} connected via {proto}")));
-                            }
-
-                            if app_payloads.is_empty() && now.duration_since(last_empty_app_log) > Duration::from_secs(5) {
-                                last_empty_app_log = now;
-                                let _ = ui_event_tx.send(UiEvent::Log(format!(
-                                    "Accepted datagrams from {peer_ip} with no app payloads (responses={})",
-                                    responses.len()
-                                )));
-                            }
-                            let _ = ui_event_tx.send(UiEvent::Rx { peer: peer_ip, bytes: size });
-
-                            for resp in responses {
-                                let resp_len = resp.len();
-                                let mut sent_tcp = false;
-                                {
-                                    let map = tcp_map.read().await;
-                                    if let Some(tx) = map.get(&peer_addr) {
-                                        let _ = tx.try_send(resp.clone());
-                                        sent_tcp = true;
-                                    }
-                                }
-                                if !sent_tcp {
-                                    let _ = socket.send_to(&resp, peer_addr).await?;
-                                }
-                                let _ = ui_event_tx.send(UiEvent::Tx { peer: peer_ip, bytes: resp_len });
-                            }
-
-                            for (session_id, stream_id, payload) in app_payloads {
-                                let _ = ui_event_tx.send(UiEvent::Log(format!(
-                                    "Deliver app payload sid={session_id} stream={stream_id} bytes={}",
-                                    payload.len()
-                                )));
-                                relay::handle_relay_message(
-                                    peer_addr,
-                                    session_id,
-                                    stream_id,
-                                    payload,
-                                    &mut dispatcher,
-                                    &socket,
-                                    &mut remotes,
-                                    &ui_event_tx,
-                                    stream_tx.clone(),
-                                    udp_reply_tx.clone(),
-                                    connect_tx.clone(),
-                                    outbound.clone(),
-                                    dns_server.clone(),
-                                    debug,
-                                    &tcp_map,
-                                ).await?;
-                            }
-                        }
-                        Err(err) => {
-                            let _ = ui_event_tx.send(UiEvent::Log(format!("Protocol error for {peer}: {err}")));
-                        }
+                    if let Err(e) = handle_udp_packet(
+                        packet, peer, &mut dispatcher, &tcp_map, &socket, &mut remotes, &ui_event_tx,
+                        stream_tx.clone(), udp_reply_tx.clone(), connect_tx.clone(),
+                        outbound.clone(), dns_server.clone(), debug,
+                        &mut peer_last_seen, &mut peer_available, &mut last_empty_app_log
+                    ).await {
+                        tracing::error!("handle_udp_packet error: {}", e);
                     }
                 }
             }
@@ -596,45 +534,154 @@ async fn run_server_loop(
                 }
             }
             _ = retransmit_tick.tick() => {
-                let now = Instant::now();
-                for (peer_ip, last_seen) in peer_last_seen.iter() {
-                    let is_available = peer_available.get(peer_ip).copied().unwrap_or(false);
-                    if is_available && now.duration_since(*last_seen) > peer_timeout {
-                        peer_available.insert(*peer_ip, false);
-                        let _ = ui_event_tx.send(UiEvent::Log(format!("Client {peer_ip} disconnected (timeout)")));
-                    }
-                }
-                let (frames, dropped_sessions) = dispatcher.on_tick();
-                for (frame, peer_addr) in frames {
-                    let mut sent_tcp = false;
-                    {
-                        let map = tcp_map.read().await;
-                        if let Some(tx) = map.get(&peer_addr) {
-                            let _ = tx.try_send(frame.clone());
-                            sent_tcp = true;
-                        }
-                    }
-                    if !sent_tcp {
-                        let _ = socket.send_to(&frame, peer_addr).await?;
-                    }
-                }
-                for sid in dropped_sessions {
-                    let _ = ui_event_tx.send(UiEvent::Log(format!("Session {sid} expired, releasing resources")));
-                    let mut streams_to_cancel = Vec::new();
-                    for &(session_id, stream_id) in remotes.keys() {
-                        if session_id == sid {
-                            streams_to_cancel.push((session_id, stream_id));
-                        }
-                    }
-                    for key in streams_to_cancel {
-                        if let Some(state) = remotes.remove(&key) {
-                            let _ = state.cancel_tx.try_send(());
-                        }
-                    }
+                if let Err(e) = handle_tick(
+                    &mut dispatcher, &tcp_map, &socket, &mut remotes, &ui_event_tx,
+                    &mut peer_last_seen, &mut peer_available
+                ).await {
+                    tracing::error!("handle_tick error: {}", e);
                 }
             }
         }
     }
 
+    Ok(())
+}
+
+async fn handle_udp_packet(
+    packet: Bytes,
+    peer: std::net::SocketAddr,
+    dispatcher: &mut Dispatcher,
+    tcp_map: &std::sync::Arc<tokio::sync::RwLock<HashMap<std::net::SocketAddr, tokio::sync::mpsc::Sender<Bytes>>>>,
+    socket: &std::sync::Arc<UdpSocket>,
+    remotes: &mut HashMap<(u32, u16), RemoteState>,
+    ui_event_tx: &mpsc::UnboundedSender<UiEvent>,
+    stream_tx: mpsc::UnboundedSender<(u32, u16, Vec<u8>)>,
+    udp_reply_tx: mpsc::UnboundedSender<(u32, u16, String, Vec<u8>)>,
+    connect_tx: mpsc::UnboundedSender<(u32, u16, String, Result<(tokio::net::tcp::OwnedWriteHalf, mpsc::Sender<()>), String>)>,
+    outbound: Option<OutboundConfig>,
+    dns_server: std::sync::Arc<dns::DnsServer>,
+    debug: bool,
+    peer_last_seen: &mut HashMap<IpAddr, Instant>,
+    peer_available: &mut HashMap<IpAddr, bool>,
+    last_empty_app_log: &mut Instant,
+) -> Result<()> {
+    let size = packet.len();
+    match dispatcher.on_datagram(peer, packet) {
+        Ok(DispatchOutcome::Unauthorized) => {
+            let _ = ui_event_tx.send(UiEvent::UnauthorizedProbe { peer: peer.ip(), bytes: size });
+        }
+        Ok(DispatchOutcome::Accepted { responses, app_payloads, peer_addr }) => {
+            let peer_ip = peer_addr.ip();
+            let now = Instant::now();
+            peer_last_seen.insert(peer_ip, now);
+            if !peer_available.get(&peer_ip).copied().unwrap_or(false) {
+                peer_available.insert(peer_ip, true);
+                let is_tcp = tcp_map.read().await.contains_key(&peer_addr);
+                let proto = if is_tcp { "TCP (UoT)" } else { "UDP" };
+                let _ = ui_event_tx.send(UiEvent::Log(format!("Client {peer_ip} connected via {proto}")));
+            }
+
+            if app_payloads.is_empty() && now.duration_since(*last_empty_app_log) > Duration::from_secs(5) {
+                *last_empty_app_log = now;
+                let _ = ui_event_tx.send(UiEvent::Log(format!(
+                    "Accepted datagrams from {peer_ip} with no app payloads (responses={})",
+                    responses.len()
+                )));
+            }
+            let _ = ui_event_tx.send(UiEvent::Rx { peer: peer_ip, bytes: size });
+
+            for resp in responses {
+                let resp_len = resp.len();
+                let mut sent_tcp = false;
+                {
+                    let map = tcp_map.read().await;
+                    if let Some(tx) = map.get(&peer_addr) {
+                        let _ = tx.try_send(resp.clone());
+                        sent_tcp = true;
+                    }
+                }
+                if !sent_tcp {
+                    let _ = socket.send_to(&resp, peer_addr).await?;
+                }
+                let _ = ui_event_tx.send(UiEvent::Tx { peer: peer_ip, bytes: resp_len });
+            }
+
+            for (session_id, stream_id, payload) in app_payloads {
+                let _ = ui_event_tx.send(UiEvent::Log(format!(
+                    "Deliver app payload sid={session_id} stream={stream_id} bytes={}",
+                    payload.len()
+                )));
+                relay::handle_relay_message(
+                    peer_addr,
+                    session_id,
+                    stream_id,
+                    payload,
+                    dispatcher,
+                    socket,
+                    remotes,
+                    ui_event_tx,
+                    stream_tx.clone(),
+                    udp_reply_tx.clone(),
+                    connect_tx.clone(),
+                    outbound.clone(),
+                    dns_server.clone(),
+                    debug,
+                    tcp_map,
+                ).await?;
+            }
+        }
+        Err(err) => {
+            let _ = ui_event_tx.send(UiEvent::Log(format!("Protocol error for {peer}: {err}")));
+        }
+    }
+    Ok(())
+}
+
+async fn handle_tick(
+    dispatcher: &mut Dispatcher,
+    tcp_map: &std::sync::Arc<tokio::sync::RwLock<HashMap<std::net::SocketAddr, tokio::sync::mpsc::Sender<Bytes>>>>,
+    socket: &std::sync::Arc<UdpSocket>,
+    remotes: &mut HashMap<(u32, u16), RemoteState>,
+    ui_event_tx: &mpsc::UnboundedSender<UiEvent>,
+    peer_last_seen: &mut HashMap<IpAddr, Instant>,
+    peer_available: &mut HashMap<IpAddr, bool>,
+) -> Result<()> {
+    let now = Instant::now();
+    let peer_timeout = Duration::from_secs(45);
+    for (peer_ip, last_seen) in peer_last_seen.iter() {
+        let is_available = peer_available.get(peer_ip).copied().unwrap_or(false);
+        if is_available && now.duration_since(*last_seen) > peer_timeout {
+            peer_available.insert(*peer_ip, false);
+            let _ = ui_event_tx.send(UiEvent::Log(format!("Client {peer_ip} disconnected (timeout)")));
+        }
+    }
+    let (frames, dropped_sessions) = dispatcher.on_tick();
+    for (frame, peer_addr) in frames {
+        let mut sent_tcp = false;
+        {
+            let map = tcp_map.read().await;
+            if let Some(tx) = map.get(&peer_addr) {
+                let _ = tx.try_send(frame.clone());
+                sent_tcp = true;
+            }
+        }
+        if !sent_tcp {
+            let _ = socket.send_to(&frame, peer_addr).await?;
+        }
+    }
+    for sid in dropped_sessions {
+        let _ = ui_event_tx.send(UiEvent::Log(format!("Session {sid} expired, releasing resources")));
+        let mut streams_to_cancel = Vec::new();
+        for &(session_id, stream_id) in remotes.keys() {
+            if session_id == sid {
+                streams_to_cancel.push((session_id, stream_id));
+            }
+        }
+        for key in streams_to_cancel {
+            if let Some(state) = remotes.remove(&key) {
+                let _ = state.cancel_tx.try_send(());
+            }
+        }
+    }
     Ok(())
 }

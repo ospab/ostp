@@ -104,6 +104,7 @@ struct InProcessState {
 struct HelperState {
     pipe_state: Arc<Mutex<HelperPipeState>>,
     cmd_tx: tokio::sync::mpsc::Sender<String>,
+    token: String,
 }
 
 enum TunnelHandle {
@@ -294,7 +295,11 @@ async fn stop_tunnel(state: tauri::State<'_, AppState>) -> Result<bool, String> 
             ).await;
         }
         Some(TunnelHandle::Helper(h)) => {
-            let _ = h.cmd_tx.send("{\"cmd\":\"stop\"}\n".to_string()).await;
+            let stop_cmd = serde_json::json!({
+                "cmd": "stop",
+                "token": h.token
+            }).to_string();
+            let _ = h.cmd_tx.send(format!("{}\n", stop_cmd)).await;
         }
     }
     Ok(true)
@@ -378,8 +383,9 @@ async fn start_tun_via_helper(
             .output();
     }
 
+    let auth_token = rand::random::<u64>().to_string();
     let helper_exe = find_helper_exe().ok_or_else(|| "ostp-tun-helper.exe not found.".to_string())?;
-    launch_as_admin(&helper_exe).map_err(|e| format!("Failed to launch helper: {}", e))?;
+    launch_as_admin(&helper_exe, &auth_token).map_err(|e| format!("Failed to launch helper: {}", e))?;
     tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
 
     let socket = tokio::time::timeout(std::time::Duration::from_secs(60), async {
@@ -396,7 +402,8 @@ async fn start_tun_via_helper(
     let mapped = map_to_client_config(raw, "tun");
     let start_cmd = serde_json::json!({
         "cmd": "start",
-        "config": serde_json::to_string(&mapped).unwrap_or_default()
+        "config": serde_json::to_string(&mapped).unwrap_or_default(),
+        "token": auth_token
     }).to_string();
 
     let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::channel::<String>(16);
@@ -434,7 +441,7 @@ async fn start_tun_via_helper(
         state_for_task.lock().await.connection_state = 0;
     });
 
-    guard.tunnel = Some(TunnelHandle::Helper(HelperState { pipe_state, cmd_tx }));
+    guard.tunnel = Some(TunnelHandle::Helper(HelperState { pipe_state, cmd_tx, token: auth_token }));
     Ok(true)
 }
 
@@ -484,26 +491,28 @@ fn find_helper_exe() -> Option<PathBuf> {
 }
 
 #[cfg(target_os = "windows")]
-fn launch_as_admin(exe: &std::path::PathBuf) -> anyhow::Result<()> {
+fn launch_as_admin(exe: &std::path::PathBuf, token: &str) -> anyhow::Result<()> {
     use std::ffi::OsStr;
     use std::os::windows::ffi::OsStrExt;
     use std::ptr::null_mut;
     use std::path::Path;
     let exe_wstr: Vec<u16> = exe.as_os_str().encode_wide().chain(Some(0)).collect();
     let verb_wstr: Vec<u16> = OsStr::new("runas").encode_wide().chain(Some(0)).collect();
+    let params_str = format!("--token {}", token);
+    let params_wstr: Vec<u16> = OsStr::new(&params_str).encode_wide().chain(Some(0)).collect();
     #[link(name = "shell32")] extern "system" { fn ShellExecuteW(h: *mut std::ffi::c_void, op: *const u16, f: *const u16, p: *const u16, d: *const u16, s: i32) -> isize; }
     
     // Use the GUI executable's directory as the working directory so dependencies are found
     let cwd_path = std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("."));
     let dir_wstr: Vec<u16> = cwd_path.parent().unwrap_or(Path::new(".")).as_os_str().encode_wide().chain(Some(0)).collect();
     
-    let ret = unsafe { ShellExecuteW(null_mut(), verb_wstr.as_ptr(), exe_wstr.as_ptr(), null_mut(), dir_wstr.as_ptr(), 0) };
+    let ret = unsafe { ShellExecuteW(null_mut(), verb_wstr.as_ptr(), exe_wstr.as_ptr(), params_wstr.as_ptr(), dir_wstr.as_ptr(), 0) };
     if ret <= 32 { anyhow::bail!("UAC denied or helper missing."); }
     Ok(())
 }
 
 #[cfg(not(target_os = "windows"))]
-fn launch_as_admin(_exe: &PathBuf) -> Result<()> { anyhow::bail!("Windows only."); }
+fn launch_as_admin(_exe: &PathBuf, _token: &str) -> Result<()> { anyhow::bail!("Windows only."); }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {

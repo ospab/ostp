@@ -235,187 +235,195 @@ impl ProtocolMachine {
         }
 
         if self.state == OstpState::Handshaking {
-            // Wire format: [session_id:4][noise_len:2][noise_payload:N][random_padding:*]
-            // Extract noise_len to pass exactly the right bytes to snow
-            if raw_vec.len() < 6 {
-                return Err(ProtocolError::Framing("handshake too short for length prefix".to_string()));
-            }
-            let noise_len = u16::from_be_bytes([raw_vec[4], raw_vec[5]]) as usize;
-            if raw_vec.len() < 6 + noise_len {
-                return Err(ProtocolError::Framing(format!(
-                    "handshake truncated: expected {} noise bytes, got {}",
-                    noise_len, raw_vec.len() - 6
-                )));
-            }
-            tracing::info!("handle_inbound: raw_vec.len()={}, noise_len={}, raw_vec[0..6]={:?}", raw_vec.len(), noise_len, &raw_vec[0..6]);
-            
-            let mut read_out = vec![0_u8; 1024];
-            let n = self.noise.read_handshake(&raw_vec[6..6 + noise_len], &mut read_out).map_err(|e| {
-                ProtocolError::Crypto(format!("noise-read: {:?} (raw_len={}, noise_len={})", e, raw_vec.len(), noise_len))
-            })?;
-            read_out.truncate(n);
-
-            let response = match self.role {
-                NoiseRole::Responder => {
-                    let mut write_out = vec![0_u8; 1024];
-                    let out_n = self.noise.write_handshake(&self.handshake_payload, &mut write_out)?;
-                    write_out.truncate(out_n);
-                    Some(self.wrap_datagram_handshake(&write_out)?)
-                }
-                NoiseRole::Initiator => None,
-            };
-
-            let mut key = [0_u8; 32];
-            self.noise.handshake_hash(&mut key)?;
-            let (send_key, recv_key) = derive_split_keys(&key, self.role);
-            self.send_cipher = Some(SessionCipher::new(&send_key));
-            self.recv_cipher = Some(SessionCipher::new(&recv_key));
-            self.state = OstpState::Established;
-
-            let extracted_payload = read_out[..n].to_vec();
-
-            Ok(ProtocolAction::HandshakePayload(Bytes::from(extracted_payload), response))
+            self.handle_handshake_inbound(&raw_vec)
         } else if self.state == OstpState::Established {
-            if raw_vec.len() < 12 {
-                return Err(ProtocolError::Framing("data datagram too short".to_string()));
+            self.handle_data_inbound(&raw_vec)
+        } else {
+            Ok(ProtocolAction::Noop)
+        }
+    }
+
+    fn handle_handshake_inbound(&mut self, raw_vec: &[u8]) -> Result<ProtocolAction, ProtocolError> {
+        // Wire format: [session_id:4][noise_len:2][noise_payload:N][random_padding:*]
+        // Extract noise_len to pass exactly the right bytes to snow
+        if raw_vec.len() < 6 {
+            return Err(ProtocolError::Framing("handshake too short for length prefix".to_string()));
+        }
+        let noise_len = u16::from_be_bytes([raw_vec[4], raw_vec[5]]) as usize;
+        if raw_vec.len() < 6 + noise_len {
+            return Err(ProtocolError::Framing(format!(
+                "handshake truncated: expected {} noise bytes, got {}",
+                noise_len, raw_vec.len() - 6
+            )));
+        }
+        tracing::info!("handle_inbound: raw_vec.len()={}, noise_len={}, raw_vec[0..6]={:?}", raw_vec.len(), noise_len, &raw_vec[0..6]);
+        
+        let mut read_out = vec![0_u8; 1024];
+        let n = self.noise.read_handshake(&raw_vec[6..6 + noise_len], &mut read_out).map_err(|e| {
+            ProtocolError::Crypto(format!("noise-read: {:?} (raw_len={}, noise_len={})", e, raw_vec.len(), noise_len))
+        })?;
+        read_out.truncate(n);
+
+        let response = match self.role {
+            NoiseRole::Responder => {
+                let mut write_out = vec![0_u8; 1024];
+                let out_n = self.noise.write_handshake(&self.handshake_payload, &mut write_out)?;
+                write_out.truncate(out_n);
+                Some(self.wrap_datagram_handshake(&write_out)?)
             }
-            let nonce = u64::from_be_bytes(raw_vec[4..12].try_into().unwrap());
-            
-            if nonce < self.expected_recv_nonce {
-                // Duplicate — the ACK we sent was likely lost or delayed.
-                tracing::debug!("Duplicate frame nonce={} (expected {}), forcing ACK", nonce, self.expected_recv_nonce);
-                if let Some(ack_frame) = self.force_build_ack()? {
-                    return Ok(ProtocolAction::SendDatagram(ack_frame));
+            NoiseRole::Initiator => None,
+        };
+
+        let mut key = [0_u8; 32];
+        self.noise.handshake_hash(&mut key)?;
+        let (send_key, recv_key) = derive_split_keys(&key, self.role);
+        self.send_cipher = Some(SessionCipher::new(&send_key));
+        self.recv_cipher = Some(SessionCipher::new(&recv_key));
+        self.state = OstpState::Established;
+
+        let extracted_payload = read_out[..n].to_vec();
+
+        Ok(ProtocolAction::HandshakePayload(Bytes::from(extracted_payload), response))
+    }
+
+    fn handle_data_inbound(&mut self, raw_vec: &[u8]) -> Result<ProtocolAction, ProtocolError> {
+        if raw_vec.len() < 12 {
+            return Err(ProtocolError::Framing("data datagram too short".to_string()));
+        }
+        let nonce = u64::from_be_bytes(raw_vec[4..12].try_into().unwrap());
+        
+        if nonce < self.expected_recv_nonce {
+            // Duplicate — the ACK we sent was likely lost or delayed.
+            tracing::debug!("Duplicate frame nonce={} (expected {}), forcing ACK", nonce, self.expected_recv_nonce);
+            if let Some(ack_frame) = self.force_build_ack()? {
+                return Ok(ProtocolAction::SendDatagram(ack_frame));
+            }
+            return Ok(ProtocolAction::Noop);
+        }
+
+        if nonce > self.expected_recv_nonce + self.max_reorder {
+            tracing::debug!("Frame nonce={} exceeds max reorder window (expected={}, max_gap={}), sending NACK",
+                nonce, self.expected_recv_nonce, self.max_reorder
+            );
+            if let Ok(nack_frame) = self.build_control_datagram(
+                0,
+                FrameKind::Nack,
+                Bytes::copy_from_slice(&self.expected_recv_nonce.to_be_bytes()),
+            ) {
+                return Ok(ProtocolAction::SendDatagram(nack_frame));
+            }
+            return Ok(ProtocolAction::Noop);
+        }
+
+        let ciphertext = &raw_vec[12..];
+        let cipher = self.recv_cipher.as_ref().ok_or_else(|| {
+            ProtocolError::State("missing recv cipher".to_string())
+        })?;
+
+        let session_id_bytes = self.session_id.to_be_bytes();
+        let plaintext = cipher.decrypt(nonce, ciphertext, &session_id_bytes)?;
+        
+        let packet = FramedPacket::decode_zero_copy(Bytes::from(plaintext))?;
+        
+        let mut outbound_actions = Vec::new();
+
+        // Fast path processing for Nacks: act immediately, bypass sequence queue
+        if packet.header.kind == FrameKind::Nack
+            && packet.payload.len() >= 8 {
+                let req_nonce = u64::from_be_bytes(packet.payload[..8].try_into().unwrap());
+                if let Some(cached_frame) = self.lookup_sent_frame(req_nonce) {
+                    tracing::debug!("NACK received: retransmitting nonce={}", req_nonce);
+                    self.cc.on_loss(cached_frame.len() as u64);
+                    outbound_actions.push(ProtocolAction::SendDatagram(cached_frame));
+                } else {
+                    tracing::debug!("NACK received: nonce={} not found in sent_history (evicted)", req_nonce);
+                    // Estimate ~1200 bytes lost for evicted frames
+                    self.cc.on_loss(1200);
                 }
-                return Ok(ProtocolAction::Noop);
             }
 
-            if nonce > self.expected_recv_nonce + self.max_reorder {
-                tracing::debug!("Frame nonce={} exceeds max reorder window (expected={}, max_gap={}), sending NACK",
-                    nonce, self.expected_recv_nonce, self.max_reorder
-                );
-                if let Ok(nack_frame) = self.build_control_datagram(
-                    0,
-                    FrameKind::Nack,
-                    Bytes::copy_from_slice(&self.expected_recv_nonce.to_be_bytes()),
-                ) {
-                    return Ok(ProtocolAction::SendDatagram(nack_frame));
-                }
-                return Ok(ProtocolAction::Noop);
-            }
+        if packet.header.kind == FrameKind::Ack {
+            let ranges = parse_ack_ranges(&packet.payload)?;
+            self.drop_acked_frames(&ranges);
+        }
 
-            let ciphertext = &raw_vec[12..];
-            let cipher = self.recv_cipher.as_ref().ok_or_else(|| {
-                ProtocolError::State("missing recv cipher".to_string())
+        let action = match packet.header.kind {
+            FrameKind::Data => {
+                ProtocolAction::DeliverApp(packet.header.stream_id, packet.payload)
+            }
+            FrameKind::Resume => {
+                // 0-RTT: treat early data as application data
+                tracing::info!("0-RTT Resume frame received, processing early data");
+                ProtocolAction::DeliverApp(packet.header.stream_id, packet.payload)
+            }
+            FrameKind::Close => {
+                tracing::info!("Received Close frame, terminating session");
+                self.state = OstpState::Closed;
+                ProtocolAction::Noop
+            }
+            FrameKind::KeepAlive => ProtocolAction::Noop,
+            _ => ProtocolAction::Noop,
+        };
+
+        let mut app_actions = Vec::new();
+
+        if matches!(packet.header.kind, FrameKind::Data | FrameKind::Close | FrameKind::KeepAlive) {
+            self.ack_pending = true;
+        }
+
+        if nonce == self.expected_recv_nonce {
+            app_actions.push(action);
+            self.expected_recv_nonce = self.expected_recv_nonce.checked_add(1).ok_or_else(|| {
+                ProtocolError::Crypto("recv nonce sequence exhausted".to_string())
             })?;
+            self.last_recv_advance = Instant::now();
 
-            let session_id_bytes = self.session_id.to_be_bytes();
-            let plaintext = cipher.decrypt(nonce, ciphertext, &session_id_bytes)?;
-            
-            let packet = FramedPacket::decode_zero_copy(Bytes::from(plaintext))?;
-            
-            let mut outbound_actions = Vec::new();
-
-            // Fast path processing for Nacks: act immediately, bypass sequence queue
-            if packet.header.kind == FrameKind::Nack
-                && packet.payload.len() >= 8 {
-                    let req_nonce = u64::from_be_bytes(packet.payload[..8].try_into().unwrap());
-                    if let Some(cached_frame) = self.lookup_sent_frame(req_nonce) {
-                        tracing::debug!("NACK received: retransmitting nonce={}", req_nonce);
-                        self.cc.on_loss(cached_frame.len() as u64);
-                        outbound_actions.push(ProtocolAction::SendDatagram(cached_frame));
-                    } else {
-                        tracing::debug!("NACK received: nonce={} not found in sent_history (evicted)", req_nonce);
-                        // Estimate ~1200 bytes lost for evicted frames
-                        self.cc.on_loss(1200);
-                    }
-                }
-
-            if packet.header.kind == FrameKind::Ack {
-                let ranges = parse_ack_ranges(&packet.payload)?;
-                self.drop_acked_frames(&ranges);
-            }
-
-            let action = match packet.header.kind {
-                FrameKind::Data => {
-                    ProtocolAction::DeliverApp(packet.header.stream_id, packet.payload)
-                }
-                FrameKind::Resume => {
-                    // 0-RTT: treat early data as application data
-                    tracing::info!("0-RTT Resume frame received, processing early data");
-                    ProtocolAction::DeliverApp(packet.header.stream_id, packet.payload)
-                }
-                FrameKind::Close => {
-                    tracing::info!("Received Close frame, terminating session");
-                    self.state = OstpState::Closed;
-                    ProtocolAction::Noop
-                }
-                FrameKind::KeepAlive => ProtocolAction::Noop,
-                _ => ProtocolAction::Noop,
-            };
-
-            let mut app_actions = Vec::new();
-
-            if matches!(packet.header.kind, FrameKind::Data | FrameKind::Close | FrameKind::KeepAlive) {
-                self.ack_pending = true;
-            }
-
-            if nonce == self.expected_recv_nonce {
-                app_actions.push(action);
+            // Drain continuous queue
+            while let Some(buffered_action) = self.reorder_buffer.remove(&self.expected_recv_nonce) {
+                app_actions.push(buffered_action);
                 self.expected_recv_nonce = self.expected_recv_nonce.checked_add(1).ok_or_else(|| {
                     ProtocolError::Crypto("recv nonce sequence exhausted".to_string())
                 })?;
-                self.last_recv_advance = Instant::now();
-
-                // Drain continuous queue
-                while let Some(buffered_action) = self.reorder_buffer.remove(&self.expected_recv_nonce) {
-                    app_actions.push(buffered_action);
-                    self.expected_recv_nonce = self.expected_recv_nonce.checked_add(1).ok_or_else(|| {
-                        ProtocolError::Crypto("recv nonce sequence exhausted".to_string())
-                    })?;
-                }
-                self.last_recv_advance = Instant::now();
-            } else {
-                // Gap detected
-                if self.reorder_buffer.len() < self.max_reorder_buffer {
-                    self.reorder_buffer.insert(nonce, action);
-                } else {
-                    tracing::warn!("Reorder buffer full ({}/{}), dropping frame nonce={}",
-                        self.reorder_buffer.len(), self.max_reorder_buffer, nonce
-                    );
-                }
-
-                // Rate-limited NACK: send at most once per 30ms to prevent retransmit storms.
-                // Under high load with natural UDP reordering, sending a NACK per packet
-                // causes exponential retransmit explosion that saturates the channel.
-                let nack_cooldown = Duration::from_millis(30);
-                if self.last_nack_sent.elapsed() >= nack_cooldown {
-                    self.last_nack_sent = Instant::now();
-                    let nack_payload = self.expected_recv_nonce.to_be_bytes();
-                    if let Ok(nack_frame) = self.build_control_datagram(0, FrameKind::Nack, Bytes::copy_from_slice(&nack_payload)) {
-                        outbound_actions.push(ProtocolAction::SendDatagram(nack_frame));
-                    }
-                }
             }
-
-            if let Some(ack_frame) = self.build_ack_if_due()? {
-                outbound_actions.push(ProtocolAction::SendDatagram(ack_frame));
-            }
-
-            // Collate both types of output (application payloads and wire actions like Nacks/Retransmissions)
-            let mut all_actions = Vec::new();
-            all_actions.extend(outbound_actions);
-            all_actions.extend(app_actions);
-
-            if all_actions.is_empty() {
-                Ok(ProtocolAction::Noop)
-            } else if all_actions.len() == 1 {
-                Ok(all_actions.pop().unwrap())
-            } else {
-                Ok(ProtocolAction::Multiple(all_actions))
-            }
+            self.last_recv_advance = Instant::now();
         } else {
+            // Gap detected
+            if self.reorder_buffer.len() < self.max_reorder_buffer {
+                self.reorder_buffer.insert(nonce, action);
+            } else {
+                tracing::warn!("Reorder buffer full ({}/{}), dropping frame nonce={}",
+                    self.reorder_buffer.len(), self.max_reorder_buffer, nonce
+                );
+            }
+
+            // Rate-limited NACK: send at most once per 30ms to prevent retransmit storms.
+            // Under high load with natural UDP reordering, sending a NACK per packet
+            // causes exponential retransmit explosion that saturates the channel.
+            let nack_cooldown = Duration::from_millis(30);
+            if self.last_nack_sent.elapsed() >= nack_cooldown {
+                self.last_nack_sent = Instant::now();
+                let nack_payload = self.expected_recv_nonce.to_be_bytes();
+                if let Ok(nack_frame) = self.build_control_datagram(0, FrameKind::Nack, Bytes::copy_from_slice(&nack_payload)) {
+                    outbound_actions.push(ProtocolAction::SendDatagram(nack_frame));
+                }
+            }
+        }
+
+        if let Some(ack_frame) = self.build_ack_if_due()? {
+            outbound_actions.push(ProtocolAction::SendDatagram(ack_frame));
+        }
+
+        // Collate both types of output (application payloads and wire actions like Nacks/Retransmissions)
+        let mut all_actions = Vec::new();
+        all_actions.extend(outbound_actions);
+        all_actions.extend(app_actions);
+
+        if all_actions.is_empty() {
             Ok(ProtocolAction::Noop)
+        } else if all_actions.len() == 1 {
+            Ok(all_actions.pop().unwrap())
+        } else {
+            Ok(ProtocolAction::Multiple(all_actions))
         }
     }
 

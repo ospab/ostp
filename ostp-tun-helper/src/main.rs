@@ -27,8 +27,8 @@ const BIND_ADDR: &str = "127.0.0.1:53211";
 #[derive(Deserialize)]
 #[serde(tag = "cmd", rename_all = "lowercase")]
 enum GuiCmd {
-    Start { config: String },
-    Stop,
+    Start { config: String, token: String },
+    Stop { token: String },
 }
 
 #[derive(Serialize)]
@@ -54,15 +54,29 @@ async fn main() -> Result<()> {
         }
     }
 
+    let mut expected_token = String::new();
+    let args: Vec<String> = std::env::args().collect();
+    for i in 1..args.len() {
+        if args[i] == "--token" && i + 1 < args.len() {
+            expected_token = args[i + 1].clone();
+        }
+    }
+
     log_to_file("Helper started (TCP mode)");
-    if let Err(e) = run_server().await {
+
+    if expected_token.is_empty() {
+        log_to_file("FATAL: --token argument is required for security. Unauthorized access denied.");
+        return Err(anyhow::anyhow!("--token argument is required"));
+    }
+
+    if let Err(e) = run_server(expected_token).await {
         log_to_file(&format!("Fatal error: {}", e));
     }
     log_to_file("Helper exiting");
     Ok(())
 }
 
-async fn run_server() -> Result<()> {
+async fn run_server(expected_token: String) -> Result<()> {
     let state = Arc::new(Mutex::new(TunnelState {
         shutdown_tx: None,
         metrics: None,
@@ -127,7 +141,12 @@ async fn run_server() -> Result<()> {
         };
 
         match cmd {
-            GuiCmd::Start { config } => {
+            GuiCmd::Start { config, token } => {
+                if token != expected_token {
+                    log_to_file("Received START command with invalid token");
+                    send_msg(HelperMsg::Error { message: "Invalid authorization token".to_string() });
+                    continue;
+                }
                 log_to_file("Received START command");
                 {
                     let mut st = state.lock().await;
@@ -202,7 +221,12 @@ async fn run_server() -> Result<()> {
 
                 send_msg(HelperMsg::Status { value: 1 });
             }
-            GuiCmd::Stop => {
+            GuiCmd::Stop { token } => {
+                if token != expected_token {
+                    log_to_file("Received STOP command with invalid token");
+                    send_msg(HelperMsg::Error { message: "Invalid authorization token".to_string() });
+                    continue;
+                }
                 log_to_file("Received STOP command");
                 let mut st = state.lock().await;
                 if let Some(tx) = st.shutdown_tx.take() {

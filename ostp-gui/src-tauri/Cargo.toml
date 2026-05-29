@@ -27,4 +27,5 @@ anyhow = "1"
 ostp-client = { path = "../../ostp-client" }
 portable-atomic = "1"
 json_comments = "0.2"
+rand = "0.8"
 

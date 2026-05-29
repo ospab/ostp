@@ -72,6 +72,7 @@ fn parse_ostp_link(link: &str) -> Result<ClientConfig> {
     let mut transport_mode = String::from("udp");
     let mut tun_enabled = false;
     let mut tun_dns = None;
+    let mut wss_enabled = false;
 
     for (k, v) in parsed.query_pairs() {
         match k.as_ref() {
@@ -83,6 +84,7 @@ fn parse_ostp_link(link: &str) -> Result<ClientConfig> {
             "type" => transport_mode = v.into_owned(),
             "tun" => tun_enabled = v == "true",
             "dns" => tun_dns = Some(v.into_owned()),
+            "wss" => wss_enabled = v == "true",
             _ => {}
         }
     }
@@ -95,6 +97,7 @@ fn parse_ostp_link(link: &str) -> Result<ClientConfig> {
             mode: Some(transport_mode),
             stealth_sni: Some(sni.clone()),
             stealth_port: Some(443),
+            wss: Some(wss_enabled),
         }),
         socks5_bind: Some("127.0.0.1:1088".to_string()),
         tun: Some(TunConfig {
@@ -331,6 +334,7 @@ struct TransportConfigRaw {
     mode: Option<String>,
     stealth_sni: Option<String>,
     stealth_port: Option<u16>,
+    wss: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -727,7 +731,8 @@ async fn run_app() -> Result<()> {
   "transport": {{
     "mode": "udp",
     "stealth_sni": "www.microsoft.com",
-    "stealth_port": 443
+    "stealth_port": 443,
+    "wss": false
   }},
   
   "mux": {{
@@ -1098,6 +1103,7 @@ async fn run_client_directly(client_cfg: ClientConfig) -> Result<()> {
             mode: client_cfg.transport.as_ref().and_then(|t| t.mode.clone()).unwrap_or_else(|| "udp".to_string()),
             stealth_sni: client_cfg.transport.as_ref().and_then(|t| t.stealth_sni.clone()).unwrap_or_else(|| "microsoft.com".to_string()),
             stealth_port: client_cfg.transport.as_ref().and_then(|t| t.stealth_port).unwrap_or(443),
+            wss: client_cfg.transport.as_ref().and_then(|t| t.wss).unwrap_or(false),
         },
         dns_server: client_cfg.tun.as_ref().and_then(|t| t.dns.clone()),
     };

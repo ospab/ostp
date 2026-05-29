@@ -67,6 +67,7 @@ pub struct Bridge {
     pub transport_mode: String,
     pub stealth_sni: String,
     pub stealth_port: u16,
+    pub wss: bool,
     pub mtu: usize,
     pub reality_enabled: bool,
 
@@ -99,6 +100,7 @@ impl Bridge {
             transport_mode: config.transport.mode.clone(),
             stealth_sni: config.transport.stealth_sni.clone(),
             stealth_port: config.transport.stealth_port,
+            wss: config.transport.wss,
             mtu: config.ostp.mtu,
             reality_enabled: !config.reality.pbk.is_empty(),
 
@@ -905,7 +907,7 @@ impl Bridge {
                 port
             };
             let (tx, rx) = crate::transport::xhttp::connect_xhttp(
-                target_ip, uot_port, &self.stealth_sni, &self.access_key, self.reality_enabled
+                target_ip, uot_port, &self.stealth_sni, &self.access_key, self.reality_enabled, self.wss
             ).await?;
             Ok(crate::transport::Transport::Uot { tx, rx })
         } else {

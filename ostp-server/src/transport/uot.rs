@@ -9,6 +9,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, RwLock};
 use tracing::info;
+use ostp_core::framing::wss::{encode_wss_frame, decode_wss_frame, WssFrameResult};
 
 pub async fn handle_tcp_connection<S>(
     mut stream: S,
@@ -40,10 +41,14 @@ where
     let headers_str = String::from_utf8_lossy(&buf[..header_len]);
 
     // Fast-fail scanner bots
-    if !headers_str.starts_with("GET /stream HTTP/1.1\r\n") {
+    let wss = if headers_str.starts_with("GET /wss HTTP/1.1\r\n") {
+        true
+    } else if headers_str.starts_with("GET /stream HTTP/1.1\r\n") {
+        false
+    } else {
         send_404(&mut stream).await?;
         anyhow::bail!("invalid request line");
-    }
+    };
 
     // Extract Authorization or Cookie for signature
     let mut signature_base64 = None;
@@ -109,9 +114,13 @@ where
         anyhow::bail!("unauthorized (invalid HMAC)");
     }
 
-    // Reply 101 Switching Protocols
-    let response = "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\nX-Ostp-Server: 1\r\n\r\n";
-    stream.write_all(response.as_bytes()).await?;
+    if wss {
+        let response = "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\nX-Ostp-Server: 1\r\n\r\n";
+        stream.write_all(response.as_bytes()).await?;
+    } else {
+        let response = "HTTP/1.1 200 OK\r\nX-Ostp-Server: 1\r\nContent-Type: application/octet-stream\r\n\r\n";
+        stream.write_all(response.as_bytes()).await?;
+    }
 
     info!("UoT client authenticated from {}", peer_addr);
 
@@ -132,11 +141,16 @@ where
     let tcp_map_clone = tcp_map.clone();
     let writer_task = tokio::spawn(async move {
         while let Some(packet) = rx.recv().await {
-            let mut out = BytesMut::with_capacity(2 + packet.len());
-            out.put_u16(packet.len() as u16);
-            out.put_slice(&packet);
-            if write_half.write_all(&out).await.is_err() {
-                break;
+            if wss {
+                let header = encode_wss_frame(&packet, false); // Server sends unmasked WSS frames
+                if write_half.write_all(&header).await.is_err() { break; }
+            } else {
+                let mut out = BytesMut::with_capacity(2 + packet.len());
+                out.put_u16(packet.len() as u16);
+                out.put_slice(&packet);
+                if write_half.write_all(&out).await.is_err() {
+                    break;
+                }
             }
         }
         // Cleanup on writer exit
@@ -146,35 +160,57 @@ where
     // Reader loop
     let mut buffer = BytesMut::from(leftover);
     loop {
-        while buffer.len() < 2 {
-            let mut temp = [0u8; 1024];
-            match read_half.read(&mut temp).await {
-                Ok(0) | Err(_) => {
-                    writer_task.abort();
-                    tcp_map.write().await.remove(&peer_addr);
-                    return Ok(());
+        if wss {
+                match decode_wss_frame(&buffer) {
+                    WssFrameResult::Incomplete => {
+                        let mut temp = [0u8; 1024];
+                        match read_half.read(&mut temp).await {
+                            Ok(0) | Err(_) => {
+                                writer_task.abort();
+                                tcp_map.write().await.remove(&peer_addr);
+                                return Ok(());
+                            }
+                            Ok(n) => buffer.extend_from_slice(&temp[..n]),
+                        }
+                    }
+                    WssFrameResult::Frame { payload, total_len } => {
+                        let _ = buffer.split_to(total_len);
+                        if udp_tx.send((Bytes::from(payload), peer_addr)).await.is_err() {
+                            break;
+                        }
+                    }
                 }
-                Ok(n) => buffer.extend_from_slice(&temp[..n]),
-            }
-        }
-        
-        let len = u16::from_be_bytes([buffer[0], buffer[1]]) as usize;
-        
-        while buffer.len() < 2 + len {
-            let mut temp = [0u8; 1024];
-            match read_half.read(&mut temp).await {
-                Ok(0) | Err(_) => {
-                    writer_task.abort();
-                    tcp_map.write().await.remove(&peer_addr);
-                    return Ok(());
+        } else {
+            while buffer.len() < 2 {
+                let mut temp = [0u8; 1024];
+                match read_half.read(&mut temp).await {
+                    Ok(0) | Err(_) => {
+                        writer_task.abort();
+                        tcp_map.write().await.remove(&peer_addr);
+                        return Ok(());
+                    }
+                    Ok(n) => buffer.extend_from_slice(&temp[..n]),
                 }
-                Ok(n) => buffer.extend_from_slice(&temp[..n]),
             }
-        }
-        
-        let packet = buffer.split_to(2 + len);
-        if udp_tx.send((Bytes::from(packet[2..].to_vec()), peer_addr)).await.is_err() {
-            break;
+            
+            let len = u16::from_be_bytes([buffer[0], buffer[1]]) as usize;
+            
+            while buffer.len() < 2 + len {
+                let mut temp = [0u8; 1024];
+                match read_half.read(&mut temp).await {
+                    Ok(0) | Err(_) => {
+                        writer_task.abort();
+                        tcp_map.write().await.remove(&peer_addr);
+                        return Ok(());
+                    }
+                    Ok(n) => buffer.extend_from_slice(&temp[..n]),
+                }
+            }
+            
+            let packet = buffer.split_to(2 + len);
+            if udp_tx.send((Bytes::from(packet[2..].to_vec()), peer_addr)).await.is_err() {
+                break;
+            }
         }
     }
 

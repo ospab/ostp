@@ -1422,7 +1422,6 @@ dependencies = [
  "anyhow",
  "bytes",
  "jni",
- "lazy_static",
  "ostp-client",
  "ostp-core",
  "portable-atomic",

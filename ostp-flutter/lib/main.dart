@@ -113,6 +113,7 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
     final transportMode = widget.prefs.getString('transport_mode') ?? 'udp';
     final stealthSni = widget.prefs.getString('stealth_sni') ?? 'vk.com';
     final stealthPort = widget.prefs.getString('stealth_port') ?? '443';
+    final wss = widget.prefs.getBool('wss') ?? false;
     final mtu = widget.prefs.getString('mtu') ?? '1350';
     final muxEnabled = widget.prefs.getBool('mux_enabled') ?? false;
     final muxSessions = widget.prefs.getString('mux_sessions') ?? '2';
@@ -141,6 +142,7 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
         "mode": transportMode,
         "stealth_sni": stealthSni,
         "stealth_port": int.tryParse(stealthPort) ?? 443,
+        "wss": wss,
       },
       "multiplex": {
         "enabled": muxEnabled,
@@ -209,6 +211,7 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
       final transportMode = widget.prefs.getString('transport_mode') ?? 'udp';
       final stealthSni = widget.prefs.getString('stealth_sni') ?? 'vk.com';
       final stealthPort = widget.prefs.getString('stealth_port') ?? '443';
+      final wss = widget.prefs.getBool('wss') ?? false;
       final mtu = widget.prefs.getString('mtu') ?? '1350';
       final muxEnabled = widget.prefs.getBool('mux_enabled') ?? false;
       final muxSessions = widget.prefs.getString('mux_sessions') ?? '2';
@@ -237,6 +240,7 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
           "mode": transportMode,
           "stealth_sni": stealthSni,
           "stealth_port": int.tryParse(stealthPort) ?? 443,
+          "wss": wss,
         },
         "multiplex": {
           "enabled": muxEnabled,
@@ -861,7 +865,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
 
   bool _obscureKey = true;
   bool _debugMode = false;
-  String _transportMode = 'udp'; // 'udp' | 'wss'
+  bool _wss = false;
+  String _transportMode = 'udp'; // 'udp' | 'uot'
   String _tunStack = 'ostp'; // 'system' | 'ostp'
   bool _muxEnabled = false;
   late TextEditingController _muxSessionsCtrl;
@@ -883,6 +888,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
     _stealthPortCtrl = TextEditingController(text: widget.prefs.getString('stealth_port') ?? '443');
     _pbkCtrl = TextEditingController(text: widget.prefs.getString('pbk') ?? '');
     _sidCtrl = TextEditingController(text: widget.prefs.getString('sid') ?? '');
+    _wss = widget.prefs.getBool('wss') ?? false;
     _transportMode = widget.prefs.getString('transport_mode') ?? 'udp';
     _tunStack = widget.prefs.getString('tun_stack') ?? 'ostp';
     _debugMode = widget.prefs.getBool('debug_mode') ?? false;
@@ -921,6 +927,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
     widget.prefs.setString('ex_ips', _ipsCtrl.text.trim());
     widget.prefs.setString('ex_processes', _processesCtrl.text.trim());
     widget.prefs.setBool('debug_mode', _debugMode);
+    widget.prefs.setBool('wss', _wss);
     widget.prefs.setString('transport_mode', _transportMode);
     widget.prefs.setString('tun_stack', _tunStack);
     widget.prefs.setString('stealth_sni', _stealthSniCtrl.text.trim());
@@ -1060,6 +1067,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                       _stealthSniCtrl.text = uri.queryParameters['sni'] ?? '';
                       _pbkCtrl.text = uri.queryParameters['pbk'] ?? '';
                       _sidCtrl.text = uri.queryParameters['sid'] ?? '';
+                      _wss = uri.queryParameters['wss'] == 'true';
                       final type = uri.queryParameters['type'] ?? 'udp';
                       _transportMode = type == 'tcp' || type == 'http' ? 'uot' : 'udp';
                       _owndns = uri.queryParameters['owndns'] == 'true';
@@ -1219,6 +1227,12 @@ class _SettingsScreenState extends State<SettingsScreen> {
                               }
                             },
                           );
+                        }),
+                        const SizedBox(height: 16),
+                        _buildToggle('WebSocket (WSS)', 'Использовать RFC 6455 (для строгого DPI)', _wss, (val) {
+                          setState(() {
+                            _wss = val;
+                          });
                         }),
                         const SizedBox(height: 16),
                         _buildTextField('Reality PublicKey (pbk)', _pbkCtrl, hint: 'Оставьте пустым для отключения Reality'),

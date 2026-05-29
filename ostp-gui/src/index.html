@@ -205,6 +205,19 @@
             <input id="in-stealth-sni" class="field-input" type="text" placeholder="www.microsoft.com" spellcheck="false" />
           </div>
 
+          <div class="toggle-row" id="group-wss">
+            <div class="toggle-text">
+              <span class="toggle-name">WebSocket (WSS)</span>
+              <span class="toggle-hint">Use RFC 6455 framing for strict DPI bypass</span>
+            </div>
+            <label class="toggle">
+              <input type="checkbox" id="in-wss" />
+              <span class="toggle-track">
+                <span class="toggle-thumb"></span>
+              </span>
+            </label>
+          </div>
+
           <div class="field-group">
             <label class="field-label" for="in-pbk" data-i18n="label_pbk">Reality PublicKey (pbk)</label>
             <input id="in-pbk" class="field-input" type="text" placeholder="Leave empty to disable Reality" spellcheck="false" />

@@ -79,6 +79,9 @@ pub struct TransportConfig {
     /// TCP Port for the stealth connection
     #[serde(default = "default_stealth_port")]
     pub stealth_port: u16,
+    /// Enable strict RFC 6455 WebSocket framing
+    #[serde(default)]
+    pub wss: bool,
 }
 
 fn default_transport_mode() -> String { "udp".to_string() }
@@ -90,6 +93,7 @@ impl Default for TransportConfig {
             mode: default_transport_mode(),
             stealth_sni: String::new(),
             stealth_port: default_stealth_port(),
+            wss: false,
         }
     }
 }
@@ -185,6 +189,7 @@ struct RawTransportSection {
     mode: Option<String>,
     stealth_sni: Option<String>,
     stealth_port: Option<u16>,
+    wss: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -274,6 +279,7 @@ impl ClientConfig {
                 mode: raw.transport.as_ref().and_then(|t| t.mode.clone()).unwrap_or_else(|| "udp".to_string()),
                 stealth_sni: raw.transport.as_ref().and_then(|t| t.stealth_sni.clone()).unwrap_or_else(|| "microsoft.com".to_string()),
                 stealth_port: raw.transport.as_ref().and_then(|t| t.stealth_port).unwrap_or(443),
+                wss: raw.transport.as_ref().and_then(|t| t.wss).unwrap_or(false),
             },
             exclusions: ExclusionConfig {
                 domains: exclusions.domains.unwrap_or_default(),

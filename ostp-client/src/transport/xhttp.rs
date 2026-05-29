@@ -12,6 +12,7 @@ use rustls::ClientConfig;
 use rustls::pki_types::ServerName;
 use std::sync::Arc as StdArc;
 use tokio_rustls::TlsConnector;
+use ostp_core::framing::wss::{encode_wss_frame, decode_wss_frame, WssFrameResult};
 
 mod danger {
     use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
@@ -73,6 +74,7 @@ pub async fn connect_xhttp(
     sni: &str,
     access_key: &[u8],
     tls_enabled: bool,
+    wss: bool,
 ) -> Result<(mpsc::Sender<Bytes>, Arc<tokio::sync::Mutex<mpsc::Receiver<Bytes>>>)> {
     let addr = std::net::SocketAddr::new(target_ip, port);
     let tcp_stream = TcpStream::connect(addr).await
@@ -96,9 +98,9 @@ pub async fn connect_xhttp(
 
         let tls_stream = connector.connect(server_name, tcp_stream).await
             .with_context(|| "TLS handshake failed")?;
-        xhttp_handshake_and_loop(tls_stream, target_ip, sni, access_key).await
+        xhttp_handshake_and_loop(tls_stream, target_ip, sni, access_key, wss).await
     } else {
-        xhttp_handshake_and_loop(tcp_stream, target_ip, sni, access_key).await
+        xhttp_handshake_and_loop(tcp_stream, target_ip, sni, access_key, wss).await
     }
 }
 
@@ -107,6 +109,7 @@ async fn xhttp_handshake_and_loop<S>(
     target_ip: IpAddr,
     sni: &str,
     access_key: &[u8],
+    wss: bool,
 ) -> Result<(mpsc::Sender<Bytes>, Arc<tokio::sync::Mutex<mpsc::Receiver<Bytes>>>)>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -126,18 +129,27 @@ where
 
     let http_host = if sni.is_empty() { target_ip.to_string() } else { sni.to_string() };
 
-    // 2. Send fake WebSocket upgrade — looks like a legit browser request to bypass DPI/proxies.
-    let req = format!(
-        "GET /stream HTTP/1.1\r\n\
-         Host: {}\r\n\
-         Upgrade: websocket\r\n\
-         Connection: upgrade\r\n\
-         Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
-         Sec-WebSocket-Version: 13\r\n\
-         Authorization: Bearer {}\r\n\
-         \r\n",
-        http_host, auth_token
-    );
+    let req = if wss {
+        format!(
+            "GET /wss HTTP/1.1\r\n\
+             Host: {}\r\n\
+             Upgrade: websocket\r\n\
+             Connection: upgrade\r\n\
+             Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+             Sec-WebSocket-Version: 13\r\n\
+             Authorization: Bearer {}\r\n\
+             \r\n",
+            http_host, auth_token
+        )
+    } else {
+        format!(
+            "GET /stream HTTP/1.1\r\n\
+             Host: {}\r\n\
+             Authorization: Bearer {}\r\n\
+             \r\n",
+            http_host, auth_token
+        )
+    };
 
     stream.write_all(req.as_bytes()).await?;
     stream.flush().await?;
@@ -168,13 +180,14 @@ where
 
     // 5. Split into read/write halves and start UoT loops
     let (rx, tx) = tokio::io::split(stream);
-    start_uot_loops(rx, tx, leftover)
+    start_uot_loops(rx, tx, leftover, wss)
 }
 
 fn start_uot_loops<R, W>(
     mut net_rx: R,
     mut net_tx: W,
-    leftover: Vec<u8>
+    leftover: Vec<u8>,
+    wss: bool,
 ) -> Result<(mpsc::Sender<Bytes>, Arc<tokio::sync::Mutex<mpsc::Receiver<Bytes>>>)>
 where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
@@ -183,39 +196,65 @@ where
     let (app_tx, mut tx_rx) = mpsc::channel::<Bytes>(16384);
     let (rx_tx, app_rx) = mpsc::channel::<Bytes>(16384);
 
-    // TX Loop (App -> UoT -> Network): prefix each frame with u16 BE length
+    // TX Loop (App -> UoT -> Network)
     tokio::spawn(async move {
         while let Some(frame) = tx_rx.recv().await {
-            let len = frame.len() as u16;
-            if net_tx.write_u16(len).await.is_err() { break; }
-            if net_tx.write_all(&frame).await.is_err() { break; }
+            let len = frame.len();
+            if wss {
+                let header = encode_wss_frame(&frame, true);
+                if net_tx.write_all(&header).await.is_err() { break; }
+            } else {
+                let len_u16 = len as u16;
+                if net_tx.write_u16(len_u16).await.is_err() { break; }
+                if net_tx.write_all(&frame).await.is_err() { break; }
+            }
         }
     });
 
-    // RX Loop (Network -> UoT -> App): parse [u16 len][payload] frames
+    // RX Loop (Network -> UoT -> App)
     tokio::spawn(async move {
         let mut buffer = BytesMut::from(&leftover[..]);
         loop {
-            while buffer.len() < 2 {
-                let mut temp = [0u8; 4096];
-                match net_rx.read(&mut temp).await {
-                    Ok(0) | Err(_) => return,
-                    Ok(n) => buffer.extend_from_slice(&temp[..n]),
+            if wss {
+                // Parse WSS frame (from server, so NOT masked)
+                match decode_wss_frame(&buffer) {
+                    WssFrameResult::Incomplete => {
+                        let mut temp = [0u8; 4096];
+                        match net_rx.read(&mut temp).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => buffer.extend_from_slice(&temp[..n]),
+                        }
+                    }
+                    WssFrameResult::Frame { payload, total_len } => {
+                        let _ = buffer.split_to(total_len);
+                        if rx_tx.send(Bytes::from(payload)).await.is_err() {
+                            break;
+                        }
+                    }
                 }
-            }
-            let len = u16::from_be_bytes([buffer[0], buffer[1]]) as usize;
-
-            while buffer.len() < 2 + len {
-                let mut temp = [0u8; 4096];
-                match net_rx.read(&mut temp).await {
-                    Ok(0) | Err(_) => return,
-                    Ok(n) => buffer.extend_from_slice(&temp[..n]),
+            } else {
+                // Parse raw u16 framing
+                while buffer.len() < 2 {
+                    let mut temp = [0u8; 4096];
+                    match net_rx.read(&mut temp).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => buffer.extend_from_slice(&temp[..n]),
+                    }
                 }
-            }
+                let len = u16::from_be_bytes([buffer[0], buffer[1]]) as usize;
 
-            let packet = buffer.split_to(2 + len);
-            if rx_tx.send(Bytes::from(packet[2..].to_vec())).await.is_err() {
-                break;
+                while buffer.len() < 2 + len {
+                    let mut temp = [0u8; 4096];
+                    match net_rx.read(&mut temp).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => buffer.extend_from_slice(&temp[..n]),
+                    }
+                }
+
+                let packet = buffer.split_to(2 + len);
+                if rx_tx.send(Bytes::from(packet[2..].to_vec())).await.is_err() {
+                    break;
+                }
             }
         }
     });

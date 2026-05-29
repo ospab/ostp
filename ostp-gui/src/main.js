@@ -45,6 +45,7 @@ const inOwndns       = $('in-owndns');
 const groupCustomDns = $('group-custom-dns');
 const inTransport    = $('in-transport');
 const inSni          = $('in-stealth-sni');
+const inWss          = $('in-wss');
 const inPbk          = $('in-pbk');
 const inSid          = $('in-sid');
 const inMtu          = $('in-mtu');
@@ -239,6 +240,7 @@ async function loadConfigIntoForm() {
     inSocks.value   = c.socks5_bind   || '127.0.0.1:1088';
     inTransport.value = c.transport?.mode || 'udp';
     inSni.value     = c.transport?.stealth_sni || '';
+    inWss.checked   = !!c.transport?.wss;
     inPbk.value     = c.reality?.pbk           || '';
     inSid.value     = c.reality?.sid           || '';
     inMtu.value     = c.mtu           || '';
@@ -292,6 +294,7 @@ async function handleSave(silent = false) {
   rawConfig.transport = rawConfig.transport || {};
   rawConfig.transport.mode = inTransport.value;
   rawConfig.transport.stealth_sni = inSni.value.trim() || undefined;
+  rawConfig.transport.wss = inWss.checked;
 
   const pbk = inPbk.value.trim();
   if (pbk) {

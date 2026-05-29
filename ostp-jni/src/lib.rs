@@ -1,7 +1,7 @@
 use jni::objects::{JClass, JString};
 use jni::sys::{jboolean, jstring};
 use jni::JNIEnv;
-use lazy_static::lazy_static;
+
 use std::collections::VecDeque;
 use std::sync::{atomic::Ordering, Arc, Mutex};
 use tokio::runtime::Runtime;
@@ -12,13 +12,19 @@ use ostp_client::tunnel;
 use ostp_client::app::{BridgeCommand, UiEvent};
 use std::io::Write;
 
+static LOG_TX: std::sync::OnceLock<std::sync::mpsc::Sender<String>> = std::sync::OnceLock::new();
+
 struct JniLogWriter;
 
 impl Write for JniLogWriter {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         let s = String::from_utf8_lossy(buf).trim().to_string();
         if !s.is_empty() {
-            add_log(s);
+            if let Some(tx) = LOG_TX.get() {
+                let _ = tx.send(s);
+            } else {
+                add_log(s);
+            }
         }
         Ok(buf.len())
     }
@@ -38,6 +44,14 @@ static TRACING_INIT: std::sync::Once = std::sync::Once::new();
 
 fn init_tracing() {
     TRACING_INIT.call_once(|| {
+        let (tx, rx) = std::sync::mpsc::channel::<String>();
+        LOG_TX.set(tx).ok();
+        std::thread::spawn(move || {
+            while let Ok(text) = rx.recv() {
+                add_log(text);
+            }
+        });
+
         let subscriber = tracing_subscriber::fmt()
             .with_writer(JniLogWriter)
             .with_ansi(false)
@@ -54,18 +68,22 @@ struct SdkState {
     cmd_tx: Option<mpsc::Sender<BridgeCommand>>,
 }
 
-lazy_static! {
-    static ref STATE: Mutex<SdkState> = Mutex::new(SdkState {
-        runtime: None,
-        shutdown_tx: None,
-        metrics: None,
-        tun_child: None,
-        cmd_tx: None,
-    });
-    static ref LOGS: Mutex<VecDeque<String>> = Mutex::new(VecDeque::new());
-    static ref JVM: Mutex<Option<jni::JavaVM>> = Mutex::new(None);
-    static ref CLASS_REF: Mutex<Option<jni::objects::GlobalRef>> = Mutex::new(None);
+impl SdkState {
+    const fn new() -> Self {
+        Self {
+            runtime: None,
+            shutdown_tx: None,
+            metrics: None,
+            tun_child: None,
+            cmd_tx: None,
+        }
+    }
 }
+
+static STATE: Mutex<SdkState> = Mutex::new(SdkState::new());
+static LOGS: Mutex<VecDeque<String>> = Mutex::new(VecDeque::new());
+static JVM: Mutex<Option<jni::JavaVM>> = Mutex::new(None);
+static CLASS_REF: Mutex<Option<jni::objects::GlobalRef>> = Mutex::new(None);
 
 fn add_log(text: String) {
     if let Ok(mut guard) = LOGS.lock() {
