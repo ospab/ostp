@@ -96,7 +96,10 @@ async fn start_udp_session(
         }
     }
 
-    let udp = UdpSocket::bind("127.0.0.1:0").await?;
+    let udp = match relay_addr {
+        SocketAddr::V4(_) => UdpSocket::bind("127.0.0.1:0").await?,
+        SocketAddr::V6(_) => UdpSocket::bind("[::1]:0").await.or_else(|_| UdpSocket::bind("[::]:0").await)?,
+    };
     
     let mut buf = vec![0u8; 65536];
     
@@ -115,7 +118,7 @@ async fn start_udp_session(
                         }
                         packet.extend_from_slice(&dst.port().to_be_bytes());
                         packet.extend_from_slice(&payload);
-                        udp.send_to(&packet, relay_addr).await?;
+                        let _ = udp.send_to(&packet, relay_addr).await;
                     }
                     Ok(None) => break,
                     Err(_) => break, // timeout

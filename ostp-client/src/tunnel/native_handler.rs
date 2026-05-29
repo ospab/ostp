@@ -329,8 +329,8 @@ pub async fn run_native_tunnel_from_fd(
             }) {
                 Ok(Ok(n)) if n > 0 => n as usize,
                 Ok(Ok(n)) if n == 0 => break, // EOF
-                Ok(Ok(_n)) => continue, // Error reading packet, skip to next
-                Ok(Err(_)) => continue, // Should not happen with try_io
+                Ok(Ok(_n)) => break, // Fatal error reading TUN, must break to prevent 100% CPU spin
+                Ok(Err(_)) => break,
                 Err(_would_block) => continue,
             };
 
