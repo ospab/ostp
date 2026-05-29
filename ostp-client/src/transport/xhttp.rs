@@ -33,6 +33,13 @@ pub async fn connect_xhttp(
         .with_context(|| format!("failed to connect to {}", addr))?;
     tcp_stream.set_nodelay(true)?;
 
+    #[cfg(target_os = "android")]
+    {
+        use std::os::unix::io::AsRawFd;
+        let fd = tcp_stream.as_raw_fd();
+        crate::bridge::invoke_socket_protector(fd);
+    }
+
     if reality_enabled {
         let pbk_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(reality_pbk)
             .context("invalid reality_pbk base64")?;
