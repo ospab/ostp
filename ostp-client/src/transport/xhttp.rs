@@ -29,16 +29,26 @@ pub async fn connect_xhttp(
     reality_sid: &str,
 ) -> Result<(mpsc::Sender<Bytes>, Arc<tokio::sync::Mutex<mpsc::Receiver<Bytes>>>)> {
     let addr = std::net::SocketAddr::new(target_ip, port);
-    let mut tcp_stream = TcpStream::connect(addr).await
+    
+    #[cfg(not(target_os = "android"))]
+    let mut tcp_stream = tokio::net::TcpStream::connect(addr).await
         .with_context(|| format!("failed to connect to {}", addr))?;
-    tcp_stream.set_nodelay(true)?;
 
     #[cfg(target_os = "android")]
-    {
+    let mut tcp_stream = {
+        let domain = if target_ip.is_ipv6() { socket2::Domain::IPV6 } else { socket2::Domain::IPV4 };
+        let sock = socket2::Socket::new(domain, socket2::Type::STREAM, Some(socket2::Protocol::TCP))?;
+        
         use std::os::unix::io::AsRawFd;
-        let fd = tcp_stream.as_raw_fd();
-        crate::bridge::invoke_socket_protector(fd);
-    }
+        crate::bridge::protect_socket(sock.as_raw_fd());
+        
+        sock.set_nonblocking(true)?;
+        let tcp_socket = tokio::net::TcpSocket::from_std_stream(sock.into());
+        tcp_socket.connect(addr).await
+            .with_context(|| format!("failed to connect to {}", addr))?
+    };
+
+    tcp_stream.set_nodelay(true)?;
 
     if reality_enabled {
         let pbk_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(reality_pbk)

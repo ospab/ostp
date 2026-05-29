@@ -120,6 +120,9 @@ pub async fn run_native_tunnel(
     }
 
     let (stack, tcp_runner, udp_socket, tcp_listener) = StackBuilder::default()
+        .stack_buffer_size(100000)
+        .tcp_buffer_size(100000)
+        .udp_buffer_size(100000)
         .enable_tcp(true)
         .enable_udp(true)
         .mtu(config.ostp.mtu)
@@ -273,17 +276,25 @@ pub async fn run_native_tunnel_from_fd(
         }
     }
 
-    let file = unsafe { std::fs::File::from_raw_fd(fd) };
+    let read_fd = unsafe { libc::dup(fd) };
+    if read_fd < 0 {
+        return Err(anyhow::anyhow!("Failed to dup tun fd for reading"));
+    }
+    
+    let file = unsafe { std::fs::File::from_raw_fd(read_fd) };
     let tun_stream = tokio::io::unix::AsyncFd::new(file)?;
 
     let (stack, tcp_runner, udp_socket, tcp_listener) = StackBuilder::default()
+        .stack_buffer_size(100000)
+        .tcp_buffer_size(100000)
+        .udp_buffer_size(100000)
         .enable_tcp(true)
         .enable_udp(true)
         .mtu(config.ostp.mtu)
         .build()?;
 
     let mut runner_task = tokio::spawn(async move {
-        if let Some(mut runner) = tcp_runner {
+        if let Some(runner) = tcp_runner {
             let _ = runner.await;
         }
     });

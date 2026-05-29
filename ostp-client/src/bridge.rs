@@ -907,7 +907,7 @@ impl Bridge {
             // For UoT, use the stealth_port if it's configured and differs from default 443;
             // otherwise fall back to the actual server port so the user doesn't need two separate
             // port fields for the same destination.
-            let uot_port = if self.stealth_port != 443 {
+            let uot_port = if self.stealth_port > 0 {
                 self.stealth_port
             } else {
                 port

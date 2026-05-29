@@ -33,6 +33,7 @@ const btnTestPing    = $('btn-test-ping');
 const toast          = $('toast');
 
 const btnGoSettings  = $('btn-go-settings');
+const btnAutoConnect = $('btn-auto-connect');
 const btnBack        = $('btn-back');
 const btnImport      = $('btn-import-url');
 const btnPeekKey     = $('btn-peek-key');
@@ -398,6 +399,73 @@ window.addEventListener('DOMContentLoaded', async () => {
   }
 
   btnConnect.addEventListener('click',       handleToggle);
+  
+  if (btnAutoConnect) {
+    btnAutoConnect.addEventListener('click', async () => {
+      if (appState !== 'disconnected') {
+        showToast('Disconnect first to run Auto mode', 'error');
+        return;
+      }
+      
+      try {
+        const raw = await invoke('get_config');
+        rawConfig = JSON.parse(raw);
+      } catch {
+        showToast('Please save your config first', 'error');
+        return;
+      }
+
+      showToast('Starting Auto search...', 'ok');
+      const mtus = [1500, 1350, 1280];
+      const modes = [
+        { t: 'udp', w: false, r: false },
+        { t: 'uot', w: false, r: false },
+        { t: 'uot', w: true, r: false },
+        { t: 'uot', w: false, r: true }
+      ];
+
+      for (let mode of modes) {
+        for (let mtu of mtus) {
+          showToast(`Testing: ${mode.t} | WSS: ${mode.w} | XTLS: ${mode.r} | MTU: ${mtu}`);
+          
+          rawConfig.mtu = mtu;
+          rawConfig.transport = rawConfig.transport || {};
+          rawConfig.transport.mode = mode.t;
+          rawConfig.transport.wss = mode.w;
+          
+          if (mode.r) {
+            rawConfig.reality = rawConfig.reality || {};
+            rawConfig.reality.enabled = true;
+          } else if (rawConfig.reality) {
+            rawConfig.reality.enabled = false;
+          }
+
+          await invoke('save_config', { jsonContent: JSON.stringify(rawConfig, null, 2) });
+          
+          setState('connecting');
+          const ok = await invoke('start_tunnel');
+          if (ok) {
+            startPolling();
+            // Wait a bit to see if it stays connected and ping works
+            await new Promise(r => setTimeout(r, 3000));
+            try {
+              const metrics = await invoke('get_metrics');
+              if (metrics && metrics.rtt_ms > 0) {
+                showToast(`Success! Found working config: ${mode.t} (MTU ${mtu})`, 'ok');
+                return; // Stop on first working
+              }
+            } catch {}
+            
+            // If we are here, ping failed, so stop and try next
+            await invoke('stop_tunnel');
+            setState('disconnected');
+          }
+        }
+      }
+      showToast('Auto search finished. No working config found.', 'error');
+    });
+  }
+
   btnGoSettings.addEventListener('click',    () => showScreen('settings'));
   btnBack.addEventListener('click',          () => showScreen('home'));
   btnImport.addEventListener('click',        handleImport);

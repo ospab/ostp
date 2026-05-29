@@ -163,9 +163,7 @@ pub async fn run_client_core(
         .map_err(|e| anyhow::anyhow!("Failed to resolve server address {}: {}", config.ostp.server_addr, e))?
         .collect();
         
-    #[cfg(target_os = "android")]
-    resolved_addrs.sort_by_key(|addr| if addr.is_ipv6() { 0 } else { 1 });
-        
+
     let target_addr = resolved_addrs.first()
         .ok_or_else(|| anyhow::anyhow!("No IP addresses resolved for {}", config.ostp.server_addr))?;
         

@@ -340,6 +340,97 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
     }
   }
 
+  Future<void> _runAutoMode() async {
+    final mtus = [1500, 1350, 1280];
+    final modes = [
+      {'t': 'udp', 'w': false, 'r': false},
+      {'t': 'uot', 'w': false, 'r': false},
+      {'t': 'uot', 'w': true,  'r': false},
+      {'t': 'uot', 'w': false, 'r': true},
+    ];
+
+    if (_serverAddr.isEmpty || _accessKey.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Please configure Server and Key first')),
+      );
+      return;
+    }
+
+    for (var mode in modes) {
+      for (var mtu in mtus) {
+        if (!mounted) return;
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Testing: ${mode['t']} | WSS: ${mode['w']} | XTLS: ${mode['r']} | MTU: $mtu'), duration: const Duration(seconds: 2)),
+        );
+
+        // Update prefs
+        await widget.prefs.setString('mtu', mtu.toString());
+        await widget.prefs.setString('transport_mode', mode['t'] as String);
+        await widget.prefs.setBool('wss', mode['w'] as bool);
+        await widget.prefs.setBool('reality_enabled', mode['r'] as bool);
+        _updateLatestConfigJson();
+
+        setState(() {
+          _state = ConnectionStateEnum.connecting;
+        });
+        _pulseController.repeat(reverse: true);
+        _spinController.repeat();
+
+        try {
+          final configJson = widget.prefs.getString('latest_config_json') ?? '{}';
+          await platform.invokeMethod('startTunnel', {"configJson": configJson});
+
+          bool started = false;
+          for (int i = 0; i < 10; i++) {
+            await Future.delayed(const Duration(milliseconds: 500));
+            final isRunning = await platform.invokeMethod('isRunning');
+            if (isRunning == true) {
+              started = true;
+              break;
+            }
+          }
+
+          if (started) {
+            _setConnected();
+            // Wait to see if connection is stable and ping is successful
+            await Future.delayed(const Duration(seconds: 3));
+            try {
+              final metricsJson = await platform.invokeMethod('getMetrics');
+              if (metricsJson != null && metricsJson.isNotEmpty) {
+                final Map<String, dynamic> parsed = jsonDecode(metricsJson);
+                final rttMs = parsed['rtt_ms'] as int? ?? 0;
+                if (rttMs > 0) {
+                  if (mounted) {
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      SnackBar(content: Text('Success! Found working config: ${mode['t']} (MTU $mtu)')),
+                    );
+                  }
+                  return; // Stop on first working config
+                }
+              }
+            } catch (e) {
+              // Ignore metrics error
+            }
+
+            // Connection seems unstable or no ping, stop and try next
+            await platform.invokeMethod('stopTunnel');
+            _setDisconnected();
+          } else {
+            _setDisconnected();
+          }
+        } catch (e) {
+          _setDisconnected();
+        }
+      }
+    }
+
+    if (mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Auto search finished. No working config found.')),
+      );
+    }
+  }
+
   void _setConnected() {
     if (!mounted) return;
     setState(() {
@@ -558,16 +649,33 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
               ),
             ],
           ),
-          IconButton(
-            iconSize: 30,
-            icon: const Icon(Icons.settings_outlined, color: Colors.white),
-            onPressed: () async {
-              await Navigator.push(
-                context,
-                MaterialPageRoute(builder: (context) => SettingsScreen(prefs: widget.prefs)),
-              );
-              _loadSettings();
-            },
+          Row(
+            children: [
+              IconButton(
+                iconSize: 30,
+                icon: const Icon(Icons.auto_mode_rounded, color: Colors.white),
+                onPressed: () {
+                  if (_state != ConnectionStateEnum.disconnected) {
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      const SnackBar(content: Text('Disconnect first to run Auto mode')),
+                    );
+                    return;
+                  }
+                  _runAutoMode();
+                },
+              ),
+              IconButton(
+                iconSize: 30,
+                icon: const Icon(Icons.settings_outlined, color: Colors.white),
+                onPressed: () async {
+                  await Navigator.push(
+                    context,
+                    MaterialPageRoute(builder: (context) => SettingsScreen(prefs: widget.prefs)),
+                  );
+                  _loadSettings();
+                },
+              )
+            ],
           )
         ],
       ),

@@ -41,8 +41,23 @@ where
     }
     header_len += n;
 
-    // Check if it's a TLS record (0x16 0x03 0x01)
-    if initial_buf[0] == 0x16 && initial_buf[1] == 0x03 && initial_buf[2] == 0x01 {
+    // Check if it's a TLS record (0x16 0x03 0x01 or 0x16 0x03 0x03)
+    if initial_buf[0] == 0x16 && initial_buf[1] == 0x03 {
+        // It's a TLS record. We need to ensure we read the entire record.
+        if header_len >= 5 {
+            let record_len = 5 + u16::from_be_bytes([initial_buf[3], initial_buf[4]]) as usize;
+            if record_len > initial_buf.len() {
+                anyhow::bail!("TLS record too large");
+            }
+            while header_len < record_len {
+                let n = stream.read(&mut initial_buf[header_len..record_len]).await?;
+                if n == 0 {
+                    anyhow::bail!("connection closed while reading TLS record");
+                }
+                header_len += n;
+            }
+        }
+        
         if let Some(rc) = reality_config {
             return handle_reality_connection(stream, initial_buf[..header_len].to_vec(), peer_addr, shared_keys, udp_tx, tcp_map, rc).await;
         } else {

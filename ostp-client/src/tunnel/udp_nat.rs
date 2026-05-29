@@ -21,7 +21,7 @@ pub async fn run_udp_nat(
         if payload.is_empty() { continue; }
 
         if !sessions.contains_key(&src) {
-            let (session_tx, mut session_rx) = mpsc::channel::<(Vec<u8>, SocketAddr)>(128);
+            let (session_tx, mut session_rx) = mpsc::channel::<(Vec<u8>, SocketAddr)>(100000);
             sessions.insert(src, session_tx);
 
             let proxy_addr_clone = proxy_addr.clone();

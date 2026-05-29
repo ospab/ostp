@@ -123,6 +123,7 @@ fn get_linux_physical_if_name() -> Option<String> {
     None
 }
 
+#[allow(unused_variables)]
 async fn connect_bypassing_tun(
     target: &str,
     physical_if_index: Option<u32>,
@@ -171,6 +172,7 @@ async fn connect_bypassing_tun(
     ))
 }
 
+#[allow(unused_variables)]
 async fn create_udp_socket_bypassing_tun(
     is_ipv6: bool,
     physical_if_index: Option<u32>,

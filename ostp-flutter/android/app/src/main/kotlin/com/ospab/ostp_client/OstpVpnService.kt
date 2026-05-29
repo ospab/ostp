@@ -35,7 +35,10 @@ class OstpVpnService : VpnService() {
         @Keep
         @JvmStatic
         fun protectSocket(fd: Int): Boolean {
-            return instance?.protect(fd) ?: false
+            // App is excluded from VPN via addDisallowedApplication/addAllowedApplication.
+            // VpnService.protect() bypasses clatd (464XLAT) on IPv6-only mobile networks,
+            // breaking IPv4 connectivity. Since we're excluded, protect() is unnecessary.
+            return true
         }
 
         /**
