@@ -63,19 +63,34 @@ async fn start_udp_session(
 
     // UDP ASSOCIATE to 0.0.0.0:0
     tcp.write_all(&[5, 3, 0, 1, 0, 0, 0, 0, 0, 0]).await?;
-    let mut rep = [0u8; 10];
-    tcp.read_exact(&mut rep).await?;
-    if rep[1] != 0 {
+    let mut rep_hdr = [0u8; 4];
+    tcp.read_exact(&mut rep_hdr).await?;
+    if rep_hdr[1] != 0 {
         return Err(anyhow::anyhow!("socks5 udp associate rejected"));
     }
 
-    // Parse BND.ADDR and BND.PORT
-    let relay_ip = std::net::Ipv4Addr::new(rep[4], rep[5], rep[6], rep[7]);
-    let relay_port = u16::from_be_bytes([rep[8], rep[9]]);
-    let mut relay_addr = SocketAddr::new(std::net::IpAddr::V4(relay_ip), relay_port);
+    let mut relay_addr = match rep_hdr[3] {
+        1 => {
+            let mut addr_buf = [0u8; 6];
+            tcp.read_exact(&mut addr_buf).await?;
+            let ip = std::net::Ipv4Addr::new(addr_buf[0], addr_buf[1], addr_buf[2], addr_buf[3]);
+            let port = u16::from_be_bytes([addr_buf[4], addr_buf[5]]);
+            SocketAddr::new(std::net::IpAddr::V4(ip), port)
+        }
+        4 => {
+            let mut addr_buf = [0u8; 18];
+            tcp.read_exact(&mut addr_buf).await?;
+            let mut octets = [0u8; 16];
+            octets.copy_from_slice(&addr_buf[0..16]);
+            let ip = std::net::Ipv6Addr::from(octets);
+            let port = u16::from_be_bytes([addr_buf[16], addr_buf[17]]);
+            SocketAddr::new(std::net::IpAddr::V6(ip), port)
+        }
+        _ => return Err(anyhow::anyhow!("unsupported ATYP in UDP ASSOCIATE response")),
+    };
     
-    // If proxy returned 0.0.0.0, use the proxy's IP
-    if relay_ip.is_unspecified() {
+    // If proxy returned 0.0.0.0 or ::, use the proxy's IP
+    if relay_addr.ip().is_unspecified() {
         if let Ok(proxy_sock) = proxy_addr.parse::<SocketAddr>() {
             relay_addr.set_ip(proxy_sock.ip());
         }
