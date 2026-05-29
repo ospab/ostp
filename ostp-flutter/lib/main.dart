@@ -149,7 +149,7 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
         "sessions": int.tryParse(muxSessions) ?? 2,
       },
       "reality": {
-        "enabled": widget.prefs.getString('pbk')?.isNotEmpty ?? false,
+        "enabled": widget.prefs.getBool('reality_enabled') ?? false,
         "dest": "",
         "private_key": "",
         "pbk": widget.prefs.getString('pbk') ?? "",
@@ -247,7 +247,7 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
           "sessions": int.tryParse(muxSessions) ?? 2,
         },
         "reality": {
-          "enabled": widget.prefs.getString('pbk')?.isNotEmpty ?? false,
+          "enabled": widget.prefs.getBool('reality_enabled') ?? false,
           "dest": "",
           "private_key": "",
           "pbk": widget.prefs.getString('pbk') ?? "",
@@ -866,6 +866,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
   bool _obscureKey = true;
   bool _debugMode = false;
   bool _wss = false;
+  bool _realityEnabled = false;
   String _transportMode = 'udp'; // 'udp' | 'uot'
   String _tunStack = 'ostp'; // 'system' | 'ostp'
   bool _muxEnabled = false;
@@ -889,6 +890,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
     _pbkCtrl = TextEditingController(text: widget.prefs.getString('pbk') ?? '');
     _sidCtrl = TextEditingController(text: widget.prefs.getString('sid') ?? '');
     _wss = widget.prefs.getBool('wss') ?? false;
+    _realityEnabled = widget.prefs.getBool('reality_enabled') ?? false;
     _transportMode = widget.prefs.getString('transport_mode') ?? 'udp';
     _tunStack = widget.prefs.getString('tun_stack') ?? 'ostp';
     _debugMode = widget.prefs.getBool('debug_mode') ?? false;
@@ -928,6 +930,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
     widget.prefs.setString('ex_processes', _processesCtrl.text.trim());
     widget.prefs.setBool('debug_mode', _debugMode);
     widget.prefs.setBool('wss', _wss);
+    widget.prefs.setBool('reality_enabled', _realityEnabled);
     widget.prefs.setString('transport_mode', _transportMode);
     widget.prefs.setString('tun_stack', _tunStack);
     widget.prefs.setString('stealth_sni', _stealthSniCtrl.text.trim());
@@ -1068,6 +1071,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                       _pbkCtrl.text = uri.queryParameters['pbk'] ?? '';
                       _sidCtrl.text = uri.queryParameters['sid'] ?? '';
                       _wss = uri.queryParameters['wss'] == 'true';
+                      _realityEnabled = uri.queryParameters['reality'] == 'true';
                       final type = uri.queryParameters['type'] ?? 'udp';
                       _transportMode = type == 'tcp' || type == 'http' ? 'uot' : 'udp';
                       _owndns = uri.queryParameters['owndns'] == 'true';
@@ -1158,7 +1162,13 @@ class _SettingsScreenState extends State<SettingsScreen> {
                     ],
                   ),
                 ),
-                const SizedBox(height: 24),
+                const SizedBox(height: 16),
+                _buildToggle('WebSocket (WSS)', 'Инкапсулировать транспорт в RFC 6455 (для строгого DPI)', _wss, (val) {
+                  setState(() {
+                    _wss = val;
+                  });
+                }),
+                const SizedBox(height: 16),
 
                 // Stealth parameters
                 AnimatedCrossFade(
@@ -1229,13 +1239,13 @@ class _SettingsScreenState extends State<SettingsScreen> {
                           );
                         }),
                         const SizedBox(height: 16),
-                        _buildToggle('WebSocket (WSS)', 'Использовать RFC 6455 (для строгого DPI)', _wss, (val) {
+                        _buildToggle('XTLS-Reality', 'Подделка TLS-сессии (Stealth-домен должен быть TLS 1.3)', _realityEnabled, (val) {
                           setState(() {
-                            _wss = val;
+                            _realityEnabled = val;
                           });
                         }),
                         const SizedBox(height: 16),
-                        _buildTextField('Reality PublicKey (pbk)', _pbkCtrl, hint: 'Оставьте пустым для отключения Reality'),
+                        _buildTextField('Reality PublicKey (pbk)', _pbkCtrl, hint: 'Публичный ключ сервера'),
                         _buildTextField('Reality ShortId (sid)', _sidCtrl, hint: 'Опционально (необязательно)'),
                       ],
                     ),
