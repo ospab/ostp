@@ -306,7 +306,7 @@ pub async fn run_native_tunnel_from_fd(
 
     let (mut stack_sink, mut stack_stream) = stack.split();
 
-    let mut tun_to_stack = tokio::spawn(async move {
+    let _tun_to_stack = tokio::spawn(async move {
         let mut buf = vec![0u8; 65536];
         loop {
             let mut guard = match tun_stream.readable().await {
@@ -321,16 +321,16 @@ pub async fn run_native_tunnel_from_fd(
                     if err.kind() == std::io::ErrorKind::WouldBlock {
                         Err(err)
                     } else {
-                        Ok(res) // Return error as success to break gracefully
+                        // EINTR or other transient error — treat as zero (will continue)
+                        Ok(0_isize)
                     }
                 } else {
-                    Ok(res)
+                    Ok(res as isize)
                 }
             }) {
                 Ok(Ok(n)) if n > 0 => n as usize,
-                Ok(Ok(n)) if n == 0 => break, // EOF
-                Ok(Ok(_n)) => break, // Fatal error reading TUN, must break to prevent 100% CPU spin
-                Ok(Err(_)) => break,
+                Ok(Ok(_)) => continue, // 0 = EINTR or transient error, try again
+                Ok(Err(_)) => continue, // WouldBlock retry
                 Err(_would_block) => continue,
             };
 
@@ -356,7 +356,7 @@ pub async fn run_native_tunnel_from_fd(
     let write_file = unsafe { std::fs::File::from_raw_fd(write_fd) };
     let tun_write_stream = tokio::io::unix::AsyncFd::new(write_file)?;
 
-    let mut stack_to_tun = tokio::spawn(async move {
+    let _stack_to_tun = tokio::spawn(async move {
         while let Some(Ok(frame)) = stack_stream.next().await {
             let mut written = 0;
             while written < frame.len() {
@@ -443,8 +443,6 @@ pub async fn run_native_tunnel_from_fd(
     tokio::select! {
         _ = shutdown.changed() => {}
         _ = &mut runner_task => {}
-        _ = &mut tun_to_stack => {}
-        _ = &mut stack_to_tun => {}
         _ = &mut udp_proxy_task => {}
         _ = &mut tcp_accept_task => {}
     }
