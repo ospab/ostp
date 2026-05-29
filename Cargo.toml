@@ -4,8 +4,7 @@ members = [
     "ostp-client",
     "ostp-server",
     "ostp-jni", "ostp",
-    "ostp-tun-helper",
-    "ostp-prober"
+    "ostp-tun-helper"
 ]
 exclude = ["ostp-gui/src-tauri"]
 resolver = "2"
