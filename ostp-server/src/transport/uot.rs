@@ -433,6 +433,8 @@ struct RealityStream<S> {
     rx_nonce: u64,
     tx_nonce: u64,
     rx_buf: BytesMut,
+    plaintext_buf: BytesMut,
+    tx_buf: BytesMut,
 }
 
 impl<S> RealityStream<S> {
@@ -443,6 +445,8 @@ impl<S> RealityStream<S> {
             rx_nonce: 0,
             tx_nonce: 0,
             rx_buf: BytesMut::with_capacity(16384),
+            plaintext_buf: BytesMut::new(),
+            tx_buf: BytesMut::new(),
         }
     }
     
@@ -456,6 +460,13 @@ impl<S> RealityStream<S> {
 impl<S: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for RealityStream<S> {
     fn poll_read(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>, buf: &mut tokio::io::ReadBuf<'_>) -> Poll<std::io::Result<()>> {
         loop {
+            if !self.plaintext_buf.is_empty() {
+                let out_len = std::cmp::min(buf.remaining(), self.plaintext_buf.len());
+                buf.put_slice(&self.plaintext_buf[..out_len]);
+                self.plaintext_buf.advance(out_len);
+                return Poll::Ready(Ok(()));
+            }
+
             if self.rx_buf.len() >= 5 {
                 let len = u16::from_be_bytes([self.rx_buf[3], self.rx_buf[4]]) as usize;
                 if self.rx_buf.len() >= 5 + len {
@@ -470,17 +481,16 @@ impl<S: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for RealityStream<S> 
                     match self.data_key.decrypt(nonce, ciphertext) {
                         Ok(plaintext) => {
                             self.rx_nonce += 1;
-                            let out_len = std::cmp::min::<usize>(buf.remaining(), plaintext.len());
-                            buf.put_slice(&plaintext[..out_len]);
+                            self.plaintext_buf.put_slice(&plaintext);
                             self.rx_buf.advance(5 + len);
-                            return Poll::Ready(Ok(()));
+                            continue;
                         }
                         Err(_) => return Poll::Ready(Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "reality decrypt failed"))),
                     }
                 }
             }
             
-            let mut read_buf = [0u8; 4096];
+            let mut read_buf = [0u8; 8192];
             let mut tokio_buf = tokio::io::ReadBuf::new(&mut read_buf);
             match Pin::new(&mut self.inner).poll_read(cx, &mut tokio_buf) {
                 Poll::Ready(Ok(())) => {
@@ -496,36 +506,59 @@ impl<S: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for RealityStream<S> 
 
 impl<S: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for RealityStream<S> {
     fn poll_write(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>, buf: &[u8]) -> Poll<std::io::Result<usize>> {
-        let nonce_bytes = Self::make_nonce(self.tx_nonce);
+        let this = self.get_mut();
+        while !this.tx_buf.is_empty() {
+            match Pin::new(&mut this.inner).poll_write(cx, &this.tx_buf) {
+                Poll::Ready(Ok(n)) => this.tx_buf.advance(n),
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+
+        let nonce_bytes = Self::make_nonce(this.tx_nonce);
         let nonce = Nonce::from_slice(&nonce_bytes);
         
-        match self.data_key.encrypt(nonce, buf) {
+        match this.data_key.encrypt(nonce, buf) {
             Ok(ciphertext) => {
-                let mut record: BytesMut = BytesMut::with_capacity(5 + ciphertext.len());
-                record.put_u8(0x17);
-                record.put_u16(0x0303);
-                record.put_u16(ciphertext.len() as u16);
-                record.put_slice(&ciphertext);
+                this.tx_nonce += 1;
+                this.tx_buf.reserve(5 + ciphertext.len());
+                this.tx_buf.put_u8(0x17);
+                this.tx_buf.put_u16(0x0303);
+                this.tx_buf.put_u16(ciphertext.len() as u16);
+                this.tx_buf.put_slice(&ciphertext);
                 
-                match tokio::io::AsyncWrite::poll_write(Pin::new(&mut self.inner), cx, &record) {
-                    Poll::Ready(Ok(n)) if n == record.len() => {
-                        self.tx_nonce += 1;
-                        Poll::Ready(Ok(buf.len()))
-                    }
-                    Poll::Ready(Ok(_n)) => Poll::Ready(Err(std::io::Error::new(std::io::ErrorKind::Other, "partial write not supported"))),
-                    Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
-                    Poll::Pending => Poll::Pending,
+                match Pin::new(&mut this.inner).poll_write(cx, &this.tx_buf) {
+                    Poll::Ready(Ok(n)) => this.tx_buf.advance(n),
+                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                    Poll::Pending => {}
                 }
+                Poll::Ready(Ok(buf.len()))
             }
             Err(_) => Poll::Ready(Err(std::io::Error::new(std::io::ErrorKind::Other, "reality encrypt failed"))),
         }
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.inner).poll_flush(cx)
+        let this = self.get_mut();
+        while !this.tx_buf.is_empty() {
+            match Pin::new(&mut this.inner).poll_write(cx, &this.tx_buf) {
+                Poll::Ready(Ok(n)) => this.tx_buf.advance(n),
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+        Pin::new(&mut this.inner).poll_flush(cx)
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.inner).poll_shutdown(cx)
+        let this = self.get_mut();
+        while !this.tx_buf.is_empty() {
+            match Pin::new(&mut this.inner).poll_write(cx, &this.tx_buf) {
+                Poll::Ready(Ok(n)) => this.tx_buf.advance(n),
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+        Pin::new(&mut this.inner).poll_shutdown(cx)
     }
 }
