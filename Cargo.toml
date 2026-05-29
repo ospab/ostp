@@ -5,8 +5,8 @@ members = [
     "ostp-server",
     "ostp-jni", "ostp",
     "ostp-tun-helper"
-, "ostp-brain"]
-exclude = ["ostp-gui/src-tauri"]
+]
+exclude = ["ostp-gui/src-tauri", "ostp-brain", "ostp-prober"]
 resolver = "2"
 
 [workspace.package]
