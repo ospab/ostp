@@ -98,7 +98,10 @@ async fn start_udp_session(
 
     let udp = match relay_addr {
         SocketAddr::V4(_) => UdpSocket::bind("127.0.0.1:0").await?,
-        SocketAddr::V6(_) => UdpSocket::bind("[::1]:0").await.or_else(|_| UdpSocket::bind("[::]:0").await)?,
+        SocketAddr::V6(_) => match UdpSocket::bind("[::1]:0").await {
+            Ok(sock) => sock,
+            Err(_) => UdpSocket::bind("[::]:0").await?,
+        },
     };
     
     let mut buf = vec![0u8; 65536];
