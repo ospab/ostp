@@ -311,25 +311,10 @@ pub async fn run_server(
     let key_count = shared_keys.read().unwrap().len();
     tracing::info!(listeners = bind_addrs.len(), keys = key_count, "server started");
     tracing::info!("ARQ config: max_reorder=16384, reorder_buf=8192, sent_history=32768, rto=100ms");
-    let tls_config = if let Some(rc) = reality_config {
-        let subject_alt_names = rc.sni_list.clone();
-        let cert = rcgen::generate_simple_self_signed(subject_alt_names)?;
-        let cert_der = cert.cert.der().to_vec();
-        let priv_key = cert.key_pair.serialize_der();
-        
-        let server_config = rustls::ServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(
-                vec![rustls::pki_types::CertificateDer::from(cert_der)],
-                rustls::pki_types::PrivatePkcs8KeyDer::from(priv_key).into(),
-            )?;
-        Some(std::sync::Arc::new(server_config))
-    } else {
-        None
-    };
+    let reality_config_arc = reality_config.map(std::sync::Arc::new);
 
     tokio::select! {
-        res = run_server_loop(bind_addrs.clone(), primary_socket, sockets, dispatcher, ui_cmd_rx, ui_event_tx, shared_keys, outbound, debug, tls_config, dns_server) => {
+        res = run_server_loop(bind_addrs.clone(), primary_socket, sockets, dispatcher, ui_cmd_rx, ui_event_tx, shared_keys, outbound, debug, reality_config_arc, dns_server) => {
             if let Err(e) = res {
                 tracing::error!("Server error: {e}");
             }
@@ -354,7 +339,7 @@ async fn run_server_loop(
     shared_keys: std::sync::Arc<std::sync::RwLock<HashMap<String, crate::api::UserMeta>>>,
     outbound: Option<OutboundConfig>,
     debug: bool,
-    tls_config: Option<std::sync::Arc<rustls::ServerConfig>>,
+    reality_config: Option<std::sync::Arc<RealityServerConfig>>,
     dns_server: std::sync::Arc<dns::DnsServer>,
 ) -> Result<()> {
     let mut remotes: HashMap<(u32, u16), RemoteState> = HashMap::new();
@@ -392,8 +377,8 @@ async fn run_server_loop(
         let tcp_map_clone = tcp_map.clone();
         let shared_keys_clone = shared_keys.clone();
         let udp_tx_clone = udp_tx.clone();
+        let reality_config_outer = reality_config.clone();
 
-        let tls_cfg = tls_config.clone();
         tokio::spawn(async move {
             if let Ok(listener) = tokio::net::TcpListener::bind(&addr).await {
                 tracing::info!("TCP (UoT) listener bound to {}", addr);
@@ -431,24 +416,10 @@ async fn run_server_loop(
                         let tm = tcp_map_clone.clone();
                         let keys = shared_keys_clone.clone();
                         let tx = udp_tx_clone.clone();
-                        let tls = tls_cfg.clone();
+                        let reality = reality_config_outer.clone();
                         tokio::spawn(async move {
-                            if let Some(cfg) = tls {
-                                let acceptor = tokio_rustls::TlsAcceptor::from(cfg);
-                                match acceptor.accept(stream).await {
-                                    Ok(tls_stream) => {
-                                        if let Err(e) = crate::transport::uot::handle_tcp_connection(tls_stream, peer_addr, keys, tx, tm).await {
-                                            tracing::warn!("UoT TLS connection from {} closed: {}", peer_addr, e);
-                                        }
-                                    }
-                                    Err(e) => {
-                                        tracing::warn!("UoT TLS handshake from {} failed: {}", peer_addr, e);
-                                    }
-                                }
-                            } else {
-                                if let Err(e) = crate::transport::uot::handle_tcp_connection(stream, peer_addr, keys, tx, tm).await {
-                                    tracing::warn!("UoT connection from {} closed: {}", peer_addr, e);
-                                }
+                            if let Err(e) = crate::transport::uot::handle_tcp_connection(stream, peer_addr, keys, tx, tm, reality).await {
+                                tracing::warn!("UoT connection from {} closed: {}", peer_addr, e);
                             }
                         });
                     }

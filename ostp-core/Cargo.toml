@@ -14,3 +14,5 @@ thiserror.workspace = true
 tracing.workspace = true
 sha2.workspace = true
 hmac.workspace = true
+x25519-dalek = { version = "2.0.1", features = ["static_secrets"] }
+hkdf = "0.12.0"

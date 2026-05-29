@@ -137,10 +137,10 @@ fn generate_reality_keys() -> (String, String, String) {
     use rand::RngCore;
     use base64::Engine;
     
-    let builder = snow::Builder::new("Noise_NN_25519_ChaChaPoly_BLAKE2s".parse().unwrap());
-    let keypair = builder.generate_keypair().expect("failed to generate reality keys");
-    let priv_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&keypair.private);
-    let pub_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&keypair.public);
+    let (priv_key, pub_key) = ostp_core::crypto::reality::generate_x25519_keypair();
+    
+    let priv_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&priv_key.to_bytes());
+    let pub_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(pub_key.as_bytes());
     
     let mut sid_bytes = [0u8; 8];
     rand::thread_rng().fill_bytes(&mut sid_bytes);

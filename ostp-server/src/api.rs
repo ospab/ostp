@@ -57,6 +57,14 @@ pub struct ApiState {
 // ── API configuration ────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct RealityConfig {
+    pub private_key: String,
+    pub short_ids: Vec<String>,
+    pub dest: String,
+    pub sni_list: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ApiConfig {
     pub enabled: bool,
     pub bind: String,

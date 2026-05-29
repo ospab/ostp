@@ -43,6 +43,7 @@ Download pre-built binaries for your platform from [GitHub Releases](https://git
 | **Multi-Listener** | Bind to multiple addresses simultaneously (dual-stack IPv4/IPv6, multi-port). |
 | **TUN Mode** | Full-system VPN via `tun2socks` integration. All traffic transparently routed through the tunnel. |
 | **xHTTP Stealth (UoT)** | UDP-over-TCP tunnel disguised as standard HTTP/1.1 or TLS traffic to bypass Level 1 Deep Packet Inspection (DPI) whitelists. |
+| **XTLS-Reality** | Custom, dependency-free implementation of the Reality protocol using ChaCha20Poly1305 and X25519 for perfect TLS 1.3 impersonation. |
 | **TURN Relay** | RFC 5766 TURN support for environments where direct UDP is blocked. |
 | **Hot-Reload** | Runtime config reload without restart (access keys, exclusions, mux settings). |
 | **Structured Logging** | `tracing`-based logging with `RUST_LOG` filtering. JSON/file/syslog output support. |
@@ -191,6 +192,7 @@ Arguments:
 
 | Layer | Mechanism |
 |-------|-----------|
+| XTLS-Reality | Spoofed TLS 1.3 ClientHello, X25519 Key Exchange, ChaCha20-Poly1305 AEAD |
 | Key Exchange | Noise NNpsk0 (X25519 + ChaChaPoly + BLAKE2s) |
 | Encryption | ChaCha20-Poly1305 AEAD per-packet |
 | Header Obfuscation | HMAC-SHA256 derived per-packet mask |

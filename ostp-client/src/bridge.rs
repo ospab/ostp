@@ -70,6 +70,8 @@ pub struct Bridge {
     pub wss: bool,
     pub mtu: usize,
     pub reality_enabled: bool,
+    pub reality_pbk: String,
+    pub reality_sid: String,
 
     metrics: Arc<BridgeMetrics>,
     sample_sent: u64,
@@ -102,7 +104,9 @@ impl Bridge {
             stealth_port: config.transport.stealth_port,
             wss: config.transport.wss,
             mtu: config.ostp.mtu,
-            reality_enabled: !config.reality.pbk.is_empty(),
+            reality_enabled: config.reality.enabled,
+            reality_pbk: config.reality.pbk.clone(),
+            reality_sid: config.reality.sid.clone(),
 
             metrics,
             sample_sent: 0,
@@ -889,6 +893,8 @@ impl Bridge {
         self.stealth_sni = cfg.transport.stealth_sni.clone();
         self.stealth_port = cfg.transport.stealth_port;
         self.reality_enabled = cfg.reality.enabled;
+        self.reality_pbk = cfg.reality.pbk.clone();
+        self.reality_sid = cfg.reality.sid.clone();
     }
 
     async fn try_connect_transport(
@@ -907,7 +913,7 @@ impl Bridge {
                 port
             };
             let (tx, rx) = crate::transport::xhttp::connect_xhttp(
-                target_ip, uot_port, &self.stealth_sni, &self.access_key, self.reality_enabled, self.wss
+                target_ip, uot_port, &self.stealth_sni, &self.access_key, self.reality_enabled, self.wss, &self.reality_pbk, &self.reality_sid
             ).await?;
             Ok(crate::transport::Transport::Uot { tx, rx })
         } else {
