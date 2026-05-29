@@ -144,19 +144,24 @@ pub async fn run_native_tunnel(
                 Ok(0) => break,
                 Ok(n) => {
                     let frame = buf[..n].to_vec();
-                    if stack_sink.send(frame).await.is_err() {
-                        break;
+                    if let Err(e) = stack_sink.send(frame).await {
+                        if e.kind() == std::io::ErrorKind::BrokenPipe {
+                            break;
+                        }
                     }
                 }
-                Err(_) => break,
+                Err(e) => {
+                    tracing::debug!("tun_read error: {}", e);
+                    // continue reading
+                }
             }
         }
     });
 
     let mut stack_to_tun = tokio::spawn(async move {
         while let Some(Ok(frame)) = stack_stream.next().await {
-            if tun_write.write_all(frame.as_slice()).await.is_err() {
-                break;
+            if let Err(e) = tun_write.write(&frame).await {
+                tracing::debug!("tun_write error: {}", e);
             }
         }
     });
@@ -323,14 +328,17 @@ pub async fn run_native_tunnel_from_fd(
                 }
             }) {
                 Ok(Ok(n)) if n > 0 => n as usize,
-                Ok(Ok(_)) => break, // EOF or Error
+                Ok(Ok(n)) if n == 0 => break, // EOF
+                Ok(Ok(_n)) => continue, // Error reading packet, skip to next
                 Ok(Err(_)) => continue, // Should not happen with try_io
                 Err(_would_block) => continue,
             };
 
             let frame = buf[..n].to_vec();
-            if stack_sink.send(frame).await.is_err() {
-                break;
+            if let Err(e) = stack_sink.send(frame).await {
+                if e.kind() == std::io::ErrorKind::BrokenPipe {
+                    break;
+                }
             }
         }
     });
@@ -373,8 +381,9 @@ pub async fn run_native_tunnel_from_fd(
 
                 match res {
                     Ok(Ok(n)) if n > 0 => written += n as usize,
-                    Ok(Ok(_)) => break,
-                    Ok(Err(_)) => continue,
+                    Ok(Ok(n)) if n == 0 => break,
+                    Ok(Ok(_)) => break, // n < 0, error writing, drop this frame
+                    Ok(Err(_)) => break,
                     Err(_) => continue,
                 }
             }
