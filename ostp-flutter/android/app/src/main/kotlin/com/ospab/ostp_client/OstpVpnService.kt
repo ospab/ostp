@@ -157,9 +157,7 @@ class OstpVpnService : VpnService() {
             val builder = Builder()
                 .setSession("OSTP Tunnel")
                 .addAddress("10.1.0.2", 24)
-                .addAddress("fd00:1:fd00:1:fd00:1:fd00:1", 128)
                 .addRoute("0.0.0.0", 0)
-                .addRoute("::", 0)
                 .addDnsServer(dnsServer)
 
             val configuredMtu = json.optJSONObject("ostp")?.optInt("mtu", 1280) ?: 1280
@@ -173,7 +171,6 @@ class OstpVpnService : VpnService() {
                 
             try {
                 builder.allowFamily(android.system.OsConstants.AF_INET)
-                builder.allowFamily(android.system.OsConstants.AF_INET6)
             } catch (e: Throwable) { }
                 
             val appRules = json.optJSONObject("app_rules")
