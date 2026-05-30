@@ -511,6 +511,19 @@ impl Bridge {
                                 // Connect/UdpAssociate over the new session, avoiding a 5-minute blackhole.
                                 stream_map.clear();
                                 self.reset_proxy_streams(&tx, &proxy_tx, "background reconnect");
+
+                                // FIX: Flush all stale proxy messages accumulated during the stall/reconnect
+                                // This prevents a massive post-reconnect UDP burst that causes mobile carriers to drop all packets
+                                let mut flushed = 0;
+                                while let Ok(stale) = proxy_rx.try_recv() {
+                                    if let ProxyEvent::NewStream { stream_id, .. } = stale {
+                                        let _ = proxy_tx.send((stream_id, ProxyToClientMsg::Error("connection reset".into())));
+                                    }
+                                    flushed += 1;
+                                }
+                                if flushed > 0 {
+                                    let _ = tx.send(UiEvent::Log(format!("Flushed {} stale proxy messages to prevent UDP burst", flushed))).await;
+                                }
                             } else {
                                 let _ = tx.send(UiEvent::Log("Background reconnect failed. Will retry on next tick...".into())).await;
                             }
