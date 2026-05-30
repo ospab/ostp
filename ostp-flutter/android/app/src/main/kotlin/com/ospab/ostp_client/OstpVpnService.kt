@@ -164,8 +164,6 @@ class OstpVpnService : VpnService() {
                 .setMtu(json.optJSONObject("ostp")?.optInt("mtu", 1280) ?: 1280)
                 
             try { builder.addDnsServer("8.8.8.8") } catch (e: Throwable) {}
-            try { builder.addDnsServer("2001:4860:4860::8888") } catch (e: Throwable) {}
-            try { builder.addDnsServer("2606:4700:4700::1111") } catch (e: Throwable) {}
 
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                 builder.allowBypass()
