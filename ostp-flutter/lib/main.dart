@@ -113,7 +113,7 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
     final stealthSni = widget.prefs.getString('stealth_sni') ?? 'vk.com';
     final stealthPort = widget.prefs.getString('stealth_port') ?? '443';
     final wss = widget.prefs.getBool('wss') ?? false;
-    final mtu = widget.prefs.getString('mtu') ?? '1280';
+    final mtu = widget.prefs.getString('mtu') ?? '1140';
     final muxEnabled = widget.prefs.getBool('mux_enabled') ?? false;
     final muxSessions = widget.prefs.getString('mux_sessions') ?? '2';
     final dnsServer = widget.prefs.getString('dns_server');
@@ -132,7 +132,7 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
         "access_key": _accessKey,
         "handshake_timeout_ms": 10000,
         "io_timeout_ms": 5000,
-        "mtu": int.tryParse(mtu) ?? 1280,
+        "mtu": int.tryParse(mtu) ?? 1140,
       },
       "local_proxy": {
         "bind_addr": localBind,
@@ -212,7 +212,7 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
       final stealthSni = widget.prefs.getString('stealth_sni') ?? 'vk.com';
       final stealthPort = widget.prefs.getString('stealth_port') ?? '443';
       final wss = widget.prefs.getBool('wss') ?? false;
-      final mtu = widget.prefs.getString('mtu') ?? '1280';
+      final mtu = widget.prefs.getString('mtu') ?? '1140';
       final muxEnabled = widget.prefs.getBool('mux_enabled') ?? false;
       final muxSessions = widget.prefs.getString('mux_sessions') ?? '2';
       final tunStack = 'ostp';
@@ -230,7 +230,7 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
           "access_key": _accessKey,
           "handshake_timeout_ms": 10000,
           "io_timeout_ms": 5000,
-          "mtu": int.tryParse(mtu) ?? 1280,
+          "mtu": int.tryParse(mtu) ?? 1140,
         },
         "local_proxy": {
           "bind_addr": localBind,
@@ -341,7 +341,7 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
   }
 
   Future<void> _runAutoMode() async {
-    final mtus = [1500, 1350, 1280];
+    final mtus = [1500, 1350, 1280, 1140];
     final modes = [
       {'t': 'udp', 'w': false, 'r': false},
       {'t': 'uot', 'w': false, 'r': false},
@@ -989,7 +989,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
     _localBindCtrl = TextEditingController(text: widget.prefs.getString('local_bind') ?? '127.0.0.1:1088');
     _keyCtrl = TextEditingController(text: widget.prefs.getString('access_key') ?? '');
     _dnsCtrl = TextEditingController(text: widget.prefs.getString('dns_server') ?? '1.1.1.1');
-    _mtuCtrl = TextEditingController(text: widget.prefs.getString('mtu') ?? '1280');
+    _mtuCtrl = TextEditingController(text: widget.prefs.getString('mtu') ?? '1140');
     _domainsCtrl = TextEditingController(text: widget.prefs.getString('ex_domains') ?? '');
     _ipsCtrl = TextEditingController(text: widget.prefs.getString('ex_ips') ?? '');
     _processesCtrl = TextEditingController(text: widget.prefs.getString('ex_processes') ?? '');
@@ -1217,7 +1217,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                 _buildTextField('Local Proxy Bind', _localBindCtrl, hint: '127.0.0.1:1088'),
                 _buildTextField('Access Key', _keyCtrl, hint: 'Secure access key', isPassword: true),
                 _buildTextField('Custom DNS Server', _dnsCtrl, hint: '1.1.1.1 (e.g. 8.8.8.8)'),
-                _buildTextField('MTU (Packet Size)', _mtuCtrl, hint: '1280 (decrease if connection drops)'),
+                _buildTextField('MTU (Packet Size)', _mtuCtrl, hint: '1140 (decrease if connection drops)'),
 
                 // ── Transport Mode ───────────────────────────────────────
                 const Text('Transport Mode', style: TextStyle(color: Colors.white54, fontSize: 13, fontWeight: FontWeight.bold, letterSpacing: 1.0)),
