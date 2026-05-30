@@ -46,10 +46,7 @@ migrate_legacy() {
         cp "$old_dir/ostp" "$INSTALL_DIR/ostp"
     fi
 
-    # Migrate tun2socks if present
-    if [ -f "$old_dir/tun2socks" ] && [ ! -f "$INSTALL_DIR/tun2socks" ]; then
-        cp "$old_dir/tun2socks" "$INSTALL_DIR/tun2socks"
-    fi
+
 
     echo "[migrate] Legacy files preserved at $old_dir (remove manually if no longer needed)"
 }

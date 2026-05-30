@@ -312,8 +312,8 @@ async function handleSave(silent = false) {
   }
 
   const mtuStr = inMtu.value.trim();
-  if (mtuStr) rawConfig.mtu = parseInt(mtuStr, 10);
-  else delete rawConfig.mtu;
+  if (mtuStr) rawConfig.ostp.mtu = parseInt(mtuStr, 10);
+  else delete rawConfig.ostp.mtu;
 
   if (inMux.checked) {
     const s = parseInt(inMuxSessions.value.trim(), 10);
@@ -416,53 +416,58 @@ window.addEventListener('DOMContentLoaded', async () => {
       }
 
       showToast('Starting Auto search...', 'ok');
-      const mtus = [1500, 1350, 1280];
-      const modes = [
-        { t: 'udp', w: false, r: false },
-        { t: 'uot', w: false, r: false },
-        { t: 'uot', w: true, r: false },
-        { t: 'uot', w: false, r: true }
-      ];
+      try {
+        const mtus = [1500, 1350, 1280];
+        const modes = [
+          { t: 'udp', w: false, r: false },
+          { t: 'uot', w: false, r: false },
+          { t: 'uot', w: true, r: false },
+          { t: 'uot', w: false, r: true }
+        ];
 
-      for (let mode of modes) {
-        for (let mtu of mtus) {
-          showToast(`Testing: ${mode.t} | WSS: ${mode.w} | XTLS: ${mode.r} | MTU: ${mtu}`);
-          
-          rawConfig.mtu = mtu;
-          rawConfig.transport = rawConfig.transport || {};
-          rawConfig.transport.mode = mode.t;
-          rawConfig.transport.wss = mode.w;
-          
-          if (mode.r) {
-            rawConfig.reality = rawConfig.reality || {};
-            rawConfig.reality.enabled = true;
-          } else if (rawConfig.reality) {
-            rawConfig.reality.enabled = false;
-          }
-
-          await invoke('save_config', { jsonContent: JSON.stringify(rawConfig, null, 2) });
-          
-          setState('connecting');
-          const ok = await invoke('start_tunnel');
-          if (ok) {
-            startPolling();
-            // Wait a bit to see if it stays connected and ping works
-            await new Promise(r => setTimeout(r, 3000));
-            try {
-              const metrics = await invoke('get_metrics');
-              if (metrics && metrics.rtt_ms > 0) {
-                showToast(`Success! Found working config: ${mode.t} (MTU ${mtu})`, 'ok');
-                return; // Stop on first working
-              }
-            } catch {}
+        for (let mode of modes) {
+          for (let mtu of mtus) {
+            showToast(`Testing: ${mode.t} | WSS: ${mode.w} | XTLS: ${mode.r} | MTU: ${mtu}`);
             
-            // If we are here, ping failed, so stop and try next
-            await invoke('stop_tunnel');
-            setState('disconnected');
+            rawConfig.ostp = rawConfig.ostp || {};
+            rawConfig.ostp.mtu = mtu;
+            rawConfig.transport = rawConfig.transport || {};
+            rawConfig.transport.mode = mode.t;
+            rawConfig.transport.wss = mode.w;
+            
+            if (mode.r) {
+              rawConfig.reality = rawConfig.reality || {};
+              rawConfig.reality.enabled = true;
+            } else if (rawConfig.reality) {
+              rawConfig.reality.enabled = false;
+            }
+
+            await invoke('save_config', { jsonContent: JSON.stringify(rawConfig, null, 2) });
+            
+            setState('connecting');
+            const ok = await invoke('start_tunnel');
+            if (ok) {
+              startPolling();
+              // Wait a bit to see if it stays connected and ping works
+              await new Promise(r => setTimeout(r, 3000));
+              try {
+                const metrics = await invoke('get_metrics');
+                if (metrics && metrics.rtt_ms > 0) {
+                  showToast(`Success! Found working config: ${mode.t} (MTU ${mtu})`, 'ok');
+                  return; // Stop on first working
+                }
+              } catch {}
+              
+              // If we are here, ping failed, so stop and try next
+              await invoke('stop_tunnel');
+              setState('disconnected');
+            }
           }
         }
+        showToast('Auto search finished. No working config found.', 'error');
+      } catch (err) {
+        showToast('Error during auto-connect: ' + String(err), 'error');
       }
-      showToast('Auto search finished. No working config found.', 'error');
     });
   }
 

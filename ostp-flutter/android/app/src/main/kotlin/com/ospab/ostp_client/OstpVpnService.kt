@@ -31,16 +31,6 @@ class OstpVpnService : VpnService() {
         private const val CHANNEL_ID = "ostp_vpn_channel"
         private const val WAKE_LOCK_TAG = "ostp:vpn_wakelock"
 
-        /** Called from Kotlin OstpClientSdk to protect VPN sockets from the VPN itself. */
-        @Keep
-        @JvmStatic
-        fun protectSocket(fd: Int): Boolean {
-            // App is excluded from VPN via addDisallowedApplication/addAllowedApplication.
-            // VpnService.protect() bypasses clatd (464XLAT) on IPv6-only mobile networks,
-            // breaking IPv4 connectivity. Since we're excluded, protect() is unnecessary.
-            return true
-        }
-
         /**
          * Called by OstpClientSdk.notifyNetworkChanged() JNI thunk.
          */
@@ -171,7 +161,15 @@ class OstpVpnService : VpnService() {
                 .addRoute("0.0.0.0", 0)
                 .addRoute("::", 0)
                 .addDnsServer(dnsServer)
-                .setMtu(1300)
+                .setMtu(json.optJSONObject("ostp")?.optInt("mtu", 1280) ?: 1280)
+                
+            try { builder.addDnsServer("8.8.8.8") } catch (e: Throwable) {}
+            try { builder.addDnsServer("2001:4860:4860::8888") } catch (e: Throwable) {}
+            try { builder.addDnsServer("2606:4700:4700::1111") } catch (e: Throwable) {}
+
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                builder.allowBypass()
+            }
                 
             try {
                 builder.allowFamily(android.system.OsConstants.AF_INET)
@@ -222,14 +220,13 @@ class OstpVpnService : VpnService() {
                 Log.e("OstpVpnService", "Failed to clear O_CLOEXEC", e)
             }
 
-            val t2sBin = applicationInfo.nativeLibraryDir + "/libtun2socks.so"
-            val success = OstpClientSdk.startClient(configJson, fd, t2sBin, localProxy)
+            val success = OstpClientSdk.startClient(configJson, fd, "", localProxy)
             if (success) {
-                Log.i("OstpVpnService", "OSTP Rust Core & tun2socks started successfully")
+                Log.i("OstpVpnService", "OSTP Rust Core started successfully")
                 isRunning = true
                 updateNotification(connected = true)
             } else {
-                Log.e("OstpVpnService", "Failed to start OSTP Rust Core & tun2socks")
+                Log.e("OstpVpnService", "Failed to start OSTP Rust Core")
                 stopVpn()
             }
 

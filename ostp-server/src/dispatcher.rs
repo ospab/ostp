@@ -346,7 +346,7 @@ impl Dispatcher {
                         }
 
                         if !self.replay_cache.contains_key(&payload.to_vec()) {
-                            if self.replay_cache.len() >= 100_000 {
+                            if self.replay_cache.len() >= 50_000 {
                                 tracing::warn!("Replay cache full (100000 entries), rejecting handshake from {}", peer);
                                 return Ok(DispatchOutcome::Unauthorized);
                             }
@@ -426,7 +426,7 @@ impl Dispatcher {
         let mut frames = Vec::new();
         let mut expired = Vec::new();
         let now = std::time::Instant::now();
-        let timeout_dur = std::time::Duration::from_secs(300); // 5 minutes session timeout
+        let timeout_dur = std::time::Duration::from_secs(600); // 10 minute session timeout (mobile NAT can be up to 5-10min)
 
         // Gather expired or invalid sessions
         for (&sid, peer_state) in &self.peer_machines {

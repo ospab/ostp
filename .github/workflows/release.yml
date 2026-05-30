@@ -28,21 +28,18 @@ jobs:
             target: x86_64-pc-windows-msvc
             artifact_name: ostp.exe
             release_name: ostp-windows-amd64.zip
-            tun2socks_arch: windows-amd64
             wintun_arch: amd64
 
           - os: windows-latest
             target: i686-pc-windows-msvc
             artifact_name: ostp.exe
             release_name: ostp-windows-386.zip
-            tun2socks_arch: windows-386
             wintun_arch: x86
 
           - os: windows-latest
             target: aarch64-pc-windows-msvc
             artifact_name: ostp.exe
             release_name: ostp-windows-arm64.zip
-            tun2socks_arch: windows-arm64
             wintun_arch: arm64
 
           # ── macOS ─────────────────────────────────────────────────────────
@@ -50,26 +47,22 @@ jobs:
             target: x86_64-apple-darwin
             artifact_name: ostp
             release_name: ostp-darwin-amd64.tar.gz
-            tun2socks_arch: darwin-amd64
 
           - os: macos-latest
             target: aarch64-apple-darwin
             artifact_name: ostp
             release_name: ostp-darwin-arm64.tar.gz
-            tun2socks_arch: darwin-arm64
 
           # ── Linux native ──────────────────────────────────────────────────
           - os: ubuntu-latest
             target: x86_64-unknown-linux-musl
             artifact_name: ostp
             release_name: ostp-linux-amd64.tar.gz
-            tun2socks_arch: linux-amd64
 
           - os: ubuntu-latest
             target: i686-unknown-linux-musl
             artifact_name: ostp
             release_name: ostp-linux-386.tar.gz
-            tun2socks_arch: linux-386
             use_cross: true
 
           # ── Linux cross ───────────────────────────────────────────────────
@@ -77,28 +70,24 @@ jobs:
             target: aarch64-unknown-linux-musl
             artifact_name: ostp
             release_name: ostp-linux-arm64.tar.gz
-            tun2socks_arch: linux-arm64
             use_cross: true
 
           - os: ubuntu-latest
             target: armv7-unknown-linux-musleabihf
             artifact_name: ostp
             release_name: ostp-linux-armv7.tar.gz
-            tun2socks_arch: linux-armv7
             use_cross: true
 
           - os: ubuntu-latest
             target: x86_64-unknown-freebsd
             artifact_name: ostp
             release_name: ostp-freebsd-amd64.tar.gz
-            tun2socks_arch: freebsd-amd64
             use_cross: true
 
           - os: ubuntu-latest
             target: mipsel-unknown-linux-musl
             artifact_name: ostp
             release_name: ostp-linux-mipsle.tar.gz
-            tun2socks_arch: linux-mipsle-softfloat
             use_cross: true
             toolchain: nightly
 
@@ -106,7 +95,6 @@ jobs:
             target: riscv64gc-unknown-linux-gnu
             artifact_name: ostp
             release_name: ostp-linux-riscv64.tar.gz
-            tun2socks_arch: linux-riscv64
             use_cross: true
 
 
@@ -175,31 +163,16 @@ jobs:
         run: cross build --release --target ${{ matrix.target }} --bin ostp
 
       # ── Driver dependencies ────────────────────────────────────────────────
-      - name: Download tun2socks + wintun (Windows)
-        if: ${{ matrix.os == 'windows-latest' && matrix.tun2socks_arch }}
+      - name: Download wintun (Windows)
+        if: ${{ matrix.os == 'windows-latest' }}
         shell: pwsh
         run: |
           $ProgressPreference = 'SilentlyContinue'
           $dir = "target/${{ matrix.target }}/release"
-          Invoke-WebRequest -Uri "https://github.com/xjasonlyu/tun2socks/releases/download/v2.6.0/tun2socks-${{ matrix.tun2socks_arch }}.zip" -OutFile "$dir/t2s.zip"
-          Expand-Archive "$dir/t2s.zip" -DestinationPath "$dir/t2s_tmp" -Force
-          Get-ChildItem "$dir/t2s_tmp" -Filter "*.exe" -Recurse | Select-Object -First 1 | Copy-Item -Destination "$dir/tun2socks.exe"
           Invoke-WebRequest -Uri "https://www.wintun.net/builds/wintun-0.14.1.zip" -OutFile "$dir/wt.zip"
           Expand-Archive "$dir/wt.zip" -DestinationPath "$dir/wt_tmp" -Force
           Get-ChildItem "$dir/wt_tmp" -Filter "wintun.dll" -Recurse | Where-Object { $_.FullName -match 'bin[\\/]${{ matrix.wintun_arch }}[\\/]' } | Copy-Item -Destination "$dir/"
-          Remove-Item "$dir/t2s.zip","$dir/t2s_tmp","$dir/wt.zip","$dir/wt_tmp" -Recurse -Force
-
-      - name: Download tun2socks (Unix)
-        if: ${{ matrix.os != 'windows-latest' && matrix.tun2socks_arch }}
-        shell: bash
-        run: |
-          dir="target/${{ matrix.target }}/release"
-          URL="https://github.com/xjasonlyu/tun2socks/releases/download/v2.6.0/tun2socks-${{ matrix.tun2socks_arch }}.zip"
-          curl -fsSL "$URL" -o "$dir/t2s.zip" || exit 0
-          unzip -o "$dir/t2s.zip" -d "$dir/t2s_tmp"
-          find "$dir/t2s_tmp" -type f -name "tun2socks*" ! -name "*.zip" | head -1 | xargs -I{} cp {} "$dir/tun2socks"
-          chmod +x "$dir/tun2socks" 2>/dev/null || true
-          rm -rf "$dir/t2s.zip" "$dir/t2s_tmp"
+          Remove-Item "$dir/wt.zip","$dir/wt_tmp" -Recurse -Force
 
       # ── Package ────────────────────────────────────────────────────────────
       - name: Package (Windows)
@@ -208,7 +181,6 @@ jobs:
         run: |
           $dir = "target/${{ matrix.target }}/release"
           $files = @("ostp.exe")
-          if (Test-Path "$dir/tun2socks.exe") { $files += "tun2socks.exe" }
           if (Test-Path "$dir/wintun.dll")    { $files += "wintun.dll" }
           Push-Location $dir
           Compress-Archive -Path $files -DestinationPath "../../../${{ matrix.release_name }}" -Force
@@ -219,7 +191,6 @@ jobs:
         run: |
           dir="target/${{ matrix.target }}/release"
           FILES="${{ matrix.artifact_name }}"
-          [ -f "$dir/tun2socks" ] && FILES="$FILES tun2socks"
           tar -czf "${{ matrix.release_name }}" -C "$dir" $FILES
 
       # ── Upload ─────────────────────────────────────────────────────────────
@@ -267,16 +238,10 @@ jobs:
             target/
           key: cargo-windows-gui-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
 
-      - name: Download wintun and tun2socks
+      - name: Download wintun
         shell: pwsh
         run: |
           $ProgressPreference = 'SilentlyContinue'
-          
-          # Download tun2socks
-          New-Item -ItemType Directory -Force -Path "t2s_tmp"
-          Invoke-WebRequest -Uri "https://github.com/xjasonlyu/tun2socks/releases/download/v2.6.0/tun2socks-windows-${{ matrix.arch }}.zip" -OutFile "t2s_tmp/t2s.zip"
-          Expand-Archive "t2s_tmp/t2s.zip" -DestinationPath "t2s_tmp/ext" -Force
-          Get-ChildItem "t2s_tmp/ext" -Filter "*.exe" -Recurse | Select-Object -First 1 | Copy-Item -Destination "t2s_tmp/tun2socks.exe" -Force
           
           # Download wintun
           New-Item -ItemType Directory -Force -Path "target/${{ matrix.target }}/release"
@@ -298,7 +263,6 @@ jobs:
           New-Item -ItemType Directory -Force -Path $dir
           Copy-Item "ostp-gui/src-tauri/target/${{ matrix.target }}/release/ostp-gui.exe" $dir
           Copy-Item "target/${{ matrix.target }}/release/ostp-tun-helper.exe" $dir
-          Copy-Item "t2s_tmp/tun2socks.exe" $dir
           Copy-Item "target/${{ matrix.target }}/release/wintun.dll" $dir
           
           Compress-Archive -Path "$dir/*" -DestinationPath "ostp-windows-gui-${{ matrix.arch }}.zip" -Force
@@ -320,7 +284,6 @@ jobs:
           - arch: arm64-v8a
             rust_target: aarch64-linux-android
             flutter_target: android-arm64
-            tun2socks_arch: linux-arm64
           - arch: armeabi-v7a
             rust_target: armv7-linux-androideabi
             flutter_target: android-arm
@@ -364,13 +327,7 @@ jobs:
           cargo ndk -t ${{ matrix.arch }} -o "../ostp-flutter/android/app/src/main/jniLibs" build --release
           cd ../ostp-flutter
           
-          # 2. Download tun2socks
-          if [ ! -f "android/app/src/main/jniLibs/${{ matrix.arch }}/libtun2socks.so" ]; then
-            curl -fsSL "https://github.com/xjasonlyu/tun2socks/releases/download/v2.6.0/tun2socks-${{ matrix.tun2socks_arch }}.zip" -o "t2s.zip"
-            unzip -o t2s.zip -d t2s_tmp
-            cp t2s_tmp/tun2socks-${{ matrix.tun2socks_arch }} android/app/src/main/jniLibs/${{ matrix.arch }}/libtun2socks.so
-            rm -rf t2s.zip t2s_tmp
-          fi
+
           
           # 3. Build Flutter APK
           flutter build apk --release --target-platform ${{ matrix.flutter_target }}

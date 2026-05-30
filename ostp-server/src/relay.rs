@@ -30,38 +30,8 @@ pub async fn handle_relay_message(
 ) -> Result<()> {
     match RelayMessage::decode(&payload)? {
         RelayMessage::Connect(target) => {
-            // Intercept DNS queries directed at the TUN gateway if our internal DNS is enabled
-            let is_internal_dns = {
-                target == "10.1.0.1:53" && dns_server.config.read().await.enabled
-            };
-
-            if is_internal_dns {
-                let client_ip = peer_addr.ip();
-                let dns_srv = dns_server.clone();
-                let stream_tx_dns = stream_tx.clone();
-                let (cancel_tx, _) = mpsc::channel::<()>(1);
-                
-                let (dns_query_tx, mut dns_query_rx) = mpsc::unbounded_channel::<Bytes>();
-
-                tokio::spawn(async move {
-                    if let Some(query_bytes) = dns_query_rx.recv().await {
-                        if let Some(resp_bytes) = dns_srv.resolve(&query_bytes, client_ip).await {
-                            let _ = stream_tx_dns.send((session_id, stream_id, resp_bytes));
-                        }
-                    }
-                    let _ = stream_tx_dns.send((session_id, stream_id, Vec::new()));
-                });
-
-                remotes.insert((session_id, stream_id), RemoteState {
-                    data_tx: dns_query_tx,
-                    udp_tx: None,
-                    cancel_tx,
-                    is_dns: true,
-                });
-
-                send_relay_to_stream(session_id, stream_id, RelayMessage::ConnectOk, dispatcher, socket, ui_event_tx, tcp_map).await?;
-                return Ok(());
-            }
+            // DNS interception disabled for stability
+            let is_internal_dns = false;
 
             let mut connect_target = target.clone();
             if connect_target.starts_with("10.1.0.1:") {
@@ -156,18 +126,11 @@ pub async fn handle_relay_message(
             let client_ip = peer_addr.ip();
             tokio::spawn(async move {
                 while let Some((target, data)) = udp_rx.recv().await {
-                    let is_internal_dns = target == "10.1.0.1:53" && dns_srv.config.read().await.enabled;
-                    if is_internal_dns {
-                        if let Some(resp_bytes) = dns_srv.resolve(&data, client_ip).await {
-                            let _ = udp_reply_clone_dns.send((session_id, stream_id, target, resp_bytes));
-                        }
-                    } else {
-                        let mut forward_target = target.clone();
-                        if forward_target.starts_with("10.1.0.1:") {
-                            forward_target = forward_target.replace("10.1.0.1:", "127.0.0.1:");
-                        }
-                        let _ = tx_sock.send_to(&data, &forward_target).await;
+                    let mut forward_target = target.clone();
+                    if forward_target.starts_with("10.1.0.1:") {
+                        forward_target = forward_target.replace("10.1.0.1:", "127.0.0.1:");
                     }
+                    let _ = tx_sock.send_to(&data, &forward_target).await;
                 }
             });
 
@@ -182,7 +145,17 @@ pub async fn handle_relay_message(
                         res = rx_sock.recv_from(&mut buf) => {
                             match res {
                                 Ok((len, addr)) => {
-                                    let _ = udp_reply_clone.send((session_id, stream_id, addr.to_string(), buf[..len].to_vec()));
+                                    let clean_addr = match addr {
+                                        std::net::SocketAddr::V6(v6) => {
+                                            if let Some(v4) = v6.ip().to_ipv4() {
+                                                std::net::SocketAddr::new(std::net::IpAddr::V4(v4), v6.port())
+                                            } else {
+                                                addr
+                                            }
+                                        }
+                                        _ => addr,
+                                    };
+                                    let _ = udp_reply_clone.send((session_id, stream_id, clean_addr.to_string(), buf[..len].to_vec()));
                                 }
                                 Err(_) => break,
                             }

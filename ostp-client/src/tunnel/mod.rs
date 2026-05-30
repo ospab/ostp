@@ -1,6 +1,4 @@
 mod proxy;
-mod wintun_handler;
-mod linux_handler;
 pub mod native_handler;
 mod udp_nat;
 
@@ -8,26 +6,7 @@ pub async fn run_tun_tunnel(
     config: crate::config::ClientConfig,
     shutdown: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
-    if config.tun_stack == "ostp" {
-        return native_handler::run_native_tunnel(config, shutdown).await;
-    }
-
-    #[cfg(target_os = "windows")]
-    {
-        wintun_handler::run_wintun_tunnel(config, shutdown).await
-    }
-
-    #[cfg(target_os = "linux")]
-    {
-        linux_handler::run_linux_tunnel(config, shutdown).await
-    }
-
-    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
-    {
-        let _ = shutdown;
-        let _ = config;
-        anyhow::bail!("Operating system unsupported, text an issue at github.");
-    }
+    native_handler::run_native_tunnel(config, shutdown).await
 }
 
 use tokio::sync::{mpsc, watch};

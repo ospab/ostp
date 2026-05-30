@@ -11,11 +11,17 @@ object OstpClientSdk {
     @Keep
     @JvmStatic
     fun protectSocket(fd: Int): Boolean {
-        val service = com.ospab.ostp_client.OstpVpnService.instance
-        if (service != null) {
-            val res = service.protect(fd)
-            android.util.Log.i("OstpClientSdk", "VpnService.protect(socketFd=$fd) -> success=$res")
-            return res
+        var retries = 5
+        while (retries > 0) {
+            val service = com.ospab.ostp_client.OstpVpnService.instance
+            if (service != null) {
+                val res = service.protect(fd)
+                android.util.Log.i("OstpClientSdk", "VpnService.protect(socketFd=$fd) -> success=$res")
+                return res
+            }
+            android.util.Log.w("OstpClientSdk", "VpnService instance is null! Retrying... ($retries left)")
+            Thread.sleep(200)
+            retries--
         }
         android.util.Log.e("OstpClientSdk", "VpnService instance is null! Cannot protect socketFd=$fd")
         return false

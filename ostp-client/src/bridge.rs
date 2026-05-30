@@ -504,6 +504,13 @@ impl Bridge {
                                 self.last_valid_recv = Instant::now();
                                 self.metrics.connection_state.store(2, Ordering::Relaxed); // State: Connected
                                 let _ = tx.send(UiEvent::Log("Background reconnect successful! Connection restored.".into())).await;
+                                
+                                // FIX: Clear existing proxy streams. Since we are on a NEW session_id,
+                                // the server does not know about our existing streams. Closing them
+                                // forces local apps/TUN to immediately recreate them and send proper
+                                // Connect/UdpAssociate over the new session, avoiding a 5-minute blackhole.
+                                stream_map.clear();
+                                self.reset_proxy_streams(&tx, &proxy_tx, "background reconnect");
                             } else {
                                 let _ = tx.send(UiEvent::Log("Background reconnect failed. Will retry on next tick...".into())).await;
                             }
@@ -753,7 +760,7 @@ impl Bridge {
             psk: secrets.psk,
             session_id,
             handshake_payload,
-            max_padding: 1280, // Safe MTU size to avoid UDP fragmentation on Windows/PPPoE
+            // max_padding computed dynamically below from mtu
             padding_strategy: PaddingStrategy::Profile(self.profile),
             obfuscation_key: secrets.obfuscation_key,
             max_reorder: 16384,          // Max gap between expected and received nonce
@@ -765,6 +772,7 @@ impl Bridge {
             handshake_pad_min: secrets.handshake_pad_min,
             handshake_pad_max: secrets.handshake_pad_max,
             mtu: self.mtu,
+            max_padding: self.mtu.saturating_sub(48).max(256), // leave room for UDP/IP/ostp headers
         })?;
 
         let resolved_addrs: Vec<std::net::SocketAddr> = match tokio::net::lookup_host(&self.server_addr).await {
@@ -895,6 +903,8 @@ impl Bridge {
         self.reality_enabled = cfg.reality.enabled;
         self.reality_pbk = cfg.reality.pbk.clone();
         self.reality_sid = cfg.reality.sid.clone();
+        self.mtu = cfg.ostp.mtu; // Fix: mtu was never updated on hot-reload
+        self.keepalive_interval_sec = cfg.ostp.keepalive_interval_sec; // Fix: keepalive was never updated on hot-reload
     }
 
     async fn try_connect_transport(

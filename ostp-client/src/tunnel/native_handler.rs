@@ -392,7 +392,12 @@ pub async fn run_native_tunnel_from_fd(
 
 
 
-    let udp_proxy_addr = config.local_proxy.bind_addr.clone();
+    let mut proxy_addr = config.local_proxy.bind_addr.clone();
+    if proxy_addr.starts_with("0.0.0.0:") {
+        proxy_addr = proxy_addr.replace("0.0.0.0:", "127.0.0.1:");
+    }
+
+    let udp_proxy_addr = proxy_addr.clone();
     let debug_udp = config.debug;
     let mut udp_proxy_task = tokio::spawn(async move {
         if let Some(udp_sock) = udp_socket {
@@ -400,7 +405,6 @@ pub async fn run_native_tunnel_from_fd(
         }
     });
 
-    let proxy_addr = config.local_proxy.bind_addr.clone();
     let mut tcp_accept_task = tokio::spawn(async move {
         if let Some(mut listener) = tcp_listener {
             while let Some((mut stream, _local, remote)) = listener.next().await {
@@ -443,6 +447,8 @@ pub async fn run_native_tunnel_from_fd(
     tokio::select! {
         _ = shutdown.changed() => {}
         _ = &mut runner_task => {}
+        _ = _tun_to_stack => {}
+        _ = _stack_to_tun => {}
         _ = &mut udp_proxy_task => {}
         _ = &mut tcp_accept_task => {}
     }

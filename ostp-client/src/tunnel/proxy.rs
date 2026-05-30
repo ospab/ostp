@@ -470,6 +470,7 @@ async fn handle_udp_associate(
                         }
                     }
                 } else {
+                    tracing::debug!("proxy.rs forwarding UDP DATA to server for target={} payload len={}", target, payload.len());
                     let _ = event_tx.send(ProxyEvent::UdpData { stream_id, target, payload }).await;
                 }
             }
@@ -501,7 +502,10 @@ async fn handle_udp_associate(
                             }
                             packet.extend_from_slice(&port.to_be_bytes());
                             packet.extend_from_slice(&data);
+                            tracing::debug!("proxy.rs forwarding UDP REPLY to client_addr={} from server for target={} payload len={}", client_addr, target, data.len());
                             let _ = sock_tx.send_to(&packet, client_addr).await;
+                        } else {
+                            tracing::error!("proxy.rs failed to parse target string as SocketAddr: {}", target);
                         }
                     }
                     Some(ProxyToClientMsg::Close) | Some(ProxyToClientMsg::Error(_)) | None => break,

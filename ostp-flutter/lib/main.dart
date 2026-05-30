@@ -104,8 +104,7 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
   }
 
   void _updateLatestConfigJson() {
-    final bool owndns = widget.prefs.getBool('owndns') ?? false;
-    final dnsServer = owndns ? '10.1.0.1' : (widget.prefs.getString('dns_server') ?? '1.1.1.1');
+
     final exDomains = widget.prefs.getString('ex_domains') ?? '';
     final exIps = widget.prefs.getString('ex_ips') ?? '';
     final exProcesses = widget.prefs.getString('ex_processes') ?? '';
@@ -114,11 +113,12 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
     final stealthSni = widget.prefs.getString('stealth_sni') ?? 'vk.com';
     final stealthPort = widget.prefs.getString('stealth_port') ?? '443';
     final wss = widget.prefs.getBool('wss') ?? false;
-    final mtu = widget.prefs.getString('mtu') ?? '1350';
+    final mtu = widget.prefs.getString('mtu') ?? '1280';
     final muxEnabled = widget.prefs.getBool('mux_enabled') ?? false;
     final muxSessions = widget.prefs.getString('mux_sessions') ?? '2';
-    final tunStack = widget.prefs.getString('tun_stack') ?? 'ostp';
-
+    final dnsServer = widget.prefs.getString('dns_server');
+    final effectiveDnsServer = (dnsServer == null || dnsServer.isEmpty) ? '1.1.1.1' : dnsServer;
+    final tunStack = 'ostp';
     final appRoutingMode = widget.prefs.getString('app_routing_mode') ?? 'bypass';
     final appRoutingPackages = widget.prefs.getStringList('app_routing_packages') ?? [];
 
@@ -132,7 +132,7 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
         "access_key": _accessKey,
         "handshake_timeout_ms": 10000,
         "io_timeout_ms": 5000,
-        "mtu": int.tryParse(mtu) ?? 1350,
+        "mtu": int.tryParse(mtu) ?? 1280,
       },
       "local_proxy": {
         "bind_addr": localBind,
@@ -169,7 +169,7 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
         "mode": appRoutingMode,
         "packages": appRoutingPackages,
       },
-      "dns_server": dnsServer,
+      "dns_server": effectiveDnsServer,
       "tun_stack": tunStack
     };
     widget.prefs.setString('latest_config_json', jsonEncode(configMap));
@@ -202,8 +202,8 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
       _pulseController.repeat(reverse: true);
       _spinController.repeat();
 
-      final bool owndns = widget.prefs.getBool('owndns') ?? false;
-      final dnsServer = owndns ? '10.1.0.1' : (widget.prefs.getString('dns_server') ?? '1.1.1.1');
+      final dnsServer = widget.prefs.getString('dns_server');
+      final effectiveDnsServer = (dnsServer == null || dnsServer.isEmpty) ? '1.1.1.1' : dnsServer;
       final exDomains = widget.prefs.getString('ex_domains') ?? '';
       final exIps = widget.prefs.getString('ex_ips') ?? '';
       final exProcesses = widget.prefs.getString('ex_processes') ?? '';
@@ -212,10 +212,10 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
       final stealthSni = widget.prefs.getString('stealth_sni') ?? 'vk.com';
       final stealthPort = widget.prefs.getString('stealth_port') ?? '443';
       final wss = widget.prefs.getBool('wss') ?? false;
-      final mtu = widget.prefs.getString('mtu') ?? '1350';
+      final mtu = widget.prefs.getString('mtu') ?? '1280';
       final muxEnabled = widget.prefs.getBool('mux_enabled') ?? false;
       final muxSessions = widget.prefs.getString('mux_sessions') ?? '2';
-      final tunStack = widget.prefs.getString('tun_stack') ?? 'ostp';
+      final tunStack = 'ostp';
 
       final appRoutingMode = widget.prefs.getString('app_routing_mode') ?? 'bypass';
       final appRoutingPackages = widget.prefs.getStringList('app_routing_packages') ?? [];
@@ -230,7 +230,7 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
           "access_key": _accessKey,
           "handshake_timeout_ms": 10000,
           "io_timeout_ms": 5000,
-          "mtu": int.tryParse(mtu) ?? 1350,
+          "mtu": int.tryParse(mtu) ?? 1280,
         },
         "local_proxy": {
           "bind_addr": localBind,
@@ -989,7 +989,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
     _localBindCtrl = TextEditingController(text: widget.prefs.getString('local_bind') ?? '127.0.0.1:1088');
     _keyCtrl = TextEditingController(text: widget.prefs.getString('access_key') ?? '');
     _dnsCtrl = TextEditingController(text: widget.prefs.getString('dns_server') ?? '1.1.1.1');
-    _mtuCtrl = TextEditingController(text: widget.prefs.getString('mtu') ?? '1350');
+    _mtuCtrl = TextEditingController(text: widget.prefs.getString('mtu') ?? '1280');
     _domainsCtrl = TextEditingController(text: widget.prefs.getString('ex_domains') ?? '');
     _ipsCtrl = TextEditingController(text: widget.prefs.getString('ex_ips') ?? '');
     _processesCtrl = TextEditingController(text: widget.prefs.getString('ex_processes') ?? '');
@@ -1216,15 +1216,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
                 _buildTextField('Server Address', _serverCtrl, hint: 'host:port'),
                 _buildTextField('Local Proxy Bind', _localBindCtrl, hint: '127.0.0.1:1088'),
                 _buildTextField('Access Key', _keyCtrl, hint: 'Secure access key', isPassword: true),
-                _buildToggle('Built-in Server DNS', 'Route DNS queries to the VPN server', _owndns, (val) {
-                  setState(() {
-                    _owndns = val;
-                  });
-                }),
-                if (!_owndns) ...[
-                  _buildTextField('Custom DNS Server', _dnsCtrl, hint: '1.1.1.1 (e.g. 8.8.8.8)'),
-                ],
-                _buildTextField('MTU (Packet Size)', _mtuCtrl, hint: '1350 (decrease if connection drops)'),
+                _buildTextField('Custom DNS Server', _dnsCtrl, hint: '1.1.1.1 (e.g. 8.8.8.8)'),
+                _buildTextField('MTU (Packet Size)', _mtuCtrl, hint: '1280 (decrease if connection drops)'),
 
                 // ── Transport Mode ───────────────────────────────────────
                 const Text('Transport Mode', style: TextStyle(color: Colors.white54, fontSize: 13, fontWeight: FontWeight.bold, letterSpacing: 1.0)),
@@ -1361,34 +1354,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   secondChild: const SizedBox.shrink(),
                 ),
 
-                const SizedBox(height: 16),
-                const Text('TUN Stack (Desktop only)', style: TextStyle(color: Colors.white54, fontSize: 13, fontWeight: FontWeight.bold, letterSpacing: 1.0)),
-                const SizedBox(height: 10),
-                Container(
-                  decoration: BoxDecoration(
-                    color: Theme.of(context).colorScheme.surface,
-                    borderRadius: BorderRadius.circular(12),
-                  ),
-                  child: Column(
-                    children: [
-                      RadioListTile<String>(
-                        value: 'system',
-                        groupValue: _tunStack,
-                        title: const Text('System (tun2socks)', style: TextStyle(fontWeight: FontWeight.w600)),
-                        activeColor: Theme.of(context).colorScheme.secondary,
-                        onChanged: (v) => setState(() { _tunStack = v!; _saveSettings(); }),
-                      ),
-                      Divider(color: Colors.white.withOpacity(0.05), height: 1),
-                      RadioListTile<String>(
-                        value: 'ostp',
-                        groupValue: _tunStack,
-                        title: const Text('OSTP (Native)', style: TextStyle(fontWeight: FontWeight.w600)),
-                        activeColor: Theme.of(context).colorScheme.primary,
-                        onChanged: (v) => setState(() { _tunStack = v!; _saveSettings(); }),
-                      ),
-                    ],
-                  ),
-                ),
 
                 const SizedBox(height: 16),
                 _buildToggle('Multiplexing (Mux)', 'Combine multiple TCP streams to bypass throttling', _muxEnabled, (v) => setState(() => _muxEnabled = v)),

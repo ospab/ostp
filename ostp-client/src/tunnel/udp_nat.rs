@@ -116,6 +116,7 @@ async fn start_udp_session(
                         }
                         packet.extend_from_slice(&dst.port().to_be_bytes());
                         packet.extend_from_slice(&payload);
+                        tracing::debug!("udp_nat SENDING UDP ASSOCIATE payload len={} to relay_addr={} (original dst: {})", payload.len(), relay_addr, dst);
                         let _ = udp.send_to(&packet, relay_addr).await;
                     }
                     Ok(None) => break,
@@ -151,8 +152,13 @@ async fn start_udp_session(
                             _ => continue,
                         };
                         let payload = buf[header_len..len].to_vec();
+                        tracing::debug!("udp_nat RECEIVED UDP ASSOCIATE REPLY from {} for {} len={}", remote_dst, client_src, payload.len());
                         use futures::SinkExt;
-                        let _ = smoltcp_tx.lock().await.send((payload, remote_dst, client_src)).await;
+                        if let Err(e) = smoltcp_tx.lock().await.send((payload, remote_dst, client_src)).await {
+                            tracing::error!("udp_nat failed to inject packet into smoltcp: {}", e);
+                        } else {
+                            tracing::debug!("udp_nat successfully injected packet into smoltcp from {} to {}", remote_dst, client_src);
+                        }
                     }
                 }
             }
