@@ -335,7 +335,7 @@ impl Bridge {
                                 tx.send(UiEvent::Log(start_msg.to_string())).await.ok();
 
                                 // Send an immediate Ping so the UI updates without a 60s delay
-                                for session in sessions.iter_mut() {
+                                for session in sessions_opt.as_mut().unwrap().iter_mut() {
                                     let ts = SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
                                     let ping_payload = Bytes::from(RelayMessage::Ping(ts).encode());
                                     if let Ok(ProtocolAction::SendDatagram(frame)) = session.machine.on_event(OstpEvent::Outbound(0, ping_payload)) {
@@ -516,7 +516,7 @@ impl Bridge {
                                 let _ = tx.send(UiEvent::Log("Background reconnect successful! Connection restored.".into())).await;
 
                                 // Send an immediate Ping so the UI updates without a 60s delay
-                                for session in new_sessions.iter_mut() {
+                                for session in sessions_opt.as_mut().unwrap().iter_mut() {
                                     let ts = SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
                                     let ping_payload = Bytes::from(RelayMessage::Ping(ts).encode());
                                     if let Ok(ProtocolAction::SendDatagram(frame)) = session.machine.on_event(OstpEvent::Outbound(0, ping_payload)) {

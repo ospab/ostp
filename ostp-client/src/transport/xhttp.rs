@@ -184,7 +184,7 @@ impl tokio::io::AsyncRead for RealityStream {
 }
 
 impl tokio::io::AsyncWrite for RealityStream {
-    fn poll_write(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>, buf: &[u8]) -> Poll<std::io::Result<usize>> {
+    fn poll_write(self: Pin<&mut Self>, cx: &mut TaskContext<'_>, buf: &[u8]) -> Poll<std::io::Result<usize>> {
         let this = self.get_mut();
         while !this.tx_buf.is_empty() {
             match Pin::new(&mut this.inner).poll_write(cx, &this.tx_buf) {
@@ -217,7 +217,7 @@ impl tokio::io::AsyncWrite for RealityStream {
         }
     }
 
-    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
         let this = self.get_mut();
         while !this.tx_buf.is_empty() {
             match Pin::new(&mut this.inner).poll_write(cx, &this.tx_buf) {
@@ -229,7 +229,7 @@ impl tokio::io::AsyncWrite for RealityStream {
         Pin::new(&mut this.inner).poll_flush(cx)
     }
 
-    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
         let this = self.get_mut();
         while !this.tx_buf.is_empty() {
             match Pin::new(&mut this.inner).poll_write(cx, &this.tx_buf) {
