@@ -103,7 +103,7 @@ impl Bridge {
             stealth_sni: config.transport.stealth_sni.clone(),
             stealth_port: config.transport.stealth_port,
             wss: config.transport.wss,
-            mtu: config.ostp.mtu,
+            mtu: config.ostp.mtu.saturating_sub(48).max(500),
             reality_enabled: config.reality.enabled,
             reality_pbk: config.reality.pbk.clone(),
             reality_sid: config.reality.sid.clone(),
@@ -936,7 +936,7 @@ impl Bridge {
         self.reality_enabled = cfg.reality.enabled;
         self.reality_pbk = cfg.reality.pbk.clone();
         self.reality_sid = cfg.reality.sid.clone();
-        self.mtu = cfg.ostp.mtu; // Fix: mtu was never updated on hot-reload
+        self.mtu = cfg.ostp.mtu.saturating_sub(48).max(500); // Fix: mtu was never updated on hot-reload
         self.keepalive_interval_sec = cfg.ostp.keepalive_interval_sec; // Fix: keepalive was never updated on hot-reload
     }
 

@@ -58,7 +58,7 @@ pub struct OstpConfig {
 
 fn default_keepalive() -> u64 { 5 }
 
-fn default_mtu() -> usize { 1140 }
+fn default_mtu() -> usize { 1280 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LocalProxyConfig {

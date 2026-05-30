@@ -161,7 +161,9 @@ class OstpVpnService : VpnService() {
                 .addRoute("0.0.0.0", 0)
                 .addRoute("::", 0)
                 .addDnsServer(dnsServer)
-                .setMtu(json.optJSONObject("ostp")?.optInt("mtu", 1140) ?: 1140)
+
+            val configuredMtu = json.optJSONObject("ostp")?.optInt("mtu", 1280) ?: 1280
+            builder.setMtu(configuredMtu - 48)
                 
             try { builder.addDnsServer("8.8.8.8") } catch (e: Throwable) {}
 

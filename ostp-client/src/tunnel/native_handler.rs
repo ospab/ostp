@@ -31,7 +31,7 @@ pub async fn run_native_tunnel(
            .address((10, 1, 0, 2))
            .netmask((255, 255, 255, 0))
            .destination((10, 1, 0, 1))
-           .mtu(config.ostp.mtu as u16)
+           .mtu(config.ostp.mtu.saturating_sub(48).max(500) as u16)
            .up();
 
     #[cfg(target_os = "linux")]
