@@ -333,6 +333,16 @@ impl Bridge {
                                 self.metrics.connection_state.store(2, Ordering::Relaxed);
                                 let start_msg = if self.mode == "tun" { "TUN tunnel established" } else { "Connection established" };
                                 tx.send(UiEvent::Log(start_msg.to_string())).await.ok();
+
+                                // Send an immediate Ping so the UI updates without a 60s delay
+                                for session in sessions.iter_mut() {
+                                    let ts = SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+                                    let ping_payload = Bytes::from(RelayMessage::Ping(ts).encode());
+                                    if let Ok(ProtocolAction::SendDatagram(frame)) = session.machine.on_event(OstpEvent::Outbound(0, ping_payload)) {
+                                        let _ = send_datagram(&session.socket, &frame, self.transport_mode == "udp").await;
+                                        self.metrics.bytes_sent.fetch_add(frame.len() as u64, Ordering::Relaxed);
+                                    }
+                                }
                             }
                         }
                         Some(BridgeCommand::NextProfile) => {
@@ -504,6 +514,16 @@ impl Bridge {
                                 self.last_valid_recv = Instant::now();
                                 self.metrics.connection_state.store(2, Ordering::Relaxed); // State: Connected
                                 let _ = tx.send(UiEvent::Log("Background reconnect successful! Connection restored.".into())).await;
+
+                                // Send an immediate Ping so the UI updates without a 60s delay
+                                for session in new_sessions.iter_mut() {
+                                    let ts = SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+                                    let ping_payload = Bytes::from(RelayMessage::Ping(ts).encode());
+                                    if let Ok(ProtocolAction::SendDatagram(frame)) = session.machine.on_event(OstpEvent::Outbound(0, ping_payload)) {
+                                        let _ = send_datagram(&session.socket, &frame, self.transport_mode == "udp").await;
+                                        self.metrics.bytes_sent.fetch_add(frame.len() as u64, Ordering::Relaxed);
+                                    }
+                                }
                                 
                                 // FIX: Clear existing proxy streams. Since we are on a NEW session_id,
                                 // the server does not know about our existing streams. Closing them
