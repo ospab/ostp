@@ -26,3 +26,6 @@ tracing = "0.1"
 sha2 = "0.10"
 hmac = "0.12"
 portable-atomic = "1.10"
+
+[patch.crates-io]
+netstack-smoltcp = { path = "netstack-smoltcp" }
