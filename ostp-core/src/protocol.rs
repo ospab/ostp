@@ -557,9 +557,6 @@ impl ProtocolMachine {
         // Limit retransmits per tick to prevent bandwidth saturation
         let mut retransmit_budget: usize = self.cc.retransmit_budget();
         for frame in self.sent_history.iter_mut() {
-            if retransmit_budget == 0 {
-                break;
-            }
             if !frame.is_retransmittable {
                 continue;
             }
@@ -571,8 +568,11 @@ impl ProtocolMachine {
             if now.duration_since(frame.last_sent) >= effective_rto {
                 frame.last_sent = now;
                 frame.retries = frame.retries.saturating_add(1);
-                actions.push(ProtocolAction::SendDatagram(frame.bytes.clone()));
-                retransmit_budget -= 1;
+                
+                if retransmit_budget > 0 {
+                    actions.push(ProtocolAction::SendDatagram(frame.bytes.clone()));
+                    retransmit_budget -= 1;
+                }
             }
         }
 

@@ -617,8 +617,8 @@ impl Bridge {
                     }
                 }
                 proxy_ev = proxy_rx.recv(), if self.running && sessions_opt.as_ref().map(|s| {
-                    // Backpressure: suspend proxy reads when ARQ window is saturated
-                    s.iter().all(|ses| ses.machine.in_flight_count() < ses.machine.cwnd_packets().clamp(16, 16384))
+                    // Backpressure: suspend proxy reads when ARQ window is saturated across ALL sessions
+                    s.iter().any(|ses| ses.machine.in_flight_count() < ses.machine.cwnd_packets().clamp(16, 16384))
                 }).unwrap_or(true) => {
                     if let Some(ev) = proxy_ev {
                         if let Some(sessions) = sessions_opt.as_mut() {
