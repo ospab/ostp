@@ -188,20 +188,14 @@ pub async fn run_client_core(
     if config.mode == "proxy" {
         println!("\n[ostp] ===========================================================================");
         println!("[ostp] Proxy mode initialized on {}", config.local_proxy.bind_addr);
-        println!("[ostp] To use this proxy in your current terminal session, run:");
-        println!("[ostp]   export http_proxy=\"http://{}\"", config.local_proxy.bind_addr);
-        println!("[ostp]   export https_proxy=\"http://{}\"", config.local_proxy.bind_addr);
-        println!("[ostp]   export all_proxy=\"socks5://{}\"", config.local_proxy.bind_addr);
-        println!("[ostp] ");
-        println!("[ostp] For GNOME desktop system-wide proxy, you can use:");
-        println!("[ostp]   gsettings set org.gnome.system.proxy mode 'manual'");
-        let mut parts = config.local_proxy.bind_addr.split(':');
-        let host = parts.next().unwrap_or("127.0.0.1");
-        let port = parts.next().unwrap_or("1088");
-        println!("[ostp]   gsettings set org.gnome.system.proxy.http host '{}'", host);
-        println!("[ostp]   gsettings set org.gnome.system.proxy.http port {}", port);
         println!("[ostp] ===========================================================================\n");
     }
+
+    let _sysproxy_guard = if config.mode == "proxy" {
+        Some(crate::sysproxy::SystemProxyGuard::enable(&config.local_proxy.bind_addr))
+    } else {
+        None
+    };
 
     if config.mode == "tun" && !config.exclusions.processes.is_empty() {
         println!("[ostp] Process exclusions are not supported in TUN mode");
