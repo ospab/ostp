@@ -46,6 +46,18 @@ struct Args {
     /// Update OSTP: re-run the install script to fetch and install the latest version
     #[arg(long)]
     update: bool,
+
+    /// Import a share link (ostp://...) into the configuration file and exit
+    #[arg(long)]
+    import: Option<String>,
+
+    /// Output shell export commands for proxy (eval $(ostp --proxy-env))
+    #[arg(long)]
+    proxy_env: bool,
+
+    /// Output shell export commands to clear proxy (eval $(ostp --proxy-env-clear))
+    #[arg(long)]
+    proxy_env_clear: bool,
 }
 
 fn parse_ostp_link(link: &str) -> Result<ClientConfig> {
@@ -512,6 +524,35 @@ async fn run_app() -> Result<()> {
         return cmd_update();
     }
 
+    if args.proxy_env {
+        let mut port = 1088;
+        if args.config.exists() {
+            if let Ok(content) = fs::read_to_string(&args.config) {
+                let mut stripped = json_comments::StripComments::new(content.as_bytes());
+                if let Ok(config) = serde_json::from_reader::<_, UnifiedConfig>(&mut stripped) {
+                    if let AppMode::Client(c) = config.mode {
+                        if let Some(bind) = c.socks5_bind {
+                            if let Some(p) = bind.split(':').last().and_then(|s| s.parse::<u16>().ok()) {
+                                port = p;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        println!("export http_proxy=\"socks5://127.0.0.1:{}\"", port);
+        println!("export https_proxy=\"socks5://127.0.0.1:{}\"", port);
+        println!("export all_proxy=\"socks5://127.0.0.1:{}\"", port);
+        return Ok(());
+    }
+
+    if args.proxy_env_clear {
+        println!("unset http_proxy");
+        println!("unset https_proxy");
+        println!("unset all_proxy");
+        return Ok(());
+    }
+
     if args.generate_key {
         let mut new_keys = Vec::new();
         for _ in 0..args.count {
@@ -548,10 +589,77 @@ async fn run_app() -> Result<()> {
         return Ok(());
     }
 
+    if let Some(import_url) = args.import {
+        println!("[ostp] Importing configuration from share link...");
+        let client_cfg = parse_ostp_link(&import_url)
+            .map_err(|e| anyhow!("Share Link Error: {e}"))?;
+        let unified = UnifiedConfig {
+            mode: AppMode::Client(client_cfg),
+            log_level: Some("info".to_string()),
+        };
+        let content = serde_json::to_string_pretty(&unified)?;
+        if let Some(parent) = args.config.parent() {
+            if !parent.as_os_str().is_empty() {
+                fs::create_dir_all(parent)?;
+            }
+        }
+        fs::write(&args.config, content)?;
+        println!("[ostp] Configuration successfully imported and saved to {:?}", args.config);
+        return Ok(());
+    }
+
     if let Some(url) = args.url {
         println!("[ostp] Connecting via share link...");
-        let client_cfg = parse_ostp_link(&url)
+        let mut client_cfg = parse_ostp_link(&url)
             .map_err(|e| anyhow!("Share Link Error: {e}"))?;
+        
+        // Interactive prompt for URL launch
+        use std::io::Write;
+        
+        print!("Enable TUN (VPN) mode? [y/N]: ");
+        std::io::stdout().flush().unwrap();
+        let mut input = String::new();
+        std::io::stdin().read_line(&mut input).unwrap();
+        if input.trim().eq_ignore_ascii_case("y") {
+            if let Some(tun) = &mut client_cfg.tun {
+                tun.enable = true;
+            }
+        }
+        
+        print!("Enable connection multiplexing (mux)? [y/N]: ");
+        std::io::stdout().flush().unwrap();
+        input.clear();
+        std::io::stdin().read_line(&mut input).unwrap();
+        if input.trim().eq_ignore_ascii_case("y") {
+            print!("How many sessions? [5]: ");
+            std::io::stdout().flush().unwrap();
+            input.clear();
+            std::io::stdin().read_line(&mut input).unwrap();
+            let mut sessions = 5;
+            if !input.trim().is_empty() {
+                if let Ok(s) = input.trim().parse() {
+                    sessions = s;
+                }
+            }
+            if client_cfg.mux.is_none() {
+                client_cfg.mux = Some(MuxConfig {
+                    enabled: Some(true),
+                    sessions: Some(sessions),
+                });
+            } else if let Some(mux) = &mut client_cfg.mux {
+                mux.enabled = Some(true);
+                mux.sessions = Some(sessions);
+            }
+        }
+        
+        print!("Enable debug mode? [y/N]: ");
+        std::io::stdout().flush().unwrap();
+        input.clear();
+        std::io::stdin().read_line(&mut input).unwrap();
+        if input.trim().eq_ignore_ascii_case("y") {
+            client_cfg.debug = Some(true);
+        }
+
         return run_client_directly(client_cfg).await;
     }
 

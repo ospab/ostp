@@ -15,6 +15,27 @@ pub async fn run_native_tunnel(
     #[cfg(target_os = "windows")]
     use std::os::windows::process::CommandExt;
 
+    #[cfg(target_os = "linux")]
+    {
+        use std::io::{self, IsTerminal, Write};
+        if io::stdout().is_terminal() {
+            println!("\n===================================================================");
+            println!("WARNING: TUN mode will modify the system routing table.");
+            println!("If you are connected to a headless server via SSH, you may lose");
+            println!("your connection when default routes are redirected into the tunnel.");
+            println!("===================================================================\n");
+            print!("Are you sure you want to initialize the TUN interface? [yes/no]: ");
+            io::stdout().flush().unwrap();
+            
+            let mut input = String::new();
+            io::stdin().read_line(&mut input).unwrap();
+            let ans = input.trim().to_lowercase();
+            if ans != "y" && ans != "yes" {
+                return Err(anyhow!("TUN initialization aborted by user. Run without TUN to use as a local proxy."));
+            }
+        }
+    }
+
     let debug = config.debug;
     tracing::info!("Initializing NATIVE TUN tunnel (smoltcp)...");
 
@@ -31,7 +52,7 @@ pub async fn run_native_tunnel(
            .address((10, 1, 0, 2))
            .netmask((255, 255, 255, 0))
            .destination((10, 1, 0, 1))
-           .mtu(config.ostp.mtu.saturating_sub(48).max(500) as u16)
+           .mtu(config.ostp.mtu as u16)
            .up();
 
     #[cfg(target_os = "linux")]
