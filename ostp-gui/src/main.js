@@ -51,8 +51,6 @@ const inPbk          = $('in-pbk');
 const inSid          = $('in-sid');
 const inMtu          = $('in-mtu');
 const inTun          = $('in-tun-mode');
-const inTunStack     = $('in-tun-stack');
-const groupTunStack  = $('group-tun-stack');
 const inMux          = $('in-mux-mode');
 const inMuxSessions  = $('in-mux-sessions');
 const inDebug        = $('in-debug');
@@ -245,13 +243,10 @@ async function loadConfigIntoForm() {
     inPbk.value     = c.reality?.pbk           || '';
     inSid.value     = c.reality?.sid           || '';
     inMtu.value     = c.mtu           || '';
-    inTun.checked   = !!c.tun?.enable;
-    inTunStack.value = c.tun?.stack   || 'system';
+    inTun.checked   = !!c.tun?.enabled;
     inMux.checked   = !!c.mux?.enabled;
     inMuxSessions.value = c.mux?.sessions || '';
     
-    groupTunStack.style.display = inTun.checked ? 'block' : 'none';
-
     // owndns: detect if saved dns is 10.1.0.1
     const savedDns = c.tun?.dns || '';
     const isOwndns = savedDns === '10.1.0.1';
@@ -322,13 +317,11 @@ async function handleSave(silent = false) {
     delete rawConfig.mux;
   }
 
-  if (!rawConfig.tun) {
-    rawConfig.tun = { wintun_path: './wintun.dll', ipv4_address: '10.1.0.2/24' };
-  }
+  rawConfig.tun = rawConfig.tun || {};
   rawConfig.tun.enable = inTun.checked;
+  rawConfig.tun.stack = 'ostp';
   // owndns: if toggle is on, always write 10.1.0.1; otherwise use the custom field
   rawConfig.tun.dns    = inOwndns.checked ? '10.1.0.1' : (inDns.value.trim() || null);
-  rawConfig.tun.stack  = inTunStack.value;
 
   rawConfig.exclude = {
     domains:   splitLines(inDomains.value),
@@ -479,7 +472,6 @@ window.addEventListener('DOMContentLoaded', async () => {
     updateDnsVisibility();
     scheduleAutoSave();
   });
-  inTun.addEventListener('change', () => { groupTunStack.style.display = inTun.checked ? 'block' : 'none'; });
   importInput.addEventListener('keydown', e => { if (e.key === 'Enter') handleImport(); });
 
   // Auto-save wiring
