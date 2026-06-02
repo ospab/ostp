@@ -513,4 +513,14 @@ window.addEventListener('DOMContentLoaded', async () => {
     const code = await invoke('get_tunnel_status');
     if (code > 0) startPolling();
   } catch { /* not in Tauri context */ }
+
+  if (window.__TAURI__?.event) {
+    const { listen } = window.__TAURI__.event;
+    listen('tray_connect', () => {
+      if (appState === 'disconnected') handleToggle();
+    });
+    listen('tray_disconnect', () => {
+      if (appState !== 'disconnected') handleToggle();
+    });
+  }
 });

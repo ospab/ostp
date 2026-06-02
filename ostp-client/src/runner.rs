@@ -111,11 +111,52 @@ fn relaunch_as_admin() -> Result<()> {
     std::process::exit(0);
 }
 
+#[cfg(target_os = "linux")]
+pub fn is_root() -> bool {
+    unsafe { libc::geteuid() == 0 }
+}
+
+#[cfg(target_os = "linux")]
+fn relaunch_as_root() -> Result<()> {
+    use std::io::IsTerminal;
+    let exe = std::env::current_exe()?;
+    let args: Vec<String> = std::env::args().skip(1).collect();
+
+    let is_gui = std::env::var("DISPLAY").is_ok() || std::env::var("WAYLAND_DISPLAY").is_ok();
+    let is_term = std::io::stdout().is_terminal();
+
+    let mut cmd = if is_gui && !is_term {
+        let mut c = std::process::Command::new("pkexec");
+        c.arg(exe);
+        c
+    } else {
+        let mut c = std::process::Command::new("sudo");
+        c.arg(exe);
+        c
+    };
+
+    cmd.args(&args);
+    
+    let status = cmd.status().map_err(|e| anyhow::anyhow!("Failed to execute privilege escalation command: {}", e))?;
+    
+    if !status.success() {
+        return Err(anyhow::anyhow!("Privilege escalation failed or was denied."));
+    }
+
+    std::process::exit(0);
+}
+
 pub async fn run_client(config: crate::config::ClientConfig) -> Result<()> {
     #[cfg(target_os = "windows")]
     if config.mode == "tun" && !is_admin() {
         println!("[ostp] TUN mode requires administrator privileges. Relaunching...");
         relaunch_as_admin()?;
+    }
+
+    #[cfg(target_os = "linux")]
+    if config.mode == "tun" && !is_root() {
+        println!("[ostp] TUN mode requires root privileges. Requesting sudo/pkexec elevation...");
+        relaunch_as_root()?;
     }
 
     let bg = std::env::args().any(|a| a == "--bg");
@@ -150,6 +191,11 @@ pub async fn run_client_core(
     #[cfg(target_os = "windows")]
     if config.mode == "tun" && !is_admin() {
         return Err(anyhow::anyhow!("Administrator privileges are required to initialize TUN mode. Please run the application as Administrator."));
+    }
+
+    #[cfg(target_os = "linux")]
+    if config.mode == "tun" && !is_root() {
+        return Err(anyhow::anyhow!("Root privileges are required to initialize TUN mode on Linux. Please run with sudo."));
     }
 
     log_to_core_file(&format!("[core] Starting run_client_core in mode: {}", config.mode));

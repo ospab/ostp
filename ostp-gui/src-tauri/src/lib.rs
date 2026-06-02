@@ -522,6 +522,91 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .manage(state)
+        .setup(|app| {
+            use tauri::menu::{Menu, MenuItem};
+            use tauri::tray::{TrayIconBuilder, TrayIconEvent, MouseButton, MouseButtonState};
+            use tauri::Manager;
+
+            let config_path = get_config_path();
+            let mut masked_ip = String::from("0.0.0.0");
+            if config_path.exists() {
+                if let Ok(content) = std::fs::read_to_string(&config_path) {
+                    let mut stripped = json_comments::StripComments::new(content.as_bytes());
+                    if let Ok(val) = serde_json::from_reader::<_, serde_json::Value>(&mut stripped) {
+                        if let Some(server) = val.get("server").and_then(|s| s.as_str()) {
+                            let parts: Vec<&str> = server.split(':').collect();
+                            let ip = parts[0];
+                            let port = if parts.len() > 1 { parts[1] } else { "" };
+                            let octets: Vec<&str> = ip.split('.').collect();
+                            if octets.len() == 4 {
+                                masked_ip = format!("{}.{}.**.**:{}", octets[0], octets[1], port);
+                            } else if octets.len() > 2 {
+                                masked_ip = format!("{}...:{}", octets[0], port);
+                            } else {
+                                masked_ip = server.to_string();
+                            }
+                        }
+                    }
+                }
+            }
+
+            let connect_i = MenuItem::with_id(app, "connect", "Подключиться", true, None::<&str>)?;
+            let disconnect_i = MenuItem::with_id(app, "disconnect", "Отключиться", true, None::<&str>)?;
+            let server_i = MenuItem::with_id(app, "server", format!("Сервер: {}", masked_ip), false, None::<&str>)?;
+            let show_i = MenuItem::with_id(app, "show", "Показать окно", true, None::<&str>)?;
+            let exit_i = MenuItem::with_id(app, "exit", "Выход", true, None::<&str>)?;
+            
+            let menu = Menu::with_items(app, &[
+                &server_i,
+                &connect_i,
+                &disconnect_i,
+                &show_i,
+                &exit_i,
+            ])?;
+
+            let _tray = TrayIconBuilder::new()
+                .icon(app.default_window_icon().unwrap().clone())
+                .menu(&menu)
+                .on_menu_event(|app, event| {
+                    match event.id.as_ref() {
+                        "connect" => {
+                            let _ = app.emit("tray_connect", ());
+                        }
+                        "disconnect" => {
+                            let _ = app.emit("tray_disconnect", ());
+                        }
+                        "show" => {
+                            if let Some(window) = app.get_webview_window("main") {
+                                let _ = window.show();
+                                let _ = window.set_focus();
+                            }
+                        }
+                        "exit" => {
+                            app.exit(0);
+                        }
+                        _ => {}
+                    }
+                })
+                .on_tray_icon_event(|tray, event| {
+                    if let TrayIconEvent::Click { button: MouseButton::Left, button_state: MouseButtonState::Up, .. } = event {
+                        let app = tray.app_handle();
+                        if let Some(window) = app.get_webview_window("main") {
+                            let _ = window.show();
+                            let _ = window.set_focus();
+                        }
+                    }
+                })
+                .build(app)?;
+
+            Ok(())
+        })
+        .on_window_event(|window, event| match event {
+            tauri::WindowEvent::CloseRequested { api, .. } => {
+                let _ = window.hide();
+                api.prevent_close();
+            }
+            _ => {}
+        })
         .invoke_handler(tauri::generate_handler![start_tunnel, stop_tunnel, get_tunnel_status, get_metrics, get_config, save_config])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
