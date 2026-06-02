@@ -426,12 +426,63 @@ pub async fn run_native_tunnel_from_fd(
         }
     });
 
+    let matcher = crate::tunnel::exclusion::ExclusionMatcher::new(&config.exclusions, None, None);
+
     let mut tcp_accept_task = tokio::spawn(async move {
         if let Some(mut listener) = tcp_listener {
-            while let Some((mut stream, _local, remote)) = listener.next().await {
+            while let Some((mut stream, local, remote)) = listener.next().await {
                 let proxy_addr = proxy_addr.clone();
+                let matcher = matcher.clone();
                 tokio::spawn(async move {
-                    if debug { tracing::info!("Native TUN intercepted TCP to {}", remote); }
+                    if debug { tracing::info!("Native TUN intercepted TCP {local} -> {remote}"); }
+
+                    // Peak first chunk to see SNI
+                    let mut sniff_buf = [0u8; 1500];
+                    let sniff_len = match tokio::time::timeout(std::time::Duration::from_millis(50), stream.read(&mut sniff_buf)).await {
+                        Ok(Ok(n)) => n,
+                        _ => 0, // Timeout or error
+                    };
+
+                    let mut should_bypass = false;
+
+                    // 1. Check SNI
+                    if sniff_len > 0 {
+                        if let Some(sni) = crate::tunnel::sni_sniff::extract_sni(&sniff_buf[..sniff_len]) {
+                            if debug { tracing::info!("Native TUN sniffed SNI: {}", sni); }
+                            if matcher.match_domain(&sni) {
+                                should_bypass = true;
+                            }
+                        }
+                    }
+
+                    // 2. Check Process
+                    if !should_bypass {
+                        if let Some(exe) = crate::tunnel::process_lookup::get_process_name_from_port(local.port()) {
+                            if debug { tracing::info!("Native TUN source port {} maps to EXE: {}", local.port(), exe); }
+                            if matcher.match_process(&exe) {
+                                should_bypass = true;
+                            }
+                        }
+                    }
+
+                    // 3. Check Target IP
+                    if !should_bypass {
+                        if matcher.match_ip(&remote.ip()) {
+                            should_bypass = true;
+                        }
+                    }
+
+                    if should_bypass {
+                        if debug { tracing::info!("Native TUN BYPASS matched for {}", remote); }
+                        if let Ok(mut direct) = tokio::time::timeout(std::time::Duration::from_secs(5), tokio::net::TcpStream::connect(remote)).await.unwrap_or(Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "Direct connect timeout"))) {
+                            if sniff_len > 0 {
+                                let _ = direct.write_all(&sniff_buf[..sniff_len]).await;
+                            }
+                            let _ = tokio::io::copy_bidirectional(&mut stream, &mut direct).await;
+                        }
+                        return;
+                    }
+
                     if let Ok(mut socks) = tokio::net::TcpStream::connect(&proxy_addr).await {
                         if socks.write_all(&[5, 1, 0]).await.is_err() { return; }
                         let mut buf = [0u8; 2];
@@ -455,6 +506,11 @@ pub async fn run_native_tunnel_from_fd(
                         
                         let mut rep = [0u8; 10];
                         if socks.read_exact(&mut rep).await.is_err() || rep[1] != 0 { return; }
+
+                        // Write sniffed buffer to socks
+                        if sniff_len > 0 {
+                            if socks.write_all(&sniff_buf[..sniff_len]).await.is_err() { return; }
+                        }
 
                         let _ = tokio::io::copy_bidirectional(&mut stream, &mut socks).await;
                     }

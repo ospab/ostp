@@ -64,7 +64,7 @@ impl RelayMessage {
             7 => {
                 let payload = decode_with_len(&input[1..])?;
                 if payload.len() != 8 { return Err(anyhow!("invalid ping payload len")); }
-                let ts = u64::from_be_bytes(payload.try_into().unwrap());
+                let ts = u64::from_be_bytes(payload.try_into().map_err(|_| anyhow!("invalid ping payload size"))?);
                 Ok(RelayMessage::Ping(ts))
             }
             8 => {

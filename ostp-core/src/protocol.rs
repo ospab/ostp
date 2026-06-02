@@ -290,7 +290,7 @@ impl ProtocolMachine {
         if raw_vec.len() < 12 {
             return Err(ProtocolError::Framing("data datagram too short".to_string()));
         }
-        let nonce = u64::from_be_bytes(raw_vec[4..12].try_into().unwrap());
+        let nonce = u64::from_be_bytes(raw_vec[4..12].try_into().map_err(|_| ProtocolError::Framing("data datagram too short for nonce".into()))?);
         
         if nonce < self.expected_recv_nonce {
             // Duplicate — the ACK we sent was likely lost or delayed.
@@ -330,7 +330,7 @@ impl ProtocolMachine {
         // Fast path processing for Nacks: act immediately, bypass sequence queue
         if packet.header.kind == FrameKind::Nack
             && packet.payload.len() >= 8 {
-                let req_nonce = u64::from_be_bytes(packet.payload[..8].try_into().unwrap());
+                let req_nonce = u64::from_be_bytes(packet.payload[..8].try_into().map_err(|_| ProtocolError::Framing("nack payload too short".into()))?);
                 if let Some(cached_frame) = self.lookup_sent_frame(req_nonce) {
                     tracing::debug!("NACK received: retransmitting nonce={}", req_nonce);
                     self.cc.on_loss(cached_frame.len() as u64);
@@ -733,8 +733,8 @@ fn parse_ack_ranges(payload: &[u8]) -> Result<Vec<(u64, u64)>, ProtocolError> {
     let mut ranges = Vec::with_capacity(count);
     let mut idx = 1;
     for _ in 0..count {
-        let start = u64::from_be_bytes(payload[idx..idx + 8].try_into().unwrap());
-        let end = u64::from_be_bytes(payload[idx + 8..idx + 16].try_into().unwrap());
+        let start = u64::from_be_bytes(payload[idx..idx + 8].try_into().map_err(|_| ProtocolError::Framing("ack range start invalid".into()))?);
+        let end = u64::from_be_bytes(payload[idx + 8..idx + 16].try_into().map_err(|_| ProtocolError::Framing("ack range end invalid".into()))?);
         ranges.push((start, end));
         idx += 16;
     }

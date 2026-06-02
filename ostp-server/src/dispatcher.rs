@@ -86,7 +86,7 @@ pub struct Dispatcher {
 impl Dispatcher {
     pub fn new(machine_config: ProtocolConfig, access_keys: Arc<RwLock<HashMap<String, crate::api::UserMeta>>>) -> Self {
         let mut initial_stats = HashMap::new();
-        for (key, meta) in access_keys.read().unwrap().iter() {
+        for (key, meta) in access_keys.read().unwrap_or_else(|e| e.into_inner()).iter() {
             initial_stats.insert(key.clone(), Arc::new(UserStats::new(meta.limit_bytes)));
         }
         Self {
@@ -108,7 +108,7 @@ impl Dispatcher {
 
     /// Snapshot all user stats for API responses.
     pub fn snapshot_all_users(&self) -> Vec<UserStatsSnapshot> {
-        let stats = self.user_stats.read().unwrap();
+        let stats = self.user_stats.read().unwrap_or_else(|e| e.into_inner());
         let online_keys: std::collections::HashSet<String> = self.peer_machines.values()
             .map(|ps| ps.access_key.clone())
             .collect();
@@ -125,15 +125,15 @@ impl Dispatcher {
 
     /// Get or create stats entry for a user key.
     fn get_or_create_user_stats(&self, key: &str) -> Arc<UserStats> {
-        let stats = self.user_stats.read().unwrap();
+        let stats = self.user_stats.read().unwrap_or_else(|e| e.into_inner());
         if let Some(existing) = stats.get(key) {
             return existing.clone();
         }
         drop(stats);
         
-        let limit_bytes = self.access_keys.read().unwrap().get(key).and_then(|m| m.limit_bytes);
+        let limit_bytes = self.access_keys.read().unwrap_or_else(|e| e.into_inner()).get(key).and_then(|m| m.limit_bytes);
         
-        let mut stats = self.user_stats.write().unwrap();
+        let mut stats = self.user_stats.write().unwrap_or_else(|e| e.into_inner());
         stats.entry(key.to_string())
             .or_insert_with(|| Arc::new(UserStats::new(limit_bytes)))
             .clone()
@@ -141,7 +141,7 @@ impl Dispatcher {
 
     /// Set traffic limit for a user.
     pub fn set_user_limit(&self, key: &str, limit: Option<u64>) {
-        let mut stats = self.user_stats.write().unwrap();
+        let mut stats = self.user_stats.write().unwrap_or_else(|e| e.into_inner());
         let entry = stats.entry(key.to_string())
             .or_insert_with(|| Arc::new(UserStats::new(limit)));
         // Replace the entry with new limit (stats reset)
@@ -212,7 +212,7 @@ impl Dispatcher {
             let key_opt = self.peer_machines.get(&session_id).map(|ps| ps.access_key.clone());
             if let Some(access_key) = key_opt {
                 // Check if key is still valid and not over limit
-                let key_valid = self.access_keys.read().unwrap().contains_key(&access_key);
+                let key_valid = self.access_keys.read().unwrap_or_else(|e| e.into_inner()).contains_key(&access_key);
                 let user_stats = self.get_or_create_user_stats(&access_key);
                 if !key_valid || user_stats.is_over_limit() {
                     tracing::info!("Dropping session {} for key {} (valid={}, over_limit={})",
@@ -280,7 +280,7 @@ impl Dispatcher {
         }
 
         // Not an existing session — try each registered access key's derived obfuscation key
-        let keys_snapshot: Vec<String> = self.access_keys.read().unwrap().keys().cloned().collect();
+        let keys_snapshot: Vec<String> = self.access_keys.read().unwrap_or_else(|e| e.into_inner()).keys().cloned().collect();
 
         for candidate_key in keys_snapshot {
             let secrets = ostp_core::crypto::derive_all_secrets(candidate_key.as_bytes());
@@ -430,7 +430,7 @@ impl Dispatcher {
 
         // Gather expired or invalid sessions
         for (&sid, peer_state) in &self.peer_machines {
-            let key_valid = self.access_keys.read().unwrap().contains_key(&peer_state.access_key);
+            let key_valid = self.access_keys.read().unwrap_or_else(|e| e.into_inner()).contains_key(&peer_state.access_key);
             let user_stats = self.get_or_create_user_stats(&peer_state.access_key);
             if now.duration_since(peer_state.last_seen) > timeout_dur || !key_valid || user_stats.is_over_limit() {
                 expired.push(sid);
@@ -441,7 +441,7 @@ impl Dispatcher {
         for sid in &expired {
             let peer_state_opt = self.peer_machines.get(sid);
             let reason = if let Some(ps) = peer_state_opt {
-                let key_valid = self.access_keys.read().unwrap().contains_key(&ps.access_key);
+                let key_valid = self.access_keys.read().unwrap_or_else(|e| e.into_inner()).contains_key(&ps.access_key);
                 let user_stats = self.get_or_create_user_stats(&ps.access_key);
                 if now.duration_since(ps.last_seen) > timeout_dur {
                     "inactive >5min"
@@ -504,15 +504,15 @@ fn get_or_create_stats(
     key: &str,
 ) -> Arc<UserStats> {
     {
-        let stats = user_stats.read().unwrap();
+        let stats = user_stats.read().unwrap_or_else(|e| e.into_inner());
         if let Some(existing) = stats.get(key) {
             return existing.clone();
         }
     }
     
-    let limit_bytes = access_keys.read().unwrap().get(key).and_then(|m| m.limit_bytes);
+    let limit_bytes = access_keys.read().unwrap_or_else(|e| e.into_inner()).get(key).and_then(|m| m.limit_bytes);
     
-    let mut stats = user_stats.write().unwrap();
+    let mut stats = user_stats.write().unwrap_or_else(|e| e.into_inner());
     stats.entry(key.to_string())
         .or_insert_with(|| Arc::new(UserStats::new(limit_bytes)))
         .clone()

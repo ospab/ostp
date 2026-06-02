@@ -82,7 +82,7 @@ pub fn enable_windows_proxy(proxy_addr: &str) {
 }
 
 #[cfg(target_os = "windows")]
-pub fn disable_windows_proxy() {
+pub fn disable_system_proxy() {
     tracing::info!("Disabling Windows system proxy");
     let _ = Command::new("reg")
         .creation_flags(CREATE_NO_WINDOW)
@@ -188,10 +188,6 @@ pub fn enable_system_proxy(proxy_addr: &str) {
     enable_windows_proxy(proxy_addr);
 }
 
-#[cfg(target_os = "windows")]
-pub fn disable_system_proxy() {
-    disable_windows_proxy();
-}
 
 pub struct SystemProxyGuard {
     active: bool,

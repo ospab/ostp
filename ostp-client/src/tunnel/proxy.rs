@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use crate::tunnel::exclusion::{ExclusionMatcher, Cidr};
 use anyhow::{anyhow, Context, Result};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
@@ -421,8 +422,10 @@ async fn handle_udp_associate(
                 };
                 let payload = bytes::Bytes::copy_from_slice(&buf[header_len..len]);
 
+                let target_host = if let Some((host, _)) = split_host_port(&target) { host } else { target.clone() };
+                let target_port = match split_host_port(&target) { Some((_, p)) => p, None => 0 };
                 // Check if target should bypass the tunnel
-                if matcher.should_bypass(&target, connect_timeout).await {
+                if matcher.should_bypass_target(&target_host, target_port, connect_timeout).await {
                     if debug {
                         tracing::info!("proxy UDP BYPASS target={}", target);
                     }
@@ -668,7 +671,9 @@ async fn handle_proxy_client(
         if debug {
             tracing::info!("proxy CONNECT stream_id={stream_id} target={target}");
         }
-        if matcher.should_bypass(&target, connect_timeout).await {
+        let target_host = if let Some((host, _)) = split_host_port(&target) { host } else { target.clone() };
+        let target_port = match split_host_port(&target) { Some((_, p)) => p, None => 0 };
+        if matcher.should_bypass_target(&target_host, target_port, connect_timeout).await {
             return direct_connect_socks5(
                 client,
                 stream_id,
@@ -753,7 +758,9 @@ async fn handle_proxy_client(
         if debug {
             tracing::info!("proxy CONNECT stream_id={stream_id} target={target}");
         }
-        if matcher.should_bypass(&target, connect_timeout).await {
+        let target_host = if let Some((host, _)) = split_host_port(&target) { host } else { target.clone() };
+        let target_port = match split_host_port(&target) { Some((_, p)) => p, None => 443 };
+        if matcher.should_bypass_target(&target_host, target_port, connect_timeout).await {
             return direct_connect_http(
                 client,
                 stream_id,
@@ -854,129 +861,6 @@ async fn handle_proxy_client(
     Ok(())
 }
 
-#[derive(Clone)]
-struct ExclusionMatcher {
-    domain_suffix: Vec<String>,
-    cidrs: Vec<Cidr>,
-    physical_if_index: Option<u32>,
-    physical_if_name: Option<String>,
-}
-
-impl ExclusionMatcher {
-    fn new(
-        exclusions: &ExclusionConfig,
-        physical_if_index: Option<u32>,
-        physical_if_name: Option<String>,
-    ) -> Self {
-        let mut cidrs = Vec::new();
-        for ip in &exclusions.ips {
-            if let Some(cidr) = parse_cidr(ip) {
-                cidrs.push(cidr);
-            }
-        }
-
-        Self {
-            domain_suffix: exclusions
-                .domains
-                .iter()
-                .map(|d| d.trim().trim_start_matches('.').to_lowercase())
-                .filter(|d| !d.is_empty())
-                .collect(),
-            cidrs,
-            physical_if_index,
-            physical_if_name,
-        }
-    }
-
-    async fn should_bypass(&self, target: &str, timeout_value: Duration) -> bool {
-        let (host, port) = match split_host_port(target) {
-            Some(v) => v,
-            None => return false,
-        };
-
-        if self.match_domain(&host) {
-            return true;
-        }
-
-        if self.cidrs.is_empty() {
-            return false;
-        }
-
-        if let Ok(ip) = host.parse::<std::net::IpAddr>() {
-            return self.match_ip(&ip);
-        }
-
-        let lookup_target = (host.clone(), port);
-        match timeout(timeout_value, tokio::net::lookup_host(lookup_target)).await {
-            Ok(Ok(addrs)) => addrs.into_iter().any(|addr| self.match_ip(&addr.ip())),
-            _ => false,
-        }
-    }
-
-    fn match_domain(&self, host: &str) -> bool {
-        if self.domain_suffix.is_empty() {
-            return false;
-        }
-        let host = host.trim_end_matches('.').to_lowercase();
-        self.domain_suffix.iter().any(|suffix| {
-            host == *suffix || host.ends_with(&format!(".{suffix}"))
-        })
-    }
-
-    fn match_ip(&self, ip: &std::net::IpAddr) -> bool {
-        self.cidrs.iter().any(|cidr| cidr.contains(ip))
-    }
-}
-
-#[derive(Clone)]
-enum Cidr {
-    V4(u32, u8),
-    V6(u128, u8),
-}
-
-impl Cidr {
-    fn contains(&self, ip: &std::net::IpAddr) -> bool {
-        match (self, ip) {
-            (Cidr::V4(net, bits), std::net::IpAddr::V4(addr)) => {
-                let mask = if *bits == 0 { 0 } else { u32::MAX << (32 - bits) };
-                let ip = u32::from_be_bytes(addr.octets());
-                (ip & mask) == (*net & mask)
-            }
-            (Cidr::V6(net, bits), std::net::IpAddr::V6(addr)) => {
-                let mask = if *bits == 0 { 0 } else { u128::MAX << (128 - bits) };
-                let ip = u128::from_be_bytes(addr.octets());
-                (ip & mask) == (*net & mask)
-            }
-            _ => false,
-        }
-    }
-}
-
-fn parse_cidr(value: &str) -> Option<Cidr> {
-    let value = value.trim();
-    if value.is_empty() {
-        return None;
-    }
-
-    if let Some((addr_str, bits_str)) = value.split_once('/') {
-        let bits: u8 = bits_str.parse().ok()?;
-        if let Ok(addr) = addr_str.parse::<std::net::IpAddr>() {
-            return match addr {
-                std::net::IpAddr::V4(v4) => Some(Cidr::V4(u32::from_be_bytes(v4.octets()), bits.min(32))),
-                std::net::IpAddr::V6(v6) => Some(Cidr::V6(u128::from_be_bytes(v6.octets()), bits.min(128))),
-            };
-        }
-    }
-
-    if let Ok(addr) = value.parse::<std::net::IpAddr>() {
-        return match addr {
-            std::net::IpAddr::V4(v4) => Some(Cidr::V4(u32::from_be_bytes(v4.octets()), 32)),
-            std::net::IpAddr::V6(v6) => Some(Cidr::V6(u128::from_be_bytes(v6.octets()), 128)),
-        };
-    }
-
-    None
-}
 
 fn split_host_port(target: &str) -> Option<(String, u16)> {
     if let Some((host, port)) = target.rsplit_once(':') {

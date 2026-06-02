@@ -5,7 +5,6 @@
 //! This replaces the fixed `retransmit_budget = 8` with an adaptive
 //! congestion window that responds to network conditions.
 
-use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 /// Congestion control state for a single OSTP session.
@@ -16,14 +15,8 @@ pub struct CongestionController {
     ssthresh: u64,
     /// Current phase
     phase: Phase,
-    /// Minimum RTT observed (used for BDP calculation)
+    /// Minimum RTT observed
     min_rtt: Duration,
-    /// Maximum bandwidth observed (bytes/sec)
-    max_bandwidth: u64,
-    /// RTT samples for smoothing
-    rtt_samples: VecDeque<RttSample>,
-    /// Bandwidth samples
-    bw_samples: VecDeque<BwSample>,
     /// Bytes currently in flight (unacknowledged)
     bytes_in_flight: u64,
     /// Total bytes acknowledged (for bandwidth estimation)
@@ -36,8 +29,6 @@ pub struct CongestionController {
     pacing_rate: u64,
     /// MTU estimate (used for cwnd → packet count conversion)
     mtu: u64,
-    /// Probe RTT phase timer
-    probe_rtt_timer: Option<Instant>,
     /// Min RTT expiry: re-probe after 10 seconds
     min_rtt_stamp: Instant,
 }
@@ -48,35 +39,14 @@ enum Phase {
     SlowStart,
     /// Probe bandwidth: cycle through pacing gains
     ProbeBandwidth,
-    /// Periodically drain the queue to measure true min RTT
-    #[allow(dead_code)]
-    ProbeRtt,
 }
 
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
-struct RttSample {
-    rtt: Duration,
-    time: Instant,
-}
-
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
-struct BwSample {
-    bytes_per_sec: u64,
-    time: Instant,
-}
-
-/// Maximum number of samples to keep for windowed min/max
-const MAX_SAMPLES: usize = 32;
 /// Initial congestion window: 10 packets × MTU
 const INITIAL_CWND_PACKETS: u64 = 10;
 /// Minimum cwnd: 2 packets
 const MIN_CWND_PACKETS: u64 = 2;
 /// Min RTT expiry window (after which we re-probe)
 const MIN_RTT_EXPIRY: Duration = Duration::from_secs(10);
-/// ProbeRTT drain duration
-const PROBE_RTT_DURATION: Duration = Duration::from_millis(200);
 
 impl CongestionController {
     pub fn new(mtu: u64) -> Self {
@@ -87,16 +57,12 @@ impl CongestionController {
             ssthresh: u64::MAX,
             phase: Phase::SlowStart,
             min_rtt: Duration::from_millis(100), // Conservative initial estimate
-            max_bandwidth: 0,
-            rtt_samples: VecDeque::with_capacity(MAX_SAMPLES),
-            bw_samples: VecDeque::with_capacity(MAX_SAMPLES),
             bytes_in_flight: 0,
             total_acked: 0,
             last_ack_time: now,
             loss_count: 0,
             pacing_rate: initial_cwnd * 10, // initial: ~10 windows/sec
             mtu,
-            probe_rtt_timer: None,
             min_rtt_stamp: now,
         }
     }
@@ -169,29 +135,7 @@ impl CongestionController {
                 // TCP Reno Additive Increase: increase cwnd by ~1 MTU per RTT
                 self.cwnd = self.cwnd.saturating_add(bytes * self.mtu / self.cwnd.max(1));
             }
-            Phase::ProbeRtt => {
-                // Drain down to 4 packets to measure true min RTT
-                self.cwnd = MIN_CWND_PACKETS * self.mtu * 2;
-                if let Some(timer) = self.probe_rtt_timer {
-                    if now.duration_since(timer) >= PROBE_RTT_DURATION {
-                        // ProbeRTT complete, return to ProbeBandwidth
-                        self.phase = Phase::ProbeBandwidth;
-                        self.probe_rtt_timer = None;
-                        self.cwnd = (MIN_CWND_PACKETS * self.mtu * 4).max(self.cwnd);
-                        tracing::debug!(cwnd = self.cwnd, min_rtt = ?self.min_rtt, "congestion: probe RTT complete");
-                    }
-                }
-            }
         }
-
-        /*
-        // Periodically enter ProbeRTT to refresh min_rtt
-        if now.duration_since(self.min_rtt_stamp) >= MIN_RTT_EXPIRY && self.phase != Phase::ProbeRtt {
-            self.phase = Phase::ProbeRtt;
-            self.probe_rtt_timer = Some(now);
-            tracing::debug!("congestion: entering probe RTT phase");
-        }
-        */
 
         self.update_pacing_rate();
         self.last_ack_time = now;
@@ -215,9 +159,6 @@ impl CongestionController {
                 self.cwnd = (self.cwnd * 7 / 10).max(MIN_CWND_PACKETS * self.mtu);
                 tracing::debug!(cwnd = self.cwnd, "congestion: loss, cwnd reduced");
             }
-            Phase::ProbeRtt => {
-                // Don't react to loss during ProbeRTT
-            }
         }
 
         self.update_pacing_rate();
@@ -236,40 +177,16 @@ impl CongestionController {
             self.min_rtt = rtt;
             self.min_rtt_stamp = now;
         }
-
-        // Keep sample history
-        self.rtt_samples.push_back(RttSample { rtt, time: now });
-        while self.rtt_samples.len() > MAX_SAMPLES {
-            self.rtt_samples.pop_front();
-        }
     }
 
-    fn update_bandwidth(&mut self, acked_bytes: u64, now: Instant) {
+    fn update_bandwidth(&mut self, _acked_bytes: u64, now: Instant) {
         let elapsed = now.duration_since(self.last_ack_time);
         if elapsed.as_micros() > 0 {
-            let bw = acked_bytes * 1_000_000 / elapsed.as_micros() as u64;
-            if bw > self.max_bandwidth {
-                self.max_bandwidth = bw;
-            }
-            self.bw_samples.push_back(BwSample { bytes_per_sec: bw, time: now });
-            while self.bw_samples.len() > MAX_SAMPLES {
-                self.bw_samples.pop_front();
-            }
+        // Removed bw_samples tracking
         }
     }
 
-    #[allow(dead_code)]
-    fn bandwidth_delay_product(&self) -> u64 {
-        // BDP = max_bandwidth * min_rtt
-        let bw = if self.max_bandwidth > 0 {
-            self.max_bandwidth
-        } else {
-            // Fallback: assume 10 Mbps
-            1_250_000
-        };
-        let rtt_secs = self.min_rtt.as_secs_f64();
-        (bw as f64 * rtt_secs) as u64
-    }
+
 
     fn update_pacing_rate(&mut self) {
         // Pacing rate = cwnd / min_rtt (with gain)

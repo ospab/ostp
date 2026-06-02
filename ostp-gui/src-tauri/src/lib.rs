@@ -106,6 +106,7 @@ struct HelperState {
     pipe_state: Arc<Mutex<HelperPipeState>>,
     cmd_tx: tokio::sync::mpsc::Sender<String>,
     token: String,
+    port: u16,
 }
 
 enum TunnelHandle {
@@ -283,6 +284,37 @@ async fn get_metrics(state: tauri::State<'_, AppState>) -> Result<Option<UIMetri
 }
 
 #[tauri::command]
+async fn reload_tunnel(state: tauri::State<'_, AppState>) -> Result<bool, String> {
+    let mut guard = state.0.lock().await;
+    if guard.tunnel.is_none() {
+        return Ok(false);
+    }
+    
+    let config_path = get_config_path();
+    let config_str = std::fs::read_to_string(&config_path)
+        .map_err(|e| format!("Read config error: {}", e))?;
+    
+    match &guard.tunnel {
+        Some(TunnelHandle::Helper(h)) => {
+            let cmd = format!(
+                "{{\"cmd\":\"reload\",\"config\":{},\"token\":\"{}\"}}\n",
+                serde_json::to_string(&config_str).unwrap(),
+                h.token
+            );
+            let _ = h.cmd_tx.send(cmd).await;
+        }
+        Some(TunnelHandle::InProcess(s)) => {
+            // Restarting in-process tunnel is not supported without re-calling start_tunnel,
+            // but we can just abort and we should really call start_tunnel again.
+            // For now, return false.
+            return Ok(false);
+        }
+        None => {}
+    }
+    Ok(true)
+}
+
+#[tauri::command]
 async fn stop_tunnel(state: tauri::State<'_, AppState>) -> Result<bool, String> {
     let mut guard = state.0.lock().await;
     match guard.tunnel.take() {
@@ -375,24 +407,19 @@ async fn start_tun_via_helper(
     guard: &mut AppStateInner,
     raw: &ClientConfigRaw,
 ) -> Result<bool, String> {
-    #[cfg(target_os = "windows")]
-    {
-        // Kill any existing helper processes to prevent os error 10048 (port already in use)
-        use std::os::windows::process::CommandExt;
-        let _ = std::process::Command::new("taskkill")
-            .args(["/F", "/IM", "ostp-tun-helper.exe"])
-            .creation_flags(0x08000000)
-            .output();
-    }
+    let port = {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").map_err(|e| format!("Bind error: {}", e))?;
+        listener.local_addr().unwrap().port()
+    };
 
     let auth_token = rand::random::<u64>().to_string();
     let helper_exe = find_helper_exe().ok_or_else(|| "ostp-tun-helper.exe not found.".to_string())?;
-    launch_as_admin(&helper_exe, &auth_token).map_err(|e| format!("Failed to launch helper: {}", e))?;
+    launch_as_admin(&helper_exe, &auth_token, port).map_err(|e| format!("Failed to launch helper: {}", e))?;
     tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
 
     let socket = tokio::time::timeout(std::time::Duration::from_secs(60), async {
         loop {
-            match tokio::net::TcpStream::connect("127.0.0.1:53211").await {
+            match tokio::net::TcpStream::connect(format!("127.0.0.1:{}", port)).await {
                 Ok(s) => return Ok::<_, std::io::Error>(s),
                 Err(_) => tokio::time::sleep(std::time::Duration::from_millis(200)).await,
             }
@@ -443,7 +470,7 @@ async fn start_tun_via_helper(
         state_for_task.lock().await.connection_state = 0;
     });
 
-    guard.tunnel = Some(TunnelHandle::Helper(HelperState { pipe_state, cmd_tx, token: auth_token }));
+    guard.tunnel = Some(TunnelHandle::Helper(HelperState { pipe_state, cmd_tx, token: auth_token, port }));
     Ok(true)
 }
 
@@ -493,14 +520,14 @@ fn find_helper_exe() -> Option<PathBuf> {
 }
 
 #[cfg(target_os = "windows")]
-fn launch_as_admin(exe: &std::path::PathBuf, token: &str) -> anyhow::Result<()> {
+fn launch_as_admin(exe: &std::path::PathBuf, token: &str, port: u16) -> anyhow::Result<()> {
     use std::ffi::OsStr;
     use std::os::windows::ffi::OsStrExt;
     use std::ptr::null_mut;
 
     let exe_wstr: Vec<u16> = exe.as_os_str().encode_wide().chain(Some(0)).collect();
     let verb_wstr: Vec<u16> = OsStr::new("runas").encode_wide().chain(Some(0)).collect();
-    let params_str = format!("--token {}", token);
+    let params_str = format!("--token {} --port {}", token, port);
     let params_wstr: Vec<u16> = OsStr::new(&params_str).encode_wide().chain(Some(0)).collect();
     #[link(name = "shell32")] extern "system" { fn ShellExecuteW(h: *mut std::ffi::c_void, op: *const u16, f: *const u16, p: *const u16, d: *const u16, s: i32) -> isize; }
     
@@ -514,7 +541,7 @@ fn launch_as_admin(exe: &std::path::PathBuf, token: &str) -> anyhow::Result<()> 
 }
 
 #[cfg(not(target_os = "windows"))]
-fn launch_as_admin(_exe: &PathBuf, _token: &str) -> Result<()> { anyhow::bail!("Windows only."); }
+fn launch_as_admin(_exe: &PathBuf, _token: &str, _port: u16) -> Result<()> { anyhow::bail!("Windows only."); }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -607,7 +634,7 @@ pub fn run() {
             }
             _ => {}
         })
-        .invoke_handler(tauri::generate_handler![start_tunnel, stop_tunnel, get_tunnel_status, get_metrics, get_config, save_config])
+        .invoke_handler(tauri::generate_handler![start_tunnel, stop_tunnel, reload_tunnel, get_tunnel_status, get_metrics, get_config, save_config])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

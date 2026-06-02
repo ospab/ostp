@@ -48,7 +48,7 @@ pub async fn run_relay_node(cfg: RelayConfig) -> Result<()> {
     if let Err(e) = sync_keys(&cfg, &shared_keys).await {
         tracing::warn!("Relay: initial key sync failed: {}. Will retry.", e);
     } else {
-        let count = shared_keys.read().unwrap().len();
+        let count = shared_keys.read().unwrap_or_else(|e| e.into_inner()).len();
         tracing::info!("Relay: synced {} access key(s) from upstream API", count);
     }
 
@@ -190,7 +190,7 @@ async fn run_udp_relay(cfg: RelayConfig, shared_keys: SharedKeys) -> Result<()> 
 
                         let ts_bytes: [u8; 8] = packet[0..8].try_into().unwrap();
                         let provided_mac = &packet[8..40];
-                        let keys_guard = keys.read().unwrap();
+                        let keys_guard = keys.read().unwrap_or_else(|e| e.into_inner());
 
                         if !verify_hmac(&ts_bytes, provided_mac, &keys_guard) {
                             tracing::debug!("Relay UDP: unauthorized probe from {}, dropped", peer);
@@ -369,7 +369,7 @@ async fn handle_tcp_client(
 
     // Проверяем по синхронизированным ключам
     let authorized = {
-        let keys = shared_keys.read().unwrap();
+        let keys = shared_keys.read().unwrap_or_else(|e| e.into_inner());
         verify_hmac(&ts_bytes, provided_mac, &keys)
     };
 

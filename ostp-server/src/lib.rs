@@ -195,11 +195,11 @@ pub async fn run_server(
                                             }
                                             
                                             // 1. Update shared_keys
-                                            let mut keys_lock = shared_keys_clone.write().unwrap();
+                                            let mut keys_lock = shared_keys_clone.write().unwrap_or_else(|e| e.into_inner());
                                             *keys_lock = new_keys.clone();
                                             
                                             // 2. Synchronize user_stats limits & cleanup deleted keys
-                                            let mut stats_lock = user_stats_clone.write().unwrap();
+                                            let mut stats_lock = user_stats_clone.write().unwrap_or_else(|e| e.into_inner());
                                             stats_lock.retain(|k, _| new_keys.contains_key(k));
                                             
                                             for (k, meta) in &new_keys {
@@ -308,7 +308,7 @@ pub async fn run_server(
         }
     });
 
-    let key_count = shared_keys.read().unwrap().len();
+    let key_count = shared_keys.read().unwrap_or_else(|e| e.into_inner()).len();
     tracing::info!(listeners = bind_addrs.len(), keys = key_count, "server started");
     tracing::info!("ARQ config: max_reorder=16384, reorder_buf=8192, sent_history=32768, rto=100ms");
     let reality_config_arc = reality_config.map(std::sync::Arc::new);
@@ -434,7 +434,7 @@ async fn run_server_loop(
 
     if debug {
         let _ = ui_event_tx.send(UiEvent::Log("Server loop started".to_string()));
-        let _ = ui_event_tx.send(UiEvent::KeyCount(shared_keys.read().unwrap().len()));
+        let _ = ui_event_tx.send(UiEvent::KeyCount(shared_keys.read().unwrap_or_else(|e| e.into_inner()).len()));
     }
 
     let mut retransmit_tick = interval(Duration::from_millis(10));
@@ -448,7 +448,7 @@ async fn run_server_loop(
                 match cmd {
                     Some(UiCommand::CreateClientKey) => {
                         let key = format!("ostp_key_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs());
-                        shared_keys.write().unwrap().insert(key.clone(), crate::api::UserMeta { name: None, limit_bytes: None });
+                        shared_keys.write().unwrap_or_else(|e| e.into_inner()).insert(key.clone(), crate::api::UserMeta { name: None, limit_bytes: None });
                         let _ = ui_event_tx.send(UiEvent::KeyCreated { key });
                     }
                     Some(UiCommand::Shutdown) | None => {

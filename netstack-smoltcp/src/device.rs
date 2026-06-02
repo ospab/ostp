@@ -16,6 +16,7 @@ pub(super) struct VirtualDevice {
     in_buf: UnboundedReceiver<Vec<u8>>,
     out_buf: Sender<AnyIpPktFrame>,
     mtu: usize,
+    cached_packet: Option<Vec<u8>>,
 }
 
 impl VirtualDevice {
@@ -31,6 +32,7 @@ impl VirtualDevice {
                 in_buf: iface_ingress_rx,
                 out_buf: iface_egress_tx,
                 mtu,
+                cached_packet: None,
             },
             iface_ingress_tx,
             iface_ingress_tx_avail,
@@ -43,12 +45,18 @@ impl Device for VirtualDevice {
     type TxToken<'a> = VirtualTxToken<'a>;
 
     fn receive(&mut self, _timestamp: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
-        let Ok(buffer) = self.in_buf.try_recv() else {
-            self.in_buf_avail.store(false, Ordering::Release);
-            return None;
+        let buffer = if let Some(buf) = self.cached_packet.take() {
+            buf
+        } else {
+            let Ok(buf) = self.in_buf.try_recv() else {
+                self.in_buf_avail.store(false, Ordering::Release);
+                return None;
+            };
+            buf
         };
 
         let Ok(permit) = self.out_buf.try_reserve() else {
+            self.cached_packet = Some(buffer);
             self.in_buf_avail.store(false, Ordering::Release);
             return None;
         };

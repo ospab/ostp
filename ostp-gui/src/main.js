@@ -319,6 +319,8 @@ async function handleSave(silent = false) {
 
   rawConfig.tun = rawConfig.tun || {};
   rawConfig.tun.enable = inTun.checked;
+  rawConfig.tun.wintun_path = rawConfig.tun.wintun_path || './wintun.dll';
+  rawConfig.tun.ipv4_address = rawConfig.tun.ipv4_address || '10.1.0.2/24';
   rawConfig.tun.stack = 'ostp';
   // owndns: if toggle is on, always write 10.1.0.1; otherwise use the custom field
   rawConfig.tun.dns    = inOwndns.checked ? '10.1.0.1' : (inDns.value.trim() || null);
@@ -477,7 +479,14 @@ window.addEventListener('DOMContentLoaded', async () => {
   // Auto-save wiring
   const formInputs = document.querySelectorAll('#settings-screen input:not(#in-import-url), #settings-screen textarea, #settings-screen select');
   formInputs.forEach(el => {
-    el.addEventListener('input', scheduleAutoSave);
+    el.addEventListener('input', () => {
+      scheduleAutoSave();
+      if (appState === 'connected') {
+        if (window.__TAURI__ && window.__TAURI__.invoke) {
+          window.__TAURI__.invoke('reload_tunnel');
+        }
+      }
+    });
     el.addEventListener('change', scheduleAutoSave);
   });
 

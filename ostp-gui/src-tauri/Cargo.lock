@@ -2641,7 +2641,7 @@ dependencies = [
 
 [[package]]
 name = "ostp-client"
-version = "0.2.73"
+version = "0.2.79"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -2666,12 +2666,13 @@ dependencies = [
  "tracing",
  "tun",
  "webpki-roots 0.26.11",
+ "winapi",
  "x25519-dalek",
 ]
 
 [[package]]
 name = "ostp-core"
-version = "0.2.73"
+version = "0.2.79"
 dependencies = [
  "anyhow",
  "bytes",

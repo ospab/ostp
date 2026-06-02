@@ -32,11 +32,13 @@ class OstpClientSdk private constructor(private val context: Context) {
 
     // ── Native JNI bindings ───────────────────────────────────────────────────
 
-    private external fun nativeStartClient(configJson: String): Boolean
-    private external fun nativeStopClient(): Boolean
-    private external fun nativeGetMetrics(): String
-    private external fun nativeGetLogs(): String
+    private external fun startClient(configJson: String, fd: Int, t2sBinPath: String, localProxy: String): Boolean
+    private external fun stopClient(): Boolean
+    private external fun getMetrics(): String
+    private external fun getLogs(): String
+    private external fun addLog(logMsg: String)
     private external fun notifyNetworkChanged()
+
 
     // ── Public data models ────────────────────────────────────────────────────
 
@@ -175,7 +177,8 @@ class OstpClientSdk private constructor(private val context: Context) {
         _state.value = TunnelState.Connecting
 
         val json = config.toNativeJson()
-        val ok = nativeStartClient(json)
+        // Default values for fd, t2sBinPath, localProxy for proxy mode
+        val ok = startClient(json, -1, "", config.proxyBind)
         if (!ok) {
             _state.value = TunnelState.Failed("Native layer rejected config")
             started.set(false)
@@ -197,7 +200,7 @@ class OstpClientSdk private constructor(private val context: Context) {
 
         pollingJob?.cancel()
         networkCallbackJob?.cancel()
-        nativeStopClient()
+        stopClient()
         unregisterNetworkCallback()
         _state.value = TunnelState.Idle
         emitLog("OSTP SDK stopped")
@@ -209,7 +212,7 @@ class OstpClientSdk private constructor(private val context: Context) {
      */
     fun drainLogs(): List<String> {
         return try {
-            val array = JSONArray(nativeGetLogs())
+            val array = JSONArray(getLogs())
             (0 until array.length()).map { array.getString(it) }
         } catch (_: Exception) {
             emptyList()
@@ -218,7 +221,7 @@ class OstpClientSdk private constructor(private val context: Context) {
 
     /** Read the latest [Metrics] snapshot. Returns zeroed metrics if tunnel is idle. */
     fun getMetrics(): Metrics {
-        return parseMetrics(nativeGetMetrics())
+        return parseMetrics(getMetrics())
     }
 
     // ── Internal helpers ──────────────────────────────────────────────────────
@@ -247,7 +250,7 @@ class OstpClientSdk private constructor(private val context: Context) {
                 }
 
                 // Update state based on metrics availability
-                val metrics = parseMetrics(nativeGetMetrics())
+                val metrics = parseMetrics(getMetrics())
                 if (wasConnected) {
                     _state.value = TunnelState.Connected(metrics)
                 }
@@ -319,6 +322,33 @@ class OstpClientSdk private constructor(private val context: Context) {
 
         @Volatile
         private var instance: OstpClientSdk? = null
+
+        @JvmStatic
+        fun protectSocket(fd: Int): Boolean {
+            var retries = 5
+            while (retries > 0) {
+                // We use reflection or explicit class to get the VpnService instance
+                try {
+                    val serviceClass = Class.forName("com.ospab.ostp_client.OstpVpnService")
+                    val instanceField = serviceClass.getDeclaredField("instance")
+                    instanceField.isAccessible = true
+                    val service = instanceField.get(null)
+                    if (service != null) {
+                        val protectMethod = serviceClass.getMethod("protect", Int::class.javaPrimitiveType)
+                        val res = protectMethod.invoke(service, fd) as Boolean
+                        android.util.Log.i("OstpClientSdk", "VpnService.protect(socketFd=$fd) -> success=$res")
+                        return res
+                    }
+                } catch (e: Exception) {
+                    android.util.Log.w("OstpClientSdk", "Error accessing VpnService via reflection: \${e.message}")
+                }
+                android.util.Log.w("OstpClientSdk", "VpnService instance not available! Retrying... (\$retries left)")
+                Thread.sleep(200)
+                retries--
+            }
+            android.util.Log.e("OstpClientSdk", "VpnService instance is null! Cannot protect socketFd=\$fd")
+            return false
+        }
 
         /**
          * Get the singleton SDK instance.

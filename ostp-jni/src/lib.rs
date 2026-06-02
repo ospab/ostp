@@ -3,7 +3,7 @@ use jni::sys::{jboolean, jstring};
 use jni::JNIEnv;
 
 use std::collections::VecDeque;
-use std::sync::{atomic::Ordering, Arc, Mutex};
+use std::sync::{atomic::Ordering, Arc, Mutex, RwLock};
 use tokio::runtime::Runtime;
 use tokio::sync::{mpsc, watch};
 use ostp_client::bridge::{Bridge, BridgeMetrics};
@@ -80,13 +80,13 @@ impl SdkState {
     }
 }
 
-static STATE: Mutex<SdkState> = Mutex::new(SdkState::new());
-static LOGS: Mutex<VecDeque<String>> = Mutex::new(VecDeque::new());
-static JVM: Mutex<Option<jni::JavaVM>> = Mutex::new(None);
-static CLASS_REF: Mutex<Option<jni::objects::GlobalRef>> = Mutex::new(None);
+static STATE: RwLock<SdkState> = RwLock::new(SdkState::new());
+static LOGS: RwLock<VecDeque<String>> = RwLock::new(VecDeque::new());
+static JVM: RwLock<Option<jni::JavaVM>> = RwLock::new(None);
+static CLASS_REF: RwLock<Option<jni::objects::GlobalRef>> = RwLock::new(None);
 
 fn add_log(text: String) {
-    if let Ok(mut guard) = LOGS.lock() {
+    if let Ok(mut guard) = LOGS.write() {
         if guard.len() >= 1000 {
             guard.pop_front();
         }
@@ -95,7 +95,7 @@ fn add_log(text: String) {
 }
 
 #[no_mangle]
-pub extern "system" fn Java_net_ostp_client_OstpClientSdk_startClient(
+pub extern "system" fn Java_net_ostp_client_OstpClientSdk_nativeStartClient(
     mut env: JNIEnv,
     _class: JClass,
     config_json: JString,
@@ -103,7 +103,7 @@ pub extern "system" fn Java_net_ostp_client_OstpClientSdk_startClient(
     t2s_bin_path: JString,
     local_proxy: JString,
 ) -> jboolean {
-    let mut state = match STATE.lock() {
+    let mut state = match STATE.write() {
         Ok(s) => s,
         Err(_) => return jni::sys::JNI_FALSE,
     };
@@ -116,25 +116,25 @@ pub extern "system" fn Java_net_ostp_client_OstpClientSdk_startClient(
     init_tracing();
 
     if let Ok(jvm) = env.get_java_vm() {
-        if let Ok(mut guard) = JVM.lock() {
+        if let Ok(mut guard) = JVM.write() {
             *guard = Some(jvm);
         }
     }
 
     if let Ok(cls) = env.find_class("net/ostp/client/OstpClientSdk") {
         if let Ok(global_cls) = env.new_global_ref(cls) {
-            if let Ok(mut guard) = CLASS_REF.lock() {
+            if let Ok(mut guard) = CLASS_REF.write() {
                 *guard = Some(global_cls);
             }
         }
     }
 
     ostp_client::bridge::set_socket_protector(|fd| {
-        let jvm_guard = match JVM.lock() {
+        let jvm_guard = match JVM.read() {
             Ok(g) => g,
             Err(_) => return false,
         };
-        let class_guard = match CLASS_REF.lock() {
+        let class_guard = match CLASS_REF.read() {
             Ok(g) => g,
             Err(_) => return false,
         };
@@ -346,12 +346,24 @@ pub extern "system" fn Java_net_ostp_client_OstpClientSdk_startClient(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_net_ostp_client_OstpClientSdk_stopClient(
+pub extern "system" fn Java_net_ostp_client_OstpClientSdk_startClient(
+    env: JNIEnv,
+    class: JClass,
+    config_json: JString,
+    fd: jni::sys::jint,
+    t2s_bin_path: JString,
+    local_proxy: JString,
+) -> jboolean {
+    Java_net_ostp_client_OstpClientSdk_nativeStartClient(env, class, config_json, fd, t2s_bin_path, local_proxy)
+}
+
+#[no_mangle]
+pub extern "system" fn Java_net_ostp_client_OstpClientSdk_nativeStopClient(
     _env: JNIEnv,
     _class: JClass,
 ) -> jboolean {
     let (tun_child, shutdown_tx, runtime) = {
-        let mut state = match STATE.lock() {
+        let mut state = match STATE.write() {
             Ok(s) => s,
             Err(_) => return jni::sys::JNI_FALSE,
         };
@@ -381,11 +393,19 @@ pub extern "system" fn Java_net_ostp_client_OstpClientSdk_stopClient(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_net_ostp_client_OstpClientSdk_getMetrics(
+pub extern "system" fn Java_net_ostp_client_OstpClientSdk_stopClient(
+    env: JNIEnv,
+    class: JClass,
+) -> jboolean {
+    Java_net_ostp_client_OstpClientSdk_nativeStopClient(env, class)
+}
+
+#[no_mangle]
+pub extern "system" fn Java_net_ostp_client_OstpClientSdk_nativeGetMetrics(
     env: JNIEnv,
     _class: JClass,
 ) -> jstring {
-    let state = match STATE.lock() {
+    let state = match STATE.read() {
         Ok(s) => s,
         Err(_) => return match env.new_string("{}") {
             Ok(s) => s.into_raw(),
@@ -415,11 +435,19 @@ pub extern "system" fn Java_net_ostp_client_OstpClientSdk_getMetrics(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_net_ostp_client_OstpClientSdk_getLogs(
+pub extern "system" fn Java_net_ostp_client_OstpClientSdk_getMetrics(
+    env: JNIEnv,
+    class: JClass,
+) -> jstring {
+    Java_net_ostp_client_OstpClientSdk_nativeGetMetrics(env, class)
+}
+
+#[no_mangle]
+pub extern "system" fn Java_net_ostp_client_OstpClientSdk_nativeGetLogs(
     env: JNIEnv,
     _class: JClass,
 ) -> jstring {
-    let logs_vec: Vec<String> = match LOGS.lock() {
+    let logs_vec: Vec<String> = match LOGS.write() {
         Ok(mut guard) => guard.drain(..).collect(),
         Err(_) => Vec::new(),
     };
@@ -433,6 +461,14 @@ pub extern "system" fn Java_net_ostp_client_OstpClientSdk_getLogs(
         Ok(s) => s.into_raw(),
         Err(_) => std::ptr::null_mut(),
     }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_net_ostp_client_OstpClientSdk_getLogs(
+    env: JNIEnv,
+    class: JClass,
+) -> jstring {
+    Java_net_ostp_client_OstpClientSdk_nativeGetLogs(env, class)
 }
 
 #[no_mangle]
@@ -454,7 +490,7 @@ pub extern "system" fn Java_net_ostp_client_OstpClientSdk_notifyNetworkChanged(
     _env: JNIEnv,
     _class: JClass,
 ) {
-    let state = match STATE.lock() {
+    let state = match STATE.read() {
         Ok(s) => s,
         Err(_) => return,
     };

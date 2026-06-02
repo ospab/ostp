@@ -310,7 +310,7 @@ fn check_token(state: &ApiState, headers: &axum::http::HeaderMap) -> bool {
     if let Some(value) = headers.get("authorization") {
         if let Ok(val) = value.to_str() {
             if let Some(token) = val.strip_prefix("Bearer ") {
-                let current_session = state.session_token.read().unwrap().clone();
+                let current_session = state.session_token.read().unwrap_or_else(|e| e.into_inner()).clone();
                 if let Some(session) = current_session {
                     if token == session {
                         allowed = true;
@@ -353,7 +353,7 @@ async fn handle_login(
 
     if hash_hex == state.password_hash {
         let token = uuid::Uuid::new_v4().to_string();
-        *state.session_token.write().unwrap() = Some(token.clone());
+        *state.session_token.write().unwrap_or_else(|e| e.into_inner()) = Some(token.clone());
         (StatusCode::OK, ApiResponse::success(LoginResponse { token }))
     } else {
         api_unauthorized::<LoginResponse>()
@@ -377,7 +377,7 @@ fn save_config_keys(state: &ApiState) -> Result<(), String> {
     let mut json_val: serde_json::Value = serde_json::from_str(&content_str)
         .map_err(|e| format!("failed to parse config JSON: {}", e))?;
 
-    let keys = state.access_keys.read().unwrap();
+    let keys = state.access_keys.read().unwrap_or_else(|e| e.into_inner());
     let mut access_keys_json = Vec::new();
     for (k, m) in keys.iter() {
         if m.name.is_none() && m.limit_bytes.is_none() {
@@ -511,8 +511,8 @@ async fn handle_status(
         return api_unauthorized::<ServerStatus>();
     }
 
-    let keys = state.access_keys.read().unwrap();
-    let stats = state.user_stats.read().unwrap();
+    let keys = state.access_keys.read().unwrap_or_else(|e| e.into_inner());
+    let stats = state.user_stats.read().unwrap_or_else(|e| e.into_inner());
     let online = stats.values()
         .filter(|us| {
             let total = us.bytes_up.load(Ordering::Relaxed) + us.bytes_down.load(Ordering::Relaxed);
@@ -538,8 +538,8 @@ async fn handle_list_users(
         return api_unauthorized::<Vec<UserStatsSnapshot>>();
     }
 
-    let keys = state.access_keys.read().unwrap();
-    let stats = state.user_stats.read().unwrap();
+    let keys = state.access_keys.read().unwrap_or_else(|e| e.into_inner());
+    let stats = state.user_stats.read().unwrap_or_else(|e| e.into_inner());
 
     let mut users: Vec<UserStatsSnapshot> = keys.iter().map(|(key, meta)| {
         if let Some(us) = stats.get(key) {
@@ -579,13 +579,13 @@ async fn handle_get_user(
         return api_unauthorized::<UserStatsSnapshot>();
     }
 
-    let keys = state.access_keys.read().unwrap();
+    let keys = state.access_keys.read().unwrap_or_else(|e| e.into_inner());
     let meta = match keys.get(&key) {
         Some(m) => m.clone(),
         None => return api_error("user not found"),
     };
 
-    let stats = state.user_stats.read().unwrap();
+    let stats = state.user_stats.read().unwrap_or_else(|e| e.into_inner());
     let snapshot = if let Some(us) = stats.get(&key) {
         UserStatsSnapshot {
             access_key: key.clone(),
@@ -628,11 +628,11 @@ async fn handle_create_user(
     });
 
     {
-        let mut keys = state.access_keys.write().unwrap();
+        let mut keys = state.access_keys.write().unwrap_or_else(|e| e.into_inner());
         keys.insert(key.clone(), UserMeta { name: body.name.clone(), limit_bytes: body.limit_bytes });
     }
 
-    let mut stats = state.user_stats.write().unwrap();
+    let mut stats = state.user_stats.write().unwrap_or_else(|e| e.into_inner());
     stats.insert(key.clone(), Arc::new(UserStats::new(body.limit_bytes)));
     drop(stats);
 
@@ -655,14 +655,14 @@ async fn delete_user(
     }
 
     {
-        let mut keys = state.access_keys.write().unwrap();
+        let mut keys = state.access_keys.write().unwrap_or_else(|e| e.into_inner());
         if keys.remove(&key).is_none() {
             return api_error::<String>("User not found");
         }
     }
 
     {
-        let mut stats = state.user_stats.write().unwrap();
+        let mut stats = state.user_stats.write().unwrap_or_else(|e| e.into_inner());
         stats.remove(&key);
     }
 
@@ -685,7 +685,7 @@ async fn update_user(
     }
 
     {
-        let mut keys = state.access_keys.write().unwrap();
+        let mut keys = state.access_keys.write().unwrap_or_else(|e| e.into_inner());
         if let Some(meta) = keys.get_mut(&key) {
             meta.name = body.name.clone();
             meta.limit_bytes = body.limit_bytes;
@@ -695,7 +695,7 @@ async fn update_user(
     }
 
     {
-        let mut stats = state.user_stats.write().unwrap();
+        let mut stats = state.user_stats.write().unwrap_or_else(|e| e.into_inner());
         let entry = stats.entry(key.clone())
             .or_insert_with(|| Arc::new(UserStats::new(body.limit_bytes)));
         
@@ -727,7 +727,7 @@ async fn handle_set_limit(
     }
 
     {
-        let mut keys = state.access_keys.write().unwrap();
+        let mut keys = state.access_keys.write().unwrap_or_else(|e| e.into_inner());
         if let Some(meta) = keys.get_mut(&key) {
             meta.limit_bytes = body.limit_bytes;
         } else {
@@ -735,7 +735,7 @@ async fn handle_set_limit(
         }
     }
 
-    let mut stats = state.user_stats.write().unwrap();
+    let mut stats = state.user_stats.write().unwrap_or_else(|e| e.into_inner());
     let entry = stats.entry(key.clone())
         .or_insert_with(|| Arc::new(UserStats::new(body.limit_bytes)));
 
@@ -765,7 +765,7 @@ async fn handle_reset_stats(
         return api_unauthorized::<bool>();
     }
 
-    let mut stats = state.user_stats.write().unwrap();
+    let mut stats = state.user_stats.write().unwrap_or_else(|e| e.into_inner());
     if let Some(us) = stats.get(&key) {
         let limit = us.limit_bytes;
         stats.insert(key.clone(), Arc::new(UserStats::new(limit)));
@@ -793,7 +793,7 @@ async fn handle_subscribe(
 
     // Validate that the key exists in a tightly scoped block to drop the guard
     let key_exists = {
-        let keys = state.access_keys.read().unwrap();
+        let keys = state.access_keys.read().unwrap_or_else(|e| e.into_inner());
         keys.contains_key(&key)
     };
 
