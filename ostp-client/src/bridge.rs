@@ -103,7 +103,7 @@ impl Bridge {
             stealth_sni: config.transport.stealth_sni.clone(),
             stealth_port: config.transport.stealth_port,
             wss: config.transport.wss,
-            mtu: config.ostp.mtu.saturating_sub(48).max(500),
+            mtu: config.ostp.mtu,
             reality_enabled: config.reality.enabled,
             reality_pbk: config.reality.pbk.clone(),
             reality_sid: config.reality.sid.clone(),
@@ -137,7 +137,7 @@ impl Bridge {
 
         let mut sessions_opt: Option<Vec<SessionState>> = None;
         let mut udp_rx_opt: Option<mpsc::Receiver<(usize, Bytes)>> = None;
-        let mut _proxy_guard: Option<crate::sysproxy::WindowsProxyGuard> = None;
+        let mut _proxy_guard: Option<crate::sysproxy::SystemProxyGuard> = None;
         let mut stream_map: std::collections::HashMap<u16, usize> = std::collections::HashMap::new();
 
         loop {
@@ -323,7 +323,7 @@ impl Bridge {
                                 self.last_valid_recv = Instant::now();
                                 
                                 let sys_proxy_addr = self.proxy_addr.replace("0.0.0.0:", "127.0.0.1:");
-                                _proxy_guard = Some(crate::sysproxy::WindowsProxyGuard::enable(&sys_proxy_addr));
+                                _proxy_guard = Some(crate::sysproxy::SystemProxyGuard::enable(&sys_proxy_addr));
 
                                 tx.send(UiEvent::Metrics {
                                     status: ConnectionStatus::Established,
@@ -936,7 +936,7 @@ impl Bridge {
         self.reality_enabled = cfg.reality.enabled;
         self.reality_pbk = cfg.reality.pbk.clone();
         self.reality_sid = cfg.reality.sid.clone();
-        self.mtu = cfg.ostp.mtu.saturating_sub(48).max(500); // Fix: mtu was never updated on hot-reload
+        self.mtu = cfg.ostp.mtu; // Fix: mtu was never updated on hot-reload
         self.keepalive_interval_sec = cfg.ostp.keepalive_interval_sec; // Fix: keepalive was never updated on hot-reload
     }
 
