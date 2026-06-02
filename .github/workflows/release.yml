@@ -275,6 +275,121 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+  build-linux-gui:
+    name: Build Linux GUI (Tauri) - ${{ matrix.arch }}
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - arch: amd64
+            target: x86_64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install Linux Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+
+      - name: Install Tauri CLI
+        run: npm install -g @tauri-apps/cli
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: cargo-linux-gui-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build Tauri App
+        working-directory: ostp-gui
+        run: |
+          npm install
+          npx tauri build --no-bundle --target ${{ matrix.target }}
+
+      - name: Package Portable Tarball
+        run: |
+          mkdir ostp-linux-gui-${{ matrix.arch }}
+          cp ostp-gui/src-tauri/target/${{ matrix.target }}/release/ostp-gui ostp-linux-gui-${{ matrix.arch }}/
+          tar -czf ostp-linux-gui-${{ matrix.arch }}.tar.gz ostp-linux-gui-${{ matrix.arch }}
+
+      - name: Upload to GitHub Release
+        if: ${{ startsWith(github.ref, 'refs/tags/') }}
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ostp-linux-gui-${{ matrix.arch }}.tar.gz
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  build-macos-gui:
+    name: Build macOS GUI (Tauri) - ${{ matrix.arch }}
+    runs-on: macos-latest
+    strategy:
+      matrix:
+        include:
+          - arch: amd64
+            target: x86_64-apple-darwin
+          - arch: arm64
+            target: aarch64-apple-darwin
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install Tauri CLI
+        run: npm install -g @tauri-apps/cli
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: cargo-macos-gui-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build Tauri App
+        working-directory: ostp-gui
+        run: |
+          npm install
+          npx tauri build --no-bundle --target ${{ matrix.target }}
+
+      - name: Package Portable Tarball
+        run: |
+          mkdir ostp-macos-gui-${{ matrix.arch }}
+          cp ostp-gui/src-tauri/target/${{ matrix.target }}/release/ostp-gui ostp-macos-gui-${{ matrix.arch }}/
+          tar -czf ostp-macos-gui-${{ matrix.arch }}.tar.gz ostp-macos-gui-${{ matrix.arch }}
+
+      - name: Upload to GitHub Release
+        if: ${{ startsWith(github.ref, 'refs/tags/') }}
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ostp-macos-gui-${{ matrix.arch }}.tar.gz
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
   build-android:
     name: Build Android Client (Flutter) - ${{ matrix.arch }}
     runs-on: ubuntu-latest
