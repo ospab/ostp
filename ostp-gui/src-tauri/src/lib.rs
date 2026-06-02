@@ -497,7 +497,7 @@ fn launch_as_admin(exe: &std::path::PathBuf, token: &str) -> anyhow::Result<()> 
     use std::ffi::OsStr;
     use std::os::windows::ffi::OsStrExt;
     use std::ptr::null_mut;
-    use std::path::Path;
+
     let exe_wstr: Vec<u16> = exe.as_os_str().encode_wide().chain(Some(0)).collect();
     let verb_wstr: Vec<u16> = OsStr::new("runas").encode_wide().chain(Some(0)).collect();
     let params_str = format!("--token {}", token);
@@ -525,7 +525,7 @@ pub fn run() {
         .setup(|app| {
             use tauri::menu::{Menu, MenuItem};
             use tauri::tray::{TrayIconBuilder, TrayIconEvent, MouseButton, MouseButtonState};
-            use tauri::Manager;
+            use tauri::{Manager, Emitter};
 
             let config_path = get_config_path();
             let mut masked_ip = String::from("0.0.0.0");
