@@ -389,6 +389,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1d07550c9036bf2ae0c684c4297d503f838287c83c53686d05370d0e139ae570"
 
 [[package]]
+name = "colored"
+version = "2.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "117725a109d387c937a1533ce01b450cbde6b88abceea8473c4d7a85853cda3c"
+dependencies = [
+ "lazy_static",
+ "windows-sys 0.52.0",
+]
+
+[[package]]
 name = "combine"
 version = "4.6.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1350,11 +1360,12 @@ checksum = "c08d65885ee38876c4f86fa503fb49d7b507c2b62552df7c70b2fce627e06381"
 
 [[package]]
 name = "ostp"
-version = "0.2.81"
+version = "0.2.82"
 dependencies = [
  "anyhow",
  "base64",
  "clap",
+ "colored",
  "json_comments",
  "ostp-client",
  "ostp-core",
@@ -1370,7 +1381,7 @@ dependencies = [
 
 [[package]]
 name = "ostp-client"
-version = "0.2.81"
+version = "0.2.82"
 dependencies = [
  "anyhow",
  "base64",
@@ -1401,7 +1412,7 @@ dependencies = [
 
 [[package]]
 name = "ostp-core"
-version = "0.2.81"
+version = "0.2.82"
 dependencies = [
  "anyhow",
  "bytes",
@@ -1435,7 +1446,7 @@ dependencies = [
 
 [[package]]
 name = "ostp-server"
-version = "0.2.81"
+version = "0.2.82"
 dependencies = [
  "anyhow",
  "axum",
@@ -1467,7 +1478,7 @@ dependencies = [
 
 [[package]]
 name = "ostp-tun-helper"
-version = "0.2.81"
+version = "0.2.82"
 dependencies = [
  "anyhow",
  "chrono",
