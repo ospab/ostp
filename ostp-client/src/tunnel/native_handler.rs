@@ -53,7 +53,8 @@ pub async fn run_native_tunnel(
         .next()
         .map(|a| a.ip())
         .ok_or_else(|| anyhow!("Could not resolve server host"))?;
-    let _server_ip_str = server_ip.to_string();
+    #[allow(unused_variables)]
+    let server_ip_str = server_ip.to_string();
 
     // ── 2. Windows: grab physical gateway BEFORE we touch any routes ──────────
     #[cfg(target_os = "windows")]
