@@ -376,7 +376,8 @@ export default function Clients() {
       {/* Share Connection Modal */}
       {showShareModal && sharingUser && (
         <ShareClientModal
-          user={sharingUser}
+          show={showShareModal}
+          sharingUser={sharingUser}
           shareLink={shareLink}
           isFetchingLink={isFetchingLink}
           qrCanvasRef={qrCanvasRef}

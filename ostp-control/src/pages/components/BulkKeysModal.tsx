@@ -1,6 +1,5 @@
 import React, { useState } from 'react';
 import { X, Copy, CheckCircle2, Zap } from 'lucide-react';
-import { useLanguage } from '../../lib/LanguageContext';
 
 interface BulkKeysModalProps {
   onClose: () => void;
@@ -8,7 +7,7 @@ interface BulkKeysModalProps {
 }
 
 export function BulkKeysModal({ onClose, onGenerate }: BulkKeysModalProps) {
-  const { t } = useLanguage();
+
   const [count, setCount] = useState<number>(10);
   const [limitGB, setLimitGB] = useState<string>('');
   const [loading, setLoading] = useState(false);
@@ -83,7 +82,7 @@ export function BulkKeysModal({ onClose, onGenerate }: BulkKeysModalProps) {
                 onClick={onClose}
                 className="flex-1 px-4 py-3 rounded-xl font-medium text-white hover:bg-white/5 transition-colors border border-white/10"
               >
-                {t('cancel')}
+                Cancel
               </button>
               <button
                 type="submit"

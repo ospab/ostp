@@ -1,12 +1,10 @@
-import React, { useState, useEffect } from 'react';
+import { useState, useEffect } from 'react';
 import { Route, Plus, Trash2, Save, Activity, ShieldAlert, ShieldCheck, HelpCircle } from 'lucide-react';
 import { api } from '../lib/api';
 import type { OutboundRule, OutboundAction } from '../lib/api';
-import { useLanguage } from '../lib/LanguageContext';
 import { addAuditLog } from '../lib/audit';
 
 export default function Routing() {
-  const { t } = useLanguage();
   const [rules, setRules] = useState<OutboundRule[]>([]);
   const [isLoading, setIsLoading] = useState(true);
   const [isSaving, setIsSaving] = useState(false);

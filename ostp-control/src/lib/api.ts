@@ -1,3 +1,5 @@
+import type { AuditLogEntry } from './audit';
+
 export interface UserStatsSnapshot {
   access_key: string;
   bytes_up: number;
