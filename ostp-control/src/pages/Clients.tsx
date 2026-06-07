@@ -1,10 +1,15 @@
 import { useState, useEffect, useRef } from 'react';
-import { Users, Plus, Key, Trash2, Edit2, Copy, Search, RefreshCw, X, Share2, ShieldAlert, Download } from 'lucide-react';
 import QRCode from 'qrcode';
+import { Users, Plus, Search, RefreshCw, ShieldAlert, Zap } from 'lucide-react';
 import { api } from '../lib/api';
 import type { UserStatsSnapshot } from '../lib/api';
 import { useLanguage } from '../lib/LanguageContext';
 import { addAuditLog } from '../lib/audit';
+import { AddClientModal } from './components/AddClientModal';
+import { EditClientModal } from './components/EditClientModal';
+import { ShareClientModal } from './components/ShareClientModal';
+import { ClientsTable } from './components/ClientsTable';
+import { BulkKeysModal } from './components/BulkKeysModal';
 
 export default function Clients() {
   const { t } = useLanguage();
@@ -16,6 +21,7 @@ export default function Clients() {
   
   // Modals state
   const [showAddModal, setShowAddModal] = useState(false);
+  const [showBulkModal, setShowBulkModal] = useState(false);
   const [showEditModal, setShowEditModal] = useState(false);
   const [showShareModal, setShowShareModal] = useState(false);
   
@@ -57,6 +63,27 @@ export default function Clients() {
     }, 5000);
     return () => clearInterval(interval);
   }, []);
+
+  const handleBulkGenerate = async (count: number, limitBytes: number | null): Promise<string[]> => {
+    try {
+      const keys = await api.bulkCreateUsers(count, limitBytes);
+      fetchUsers(false);
+      addAuditLog(
+        `Bulk generated ${count} keys`,
+        `Сгенерирован пакет из ${count} ключей`,
+        true
+      );
+      return keys;
+    } catch (err: any) {
+      setErrorMsg(err.message || 'Failed to bulk generate keys');
+      addAuditLog(
+        `Failed to bulk generate keys: ${err.message || err}`,
+        `Не удалось сгенерировать ключи: ${err.message || err}`,
+        false
+      );
+      throw err;
+    }
+  };
 
   const handleAddClient = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -267,6 +294,13 @@ export default function Clients() {
             <RefreshCw className={`w-5 h-5 ${isLoading ? 'animate-spin text-primary' : ''}`} />
           </button>
           <button 
+            onClick={() => setShowBulkModal(true)}
+            className="flex items-center gap-2 bg-secondary hover:bg-secondary/90 text-black px-4 py-2.5 rounded-xl font-medium transition-colors shadow-[0_0_15px_rgba(34,211,165,0.3)]"
+          >
+            <Zap className="w-5 h-5" />
+            <span className="hidden sm:inline">Bulk Gen</span>
+          </button>
+          <button 
             onClick={() => setShowAddModal(true)}
             className="flex items-center gap-2 bg-primary hover:bg-primary/90 text-white px-4 py-2.5 rounded-xl font-medium transition-colors shadow-[0_0_15px_rgba(108,114,255,0.3)]"
           >
@@ -297,332 +331,66 @@ export default function Clients() {
       </div>
 
       {/* Clients Table */}
-      <div className="glass-panel rounded-2xl overflow-hidden">
-        <div className="overflow-x-auto">
-          <table className="w-full text-left border-collapse">
-            <thead>
-              <tr className="border-b border-white/5 bg-white/[0.02]">
-                <th className="px-6 py-4 font-medium text-text-muted">{t('cl_status')}</th>
-                <th className="px-6 py-4 font-medium text-text-muted">{t('cl_name')}</th>
-                <th className="px-6 py-4 font-medium text-text-muted">{t('cl_key')}</th>
-                <th className="px-6 py-4 font-medium text-text-muted">{t('cl_usage')}</th>
-                <th className="px-6 py-4 font-medium text-text-muted">{t('cl_limit')}</th>
-                <th className="px-6 py-4 font-medium text-text-muted text-right">{t('cl_actions')}</th>
-              </tr>
-            </thead>
-            <tbody className="divide-y divide-white/5">
-              {filteredUsers.map((user) => (
-                <tr key={user.access_key} className="hover:bg-white/[0.02] transition-colors group">
-                  <td className="px-6 py-4">
-                    {user.online ? (
-                      <div className="flex items-center gap-2 text-secondary">
-                        <span className="w-2 h-2 rounded-full bg-secondary shadow-[0_0_8px_#22D3A5]"></span>
-                        <span className="text-sm font-medium">{t('cl_active')}</span>
-                      </div>
-                    ) : (
-                      <div className="flex items-center gap-2 text-text-muted">
-                        <span className="w-2 h-2 rounded-full bg-text-muted"></span>
-                        <span className="text-sm">{t('cl_offline')}</span>
-                      </div>
-                    )}
-                  </td>
-                  <td className="px-6 py-4 font-medium text-white">
-                    {user.name || (
-                      <span className="text-text-muted italic">{t('cl_unnamed')}</span>
-                    )}
-                  </td>
-                  <td className="px-6 py-4">
-                    <div className="flex items-center gap-2 text-text-muted font-mono text-sm">
-                      <Key className="w-4 h-4 shrink-0 text-primary/70" />
-                      <span title={user.access_key}>
-                        {user.access_key.length > 20 ? `${user.access_key.substring(0, 16)}...` : user.access_key}
-                      </span>
-                    </div>
-                  </td>
-                  <td className="px-6 py-4">
-                    <div className="flex flex-col gap-0.5">
-                      <div className="flex items-center gap-2 text-sm text-white">
-                        <span className="text-xs text-text-muted w-8">Up:</span>
-                        <span className="text-red-400 font-mono">{formatBytes(user.bytes_up || 0)}</span>
-                      </div>
-                      <div className="flex items-center gap-2 text-sm text-white">
-                        <span className="text-xs text-text-muted w-8">Down:</span>
-                        <span className="text-secondary font-mono">{formatBytes(user.bytes_down || 0)}</span>
-                      </div>
-                      <div className="flex items-center gap-2 text-xs text-text-muted mt-0.5">
-                        <span>Sessions:</span>
-                        <span className="font-mono text-white">{user.connections}</span>
-                      </div>
-                    </div>
-                  </td>
-                  <td className="px-6 py-4">
-                    <div className="text-sm font-mono text-text-muted">
-                      {user.limit_bytes ? (
-                        <span className={(user.bytes_up || 0) + (user.bytes_down || 0) >= user.limit_bytes ? 'text-red-400 font-bold' : 'text-white'}>
-                          {formatBytes(user.limit_bytes)}
-                        </span>
-                      ) : (
-                        t('cl_unlimited')
-                      )}
-                    </div>
-                  </td>
-                  <td className="px-6 py-4 text-right">
-                    <div className="flex items-center justify-end gap-1 sm:opacity-0 group-hover:opacity-100 transition-opacity">
-                      <button 
-                        onClick={() => handleOpenShare(user)}
-                        className="p-2 hover:bg-white/10 rounded-lg text-text-muted hover:text-white transition-colors"
-                        title="Get Share Connection Link"
-                      >
-                        <Share2 className="w-4 h-4" />
-                      </button>
-                      <button 
-                        onClick={() => handleResetStats(user.access_key)}
-                        className="p-2 hover:bg-white/10 rounded-lg text-text-muted hover:text-yellow-400 transition-colors"
-                        title="Reset Traffic Counters"
-                      >
-                        <RefreshCw className="w-4 h-4" />
-                      </button>
-                      <button 
-                        onClick={() => openEditModal(user)}
-                        className="p-2 hover:bg-white/10 rounded-lg text-text-muted hover:text-white transition-colors"
-                        title="Edit Client Description/Limit"
-                      >
-                        <Edit2 className="w-4 h-4" />
-                      </button>
-                      <button 
-                        onClick={() => handleDeleteClient(user.access_key)}
-                        className="p-2 hover:bg-red-500/20 rounded-lg text-text-muted hover:text-red-400 transition-colors"
-                        title="Delete Client"
-                      >
-                        <Trash2 className="w-4 h-4" />
-                      </button>
-                    </div>
-                  </td>
-                </tr>
-              ))}
-              
-              {filteredUsers.length === 0 && !isLoading && (
-                <tr>
-                  <td colSpan={6} className="px-6 py-12 text-center text-text-muted">
-                    <Users className="w-12 h-12 mx-auto mb-4 opacity-20" />
-                    <p>No clients found matching query.</p>
-                  </td>
-                </tr>
-              )}
-            </tbody>
-          </table>
-        </div>
-      </div>
+      <ClientsTable
+        users={filteredUsers}
+        isLoading={isLoading}
+        formatBytes={formatBytes}
+        handleOpenShare={handleOpenShare}
+        handleResetStats={handleResetStats}
+        openEditModal={openEditModal}
+        handleDeleteClient={handleDeleteClient}
+      />
 
       {/* Add Client Modal */}
-      {showAddModal && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm">
-          <div className="glass-panel w-full max-w-md rounded-2xl p-6 space-y-4 relative animate-in fade-in zoom-in-95 duration-200">
-            <button 
-              onClick={() => setShowAddModal(false)}
-              className="absolute top-4 right-4 p-1 rounded-lg hover:bg-white/10 text-text-muted hover:text-white transition-colors"
-            >
-              <X className="w-5 h-5" />
-            </button>
-            <h2 className="text-xl font-bold text-white">{t('cl_add_title')}</h2>
-            
-            <form onSubmit={handleAddClient} className="space-y-4">
-              <div className="space-y-1">
-                <label className="text-xs font-semibold text-text-muted uppercase">{t('cl_form_name')}</label>
-                <input
-                  type="text"
-                  className="w-full bg-white/5 border border-white/10 rounded-xl px-4 py-2.5 text-white placeholder-text-muted focus:outline-none focus:border-primary transition-colors"
-                  placeholder="e.g. My Phone, Home Laptop"
-                  value={clientName}
-                  onChange={(e) => setClientName(e.target.value)}
-                />
-              </div>
-
-              <div className="space-y-1">
-                <label className="text-xs font-semibold text-text-muted uppercase">{t('cl_form_limit')}</label>
-                <div className="flex gap-2">
-                  <input
-                    type="number"
-                    className="w-full bg-white/5 border border-white/10 rounded-xl px-4 py-2.5 text-white placeholder-text-muted focus:outline-none focus:border-primary transition-colors font-mono"
-                    placeholder={t('cl_form_limit_sub')}
-                    value={clientLimit}
-                    onChange={(e) => setClientLimit(e.target.value)}
-                  />
-                  <select
-                    className="bg-surface-light border border-white/10 rounded-xl px-3 py-2 text-white focus:outline-none focus:border-primary"
-                    value={clientLimitUnit}
-                    onChange={(e) => setClientLimitUnit(e.target.value)}
-                  >
-                    <option value="MB">MB</option>
-                    <option value="GB">GB</option>
-                    <option value="TB">TB</option>
-                  </select>
-                </div>
-              </div>
-
-              <div className="space-y-1">
-                <label className="text-xs font-semibold text-text-muted uppercase">{t('cl_form_custom')}</label>
-                <input
-                  type="text"
-                  className="w-full bg-white/5 border border-white/10 rounded-xl px-4 py-2.5 text-white placeholder-text-muted focus:outline-none focus:border-primary transition-colors font-mono"
-                  placeholder={t('cl_form_custom_sub')}
-                  value={clientCustomKey}
-                  onChange={(e) => setClientCustomKey(e.target.value)}
-                />
-              </div>
-
-              <button
-                type="submit"
-                className="w-full bg-primary hover:bg-primary/90 text-white py-2.5 rounded-xl font-medium transition-colors mt-2 shadow-[0_0_15px_rgba(108,114,255,0.3)]"
-              >
-                {t('cl_add')}
-              </button>
-            </form>
-          </div>
-        </div>
-      )}
+      <AddClientModal
+        show={showAddModal}
+        onClose={() => setShowAddModal(false)}
+        onSubmit={handleAddClient}
+        clientName={clientName}
+        setClientName={setClientName}
+        clientLimit={clientLimit}
+        setClientLimit={setClientLimit}
+        clientLimitUnit={clientLimitUnit}
+        setClientLimitUnit={setClientLimitUnit}
+        clientCustomKey={clientCustomKey}
+        setClientCustomKey={setClientCustomKey}
+      />
 
       {/* Edit Client Modal */}
-      {showEditModal && editingUser && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm">
-          <div className="glass-panel w-full max-w-md rounded-2xl p-6 space-y-4 relative animate-in fade-in zoom-in-95 duration-200">
-            <button 
-              onClick={() => {
-                setShowEditModal(false);
-                setEditingUser(null);
-              }}
-              className="absolute top-4 right-4 p-1 rounded-lg hover:bg-white/10 text-text-muted hover:text-white transition-colors"
-            >
-              <X className="w-5 h-5" />
-            </button>
-            <h2 className="text-xl font-bold text-white">{t('cl_edit_title')}</h2>
-            
-            <form onSubmit={handleEditClient} className="space-y-4">
-              <div className="space-y-1">
-                <label className="text-xs font-semibold text-text-muted uppercase">{t('cl_form_name')}</label>
-                <input
-                  type="text"
-                  className="w-full bg-white/5 border border-white/10 rounded-xl px-4 py-2.5 text-white placeholder-text-muted focus:outline-none focus:border-primary transition-colors"
-                  placeholder="e.g. My Phone, Home Laptop"
-                  value={editName}
-                  onChange={(e) => setEditName(e.target.value)}
-                />
-              </div>
-
-              <div className="space-y-1">
-                <label className="text-xs font-semibold text-text-muted uppercase">{t('cl_form_limit')}</label>
-                <div className="flex gap-2">
-                  <input
-                    type="number"
-                    className="w-full bg-white/5 border border-white/10 rounded-xl px-4 py-2.5 text-white placeholder-text-muted focus:outline-none focus:border-primary transition-colors font-mono"
-                    placeholder={t('cl_form_limit_sub')}
-                    value={editLimit}
-                    onChange={(e) => setEditLimit(e.target.value)}
-                  />
-                  <select
-                    className="bg-surface-light border border-white/10 rounded-xl px-3 py-2 text-white focus:outline-none focus:border-primary"
-                    value={editLimitUnit}
-                    onChange={(e) => setEditLimitUnit(e.target.value)}
-                  >
-                    <option value="MB">MB</option>
-                    <option value="GB">GB</option>
-                    <option value="TB">TB</option>
-                  </select>
-                </div>
-              </div>
-
-              <div className="text-xs text-text-muted font-mono truncate">
-                Access Key: {editingUser.access_key}
-              </div>
-
-              <button
-                type="submit"
-                className="w-full bg-primary hover:bg-primary/90 text-white py-2.5 rounded-xl font-medium transition-colors mt-2 shadow-[0_0_15px_rgba(108,114,255,0.3)]"
-              >
-                {t('cl_form_save')}
-              </button>
-            </form>
-          </div>
-        </div>
-      )}
+      <EditClientModal
+        show={showEditModal}
+        onClose={() => {
+          setShowEditModal(false);
+          setEditingUser(null);
+        }}
+        onSubmit={handleEditClient}
+        editingUser={editingUser}
+        editName={editName}
+        setEditName={setEditName}
+        editLimit={editLimit}
+        setEditLimit={setEditLimit}
+        editLimitUnit={editLimitUnit}
+        setEditLimitUnit={setEditLimitUnit}
+      />
 
       {/* Share Connection Modal */}
       {showShareModal && sharingUser && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm">
-          <div className="glass-panel w-full max-w-lg rounded-2xl relative animate-in fade-in zoom-in-95 duration-200 flex flex-col" style={{ maxHeight: '90vh' }}>
-            {/* Sticky header */}
-            <div className="flex items-start justify-between p-6 pb-4 shrink-0">
-              <div>
-                <h2 className="text-xl font-bold text-white">{t('cl_share_title')}</h2>
-                <p className="text-sm text-text-muted mt-0.5">{t('cl_share_sub')}</p>
-              </div>
-              <button 
-                onClick={() => {
-                  setShowShareModal(false);
-                  setSharingUser(null);
-                }}
-                className="ml-4 shrink-0 p-1.5 rounded-lg hover:bg-white/10 text-text-muted hover:text-white transition-colors"
-              >
-                <X className="w-5 h-5" />
-              </button>
-            </div>
+        <ShareClientModal
+          user={sharingUser}
+          shareLink={shareLink}
+          isFetchingLink={isFetchingLink}
+          qrCanvasRef={qrCanvasRef}
+          onClose={() => setShowShareModal(false)}
+          downloadQr={downloadQr}
+          copyToClipboard={copyToClipboard}
+        />
+      )}
 
-            {/* Scrollable body */}
-            <div className="overflow-y-auto px-6 pb-6 space-y-4">
-              <div className="space-y-1.5">
-                <label className="text-xs font-semibold text-text-muted uppercase">{t('cl_name')}</label>
-                <div className="text-white font-medium">{sharingUser.name || t('cl_unnamed')}</div>
-              </div>
-
-              <div className="space-y-2">
-                <label className="text-xs font-semibold text-text-muted uppercase">{t('cl_share_link')}</label>
-                {isFetchingLink ? (
-                  <div className="bg-white/5 border border-white/10 rounded-xl p-4 flex items-center justify-center">
-                    <RefreshCw className="w-6 h-6 animate-spin text-primary mr-2" />
-                    <span className="text-sm text-text-muted">Generating link...</span>
-                  </div>
-                ) : (
-                  <div className="flex gap-2">
-                    <input
-                      type="text"
-                      readOnly
-                      className="w-full bg-white/5 border border-white/10 rounded-xl px-4 py-2.5 text-white font-mono text-xs select-all focus:outline-none"
-                      value={shareLink}
-                    />
-                    <button
-                      onClick={() => copyToClipboard(shareLink)}
-                      className="p-2.5 bg-primary hover:bg-primary/90 text-white rounded-xl transition-colors shrink-0"
-                      title="Copy Link"
-                    >
-                      <Copy className="w-5 h-5" />
-                    </button>
-                  </div>
-                )}
-              </div>
-
-              {/* QR Code — compact, side layout */}
-              {!isFetchingLink && shareLink && (
-                <div className="flex items-center gap-4 p-3 rounded-xl border border-white/10" style={{ background: 'linear-gradient(135deg, rgba(108,114,255,0.10) 0%, rgba(34,211,165,0.07) 100%)' }}>
-                  <div className="shrink-0" style={{ background: 'rgba(0,0,0,0.3)', borderRadius: '0.5rem', padding: '8px' }}>
-                    <canvas ref={qrCanvasRef} style={{ display: 'block', borderRadius: '4px' }} />
-                  </div>
-                  <div className="flex flex-col gap-2 min-w-0">
-                    <p className="text-xs text-text-muted leading-snug">{t('cl_share_scan')}</p>
-                    <button
-                      onClick={downloadQr}
-                      className="flex items-center gap-2 px-3 py-1.5 bg-white/5 hover:bg-white/10 border border-white/10 text-white text-xs rounded-lg transition-colors w-fit"
-                    >
-                      <Download className="w-3.5 h-3.5" />
-                      {t('cl_share_download_qr')}
-                    </button>
-                  </div>
-                </div>
-              )}
-
-
-            </div>
-          </div>
-        </div>
+      {showBulkModal && (
+        <BulkKeysModal
+          onClose={() => setShowBulkModal(false)}
+          onGenerate={handleBulkGenerate}
+        />
       )}
     </div>
   );

@@ -57,5 +57,30 @@
     "sid": "960223edfa174fc5",
     "sni_list": ["www.microsoft.com"]
   },
-  "debug": false
+  "debug": false,
+
+  // Встроенный DNS-сервер
+  "dns": {
+    // Полный режим: кастомные домены + AdBlock списки + DoH форвардинг
+    "enabled": false,
+    // Перехватывать весь UDP-трафик к порту 53 и резолвить через DoH
+    // (работает даже если enabled=false, предотвращает DNS-утечки через сервер)
+    "intercept_all_port53": false,
+    // УДП порт встроенного DNS (клиент может указать <server_ip>:50053 как DNS)
+    "local_port": 50053,
+    // DoH вверх: Cloudflare, Google, NextDNS и др.
+    "doh_upstream": "https://cloudflare-dns.com/dns-query",
+    // "doh_upstream": "https://dns.google/dns-query",
+    // "doh_upstream": "https://dns10.quad9.net/dns-query",
+    // Списки доменов для блокировки (формат: hosts-файл, ||domain^, один домен на строку)
+    "adblock_urls": [
+      // "https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts",
+      // "https://adguardteam.github.io/AdGuardSDNSFilter/Filters/filter.txt"
+    ],
+    // Кастомные домены: отвечаем A-записью напрямую (не через DoH)
+    "custom_domains": {
+      // "myserver.internal": "10.0.0.1",
+      // "home.local": "192.168.1.100"
+    }
+  }
 }

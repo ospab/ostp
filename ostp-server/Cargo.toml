@@ -30,3 +30,4 @@ simple-dns = "0.11.3"
 hex = "0.4.3"
 chacha20poly1305.workspace = true
 x25519-dalek = { version = "2.0.1", features = ["static_secrets"] }
+chrono = "0.4.44"

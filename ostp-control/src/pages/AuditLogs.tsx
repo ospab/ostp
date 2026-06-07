@@ -8,8 +8,9 @@ export default function AuditLogs() {
   const { t, language } = useLanguage();
   const [logs, setLogs] = useState<AuditLogEntry[]>([]);
 
-  const loadLogs = () => {
-    setLogs(getAuditLogs());
+  const loadLogs = async () => {
+    const data = await getAuditLogs();
+    setLogs(data);
   };
 
   useEffect(() => {
@@ -22,9 +23,9 @@ export default function AuditLogs() {
     };
   }, []);
 
-  const handleClear = () => {
+  const handleClear = async () => {
     if (confirm(language === 'ru' ? 'Очистить журнал действий?' : 'Clear audit log history?')) {
-      clearAuditLogs();
+      await clearAuditLogs();
     }
   };
 

@@ -6,6 +6,15 @@ export interface UserStatsSnapshot {
   limit_bytes: number | null;
   online: boolean;
   name?: string | null;
+  last_seen?: number | null;
+}
+
+export type OutboundAction = 'proxy' | 'direct' | 'block';
+
+export interface OutboundRule {
+  domain_suffix: string[];
+  ip_cidr: string[];
+  action: OutboundAction;
 }
 
 export interface ServerStatus {
@@ -154,4 +163,15 @@ export const api = {
   refreshDnsBlocklists: () => request<boolean>('/api/dns/blocklists/refresh', {
     method: 'POST',
   }),
+
+  getAuditLogs: () => request<AuditLogEntry[]>('/api/audit'),
+  createAuditLog: (eventEn: string, eventRu: string, success: boolean) => 
+    request<void>('/api/audit', { method: 'POST', body: JSON.stringify({ eventEn, eventRu, success }) }),
+  clearAuditLogs: () => request<void>('/api/audit', { method: 'DELETE' }),
+
+  bulkCreateUsers: (count: number, limit_bytes: number | null) => 
+    request<string[]>('/api/users/bulk', { method: 'POST', body: JSON.stringify({ count, limit_bytes }) }),
+    
+  getRouterRules: () => request<OutboundRule[]>('/api/router/rules'),
+  updateRouterRules: (rules: OutboundRule[]) => request<boolean>('/api/router/rules', { method: 'PUT', body: JSON.stringify(rules) }),
 };

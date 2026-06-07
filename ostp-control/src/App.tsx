@@ -1,5 +1,5 @@
 import { HashRouter as Router, Routes, Route, Link, Navigate, useLocation } from 'react-router-dom';
-import { Activity, Users, Settings, Shield, MoreVertical, RefreshCw, BookOpen, Wrench, History, Globe, LogOut } from 'lucide-react';
+import { Activity, Users, Settings, Shield, MoreVertical, RefreshCw, BookOpen, Wrench, History, Globe, LogOut, Route as RouteIcon } from 'lucide-react';
 import { useState, useEffect } from 'react';
 import type { ReactNode } from 'react';
 
@@ -12,6 +12,7 @@ import Tools from './pages/Tools';
 import AuditLogs from './pages/AuditLogs';
 import Login from './pages/Login';
 import Dns from './pages/Dns';
+import Routing from './pages/Routing';
 
 // State and Context
 import { api } from './lib/api';
@@ -77,6 +78,10 @@ function MainLayout() {
             <Link to="/wiki" className="flex items-center gap-3 px-3 py-3 rounded-xl hover:bg-white/5 transition-colors text-text-muted hover:text-white">
               <BookOpen className="w-5 h-5 text-blue-400" />
               {isSidebarOpen && <span>{t('sidebar_wiki')}</span>}
+            </Link>
+            <Link to="/routing" className="flex items-center gap-3 px-3 py-3 rounded-xl hover:bg-white/5 transition-colors text-text-muted hover:text-white">
+              <RouteIcon className="w-5 h-5 text-orange-400" />
+              {isSidebarOpen && <span>Routing</span>}
             </Link>
             <Link to="/dns" className="flex items-center gap-3 px-3 py-3 rounded-xl hover:bg-white/5 transition-colors text-text-muted hover:text-white">
               <Globe className="w-5 h-5 text-emerald-400" />
@@ -147,6 +152,7 @@ function MainLayout() {
               <Route path="/clients" element={<Clients />} />
               <Route path="/settings" element={<SettingsPage />} />
               <Route path="/wiki" element={<Wiki />} />
+              <Route path="/routing" element={<Routing />} />
               <Route path="/tools" element={<Tools />} />
               <Route path="/dns" element={<Dns />} />
               <Route path="/logs" element={<AuditLogs />} />

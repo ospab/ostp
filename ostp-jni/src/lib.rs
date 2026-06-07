@@ -212,6 +212,9 @@ pub extern "system" fn Java_net_ostp_client_OstpClientSdk_nativeStartClient(
     let (cmd_tx, cmd_rx) = mpsc::channel(128);
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let proxy_shutdown_rx = shutdown_tx.subscribe();
+    
+    // Create exclusions channel
+    let (_, exclusions_rx) = watch::channel(config.exclusions.clone());
 
     let metrics_clone = Arc::clone(&metrics);
 
@@ -225,7 +228,7 @@ pub extern "system" fn Java_net_ostp_client_OstpClientSdk_nativeStartClient(
         tunnel::run_local_proxy(
             config_proxy.local_proxy,
             config_proxy.ostp,
-            config_proxy.exclusions,
+            exclusions_rx,
             config_proxy.debug,
             proxy_shutdown_rx,
             proxy_events_tx,

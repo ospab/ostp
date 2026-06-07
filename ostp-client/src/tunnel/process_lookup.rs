@@ -1,6 +1,6 @@
 #[cfg(target_os = "windows")]
 pub fn get_process_name_from_port(port: u16) -> Option<String> {
-    use winapi::shared::minwindef::{DWORD, ULONG};
+    use winapi::shared::minwindef::ULONG;
     use winapi::shared::winerror::ERROR_INSUFFICIENT_BUFFER;
     use winapi::um::iphlpapi::GetExtendedTcpTable;
     use winapi::shared::tcpmib::{MIB_TCPTABLE_OWNER_PID, MIB_TCPROW_OWNER_PID};
@@ -37,6 +37,54 @@ pub fn get_process_name_from_port(port: u16) -> Option<String> {
             for i in 0..tcp_table.dwNumEntries {
                 let row = &*row_ptr.add(i as usize);
                 // Local port is in network byte order
+                let local_port = u16::from_be(row.dwLocalPort as u16);
+                if local_port == port {
+                    return get_process_name_from_pid(row.dwOwningPid);
+                }
+            }
+        }
+    }
+    None
+}
+
+#[cfg(target_os = "windows")]
+pub fn get_process_name_from_port_udp(port: u16) -> Option<String> {
+    use winapi::shared::minwindef::ULONG;
+    use winapi::shared::winerror::ERROR_INSUFFICIENT_BUFFER;
+    use winapi::um::iphlpapi::GetExtendedUdpTable;
+    use winapi::shared::udpmib::{MIB_UDPTABLE_OWNER_PID, MIB_UDPROW_OWNER_PID};
+
+    let mut size: ULONG = 0;
+    let table_class = 1; // UDP_TABLE_OWNER_PID
+    let mut table = vec![0u8; 1024];
+
+    unsafe {
+        let mut ret = GetExtendedUdpTable(
+            table.as_mut_ptr() as *mut _,
+            &mut size,
+            0,
+            2, // AF_INET
+            table_class,
+            0,
+        );
+
+        if ret == ERROR_INSUFFICIENT_BUFFER {
+            table.resize(size as usize, 0);
+            ret = GetExtendedUdpTable(
+                table.as_mut_ptr() as *mut _,
+                &mut size,
+                0,
+                2, // AF_INET
+                table_class,
+                0,
+            );
+        }
+
+        if ret == 0 {
+            let udp_table = &*(table.as_ptr() as *const MIB_UDPTABLE_OWNER_PID);
+            let row_ptr = &udp_table.table[0] as *const MIB_UDPROW_OWNER_PID;
+            for i in 0..udp_table.dwNumEntries {
+                let row = &*row_ptr.add(i as usize);
                 let local_port = u16::from_be(row.dwLocalPort as u16);
                 if local_port == port {
                     return get_process_name_from_pid(row.dwOwningPid);
@@ -139,4 +187,9 @@ pub fn get_process_name_from_port(port: u16) -> Option<String> {
 #[cfg(not(any(target_os = "windows", target_os = "linux")))]
 pub fn get_process_name_from_port(_port: u16) -> Option<String> {
     None
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn get_process_name_from_port_udp(port: u16) -> Option<String> {
+    get_process_name_from_port(port)
 }

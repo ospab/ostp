@@ -9,7 +9,7 @@
     <application
         android:label="ostp_client"
         android:name="${applicationName}"
-        android:icon="@mipmap/ic_launcher"
+        android:icon="@mipmap/launcher_icon"
         android:extractNativeLibs="true">
         <activity
             android:name=".MainActivity"
@@ -51,7 +51,7 @@
         <!-- Quick Settings Tile -->
         <service
             android:name=".OstpTileService"
-            android:icon="@mipmap/ic_launcher"
+            android:icon="@mipmap/launcher_icon"
             android:label="OSTP VPN"
             android:permission="android.permission.BIND_QUICK_SETTINGS_TILE"
             android:exported="true">

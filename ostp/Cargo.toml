@@ -19,3 +19,4 @@ url = "2.5"
 tracing.workspace = true
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 ostp-core = { version = "0.2.68", path = "../ostp-core" }
+colored = "2.1"

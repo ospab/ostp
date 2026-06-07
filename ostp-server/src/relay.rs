@@ -8,7 +8,6 @@ use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 
 use crate::dispatcher::Dispatcher;
-use crate::outbound::{self, OutboundConfig};
 use crate::{RemoteState, UiEvent};
 
 pub async fn handle_relay_message(
@@ -23,15 +22,13 @@ pub async fn handle_relay_message(
     stream_tx: mpsc::UnboundedSender<(u32, u16, Vec<u8>)>,
     udp_reply_tx: mpsc::UnboundedSender<(u32, u16, String, Vec<u8>)>,
     connect_tx: mpsc::UnboundedSender<(u32, u16, String, Result<(tokio::net::tcp::OwnedWriteHalf, mpsc::Sender<()>), String>)>,
-    outbound_cfg: Option<OutboundConfig>,
-    dns_server: std::sync::Arc<crate::dns::DnsServer>,
-    debug: bool,
+    router: std::sync::Arc<crate::router::Router>,
     tcp_map: &std::sync::Arc<tokio::sync::RwLock<HashMap<std::net::SocketAddr, tokio::sync::mpsc::Sender<Bytes>>>>,
 ) -> Result<()> {
     match RelayMessage::decode(&payload)? {
         RelayMessage::Connect(target) => {
             // DNS interception disabled for stability
-            let is_internal_dns = false;
+            let _is_internal_dns = false;
 
             let mut connect_target = target.clone();
             if connect_target.starts_with("10.1.0.1:") {
@@ -41,9 +38,9 @@ pub async fn handle_relay_message(
             let target_clone = connect_target.clone();
             let connect_tx_clone = connect_tx.clone();
             let stream_tx_clone = stream_tx.clone();
-            let outbound_clone = outbound_cfg.clone();
+            let router_clone = router.clone();
             tokio::spawn(async move {
-                let stream_res = outbound::connect_target(&target_clone, outbound_clone.as_ref(), debug).await;
+                let stream_res = router_clone.route_tcp(&target_clone).await;
                 match stream_res {
                     Ok(stream) => {
                         let (mut reader, writer) = stream.into_split();
@@ -100,7 +97,7 @@ pub async fn handle_relay_message(
         }
         RelayMessage::Pong(_) => {}
         RelayMessage::UdpAssociate => {
-            if debug {
+            if router.debug {
                 let _ = ui_event_tx.send(UiEvent::Log(format!("Relay UDP ASSOCIATE stream_id={stream_id}")));
             }
             let udp_bind_result = match UdpSocket::bind("[::]:0").await {
@@ -121,9 +118,9 @@ pub async fn handle_relay_message(
 
             // Outbound UDP loop (tunnel -> target)
             let tx_sock = server_udp.clone();
-            let dns_srv = dns_server.clone();
-            let udp_reply_clone_dns = udp_reply_tx.clone();
-            let client_ip = peer_addr.ip();
+            let _dns_srv = router.dns_server.clone();
+            let _udp_reply_clone_dns = udp_reply_tx.clone();
+            let _client_ip = peer_addr.ip();
             tokio::spawn(async move {
                 while let Some((target, data)) = udp_rx.recv().await {
                     let mut forward_target = target.clone();
@@ -175,6 +172,41 @@ pub async fn handle_relay_message(
         }
         RelayMessage::UdpData(target, data) => {
             if let Some(remote) = remotes.get_mut(&(session_id, stream_id)) {
+                // Если целевой порт 53 — пробуем перехватить через встроенный DNS
+                if target.ends_with(":53") {
+                    let should_intercept = {
+                        let cfg = router.dns_server.config.read().await;
+                        cfg.enabled || cfg.intercept_all_port53
+                    };
+
+                    if should_intercept {
+                        match router.route_dns(peer_addr.ip(), &data).await {
+                            Some(response) => {
+                                let _ = udp_reply_tx.send((session_id, stream_id, target, response));
+                                return Ok(());
+                            }
+                            None => {
+                                // route_dns вернул None — значит DoH упал и enabled=true
+                                // в режиме перехвата уже вернул SERVFAIL
+                                // просто блокируем, не пускаем к 8.8.8.8 с IP сервера
+                                if router.debug {
+                                    let _ = ui_event_tx.send(UiEvent::Log(format!(
+                                        "DNS [{session_id}:{stream_id}] DoH failed for {target}, dropping (intercept=true)"
+                                    )));
+                                }
+                                return Ok(());
+                            }
+                        }
+                    } else {
+                        // intercept отключён: forward как обычный UDP
+                        if router.debug {
+                            let _ = ui_event_tx.send(UiEvent::Log(format!(
+                                "DNS [{session_id}:{stream_id}] passthrough to {target} (intercept disabled)"
+                            )));
+                        }
+                    }
+                }
+
                 if let Some(ref udp_tx) = remote.udp_tx {
                     let _ = udp_tx.send((target, Bytes::from(data)));
                 }

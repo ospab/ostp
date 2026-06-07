@@ -2,13 +2,13 @@
 
 [Русский язык](README.ru.md) · [Wiki](https://github.com/ospab/ostp/wiki) · [Contributing](CONTRIBUTING.md) · [Releases](https://github.com/ospab/ostp/releases)
 
-![GitHub Release](https://img.shields.io/github/v/release/ospab/ostp?style=flat-square&color=blue)
-![License: BSL 1.1](https://img.shields.io/badge/License-BSL%201.1-orange.svg?style=flat-square)
-![Platform: Windows | Linux | macOS | Android](https://img.shields.io/badge/Platform-Windows%20%7C%20Linux%20%7C%20macOS%20%7C%20Android-green.svg?style=flat-square)
-![Crypto](https://img.shields.io/badge/Crypto-Noise__NNpsk0-blueviolet?style=flat-square)
-![Transport](https://img.shields.io/badge/Transport-UDP%20ARQ-informational?style=flat-square)
+![GitHub Release](https://img.shields.io/github/v/release/ospab/ostp?style=for-the-badge&color=blue)
+![License: BSL 1.1](https://img.shields.io/badge/License-BSL%201.1-orange.svg?style=for-the-badge)
+![Platform: Windows | Linux | macOS | Android](https://img.shields.io/badge/Platform-Windows%20%7C%20Linux%20%7C%20macOS%20%7C%20Android-green.svg?style=for-the-badge)
+![Crypto](https://img.shields.io/badge/Crypto-Noise__NNpsk0-blueviolet?style=for-the-badge)
+![Transport](https://img.shields.io/badge/Transport-UDP%20ARQ-informational?style=for-the-badge)
 
-**OSTP** is a high-performance, censorship-resistant transport protocol designed to tunnel TCP traffic over UDP with full traffic obfuscation. Every byte on the wire — including packet headers — is cryptographically indistinguishable from random noise. Resistant to Deep Packet Inspection (DPI), active probing, and statistical traffic analysis.
+**OSTP** (Ospab Stealth Transport Protocol) is a high-performance, censorship-resistant transport protocol designed to tunnel TCP traffic over UDP with full traffic obfuscation. Every byte on the wire — including packet headers — is cryptographically indistinguishable from random noise. Resistant to Deep Packet Inspection (DPI), active probing, and statistical traffic analysis.
 
 ---
 
@@ -53,40 +53,36 @@ Download pre-built binaries for your platform from [GitHub Releases](https://git
 
 ## Architecture
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│  Client                                                     │
-│  ┌──────────┐   ┌──────────┐   ┌────────────────────────┐   │
-│  │ Browser  │──▸│ SOCKS5/  │──▸│    Bridge (Mux)        │   │
-│  │ / Apps   │   │ HTTP     │   │  ┌─────────────────┐   │   │
-│  │          │   │ Proxy    │   │  │ ProtocolMachine │   │   │
-│  └──────────┘   └──────────┘   │  │ (Noise + AEAD)  │   │   │
-│                                │  └────────┬────────┘   │   │
-│  ┌──────────┐                  │           │            │   │
-│  │ TUN Mode │──────────────────┤      UDP Socket        │   │
-│  │tun2socks │                  │  (32MB buffers,        │   │
-│  └──────────┘                  │   obfuscated wire)     │   │
-│                                └───────────┬────────────┘   │
-└────────────────────────────────────────────┼────────────────┘
-                                             │ UDP
-┌────────────────────────────────────────────┼────────────────┐
-│  Server                                    │                │
-│  ┌─────────────────────────────────────────┴───────────┐    │
-│  │              Dispatcher                             │    │
-│  │  (Session lookup, roaming, replay guard, per-user   │    │
-│  │   traffic accounting, limit enforcement)            │    │
-│  └──┬──────────────────────┬───────────────────────────┘    │
-│     │                      │                                │
-│  ┌──▾──────────────────┐ ┌─▾──────────────────────────┐     │
-│  │ Relay Loop          │ │ Management API (REST)      │     │
-│  │ (per-stream TCP)    │ │ /api/users, /api/stats     │     │
-│  │ ──▸ Internet        │ │ Bearer token auth          │     │
-│  └─────────────────────┘ └────────────────────────────┘     │
-│                                                             │
-│  ┌──────────────────────────────────────────────────────┐   │
-│  │ Fallback TCP Proxy ──▸ nginx/caddy (anti-DPI)        │   │
-│  └──────────────────────────────────────────────────────┘   │
-└─────────────────────────────────────────────────────────────┘
+```mermaid
+graph TD
+    subgraph Client ["Client"]
+        A[Browser / Apps] -->|SOCKS5 / HTTP| B(Bridge Multiplexer)
+        TUN[TUN Interface] -->|IP Packets| B
+        
+        subgraph OSTPCoreClient ["OSTP Core Protocol"]
+            B --> C{Protocol Machine}
+            C -->|Noise Handshake| D[ChaCha20Poly1305 AEAD]
+            D -->|Obfuscated UDP Payload| E((UDP Socket))
+        end
+    end
+
+    E <==>|Encrypted & Obfuscated UDP Tunnel| F
+
+    subgraph Server ["Server"]
+        F((UDP Socket)) --> G{Dispatcher}
+        
+        subgraph OSTPCoreServer ["OSTP Core Backend"]
+            G -->|Auth & Decrypt| H[Session & State Guard]
+            H -->|TCP Stream| I[Relay Loop]
+        end
+        
+        G -->|Active Probing / Unauth| FB[TCP Fallback Proxy]
+        FB -->|Forward| NGINX[nginx / Caddy]
+        
+        H -->|Stats & Traffic| API[Management API]
+        
+        I -->|Outbound| WWW((Internet))
+    end
 ```
 
 ---
@@ -142,7 +138,9 @@ Download pre-built binaries for your platform from [GitHub Releases](https://git
 ```bash
 ./ostp "ostp://ACCESS_KEY@server.com:50000?..."
 ```
-> **Note**: Always wrap the `ostp://...` link in quotes (`"`) so your terminal doesn't misinterpret special characters like `&` or `?`.
+
+> [!WARNING]
+> Always wrap the `ostp://...` link in quotes (`"`) so your terminal doesn't misinterpret special characters like `&` or `?`.
 
 ---
 

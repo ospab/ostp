@@ -72,6 +72,8 @@ pub struct Bridge {
     pub reality_enabled: bool,
     pub reality_pbk: String,
     pub reality_sid: String,
+    pub kill_switch: bool,
+    pub reload_tx: Option<watch::Sender<crate::config::ExclusionConfig>>,
 
     metrics: Arc<BridgeMetrics>,
     sample_sent: u64,
@@ -107,6 +109,8 @@ impl Bridge {
             reality_enabled: config.reality.enabled,
             reality_pbk: config.reality.pbk.clone(),
             reality_sid: config.reality.sid.clone(),
+            kill_switch: config.kill_switch,
+            reload_tx: None,
 
             metrics,
             sample_sent: 0,
@@ -465,16 +469,32 @@ impl Bridge {
             Some(BridgeCommand::ReloadConfig) => {
                 match ClientConfig::reload_from_json_near_binary() {
                     Ok(cfg) => {
+                        let old_server = self.server_addr.clone();
+                        let old_mode = self.mode.clone();
+                        let old_transport = self.transport_mode.clone();
+                        
                         self.apply_runtime_config(&cfg);
-                        tx.send(UiEvent::Log("Runtime config reloaded".to_string())).await.ok();
-                        if self.running {
-                            self.running = false;
-                            self.metrics.connection_state.store(0, Ordering::Relaxed);
-                            *proxy_guard = None;
-                            *sessions_opt = None;
-                            stream_map.clear();
-                            self.reset_proxy_streams(&tx, &proxy_tx, "config reload");
-                            let _ = tx.send(UiEvent::TunnelStopped).await;
+                        
+                        let requires_restart = self.server_addr != old_server || 
+                                               self.mode != old_mode || 
+                                               self.transport_mode != old_transport;
+                                               
+                        if !requires_restart {
+                            if let Some(tx_watch) = &self.reload_tx {
+                                let _ = tx_watch.send(cfg.exclusions.clone());
+                            }
+                            tx.send(UiEvent::Log("Exclusions updated in real-time (hot reload)".to_string())).await.ok();
+                        } else {
+                            tx.send(UiEvent::Log("Runtime config reloaded. Restarting tunnel due to critical parameter changes.".to_string())).await.ok();
+                            if self.running {
+                                self.running = false;
+                                self.metrics.connection_state.store(0, Ordering::Relaxed);
+                                *proxy_guard = None;
+                                *sessions_opt = None;
+                                stream_map.clear();
+                                self.reset_proxy_streams(&tx, &proxy_tx, "config reload");
+                                let _ = tx.send(UiEvent::TunnelStopped).await;
+                            }
                         }
                     }
                     Err(err) => {
@@ -504,18 +524,23 @@ impl Bridge {
         if self.last_valid_recv.elapsed().as_secs() > 25 {
             let elapsed = self.last_valid_recv.elapsed().as_secs();
             if elapsed > 180 {
-                let _ = tx.send(UiEvent::Log("Connection permanently lost (3-minute hard timeout). Stopping tunnel.".into())).await;
-                self.running = false;
-                *proxy_guard = None;
-                *sessions_opt = None;
-                stream_map.clear();
-                self.reset_proxy_streams(&tx, &proxy_tx, "keepalive hard timeout");
-                let _ = tx.send(UiEvent::TunnelStopped).await;
-                self.metrics.connection_state.store(0, Ordering::Relaxed);
-                return;
+                if self.kill_switch {
+                    let _ = tx.send(UiEvent::Log(format!("Connection stall ({}s). Kill Switch is ON, retrying reconnect indefinitely...", elapsed))).await;
+                } else {
+                    let _ = tx.send(UiEvent::Log("Connection permanently lost (3-minute hard timeout). Stopping tunnel.".into())).await;
+                    self.running = false;
+                    *proxy_guard = None;
+                    *sessions_opt = None;
+                    stream_map.clear();
+                    self.reset_proxy_streams(&tx, &proxy_tx, "keepalive hard timeout");
+                    let _ = tx.send(UiEvent::TunnelStopped).await;
+                    self.metrics.connection_state.store(0, Ordering::Relaxed);
+                    return;
+                }
+            } else {
+                let _ = tx.send(UiEvent::Log(format!("Connection stall detected ({}s silence). Attempting background reconnect...", elapsed))).await;
             }
 
-            let _ = tx.send(UiEvent::Log(format!("Connection stall detected ({}s silence). Attempting background reconnect...", elapsed))).await;
             self.metrics.connection_state.store(1, Ordering::Relaxed);
 
             let session_count = if self.mux_enabled { self.mux_sessions.max(1) } else { 1 };
@@ -970,8 +995,9 @@ impl Bridge {
         self.reality_enabled = cfg.reality.enabled;
         self.reality_pbk = cfg.reality.pbk.clone();
         self.reality_sid = cfg.reality.sid.clone();
-        self.mtu = cfg.ostp.mtu; // Fix: mtu was never updated on hot-reload
-        self.keepalive_interval_sec = cfg.ostp.keepalive_interval_sec; // Fix: keepalive was never updated on hot-reload
+        self.mtu = cfg.ostp.mtu;
+        self.keepalive_interval_sec = cfg.ostp.keepalive_interval_sec;
+        self.kill_switch = cfg.kill_switch;
     }
 
     async fn try_connect_transport(

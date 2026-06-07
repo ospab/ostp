@@ -1,21 +1,26 @@
 use anyhow::Result;
 use tokio::net::TcpStream;
 use tokio::time::Duration;
+use serde::{Serialize, Deserialize};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum OutboundAction {
     Proxy,
     Direct,
+    Block,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OutboundRule {
+    #[serde(default)]
     pub domain_suffix: Vec<String>,
+    #[serde(default)]
     pub ip_cidr: Vec<String>,
     pub action: OutboundAction,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OutboundConfig {
     pub enabled: bool,
     pub protocol: String,
@@ -36,6 +41,9 @@ pub async fn connect_target(
     if let Some(outbound) = outbound {
         if outbound.enabled {
             let action = select_outbound_action(target, outbound, debug).await;
+            if action == OutboundAction::Block {
+                return Err(anyhow::anyhow!("blocked by outbound rule: {}", target));
+            }
             if action == OutboundAction::Proxy {
                 let proxy_addr = format!("{}:{}", outbound.address, outbound.port);
                 return match outbound.protocol.as_str() {

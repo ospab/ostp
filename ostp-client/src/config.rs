@@ -22,6 +22,8 @@ pub struct ClientConfig {
     pub dns_server: Option<String>,
     #[serde(default = "default_tun_stack")]
     pub tun_stack: String,
+    #[serde(default)]
+    pub kill_switch: bool,
 }
 
 fn default_tun_stack() -> String { "system".to_string() }
@@ -153,6 +155,7 @@ impl Default for ClientConfig {
             multiplex: MultiplexConfig::default(),
             dns_server: None,
             tun_stack: "system".to_string(),
+            kill_switch: false,
         }
     }
 }
@@ -197,6 +200,7 @@ struct RawTunSection {
     enable: Option<bool>,
     dns: Option<String>,
     stack: Option<String>,
+    kill_switch: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -292,7 +296,7 @@ impl ClientConfig {
             },
             dns_server: raw.tun.as_ref().and_then(|t| t.dns.clone()),
             tun_stack: raw.tun.as_ref().and_then(|t| t.stack.clone()).unwrap_or_else(|| "system".to_string()),
+            kill_switch: raw.tun.as_ref().and_then(|t| t.kill_switch).unwrap_or(false),
         })
-
     }
 }

@@ -1,0 +1,3 @@
+-keep class net.ostp.client.OstpClientSdk { *; }
+-keep class com.ospab.ostp_client.OstpVpnService { *; }
+-keep class com.ospab.ostp_client.MainActivity { *; }

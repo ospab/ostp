@@ -106,7 +106,9 @@ if [ -z "$LATEST_RELEASE" ] || [[ "$LATEST_RELEASE" == *"null"* ]]; then
     fi
 else
     ARCHIVE_NAME="ostp-linux-${ARCH}.tar.gz"
+    GUI_ARCHIVE_NAME="ostp-gui-linux-${ARCH}.tar.gz"
     DOWNLOAD_URL="https://github.com/${GITHUB_REPO}/releases/download/${LATEST_RELEASE}/${ARCHIVE_NAME}"
+    GUI_DOWNLOAD_URL="https://github.com/${GITHUB_REPO}/releases/download/${LATEST_RELEASE}/${GUI_ARCHIVE_NAME}"
     echo "Downloading: $ARCHIVE_NAME ($LATEST_RELEASE)"
 
     TEMP_TAR="/tmp/ostp_temp.tar.gz"
@@ -131,6 +133,9 @@ else
     echo "[error] Binary not found at $INSTALL_DIR/ostp."
     exit 1
 fi
+
+# We don't download GUI binary immediately, we will do it if the user selects Client + GUI mode
+
 
 # ── Create global symlink ────────────────────────────────────────────
 
@@ -317,8 +322,9 @@ echo "  1) Server"
 echo "  2) Client"
 echo "  3) Relay"
 echo "  4) Server + Web Panel"
+echo "  5) Client + GUI"
 echo "--------------------------------------------------------"
-read -p "Choice [1-4]: " NODE_MODE
+read -p "Choice [1-5]: " NODE_MODE
 
 cd "$INSTALL_DIR"
 
@@ -413,7 +419,7 @@ with open('$CONFIG_FILE', 'w') as f:
     echo "Password: $PASSWORD"
     echo "========================================================"
 
-elif [ "$NODE_MODE" == "2" ]; then
+elif [ "$NODE_MODE" == "2" ] || [ "$NODE_MODE" == "5" ]; then
     echo "Initializing client configuration..."
     ./ostp --init client --config "$CONFIG_FILE"
 
@@ -436,6 +442,45 @@ elif [ "$NODE_MODE" == "2" ]; then
         sed -i "s/\"socks5_bind\": \"127.0.0.1:1088\"/\"socks5_bind\": \"$SOCKS_BIND\"/g" "$CONFIG_FILE"
     fi
     echo "Client configuration saved: $CONFIG_FILE"
+
+    if [ "$NODE_MODE" == "5" ]; then
+        echo "Installing GUI..."
+        if [ -n "$LATEST_RELEASE" ]; then
+            TEMP_GUI_TAR="/tmp/ostp_gui_temp.tar.gz"
+            echo "Downloading GUI: $GUI_ARCHIVE_NAME ($LATEST_RELEASE)"
+            HTTP_CODE_GUI=$(curl -sL -w "%{http_code}" "$GUI_DOWNLOAD_URL" -o "$TEMP_GUI_TAR")
+            if [ "$HTTP_CODE_GUI" -eq 200 ]; then
+                tar -xzf "$TEMP_GUI_TAR" -C "$INSTALL_DIR" ostp-gui 2>/dev/null || tar -xzf "$TEMP_GUI_TAR" -C "$INSTALL_DIR"
+                rm -f "$TEMP_GUI_TAR"
+                if [ -f "$INSTALL_DIR/ostp-gui" ]; then
+                    chmod +x "$INSTALL_DIR/ostp-gui"
+                    ln -sf "$INSTALL_DIR/ostp-gui" "/usr/local/bin/ostp-gui"
+                    echo "GUI binary installed at $INSTALL_DIR/ostp-gui"
+                    
+                    # Create desktop entry
+                    DESKTOP_FILE="/usr/share/applications/ostp-gui.desktop"
+                    cat <<EOF > "$DESKTOP_FILE"
+[Desktop Entry]
+Name=OSTP Client
+Comment=Ospab Stealth Transport Protocol Client
+Exec=/usr/local/bin/ostp-gui
+Icon=utilities-terminal
+Terminal=false
+Type=Application
+Categories=Network;Utility;
+EOF
+                    echo "Desktop entry created at $DESKTOP_FILE"
+                else
+                    echo "[error] GUI binary not found in archive."
+                fi
+            else
+                echo "[error] Download failed for GUI (HTTP $HTTP_CODE_GUI)."
+                rm -f "$TEMP_GUI_TAR"
+            fi
+        else
+            echo "[notice] Automatic download not possible. Install GUI manually."
+        fi
+    fi
 
 elif [ "$NODE_MODE" == "3" ]; then
     echo "Initializing relay configuration..."

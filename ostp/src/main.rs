@@ -3,6 +3,7 @@ use clap::Parser;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
+use colored::Colorize;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about = "OSTP Core - Ospab Stealth Transport Protocol", long_about = None)]
@@ -117,6 +118,7 @@ fn parse_ostp_link(link: &str) -> Result<ClientConfig> {
             wintun_path: Some("./wintun.dll".to_string()),
             ipv4_address: Some("10.1.0.2/24".to_string()),
             dns: tun_dns,
+            kill_switch: Some(false),
         }),
         reality: Some(RealityConfigRaw {
             enabled: true,
@@ -355,6 +357,7 @@ struct TunConfig {
     wintun_path: Option<String>,
     ipv4_address: Option<String>,
     dns: Option<String>,
+    kill_switch: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -426,7 +429,7 @@ async fn main() -> Result<()> {
     let res = run_app().await;
     if let Err(e) = res {
         eprintln!();
-        eprintln!("[ostp] Fatal error: {}", e);
+        eprintln!("{} {}", "[FATAL ERROR]".red().bold(), e);
         eprintln!();
         
         #[cfg(target_os = "windows")]
@@ -590,7 +593,7 @@ async fn run_app() -> Result<()> {
     }
 
     if let Some(import_url) = args.import {
-        println!("[ostp] Importing configuration from share link...");
+        println!("{} Importing configuration from share link...", "[ostp]".cyan().bold());
         let client_cfg = parse_ostp_link(&import_url)
             .map_err(|e| anyhow!("Share Link Error: {e}"))?;
         let unified = UnifiedConfig {
@@ -604,19 +607,19 @@ async fn run_app() -> Result<()> {
             }
         }
         fs::write(&args.config, content)?;
-        println!("[ostp] Configuration successfully imported and saved to {:?}", args.config);
+        println!("{} Configuration successfully imported and saved to {:?}", "[ostp]".green().bold(), args.config);
         return Ok(());
     }
 
     if let Some(url) = args.url {
-        println!("[ostp] Connecting via share link...");
+        println!("{} Connecting via share link...", "[ostp]".cyan().bold());
         let mut client_cfg = parse_ostp_link(&url)
             .map_err(|e| anyhow!("Share Link Error: {e}"))?;
         
         // Interactive prompt for URL launch
         use std::io::Write;
         
-        print!("Enable TUN (VPN) mode? [y/N]: ");
+        print!("{} Enable TUN (VPN) mode? [y/N]: ", "?".blue().bold());
         std::io::stdout().flush().unwrap();
         let mut input = String::new();
         std::io::stdin().read_line(&mut input).unwrap();
@@ -626,7 +629,7 @@ async fn run_app() -> Result<()> {
             }
         }
         
-        print!("Enable connection multiplexing (mux)? [y/N]: ");
+        print!("{} Enable connection multiplexing (mux)? [y/N]: ", "?".blue().bold());
         std::io::stdout().flush().unwrap();
         input.clear();
         std::io::stdin().read_line(&mut input).unwrap();
@@ -675,9 +678,9 @@ async fn run_app() -> Result<()> {
                 config.validate()?;
                 match &config.mode {
                     AppMode::Server(s) => {
-                        println!("[ostp] Config OK: server mode");
-                        println!("  Listen: {:?}", s.listen.primary());
-                        println!("  Access keys: {}", s.access_keys.len());
+                        println!("{} Config OK: server mode", "[ostp]".green().bold());
+                        println!("  Listen: {:?}", s.listen.primary().as_str().cyan());
+                        println!("  Access keys: {}", s.access_keys.len().to_string().yellow());
                         if let Some(api) = &s.api {
                             println!("  API: {} (bind: {})",
                                 if api.enabled.unwrap_or(false) { "enabled" } else { "disabled" },
@@ -696,16 +699,16 @@ async fn run_app() -> Result<()> {
                         }
                     }
                     AppMode::Client(c) => {
-                        println!("[ostp] Config OK: client mode");
-                        println!("  Server: {}", c.server);
-                        println!("  Key: {}...", &c.access_key[..8.min(c.access_key.len())]);
+                        println!("{} Config OK: client mode", "[ostp]".green().bold());
+                        println!("  Server: {}", c.server.cyan());
+                        println!("  Key: {}...", &c.access_key[..8.min(c.access_key.len())].yellow());
                     }
                     AppMode::Relay(r) => {
-                        println!("[ostp] Config OK: relay mode");
-                        println!("  Listen: {:?}", r.listen.primary());
-                        println!("  Upstream TCP: {}", r.upstream_tcp);
-                        println!("  Upstream UDP: {}", r.upstream_udp);
-                        println!("  API sync: {}", r.upstream_api_url);
+                        println!("{} Config OK: relay mode", "[ostp]".green().bold());
+                        println!("  Listen: {:?}", r.listen.primary().cyan());
+                        println!("  Upstream TCP: {}", r.upstream_tcp.cyan());
+                        println!("  Upstream UDP: {}", r.upstream_udp.cyan());
+                        println!("  API sync: {}", r.upstream_api_url.yellow());
                     }
                 }
             }
@@ -780,6 +783,29 @@ async fn run_app() -> Result<()> {
     "pbk": "{}",
     "sid": "{}",
     "sni_list": ["www.microsoft.com"]
+  }},
+
+  // Built-in DNS server
+  "dns": {{
+    // Full mode: custom domains + AdBlock lists + DoH forwarding
+    "enabled": false,
+    // Intercept ALL UDP port 53 traffic and resolve via DoH (prevents DNS leaks through the server)
+    // Works even if enabled=false — just strips AdBlock/custom domains logic
+    "intercept_all_port53": false,
+    // UDP port the built-in DNS server listens on (clients can use <server_ip>:50053 as DNS)
+    "local_port": 50053,
+    // DoH upstream: Cloudflare, Google, NextDNS, etc.
+    "doh_upstream": "https://cloudflare-dns.com/dns-query",
+    // AdBlock lists (hosts format, ||domain^, or one domain per line)
+    "adblock_urls": [
+      // "https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts",
+      // "https://adguardteam.github.io/AdGuardSDNSFilter/Filters/filter.txt"
+    ],
+    // Custom domains: respond with A record directly (bypasses DoH)
+    "custom_domains": {{
+      // "myserver.internal": "10.0.0.1",
+      // "home.local": "192.168.1.100"
+    }}
   }},
   "debug": false
 }}"#, key, priv_key, pub_key, sid)
@@ -1001,11 +1027,13 @@ async fn run_app() -> Result<()> {
 
     match config.mode {
         AppMode::Server(server_cfg) => {
+            println!("{}", include_str!("../../docs/banner.txt").blue().bold());
+            
             let listen_addrs = server_cfg.listen.addresses();
-            println!("[ostp] Starting server on {:?}", listen_addrs);
+            println!("{} Starting server on {:?}", "[ostp]".cyan().bold(), listen_addrs);
             if let Some(ref reality) = server_cfg.reality {
                 if reality.enabled {
-                    println!("[ostp] Reality mode enabled (dest: {})", reality.dest);
+                    println!("{} Reality mode enabled (dest: {})", "[ostp]".cyan().bold(), reality.dest);
                 }
             }
             let debug = server_cfg.debug.unwrap_or(false);
@@ -1065,14 +1093,16 @@ async fn run_app() -> Result<()> {
             ostp_server::run_server(listen_addrs, Some(host), access_keys_meta, outbound, api_config, fallback_config, debug, rq, rc, dns_cfg, Some(args.config)).await?;
         }
         AppMode::Client(client_cfg) => {
+            println!("{}", include_str!("../../docs/banner.txt").blue().bold());
             run_client_directly(client_cfg).await?;
         }
         AppMode::Relay(relay_cfg) => {
+            println!("{}", include_str!("../../docs/banner.txt").blue().bold());
             let listen_addrs = relay_cfg.listen.addresses();
-            println!("[ostp] Starting relay node on {:?}", listen_addrs);
-            println!("[ostp] Upstream TCP: {}", relay_cfg.upstream_tcp);
-            println!("[ostp] Upstream UDP: {}", relay_cfg.upstream_udp);
-            println!("[ostp] Key sync API: {}", relay_cfg.upstream_api_url);
+            println!("{} Starting relay node on {:?}", "[ostp]".cyan().bold(), listen_addrs);
+            println!("{} Upstream TCP: {}", "[ostp]".cyan().bold(), relay_cfg.upstream_tcp);
+            println!("{} Upstream UDP: {}", "[ostp]".cyan().bold(), relay_cfg.upstream_udp);
+            println!("{} Key sync API: {}", "[ostp]".cyan().bold(), relay_cfg.upstream_api_url);
             let relay_config = ostp_server::RelayConfig {
                 listen_addrs,
                 upstream_tcp: relay_cfg.upstream_tcp,
@@ -1171,7 +1201,7 @@ fn cmd_update() -> Result<()> {
 async fn run_client_directly(client_cfg: ClientConfig) -> Result<()> {
     let is_tun_enabled = client_cfg.tun.as_ref().map(|t| t.enable).unwrap_or(false);
     let mode_str = if is_tun_enabled { "tun" } else { "proxy" };
-    println!("[ostp] Starting client (mode={}, server={})", mode_str, client_cfg.server);
+    println!("{} Starting client (mode={}, server={})", "[ostp]".cyan().bold(), mode_str.yellow(), client_cfg.server.cyan());
     let reality_cfg = client_cfg.reality.as_ref();
     let client_conf = ostp_client::config::ClientConfig {
         mode: if is_tun_enabled { "tun".to_string() } else { "proxy".to_string() },
@@ -1214,6 +1244,7 @@ async fn run_client_directly(client_cfg: ClientConfig) -> Result<()> {
             wss: client_cfg.transport.as_ref().and_then(|t| t.wss).unwrap_or(false),
         },
         dns_server: client_cfg.tun.as_ref().and_then(|t| t.dns.clone()),
+        kill_switch: client_cfg.tun.as_ref().and_then(|t| t.kill_switch).unwrap_or(false),
     };
 
     // Run the client implementation

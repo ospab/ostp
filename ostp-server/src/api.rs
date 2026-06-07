@@ -32,6 +32,7 @@ use serde::{Deserialize, Serialize};
 use tower_http::cors::{Any, CorsLayer};
 
 use crate::dispatcher::{UserStats, UserStatsSnapshot};
+use crate::outbound::OutboundRule;
 
 // ── Shared state for API handlers ────────────────────────────────────────────
 
@@ -52,6 +53,28 @@ pub struct ApiState {
     pub reality_query: String,
     pub config_path: Option<std::path::PathBuf>,
     pub dns_server: std::sync::Arc<crate::dns::DnsServer>,
+    pub audit_logs: Arc<RwLock<Vec<AuditLogEntry>>>,
+    pub router: std::sync::Arc<crate::router::Router>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuditLogEntry {
+    pub id: String,
+    pub time: String,
+    #[serde(rename = "eventEn")]
+    pub event_en: String,
+    #[serde(rename = "eventRu")]
+    pub event_ru: String,
+    pub success: bool,
+}
+
+#[derive(Deserialize)]
+pub struct CreateAuditLogRequest {
+    #[serde(rename = "eventEn")]
+    pub event_en: String,
+    #[serde(rename = "eventRu")]
+    pub event_ru: String,
+    pub success: bool,
 }
 
 // ── API configuration ────────────────────────────────────────────────────────
@@ -223,7 +246,15 @@ pub fn create_api_router(state: ApiState) -> Router {
         .route("/login", post(handle_login))
         .route("/dns/config", get(handle_get_dns_config).post(handle_post_dns_config))
         .route("/dns/queries", get(handle_get_dns_queries))
-        .route("/dns/blocklists/refresh", post(handle_refresh_blocklists));
+        .route("/dns/blocklists/refresh", post(handle_refresh_blocklists))
+        .route(
+            "/audit",
+            get(handle_get_audit)
+                .post(handle_create_audit)
+                .delete(handle_clear_audit),
+        )
+        .route("/users/bulk", post(handle_bulk_create_users))
+        .route("/router/rules", get(handle_get_rules).put(handle_put_rules));
 
     let webpath = state.webpath.clone();
     let webpath = webpath.trim_matches('/');
@@ -262,6 +293,7 @@ pub async fn start_api_server(
     reality_query: String,
     config_path: Option<std::path::PathBuf>,
     dns_server: std::sync::Arc<crate::dns::DnsServer>,
+    router: std::sync::Arc<crate::router::Router>,
 ) {
     let state = ApiState {
         access_keys,
@@ -277,6 +309,8 @@ pub async fn start_api_server(
         reality_query,
         config_path,
         dns_server,
+        audit_logs: Arc::new(RwLock::new(Vec::new())),
+        router,
     };
 
     let app = create_api_router(state);
@@ -542,15 +576,16 @@ async fn handle_list_users(
     let stats = state.user_stats.read().unwrap_or_else(|e| e.into_inner());
 
     let mut users: Vec<UserStatsSnapshot> = keys.iter().map(|(key, meta)| {
-        if let Some(us) = stats.get(key) {
+        if let Some(st) = stats.get(key) {
             UserStatsSnapshot {
                 access_key: key.clone(),
                 name: meta.name.clone(),
-                bytes_up: us.bytes_up.load(Ordering::Relaxed),
-                bytes_down: us.bytes_down.load(Ordering::Relaxed),
-                connections: us.connections.load(Ordering::Relaxed),
-                limit_bytes: us.limit_bytes,
-                online: true,
+                bytes_up: st.bytes_up.load(Ordering::Relaxed),
+                bytes_down: st.bytes_down.load(Ordering::Relaxed),
+                connections: st.connections.load(Ordering::Relaxed),
+                limit_bytes: st.limit_bytes,
+                online: st.connections.load(Ordering::Relaxed) > 0,
+                last_seen: None,
             }
         } else {
             UserStatsSnapshot {
@@ -561,6 +596,7 @@ async fn handle_list_users(
                 connections: 0,
                 limit_bytes: meta.limit_bytes,
                 online: false,
+                last_seen: None,
             }
         }
     }).collect();
@@ -586,15 +622,16 @@ async fn handle_get_user(
     };
 
     let stats = state.user_stats.read().unwrap_or_else(|e| e.into_inner());
-    let snapshot = if let Some(us) = stats.get(&key) {
+    let snapshot = if let Some(st) = stats.get(&key) {
         UserStatsSnapshot {
             access_key: key.clone(),
             name: meta.name.clone(),
-            bytes_up: us.bytes_up.load(Ordering::Relaxed),
-            bytes_down: us.bytes_down.load(Ordering::Relaxed),
-            connections: us.connections.load(Ordering::Relaxed),
-            limit_bytes: us.limit_bytes,
-            online: true,
+            bytes_up: st.bytes_up.load(Ordering::Relaxed),
+            bytes_down: st.bytes_down.load(Ordering::Relaxed),
+            connections: st.connections.load(Ordering::Relaxed),
+            limit_bytes: st.limit_bytes,
+            online: st.connections.load(Ordering::Relaxed) > 0,
+            last_seen: None,
         }
     } else {
         UserStatsSnapshot {
@@ -605,6 +642,7 @@ async fn handle_get_user(
             connections: 0,
             limit_bytes: meta.limit_bytes,
             online: false,
+            last_seen: None,
         }
     };
 
@@ -939,6 +977,8 @@ mod tests {
             reality_query: "".to_string(),
             config_path: None,
             dns_server: crate::dns::DnsServer::new(Default::default()),
+            audit_logs: Arc::new(RwLock::new(Vec::new())),
+            router: Arc::new(crate::router::Router::new(None, crate::dns::DnsServer::new(Default::default()), false)),
         }
     }
 
@@ -954,4 +994,127 @@ mod tests {
         let _router = create_api_router(state);
     }
 }
+
+async fn handle_get_audit(State(state): State<ApiState>) -> impl IntoResponse {
+    let logs = state.audit_logs.read().unwrap();
+    ApiResponse::success(logs.clone())
+}
+
+async fn handle_create_audit(State(state): State<ApiState>, Json(req): Json<CreateAuditLogRequest>) -> impl IntoResponse {
+    let mut logs = state.audit_logs.write().unwrap();
+    let id = format!("{:x}", rand::random::<u64>());
+    let now = chrono::Local::now();
+    let entry = AuditLogEntry {
+        id,
+        time: now.format("%H:%M:%S").to_string(),
+        event_en: req.event_en,
+        event_ru: req.event_ru,
+        success: req.success,
+    };
+    logs.insert(0, entry);
+    if logs.len() > 100 {
+        logs.truncate(100);
+    }
+
+    ApiResponse::success(true)
+}
+
+// ── Bulk keys & Router Rules ─────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+pub struct BulkCreateRequest {
+    pub count: usize,
+    pub limit_bytes: Option<u64>,
+}
+
+async fn handle_bulk_create_users(
+    State(state): State<ApiState>,
+    headers: axum::http::HeaderMap,
+    Json(payload): Json<BulkCreateRequest>,
+) -> impl IntoResponse {
+    if !check_token(&state, &headers) { return api_unauthorized(); }
+    if payload.count > 1000 {
+        return api_error("Count too large, max 1000");
+    }
+
+    let mut new_keys = Vec::new();
+    let mut keys = match state.access_keys.write() {
+        Ok(k) => k,
+        Err(e) => e.into_inner(),
+    };
+
+    for _ in 0..payload.count {
+        let key = uuid::Uuid::new_v4().to_string().replace("-", "")[..16].to_string();
+        keys.insert(key.clone(), UserMeta {
+            name: None,
+            limit_bytes: payload.limit_bytes,
+        });
+        new_keys.push(key);
+    }
+    // Save keys by dropping lock, then saving to config
+    drop(keys);
+    let _ = save_config_keys(&state);
+
+    (StatusCode::OK, ApiResponse::success(new_keys))
+}
+
+async fn handle_get_rules(
+    State(state): State<ApiState>,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    if !check_token(&state, &headers) { return api_unauthorized(); }
+    
+    let lock = state.router.outbound_cfg.read().unwrap();
+    let rules = if let Some(cfg) = lock.as_ref() {
+        cfg.rules.clone()
+    } else {
+        Vec::new()
+    };
+    
+    (StatusCode::OK, ApiResponse::success(rules))
+}
+
+async fn handle_put_rules(
+    State(state): State<ApiState>,
+    headers: axum::http::HeaderMap,
+    Json(new_rules): Json<Vec<OutboundRule>>,
+) -> impl IntoResponse {
+    if !check_token(&state, &headers) { return api_unauthorized(); }
+    
+    // Update memory
+    {
+        let mut lock = state.router.outbound_cfg.write().unwrap();
+        if let Some(cfg) = lock.as_mut() {
+            cfg.rules = new_rules.clone();
+        } else {
+            return api_error("Outbound routing is not enabled in config");
+        }
+    }
+    
+    // Save to config.json
+    if let Some(path) = &state.config_path {
+        if let Ok(content) = std::fs::read_to_string(path) {
+            let mut cfg: serde_json::Value = serde_json::from_str(&content).unwrap_or_default();
+            if let Some(obj) = cfg.as_object_mut() {
+                if let Some(outbound) = obj.get_mut("outbound") {
+                    if let Some(outbound_obj) = outbound.as_object_mut() {
+                        if let Ok(rules_json) = serde_json::to_value(&new_rules) {
+                            outbound_obj.insert("rules".to_string(), rules_json);
+                        }
+                    }
+                }
+            }
+            let _ = std::fs::write(path, serde_json::to_string_pretty(&cfg).unwrap_or_default());
+        }
+    }
+    
+    (StatusCode::OK, ApiResponse::success(true))
+}
+
+async fn handle_clear_audit(State(state): State<ApiState>) -> impl IntoResponse {
+    let mut logs = state.audit_logs.write().unwrap();
+    logs.clear();
+    ApiResponse::success(())
+}
+
 

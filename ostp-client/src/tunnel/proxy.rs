@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use crate::tunnel::exclusion::{ExclusionMatcher, Cidr};
+use crate::tunnel::exclusion::ExclusionMatcher;
 use anyhow::{anyhow, Context, Result};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
@@ -29,7 +29,7 @@ extern "system" {
 }
 
 #[cfg(target_os = "windows")]
-fn bind_socket_to_interface(socket: &impl AsRawSocket, is_ipv6: bool, if_index: u32) -> std::io::Result<()> {
+pub fn bind_socket_to_interface(socket: &impl AsRawSocket, is_ipv6: bool, if_index: u32) -> std::io::Result<()> {
     let s = socket.as_raw_socket() as usize;
     if is_ipv6 {
         let optval = if_index;
@@ -64,7 +64,7 @@ fn bind_socket_to_interface(socket: &impl AsRawSocket, is_ipv6: bool, if_index: 
 }
 
 #[cfg(target_os = "linux")]
-fn bind_socket_to_interface(socket: &impl AsRawFd, if_name: &str) -> std::io::Result<()> {
+pub fn bind_socket_to_interface(socket: &impl AsRawFd, if_name: &str) -> std::io::Result<()> {
     let fd = socket.as_raw_fd();
     let mut if_name_bytes = if_name.as_bytes().to_vec();
     if_name_bytes.push(0);
@@ -83,31 +83,18 @@ fn bind_socket_to_interface(socket: &impl AsRawFd, if_name: &str) -> std::io::Re
     Ok(())
 }
 
-fn get_windows_physical_if_index() -> Option<u32> {
+pub fn get_windows_physical_if_index() -> Option<u32> {
     #[cfg(target_os = "windows")]
     {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x08000000;
-        let output = std::process::Command::new("powershell")
-            .creation_flags(CREATE_NO_WINDOW)
-            .args([
-                "-NoProfile",
-                "-Command",
-                "Get-NetRoute -DestinationPrefix '0.0.0.0/0' | Where-Object { $_.InterfaceAlias -notmatch 'ostp' -and $_.InterfaceAlias -notmatch 'tun' -and $_.InterfaceAlias -notmatch 'wintun' } | Sort-Object RouteMetric | Select-Object -ExpandProperty InterfaceIndex -First 1"
-            ])
-            .output()
-            .ok()?;
-        if output.status.success() {
-            let s = String::from_utf8_lossy(&output.stdout);
-            if let Ok(index) = s.trim().parse::<u32>() {
-                return Some(index);
-            }
-        }
+        return super::windows_route::sys::get_default_ipv4_route().map(|(_, idx)| idx);
     }
-    None
+    #[cfg(not(target_os = "windows"))]
+    {
+        None
+    }
 }
 
-fn get_linux_physical_if_name() -> Option<String> {
+pub fn get_linux_physical_if_name() -> Option<String> {
     #[cfg(target_os = "linux")]
     {
         let output = std::process::Command::new("ip")
@@ -208,7 +195,7 @@ async fn create_udp_socket_bypassing_tun(
 pub async fn run_local_socks5_proxy(
     cfg: LocalProxyConfig,
     ostp: OstpConfig,
-    exclusions: ExclusionConfig,
+    mut exclusions_rx: watch::Receiver<ExclusionConfig>,
     debug: bool,
     mut shutdown: watch::Receiver<bool>,
     proxy_events_tx: mpsc::Sender<ProxyEvent>,
@@ -234,7 +221,8 @@ pub async fn run_local_socks5_proxy(
         tracing::info!("Local proxy physical interface name: {:?}", physical_if_name);
     }
 
-    let matcher = ExclusionMatcher::new(&exclusions, physical_if_index, physical_if_name.clone());
+    let mut current_exclusions = exclusions_rx.borrow().clone();
+    let mut matcher = ExclusionMatcher::new(&current_exclusions, physical_if_index, physical_if_name.clone());
     let (connect_tx, mut connect_rx) = mpsc::channel(128);
     let max_chunk = ostp.mtu.saturating_sub(150).max(512);
 
@@ -246,6 +234,13 @@ pub async fn run_local_socks5_proxy(
             _ = shutdown.changed() => {
                 if *shutdown.borrow() {
                     break;
+                }
+            }
+            Ok(_) = exclusions_rx.changed() => {
+                current_exclusions = exclusions_rx.borrow().clone();
+                matcher = ExclusionMatcher::new(&current_exclusions, physical_if_index, physical_if_name.clone());
+                if debug {
+                    tracing::info!("Local proxy exclusions hot-reloaded");
                 }
             }
             accepted = listener.accept() => {

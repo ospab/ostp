@@ -1,12 +1,14 @@
 mod proxy;
 pub mod native_handler;
+pub mod windows_route;
 mod udp_nat;
 
 pub async fn run_tun_tunnel(
     config: crate::config::ClientConfig,
-    shutdown: watch::Receiver<bool>,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+    exclusions_rx: tokio::sync::watch::Receiver<crate::config::ExclusionConfig>,
 ) -> anyhow::Result<()> {
-    native_handler::run_native_tunnel(config, shutdown).await
+    native_handler::run_native_tunnel(config, shutdown, exclusions_rx).await
 }
 
 use tokio::sync::{mpsc, watch};
@@ -51,16 +53,14 @@ pub enum ProxyToClientMsg {
 pub async fn run_local_proxy(
     cfg: LocalProxyConfig,
     ostp: OstpConfig,
-    exclusions: ExclusionConfig,
+    exclusions_rx: watch::Receiver<ExclusionConfig>,
     debug: bool,
     shutdown: watch::Receiver<bool>,
     proxy_events_tx: mpsc::Sender<ProxyEvent>,
     client_msgs_rx: mpsc::UnboundedReceiver<(u16, ProxyToClientMsg)>,
 ) -> anyhow::Result<()> {
-    run_local_socks5_proxy(cfg, ostp, exclusions, debug, shutdown, proxy_events_tx, client_msgs_rx).await
+    run_local_socks5_proxy(cfg, ostp, exclusions_rx, debug, shutdown, proxy_events_tx, client_msgs_rx).await
 }
-
-
 
 pub mod exclusion;
 pub mod process_lookup;

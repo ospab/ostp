@@ -43,6 +43,7 @@ struct TunConfig {
     ipv4_address: Option<String>,
     dns: Option<String>,
     stack: Option<String>,
+    kill_switch: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -186,6 +187,7 @@ fn map_to_client_config(raw: &ClientConfigRaw, mode: &str) -> ostp_client::confi
         },
         dns_server: raw.tun.as_ref().and_then(|t| t.dns.clone()),
         tun_stack: raw.tun.as_ref().and_then(|t| t.stack.clone()).unwrap_or_else(|| "system".to_string()),
+        kill_switch: raw.tun.as_ref().and_then(|t| t.kill_switch).unwrap_or(false),
     }
 }
 
@@ -214,7 +216,8 @@ async fn get_config() -> Result<String, String> {
     "enable": false,
     "wintun_path": "./wintun.dll",
     "ipv4_address": "10.1.0.2/24",
-    "dns": "1.1.1.1"
+    "dns": "1.1.1.1",
+    "kill_switch": false
   },
   
   "_comment_exclude": "Bypass tunnel for these domains/IPs (only works in proxy mode)",
@@ -290,10 +293,20 @@ async fn reload_tunnel(state: tauri::State<'_, AppState>) -> Result<bool, String
         return Ok(false);
     }
     
-    let config_path = get_config_path();
-    let config_str = std::fs::read_to_string(&config_path)
+    let path = get_config_path();
+    let content = std::fs::read_to_string(&path)
         .map_err(|e| format!("Read config error: {}", e))?;
-    
+    let mut stripped = json_comments::StripComments::new(content.as_bytes());
+    let unified: UnifiedConfig = serde_json::from_reader(&mut stripped)
+        .map_err(|e| format!("Parse config error: {}", e))?;
+    let client_cfg = match unified.mode {
+        AppMode::Client(c) => c,
+        AppMode::Server(_) => return Err("GUI only supports Client mode.".into()),
+    };
+    let mode_str = if client_cfg.tun.as_ref().map(|t| t.enable).unwrap_or(false) { "tun" } else { "proxy" };
+    let core_cfg = map_to_client_config(&client_cfg, mode_str);
+    let config_str = serde_json::to_string(&core_cfg).unwrap();
+
     match &guard.tunnel {
         Some(TunnelHandle::Helper(h)) => {
             let cmd = format!(
@@ -389,7 +402,7 @@ async fn start_proxy_in_process(
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let metrics_clone = metrics.clone();
     let handle = tokio::spawn(async move {
-        match ostp_client::runner::run_client_core(mapped, metrics_clone, shutdown_rx).await {
+        match ostp_client::runner::run_client_core(mapped, metrics_clone, shutdown_rx, None).await {
             Ok(_) => Ok(()),
             Err(e) => Err(e.to_string()),
         }
@@ -527,7 +540,7 @@ fn launch_as_admin(exe: &std::path::PathBuf, token: &str, port: u16) -> anyhow::
 
     let exe_wstr: Vec<u16> = exe.as_os_str().encode_wide().chain(Some(0)).collect();
     let verb_wstr: Vec<u16> = OsStr::new("runas").encode_wide().chain(Some(0)).collect();
-    let params_str = format!("--token {} --port {}", token, port);
+    let params_str = format!("--port {} --token {}", port, token);
     let params_wstr: Vec<u16> = OsStr::new(&params_str).encode_wide().chain(Some(0)).collect();
     #[link(name = "shell32")] extern "system" { fn ShellExecuteW(h: *mut std::ffi::c_void, op: *const u16, f: *const u16, p: *const u16, d: *const u16, s: i32) -> isize; }
     
@@ -536,6 +549,7 @@ fn launch_as_admin(exe: &std::path::PathBuf, token: &str, port: u16) -> anyhow::
     let dir_wstr: Vec<u16> = cwd_path.parent().unwrap_or(std::path::Path::new(".")).as_os_str().encode_wide().chain(Some(0)).collect();
     
     let ret = unsafe { ShellExecuteW(null_mut(), verb_wstr.as_ptr(), exe_wstr.as_ptr(), params_wstr.as_ptr(), dir_wstr.as_ptr(), 0) };
+    
     if ret <= 32 { anyhow::bail!("UAC denied or helper missing."); }
     Ok(())
 }
@@ -543,8 +557,31 @@ fn launch_as_admin(exe: &std::path::PathBuf, token: &str, port: u16) -> anyhow::
 #[cfg(not(target_os = "windows"))]
 fn launch_as_admin(_exe: &PathBuf, _token: &str, _port: u16) -> Result<()> { anyhow::bail!("Windows only."); }
 
+#[cfg(target_os = "windows")]
+fn show_error_dialog(msg: &str) {
+    use std::os::windows::ffi::OsStrExt;
+    let msg_w: Vec<u16> = std::ffi::OsStr::new(msg).encode_wide().chain(Some(0)).collect();
+    let title_w: Vec<u16> = std::ffi::OsStr::new("OSTP GUI Error").encode_wide().chain(Some(0)).collect();
+    #[link(name = "user32")] extern "system" { fn MessageBoxW(hWnd: *mut std::ffi::c_void, lpText: *const u16, lpCaption: *const u16, uType: u32) -> i32; }
+    unsafe { MessageBoxW(std::ptr::null_mut(), msg_w.as_ptr(), title_w.as_ptr(), 0x10); } // 0x10 is MB_ICONERROR
+}
+
+#[cfg(not(target_os = "windows"))]
+fn show_error_dialog(msg: &str) {
+    println!("ERROR: {}", msg);
+}
+
+static SINGLE_INSTANCE_LOCK: std::sync::OnceLock<std::net::TcpListener> = std::sync::OnceLock::new();
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    if let Ok(listener) = std::net::TcpListener::bind("127.0.0.1:49153") {
+        let _ = SINGLE_INSTANCE_LOCK.set(listener);
+    } else {
+        show_error_dialog("Приложение OSTP GUI уже запущено!");
+        return;
+    }
+
     let state = AppState(Mutex::new(AppStateInner { tunnel: None }));
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())

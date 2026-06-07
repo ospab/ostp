@@ -19,6 +19,7 @@ pub mod relay_node;
 mod relay;
 mod signal;
 pub mod dns;
+pub mod router;
 
 pub use outbound::{OutboundAction, OutboundConfig, OutboundRule};
 pub use api::ApiConfig;
@@ -245,8 +246,22 @@ pub async fn run_server(
         }
     });
 
-    // Initialize DNS server
-    let dns_server = dns::DnsServer::new(dns_config.unwrap_or_default());
+    // Инициализируем DNS-сервер
+    let dns_cfg = dns_config.unwrap_or_default();
+    // Запускаем UDP listener если dns.enabled=true (полный режим) или intercept_all_port53=true
+    let start_dns_listener = dns_cfg.enabled || dns_cfg.intercept_all_port53;
+    let dns_server = dns::DnsServer::new(dns_cfg);
+    if start_dns_listener {
+        let dns_srv = dns_server.clone();
+        tokio::spawn(async move { dns_srv.run_local_udp_listener().await });
+    }
+    
+    // Initialize Router
+    let router = std::sync::Arc::new(router::Router::new(
+        outbound.clone(),
+        dns_server.clone(),
+        debug,
+    ));
 
     // Spawn Management API if configured
     if let Some(api_cfg) = api_config {
@@ -261,8 +276,9 @@ pub async fn run_server(
             let rq = reality_query.clone().unwrap_or_default();
             let config_path_api = config_path.clone();
             let dns_server_api = dns_server.clone();
+            let router_api = router.clone();
             tokio::spawn(async move {
-                api::start_api_server(api_cfg, api_keys, api_stats, server_host, server_port, rq, config_path_api, dns_server_api).await;
+                api::start_api_server(api_cfg, api_keys, api_stats, server_host, server_port, rq, config_path_api, dns_server_api, router_api).await;
             });
         }
     }
@@ -314,7 +330,7 @@ pub async fn run_server(
     let reality_config_arc = reality_config.map(std::sync::Arc::new);
 
     tokio::select! {
-        res = run_server_loop(bind_addrs.clone(), primary_socket, sockets, dispatcher, ui_cmd_rx, ui_event_tx, shared_keys, outbound, debug, reality_config_arc, dns_server) => {
+        res = run_server_loop(bind_addrs.clone(), primary_socket, sockets, dispatcher, ui_cmd_rx, ui_event_tx, shared_keys, router, reality_config_arc) => {
             if let Err(e) = res {
                 tracing::error!("Server error: {e}");
             }
@@ -337,10 +353,8 @@ async fn run_server_loop(
     mut ui_cmd_rx: mpsc::UnboundedReceiver<UiCommand>,
     ui_event_tx: mpsc::UnboundedSender<UiEvent>,
     shared_keys: std::sync::Arc<std::sync::RwLock<HashMap<String, crate::api::UserMeta>>>,
-    outbound: Option<OutboundConfig>,
-    debug: bool,
+    router: std::sync::Arc<crate::router::Router>,
     reality_config: Option<std::sync::Arc<RealityServerConfig>>,
-    dns_server: std::sync::Arc<dns::DnsServer>,
 ) -> Result<()> {
     let mut remotes: HashMap<(u32, u16), RemoteState> = HashMap::new();
     let (stream_tx, mut stream_rx) = mpsc::unbounded_channel::<(u32, u16, Vec<u8>)>();
@@ -432,7 +446,7 @@ async fn run_server_loop(
 
     drop(udp_tx); // Drop the original sender so the channel closes when all tasks end
 
-    if debug {
+    if router.debug {
         let _ = ui_event_tx.send(UiEvent::Log("Server loop started".to_string()));
         let _ = ui_event_tx.send(UiEvent::KeyCount(shared_keys.read().unwrap_or_else(|e| e.into_inner()).len()));
     }
@@ -462,7 +476,7 @@ async fn run_server_loop(
                     if let Err(e) = handle_udp_packet(
                         packet, peer, &mut dispatcher, &tcp_map, &socket, &mut remotes, &ui_event_tx,
                         stream_tx.clone(), udp_reply_tx.clone(), connect_tx.clone(),
-                        outbound.clone(), dns_server.clone(), debug,
+                        router.clone(),
                         &mut peer_last_seen, &mut peer_available, &mut last_empty_app_log
                     ).await {
                         tracing::error!("handle_udp_packet error: {}", e);
@@ -529,9 +543,7 @@ async fn handle_udp_packet(
     stream_tx: mpsc::UnboundedSender<(u32, u16, Vec<u8>)>,
     udp_reply_tx: mpsc::UnboundedSender<(u32, u16, String, Vec<u8>)>,
     connect_tx: mpsc::UnboundedSender<(u32, u16, String, Result<(tokio::net::tcp::OwnedWriteHalf, mpsc::Sender<()>), String>)>,
-    outbound: Option<OutboundConfig>,
-    dns_server: std::sync::Arc<dns::DnsServer>,
-    debug: bool,
+    router: std::sync::Arc<crate::router::Router>,
     peer_last_seen: &mut HashMap<IpAddr, Instant>,
     peer_available: &mut HashMap<IpAddr, bool>,
     last_empty_app_log: &mut Instant,
@@ -594,9 +606,7 @@ async fn handle_udp_packet(
                     stream_tx.clone(),
                     udp_reply_tx.clone(),
                     connect_tx.clone(),
-                    outbound.clone(),
-                    dns_server.clone(),
-                    debug,
+                    router.clone(),
                     tcp_map,
                 ).await?;
             }

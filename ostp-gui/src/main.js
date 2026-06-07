@@ -51,6 +51,7 @@ const inPbk          = $('in-pbk');
 const inSid          = $('in-sid');
 const inMtu          = $('in-mtu');
 const inTun          = $('in-tun-mode');
+const inKillSwitch   = $('in-kill-switch');
 const inMux          = $('in-mux-mode');
 const inMuxSessions  = $('in-mux-sessions');
 const inDebug        = $('in-debug');
@@ -91,10 +92,16 @@ function showToast(msg, variant = '') {
   }, 2400);
 }
 
-// ── DNS visibility ────────────────────────────────────────────────────────────
+// ── DNS & Kill Switch visibility ──────────────────────────────────────────────
 function updateDnsVisibility() {
   if (!groupCustomDns || !inOwndns) return;
   groupCustomDns.style.display = inOwndns.checked ? 'none' : 'block';
+}
+
+function updateKillSwitchVisibility() {
+  const group = $('group-kill-switch');
+  if (!group || !inTun) return;
+  group.style.display = inTun.checked ? 'flex' : 'none';
 }
 
 
@@ -162,19 +169,22 @@ function setState(next) {
 
 // ── Polling ──────────────────────────────────────────────────────────────────
 async function poll() {
+  if (!pollTimer) return;
   try {
     const code = await invoke('get_tunnel_status');
+    if (!pollTimer) return; // Prevent race condition if disconnected during await
+    
     if      (code === 0) { setState('disconnected'); return; }
     else if (code === 1)   setState('connecting');
     else if (code === 2)   setState('connected');
 
     const metrics = await invoke('get_metrics');
-    if (metrics) {
+    if (metrics && pollTimer) {
       metricDown.textContent = fmtBytes(metrics.bytes_recv);
       metricUp.textContent   = fmtBytes(metrics.bytes_sent);
     }
   } catch {
-    setState('disconnected');
+    if (pollTimer) setState('disconnected');
   }
 }
 
@@ -202,10 +212,12 @@ async function handleToggle() {
       } else {
         setState('disconnected');
         showToast(t('toast_error') || 'Failed to connect', 'error');
+        alert(t('toast_error') || 'Failed to connect');
       }
     } catch (err) {
       setState('disconnected');
       showToast(String(err), 'error');
+      alert(String(err));
     }
   } else {
     try { await invoke('stop_tunnel'); } catch { /* ignore */ }
@@ -243,7 +255,8 @@ async function loadConfigIntoForm() {
     inPbk.value     = c.reality?.pbk           || '';
     inSid.value     = c.reality?.sid           || '';
     inMtu.value     = c.mtu           || '';
-    inTun.checked   = !!c.tun?.enabled;
+    inTun.checked   = !!c.tun?.enable;
+    if (inKillSwitch) inKillSwitch.checked = !!c.tun?.kill_switch;
     inMux.checked   = !!c.mux?.enabled;
     inMuxSessions.value = c.mux?.sessions || '';
     
@@ -253,6 +266,7 @@ async function loadConfigIntoForm() {
     inOwndns.checked = isOwndns;
     inDns.value = isOwndns ? '' : savedDns;
     updateDnsVisibility();
+    updateKillSwitchVisibility();
 
     inDebug.checked = !!c.debug;
 
@@ -307,8 +321,8 @@ async function handleSave(silent = false) {
   }
 
   const mtuStr = inMtu.value.trim();
-  if (mtuStr) rawConfig.ostp.mtu = parseInt(mtuStr, 10);
-  else delete rawConfig.ostp.mtu;
+  if (mtuStr) rawConfig.mtu = parseInt(mtuStr, 10);
+  else delete rawConfig.mtu;
 
   if (inMux.checked) {
     const s = parseInt(inMuxSessions.value.trim(), 10);
@@ -319,6 +333,7 @@ async function handleSave(silent = false) {
 
   rawConfig.tun = rawConfig.tun || {};
   rawConfig.tun.enable = inTun.checked;
+  rawConfig.tun.kill_switch = inKillSwitch ? inKillSwitch.checked : false;
   rawConfig.tun.wintun_path = rawConfig.tun.wintun_path || './wintun.dll';
   rawConfig.tun.ipv4_address = rawConfig.tun.ipv4_address || '10.1.0.2/24';
   rawConfig.tun.stack = 'ostp';
@@ -384,12 +399,14 @@ window.addEventListener('DOMContentLoaded', async () => {
   applyTranslations();
   setState('disconnected');
   updateDnsVisibility(); // initialise field visibility from current checkbox state
+  updateKillSwitchVisibility();
 
   // Event wiring
   if (window.__TAURI__ && window.__TAURI__.event) {
     window.__TAURI__.event.listen('tunnel-error', (evt) => {
       setState('disconnected');
       showToast(String(evt.payload), 'error');
+      alert(String(evt.payload));
     });
   }
 
@@ -472,6 +489,10 @@ window.addEventListener('DOMContentLoaded', async () => {
   btnPeekKey.addEventListener('click',       togglePeek);
   inOwndns.addEventListener('change', () => {
     updateDnsVisibility();
+    scheduleAutoSave();
+  });
+  inTun.addEventListener('change', () => {
+    updateKillSwitchVisibility();
     scheduleAutoSave();
   });
   importInput.addEventListener('keydown', e => { if (e.key === 'Enter') handleImport(); });

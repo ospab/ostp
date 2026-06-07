@@ -180,13 +180,14 @@ pub async fn run_client(config: crate::config::ClientConfig) -> Result<()> {
         }
     });
 
-    run_client_core(config, metrics, shutdown_rx).await
+    run_client_core(config, metrics, shutdown_rx, None).await
 }
 
 pub async fn run_client_core(
     mut config: crate::config::ClientConfig,
     metrics: Arc<BridgeMetrics>,
     mut shutdown_rx_ext: watch::Receiver<bool>,
+    mut config_rx: Option<watch::Receiver<crate::config::ClientConfig>>,
 ) -> Result<()> {
     #[cfg(target_os = "windows")]
     if config.mode == "tun" && !is_admin() {
@@ -249,8 +250,12 @@ pub async fn run_client_core(
 
     let (proxy_events_tx, proxy_events_rx) = mpsc::channel(256);
     let (client_msgs_tx, client_msgs_rx) = mpsc::unbounded_channel();
+    
+    // Setup exclusions hot-reload channel
+    let (reload_tx, reload_rx) = watch::channel(config.exclusions.clone());
 
-    let bridge = Bridge::new(&config, metrics)?;
+    let mut bridge = Bridge::new(&config, metrics)?;
+    bridge.reload_tx = Some(reload_tx.clone());
 
     let (ui_tx, mut ui_rx) = mpsc::channel(512);
     let (cmd_tx, cmd_rx) = mpsc::channel(128);
@@ -305,11 +310,12 @@ pub async fn run_client_core(
     });
 
     let config_clone = config.clone();
+    let proxy_exclusions_rx = reload_rx.clone();
     let mut proxy_task = tokio::spawn(async move {
         tunnel::run_local_proxy(
             config.local_proxy,
             config.ostp,
-            config.exclusions,
+            proxy_exclusions_rx,
             config.debug,
             proxy_shutdown_rx,
             proxy_events_tx,
@@ -319,13 +325,42 @@ pub async fn run_client_core(
     });
 
     let wintun_shutdown_rx = shutdown_tx.subscribe();
+    let wintun_exclusions_rx = reload_rx.clone();
     let mut wintun_task = if config_clone.mode == "tun" {
         Some(tokio::spawn(async move {
-            tunnel::run_tun_tunnel(config_clone, wintun_shutdown_rx).await
+            tunnel::run_tun_tunnel(config_clone, wintun_shutdown_rx, wintun_exclusions_rx).await
         }))
     } else {
         None
     };
+
+    // Wait for local_shutdown
+    let mut local_shutdown = shutdown_rx_ext.clone();
+    let cmd_tx_loop = cmd_tx.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = local_shutdown.changed() => {
+                    if *local_shutdown.borrow() {
+                        let _ = cmd_tx_loop.send(BridgeCommand::Shutdown).await;
+                        break;
+                    }
+                }
+                Some(Ok(_)) = async {
+                    if let Some(ref mut rx) = config_rx {
+                        Some(rx.changed().await)
+                    } else {
+                        std::future::pending().await
+                    }
+                } => {
+                    if let Some(ref rx) = config_rx {
+                        let new_cfg = rx.borrow().clone();
+                        let _ = reload_tx.send(new_cfg.exclusions);
+                    }
+                }
+            }
+        }
+    });
 
     // Wait for either external shutdown OR any task to fail
     tokio::select! {

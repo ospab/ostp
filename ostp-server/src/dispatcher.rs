@@ -61,6 +61,7 @@ pub struct UserStatsSnapshot {
     pub connections: u64,
     pub limit_bytes: Option<u64>,
     pub online: bool,
+    pub last_seen: Option<u64>,
 }
 
 pub struct PeerState {
@@ -109,17 +110,37 @@ impl Dispatcher {
     /// Snapshot all user stats for API responses.
     pub fn snapshot_all_users(&self) -> Vec<UserStatsSnapshot> {
         let stats = self.user_stats.read().unwrap_or_else(|e| e.into_inner());
-        let online_keys: std::collections::HashSet<String> = self.peer_machines.values()
-            .map(|ps| ps.access_key.clone())
-            .collect();
-        stats.iter().map(|(key, us)| UserStatsSnapshot {
-            access_key: key.clone(),
-            name: None,
-            bytes_up: us.bytes_up.load(Ordering::Relaxed),
-            bytes_down: us.bytes_down.load(Ordering::Relaxed),
-            connections: us.connections.load(Ordering::Relaxed),
-            limit_bytes: us.limit_bytes,
-            online: online_keys.contains(key),
+        let mut online_keys: HashMap<String, std::time::Instant> = HashMap::new();
+        for ps in self.peer_machines.values() {
+            let key = ps.access_key.clone();
+            if let Some(existing) = online_keys.get(&key) {
+                if ps.last_seen > *existing {
+                    online_keys.insert(key, ps.last_seen);
+                }
+            } else {
+                online_keys.insert(key, ps.last_seen);
+            }
+        }
+        
+        let now = std::time::Instant::now();
+        let current_sys_time = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+
+        stats.iter().map(|(key, us)| {
+            let last_seen_unix = online_keys.get(key).map(|&instant| {
+                let diff = now.duration_since(instant).as_secs();
+                current_sys_time.saturating_sub(diff)
+            });
+            
+            UserStatsSnapshot {
+                access_key: key.clone(),
+                name: None,
+                bytes_up: us.bytes_up.load(Ordering::Relaxed),
+                bytes_down: us.bytes_down.load(Ordering::Relaxed),
+                connections: us.connections.load(Ordering::Relaxed),
+                limit_bytes: us.limit_bytes,
+                online: online_keys.contains_key(key),
+                last_seen: last_seen_unix,
+            }
         }).collect()
     }
 
