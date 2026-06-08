@@ -59,6 +59,10 @@ const inDomains      = $('in-ex-domains');
 const inIps          = $('in-ex-ips');
 const inProcesses    = $('in-ex-processes');
 
+const wintunModal       = $('wintun-modal');
+const btnWintunCancel   = $('btn-wintun-cancel');
+const btnWintunDownload = $('btn-wintun-download');
+
 // ── Utilities ────────────────────────────────────────────────────────────────
 function fmtBytes(b) {
   if (!b || b === 0) return '0 B';
@@ -81,6 +85,22 @@ function splitLines(val) {
   return val.split('\n').map(l => l.trim()).filter(Boolean);
 }
 
+// ── Theme ────────────────────────────────────────────────────────────────────
+function applyTheme(theme) {
+  document.documentElement.setAttribute('data-theme', theme);
+  localStorage.setItem('ostp-theme', theme);
+}
+
+function toggleTheme() {
+  const current = document.documentElement.getAttribute('data-theme');
+  applyTheme(current === 'light' ? 'dark' : 'light');
+}
+
+// Apply saved theme immediately (before any paint)
+(function() {
+  const saved = localStorage.getItem('ostp-theme') || 'dark';
+  document.documentElement.setAttribute('data-theme', saved);
+})();
 // ── Toast ────────────────────────────────────────────────────────────────────
 let toastTimer = null;
 function showToast(msg, variant = '') {
@@ -216,8 +236,12 @@ async function handleToggle() {
       }
     } catch (err) {
       setState('disconnected');
-      showToast(String(err), 'error');
-      alert(String(err));
+      if (err === "WINTUN_MISSING") {
+        wintunModal.classList.remove('hidden');
+      } else {
+        showToast(String(err), 'error');
+        alert(String(err));
+      }
     }
   } else {
     try { await invoke('stop_tunnel'); } catch { /* ignore */ }
@@ -487,6 +511,12 @@ window.addEventListener('DOMContentLoaded', async () => {
   btnBack.addEventListener('click',          () => showScreen('home'));
   btnImport.addEventListener('click',        handleImport);
   btnPeekKey.addEventListener('click',       togglePeek);
+
+  // Theme toggle
+  const btnThemeToggle = $('btn-theme-toggle');
+  if (btnThemeToggle) {
+    btnThemeToggle.addEventListener('click', toggleTheme);
+  }
   inOwndns.addEventListener('change', () => {
     updateDnsVisibility();
     scheduleAutoSave();
@@ -511,7 +541,30 @@ window.addEventListener('DOMContentLoaded', async () => {
     el.addEventListener('change', scheduleAutoSave);
   });
 
-  btnTestPing.addEventListener('click', async () => {
+  btnTestPing.addEventListener('click', runPingTest);
+
+  btnWintunCancel.addEventListener('click', () => {
+    wintunModal.classList.add('hidden');
+  });
+
+  btnWintunDownload.addEventListener('click', async () => {
+    try {
+      btnWintunDownload.disabled = true;
+      btnWintunDownload.textContent = "Downloading...";
+      await invoke('download_wintun');
+      wintunModal.classList.add('hidden');
+      showToast("Wintun driver downloaded successfully!", "ok");
+      handleToggle();
+    } catch (err) {
+      showToast("Failed to download: " + err, "error");
+      alert("Download failed: " + err);
+    } finally {
+      btnWintunDownload.disabled = false;
+      btnWintunDownload.textContent = "Download";
+    }
+  });
+
+  async function runPingTest() {
     pingValueTxt.textContent = 'Testing...';
     pingValueTxt.className = 'ping-test-value';
     try {
@@ -528,7 +581,7 @@ window.addEventListener('DOMContentLoaded', async () => {
     } catch {
       pingValueTxt.textContent = 'Target Ping: Error';
     }
-  });
+  }
 
   // Restore status on app open
   try {

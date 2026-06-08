@@ -33,6 +33,17 @@
               <path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83"/>
             </svg>
           </button>
+          <button id="btn-theme-toggle" class="theme-toggle-btn" aria-label="Toggle theme">
+            <!-- Sun icon (shown in dark mode) -->
+            <svg class="icon-sun" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <circle cx="12" cy="12" r="5"/>
+              <path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/>
+            </svg>
+            <!-- Moon icon (shown in light mode) -->
+            <svg class="icon-moon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/>
+            </svg>
+          </button>
           <button id="btn-go-settings" class="icon-btn" aria-label="Settings">
             <!-- Gear icon -->
             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -326,6 +337,18 @@
 
     <!-- Toast -->
     <div id="toast" class="toast" role="status" aria-live="polite"></div>
+
+    <!-- Wintun Modal -->
+    <div id="wintun-modal" class="modal-overlay hidden">
+      <div class="modal-content">
+        <h3 class="modal-title" data-i18n="wintun_missing_title">Wintun Driver Missing</h3>
+        <p class="modal-text" data-i18n="wintun_missing_desc">To use TUN mode, the Wintun driver (wintun.dll) is required. Would you like to download it now?</p>
+        <div class="modal-actions">
+          <button id="btn-wintun-cancel" class="btn secondary">Cancel</button>
+          <button id="btn-wintun-download" class="btn primary">Download</button>
+        </div>
+      </div>
+    </div>
 
   </div>
   <script type="module" src="main.js"></script>

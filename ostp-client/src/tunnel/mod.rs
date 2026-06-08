@@ -1,6 +1,6 @@
 mod proxy;
 pub mod native_handler;
-pub mod windows_route;
+
 mod udp_nat;
 
 pub async fn run_tun_tunnel(

@@ -28,4 +28,6 @@ ostp-client = { path = "../../ostp-client" }
 portable-atomic = "1"
 json_comments = "0.2"
 rand = "0.8"
+reqwest = { version = "0.13.4", features = ["blocking"] }
+zip = "8.6.0"
 

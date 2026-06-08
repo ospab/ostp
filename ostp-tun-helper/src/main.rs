@@ -52,6 +52,9 @@ struct TunnelState {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    ostp_client::logging::setup_panic_hook();
+    let _log_guard = ostp_client::logging::init_tracing("info", "ostp-helper", env!("CARGO_PKG_VERSION"));
+
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
             let _ = std::env::set_current_dir(dir);

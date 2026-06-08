@@ -52,7 +52,7 @@ pub fn extract_sni(data: &[u8]) -> Option<String> {
 
         if ext_type == 0x0000 { // Server Name Indication (SNI)
             if pos + 5 <= extensions_end {
-                let list_len = ((data[pos] as usize) << 8) | (data[pos + 1] as usize);
+                let _list_len = ((data[pos] as usize) << 8) | (data[pos + 1] as usize);
                 let name_type = data[pos + 2];
                 if name_type == 0 { // Hostname
                     let name_len = ((data[pos + 3] as usize) << 8) | (data[pos + 4] as usize);

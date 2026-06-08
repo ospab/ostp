@@ -39,6 +39,39 @@ if (Test-Path $CargoToml) {
             [System.IO.File]::WriteAllText($CargoToml, $NewContent)
         }
         Write-Output "[ok] Version: v$Version"
+
+        # Bump Tauri GUI
+        $TauriConf = Join-Path $ProjectRoot "ostp-gui\src-tauri\tauri.conf.json"
+        if (Test-Path $TauriConf) {
+            $TauriContent = [System.IO.File]::ReadAllText($TauriConf)
+            $TauriRegex = [regex] '"version":\s*"[^"]+"'
+            $TauriContent = $TauriRegex.Replace($TauriContent, ('"version": "' + $Version + '"'), 1)
+            [System.IO.File]::WriteAllText($TauriConf, $TauriContent)
+            Write-Output "  [ok] Updated tauri.conf.json"
+        }
+
+        # Bump React Control Panel
+        $PackageJson = Join-Path $ProjectRoot "ostp-control\package.json"
+        if (Test-Path $PackageJson) {
+            $PkgContent = [System.IO.File]::ReadAllText($PackageJson)
+            $PkgRegex = [regex] '"version":\s*"[^"]+"'
+            $PkgContent = $PkgRegex.Replace($PkgContent, ('"version": "' + $Version + '"'), 1)
+            [System.IO.File]::WriteAllText($PackageJson, $PkgContent)
+            Write-Output "  [ok] Updated package.json"
+        }
+
+        # Bump Flutter App
+        $Pubspec = Join-Path $ProjectRoot "ostp-flutter\pubspec.yaml"
+        if (Test-Path $Pubspec) {
+            $PubContent = [System.IO.File]::ReadAllText($Pubspec)
+            if ($PubContent -match 'version:\s*(\d+\.\d+\.\d+)\+(\d+)') {
+                $BuildNumber = [int]$Matches[2] + 1
+                $PubRegex = [regex] 'version:\s*\d+\.\d+\.\d+\+\d+'
+                $PubContent = $PubRegex.Replace($PubContent, ("version: $Version+$BuildNumber"), 1)
+                [System.IO.File]::WriteAllText($Pubspec, $PubContent)
+                Write-Output "  [ok] Updated pubspec.yaml"
+            }
+        }
     }
 }
 

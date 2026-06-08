@@ -86,7 +86,7 @@ pub fn bind_socket_to_interface(socket: &impl AsRawFd, if_name: &str) -> std::io
 pub fn get_windows_physical_if_index() -> Option<u32> {
     #[cfg(target_os = "windows")]
     {
-        return super::windows_route::sys::get_default_ipv4_route().map(|(_, idx)| idx);
+        return ostp_tun::windows::windows_route::sys::get_default_ipv4_route().map(|(_, idx)| idx);
     }
     #[cfg(not(target_os = "windows"))]
     {

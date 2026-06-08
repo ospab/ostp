@@ -153,8 +153,6 @@ impl Bridge {
                         self.running = false;
                         self.metrics.connection_state.store(0, Ordering::Relaxed);
                         proxy_guard = None;
-                        sessions_opt = None;
-                        udp_rx_opt = None;
                         stream_map.clear();
                         self.reset_proxy_streams(&tx, &proxy_tx, "manual stop");
                         break;

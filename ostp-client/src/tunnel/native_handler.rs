@@ -12,13 +12,9 @@ pub async fn run_native_tunnel(
     mut exclusions_rx: watch::Receiver<crate::config::ExclusionConfig>,
 ) -> Result<()> {
     use std::net::ToSocketAddrs;
-    use std::process::Command;
     use netstack_smoltcp::StackBuilder;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use futures::{StreamExt, SinkExt};
-
-    #[cfg(target_os = "windows")]
-    use std::os::windows::process::CommandExt;
 
     #[cfg(target_os = "linux")]
     {
@@ -56,217 +52,56 @@ pub async fn run_native_tunnel(
     #[allow(unused_variables)]
     let server_ip_str = server_ip.to_string();
 
-    // ── 2. Windows: grab physical gateway BEFORE we touch any routes ──────────
-    #[cfg(target_os = "windows")]
-    let (phys_gw, phys_if) = super::windows_route::sys::get_default_ipv4_route()
-        .ok_or_else(|| anyhow!("Cannot find physical default IPv4 route"))?;
+    // ── 2. Resolve excluded domains → IP addresses for bypass routing ─────────
+    let mut bypass_ips: Vec<std::net::IpAddr> = Vec::new();
 
-    // ── 3. Resolve excluded domains → IPv4 addresses for bypass routing ───────
-    //
-    //  Strategy identical to sing-box / v2rayN:
-    //    • IP exclusions  → add /32 host routes via physical gateway right now
-    //    • Domain exclusions → resolve them NOW, add /32 routes for the IPs
-    //    • Process exclusions → NOT possible via pure routing on Windows without
-    //      WFP; we log a warning and skip them at the routing level
-    #[cfg(target_os = "windows")]
-    // Will be populated after TUN is up; tracks /32 routes added for cleanup.
-    let bypass_routes: Vec<(std::net::Ipv4Addr, std::net::Ipv4Addr, u32)>;
+    // Server IP always bypasses TUN
+    bypass_ips.push(server_ip);
 
-    #[cfg(target_os = "windows")]
-    {
-        // Collect all IPs to bypass: server IP + configured IPs + resolved domains
-        let mut bypass_v4: Vec<std::net::Ipv4Addr> = Vec::new();
-
-        // Server IP always bypasses TUN
-        if let std::net::IpAddr::V4(v4) = server_ip {
-            bypass_v4.push(v4);
+    for ip_str in &config.exclusions.ips {
+        let host = ip_str.split('/').next().unwrap_or(ip_str);
+        if let Ok(ip) = host.parse() {
+            bypass_ips.push(ip);
         }
+    }
 
-        // Explicitly configured IPs / CIDRs
-        for ip_str in &config.exclusions.ips {
-            // Accept single IPs ("1.2.3.4") or CIDR ("1.2.3.0/24")
-            let host = ip_str.split('/').next().unwrap_or(ip_str);
-            if let Ok(std::net::IpAddr::V4(v4)) = host.parse() {
-                bypass_v4.push(v4);
-            }
-        }
-
-        // Resolve configured excluded domains (best-effort, DNS at startup).
-        // Use (host, port) tuple so lookup_host does NOT borrow a temporary string.
-        for domain in &config.exclusions.domains {
-            match tokio::net::lookup_host((domain.as_str(), 443u16)).await {
-                Ok(addrs) => {
-                    for addr in addrs {
-                        if let std::net::IpAddr::V4(v4) = addr.ip() {
-                            bypass_v4.push(v4);
-                        }
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!("Failed to pre-resolve excluded domain {domain}: {e}");
+    for domain in &config.exclusions.domains {
+        match tokio::net::lookup_host((domain.as_str(), 443u16)).await {
+            Ok(addrs) => {
+                for addr in addrs {
+                    bypass_ips.push(addr.ip());
                 }
             }
+            Err(e) => {
+                tracing::warn!("Failed to pre-resolve excluded domain {domain}: {e}");
+            }
         }
+    }
 
-        if !config.exclusions.processes.is_empty() {
-            tracing::warn!(
-                "Process-based split tunneling is not supported in TUN mode on Windows \
-                 without WFP. Processes in the exclusion list will still be tunneled. \
-                 Use IP or domain exclusions instead."
-            );
-        }
-
-        // Add /32 bypass routes via physical gateway BEFORE setting up TUN default route
-        bypass_routes = super::windows_route::sys::add_bypass_routes(&bypass_v4, phys_gw, phys_if, 1);
-        tracing::info!(
-            "Added {} bypass routes via {} (if_index={})",
-            bypass_routes.len(),
-            phys_gw,
-            phys_if
+    if !config.exclusions.processes.is_empty() {
+        tracing::warn!(
+            "Process-based split tunneling is not fully supported in TUN mode on all platforms \
+             without WFP/eBPF. Processes in the exclusion list will still be tunneled. \
+             Use IP or domain exclusions instead."
         );
     }
 
-    // ── 4. Create TUN device ──────────────────────────────────────────────────
-    let mut tun_cfg = tun::Configuration::default();
-    tun_cfg
-        .tun_name("ostp_tun")
-        .address((10, 1, 0, 2))
-        .netmask((255, 255, 255, 0))
-        .destination((10, 1, 0, 1))
-        .mtu(config.ostp.mtu as u16)
-        .up();
+    // ── 3. Create TUN device via ostp-tun crate ───────────────────────────────
+    let opts = ostp_tun::OstpTunOptions {
+        server_ip,
+        bypass_ips,
+        dns_server: config.dns_server.clone(),
+        kill_switch: config.kill_switch,
+        mtu: config.ostp.mtu as u16,
+        wintun_path: None,
+    };
 
-    #[cfg(target_os = "linux")]
-    tun_cfg.platform_config(|cfg| {
-        cfg.packet_information(false);
-    });
-
-    let dev = tun::create(&tun_cfg).map_err(|e| anyhow!("Failed to create TUN device: {}", e))?;
-    let dev = tun::AsyncDevice::new(dev).map_err(|e| anyhow!("TUN device async failed: {}", e))?;
-    tracing::info!("TUN device 'ostp_tun' created.");
-
-    // ── 5. Windows: set default route through TUN + miscellaneous setup ───────
-    #[cfg(target_os = "windows")]
-    {
-        const CREATE_NO_WINDOW: u32 = 0x08000000;
-        let current_exe = std::env::current_exe()?.to_string_lossy().into_owned();
-
-        // Wait for ostp_tun to be visible in the routing table
-        let mut tun_index = None;
-        for _ in 0..20 {
-            if let Some(idx) = super::windows_route::sys::get_interface_index("ostp_tun") {
-                tun_index = Some(idx);
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        }
-
-        if let Some(idx) = tun_index {
-            // Default route through TUN with metric=5 — higher than bypass routes (metric=1)
-            // so that non-excluded traffic is captured but excluded IPs go via real NIC.
-            let _ = super::windows_route::sys::add_ipv4_route(
-                std::net::Ipv4Addr::new(0, 0, 0, 0),
-                std::net::Ipv4Addr::new(0, 0, 0, 0),
-                std::net::Ipv4Addr::new(10, 1, 0, 1),
-                idx,
-                5,
-            );
-            tracing::info!("Default route via TUN (if_index={idx}, metric=5) added.");
-        } else {
-            tracing::warn!("Could not find ostp_tun index in routing table — traffic may not be captured.");
-        }
-
-        let exe1 = current_exe.clone();
-        let exe2 = current_exe.clone();
-        let _ = tokio::task::spawn_blocking(move || {
-            // Firewall allow-rules for OSTP binary
-            let _ = Command::new("netsh")
-                .creation_flags(CREATE_NO_WINDOW)
-                .args(["advfirewall", "firewall", "add", "rule",
-                       "name=OSTP Tunnel In", "dir=in", "action=allow",
-                       &format!("program={}", exe1)])
-                .output();
-            let _ = Command::new("netsh")
-                .creation_flags(CREATE_NO_WINDOW)
-                .args(["advfirewall", "firewall", "add", "rule",
-                       "name=OSTP Tunnel Out", "dir=out", "action=allow",
-                       &format!("program={}", exe2)])
-                .output();
-            // Disable DAD / Router Discovery to avoid 15s delay
-            let _ = Command::new("netsh")
-                .creation_flags(CREATE_NO_WINDOW)
-                .args(["interface", "ipv4", "set", "interface", "name=ostp_tun",
-                       "routerdiscovery=disabled", "dadtransmits=0",
-                       "managedaddress=disabled", "otherstateful=disabled"])
-                .output();
-        });
-
-        if let Some(ref dns) = config.dns_server {
-            if !dns.is_empty() {
-                let dns_clone = dns.clone();
-                let _ = tokio::task::spawn_blocking(move || {
-                    let _ = Command::new("netsh")
-                        .creation_flags(CREATE_NO_WINDOW)
-                        .args(["interface", "ipv4", "set", "dnsservers",
-                               "name=ostp_tun", "static", &dns_clone, "primary"])
-                        .output();
-                });
-            }
-        }
-
-        if config.kill_switch {
-            tracing::info!("Kill Switch enabled: Adding metric 10 blackhole route to prevent leakage");
-            let _ = tokio::task::spawn_blocking(move || {
-                let _ = Command::new("route")
-                    .creation_flags(CREATE_NO_WINDOW)
-                    .args(["add", "0.0.0.0", "mask", "0.0.0.0", "127.0.0.1", "metric", "10", "if", "1"])
-                    .output();
-            });
-        }
-    }
-
-    // ── 6. Linux: exclusion routes via real gateway ───────────────────────────
-    #[cfg(target_os = "linux")]
-    {
-        let gw_out = Command::new("ip")
-            .args(["route", "show", "default"])
-            .output()
-            .ok()
-            .and_then(|o| String::from_utf8(o.stdout).ok());
-
-        let real_gw = gw_out.as_deref().and_then(|s| {
-            s.split_whitespace()
-                .skip_while(|w| *w != "via")
-                .nth(1)
-                .map(|s| s.to_string())
-        });
-        let real_dev = gw_out.as_deref().and_then(|s| {
-            s.split_whitespace()
-                .skip_while(|w| *w != "dev")
-                .nth(1)
-                .map(|s| s.to_string())
-        });
-
-        if let (Some(ref gw), Some(ref dev)) = (&real_gw, &real_dev) {
-            // Server IP bypass
-            let _ = Command::new("ip")
-                .args(["route", "add", &format!("{}/32", server_ip_str), "via", gw, "dev", dev])
-                .output();
-            // Configured IP exclusions
-            for ip_str in &config.exclusions.ips {
-                let host = ip_str.split('/').next().unwrap_or(ip_str);
-                let route = if ip_str.contains('/') { ip_str.as_str() } else { &format!("{}/32", host) };
-                let _ = Command::new("ip")
-                    .args(["route", "add", route, "via", gw, "dev", dev])
-                    .output();
-            }
-        }
-
-        // Default route through TUN
-        let _ = Command::new("ip")
-            .args(["route", "add", "default", "via", "10.1.0.1", "dev", "ostp_tun", "metric", "10"])
-            .output();
-    }
+    let tun_interface = ostp_tun::OstpTunInterface::create(opts)
+        .await
+        .map_err(|e| anyhow!("Failed to create OstpTunInterface: {}", e))?;
+        
+    let dev = tun_interface.device;
+    let _route_guard = tun_interface.guard;
 
     // ── 7. Build smoltcp network stack ────────────────────────────────────────
     let (stack, tcp_runner, udp_socket, tcp_listener) = StackBuilder::default()
@@ -371,7 +206,7 @@ pub async fn run_native_tunnel(
 
     // Physical interface index — Some on Windows, None everywhere else
     #[cfg(target_os = "windows")]
-    let phys_if_for_bypass: Option<u32> = Some(phys_if);
+    let phys_if_for_bypass: Option<u32> = ostp_tun::windows::windows_route::sys::get_default_ipv4_route().map(|(_, idx)| idx);
     #[cfg(not(target_os = "windows"))]
     let phys_if_for_bypass: Option<u32> = None;
 
@@ -447,6 +282,7 @@ pub async fn run_native_tunnel(
                     let Ok(socket) = socket else { return; };
 
                     // Bind to physical interface so packets don't loop back into TUN
+
                     #[cfg(target_os = "windows")]
                     if let Some(idx) = phys_if_for_bypass {
                         if let Err(e) = crate::tunnel::proxy::bind_socket_to_interface(
@@ -537,54 +373,7 @@ pub async fn run_native_tunnel(
     tracing::info!("Deactivating NATIVE TUN tunnel...");
 
     // ── Cleanup ───────────────────────────────────────────────────────────────
-    #[cfg(target_os = "windows")]
-    {
-        const CREATE_NO_WINDOW: u32 = 0x08000000;
-
-        // Remove all bypass /32 host routes we added
-        super::windows_route::sys::remove_bypass_routes(&bypass_routes);
-        tracing::info!("Removed {} bypass routes.", bypass_routes.len());
-
-        let is_kill_switch = config.kill_switch;
-        let _ = tokio::task::spawn_blocking(move || {
-            let _ = Command::new("netsh")
-                .creation_flags(CREATE_NO_WINDOW)
-                .args(["advfirewall", "firewall", "delete", "rule", "name=OSTP Tunnel In"])
-                .output();
-            let _ = Command::new("netsh")
-                .creation_flags(CREATE_NO_WINDOW)
-                .args(["advfirewall", "firewall", "delete", "rule", "name=OSTP Tunnel Out"])
-                .output();
-            let _ = Command::new("netsh")
-                .creation_flags(CREATE_NO_WINDOW)
-                .args(["interface", "ipv4", "set", "dnsservers",
-                       "name=ostp_tun", "source=dhcp"])
-                .output();
-            if is_kill_switch {
-                let _ = Command::new("route")
-                    .creation_flags(CREATE_NO_WINDOW)
-                    .args(["delete", "0.0.0.0", "mask", "0.0.0.0", "127.0.0.1"])
-                    .output();
-            }
-        });
-    }
-
-    #[cfg(target_os = "linux")]
-    {
-        let _ = Command::new("ip").args(["route", "del", "default", "dev", "ostp_tun"]).output();
-        let _ = Command::new("ip")
-            .args(["route", "del", &format!("{}/32", server_ip_str)])
-            .output();
-        for ip_str in &config.exclusions.ips {
-            let host = ip_str.split('/').next().unwrap_or(ip_str);
-            let route = if ip_str.contains('/') {
-                ip_str.as_str().to_string()
-            } else {
-                format!("{}/32", host)
-            };
-            let _ = Command::new("ip").args(["route", "del", &route]).output();
-        }
-    }
+    // Cleanup is handled automatically by the _route_guard Drop trait in ostp-tun
 
     Ok(())
 }
@@ -597,6 +386,7 @@ pub async fn run_native_tunnel(
 pub async fn run_native_tunnel(
     _config: crate::config::ClientConfig,
     _shutdown: watch::Receiver<bool>,
+    _exclusions_rx: watch::Receiver<crate::config::ExclusionConfig>,
 ) -> Result<()> {
     Err(anyhow!("Native TUN tunnel is only supported on Windows/Linux"))
 }
