@@ -109,7 +109,6 @@ fn parse_ostp_link(link: &str) -> Result<ClientConfig> {
         transport: Some(TransportConfigRaw {
             mode: Some(transport_mode),
             stealth_sni: Some(sni.clone()),
-            stealth_port: Some(443),
             wss: Some(wss_enabled),
         }),
         socks5_bind: Some("127.0.0.1:1088".to_string()),
@@ -347,7 +346,6 @@ struct ClientConfig {
 struct TransportConfigRaw {
     mode: Option<String>,
     stealth_sni: Option<String>,
-    stealth_port: Option<u16>,
     wss: Option<bool>,
 }
 
@@ -857,7 +855,6 @@ async fn run_app() -> Result<()> {
   "transport": {{
     "mode": "udp",
     "stealth_sni": "www.microsoft.com",
-    "stealth_port": 443,
     "wss": false
   }},
   
@@ -1232,7 +1229,6 @@ async fn run_client_directly(client_cfg: ClientConfig) -> Result<()> {
         transport: ostp_client::config::TransportConfig {
             mode: client_cfg.transport.as_ref().and_then(|t| t.mode.clone()).unwrap_or_else(|| "udp".to_string()),
             stealth_sni: client_cfg.transport.as_ref().and_then(|t| t.stealth_sni.clone()).unwrap_or_else(|| "microsoft.com".to_string()),
-            stealth_port: client_cfg.transport.as_ref().and_then(|t| t.stealth_port).unwrap_or(443),
             wss: client_cfg.transport.as_ref().and_then(|t| t.wss).unwrap_or(false),
         },
         dns_server: client_cfg.tun.as_ref().and_then(|t| t.dns.clone()),

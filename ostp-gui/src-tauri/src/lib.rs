@@ -35,6 +35,13 @@ struct ClientConfigRaw {
     debug: Option<bool>,
     exclude: Option<ExcludeConfig>,
     mux: Option<MuxConfig>,
+    gui: Option<GuiConfig>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+struct GuiConfig {
+    autoconnect: Option<bool>,
+    launch_startup: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -61,7 +68,6 @@ struct RealityConfigRaw {
 struct TransportConfigRaw {
     mode: Option<String>,
     stealth_sni: Option<String>,
-    stealth_port: Option<u16>,
     wss: Option<bool>,
 }
 
@@ -99,9 +105,10 @@ enum HelperMsg {
 // ── Application state ─────────────────────────────────────────────────────────
 
 struct InProcessState {
-    shutdown_tx: Option<watch::Sender<bool>>,
-    metrics: Arc<BridgeMetrics>,
-    handle: JoinHandle<Result<(), String>>,
+    shutdown_tx: Option<tokio::sync::watch::Sender<bool>>,
+    metrics: Arc<ostp_client::bridge::BridgeMetrics>,
+    handle: tokio::task::JoinHandle<Result<(), String>>,
+    error_msg: Arc<tokio::sync::Mutex<Option<String>>>,
 }
 
 struct HelperState {
@@ -174,7 +181,6 @@ fn map_to_client_config(raw: &ClientConfigRaw, mode: &str) -> ostp_client::confi
         transport: ostp_client::config::TransportConfig {
             mode: raw.transport.as_ref().and_then(|t| t.mode.clone()).unwrap_or_else(|| "udp".to_string()),
             stealth_sni: raw.transport.as_ref().and_then(|t| t.stealth_sni.clone()).unwrap_or_else(|| "microsoft.com".to_string()),
-            stealth_port: raw.transport.as_ref().and_then(|t| t.stealth_port).unwrap_or(443),
             wss: raw.transport.as_ref().and_then(|t| t.wss).unwrap_or(false),
         },
         exclusions: ostp_client::config::ExclusionConfig {
@@ -194,48 +200,63 @@ fn map_to_client_config(raw: &ClientConfigRaw, mode: &str) -> ostp_client::confi
 
 // ── Tauri commands ────────────────────────────────────────────────────────────
 
+/// Returns the directory path where wintun.dll should be placed.
 #[tauri::command]
-async fn download_wintun() -> Result<bool, String> {
-    tokio::task::spawn_blocking(move || {
-        let response = reqwest::blocking::get("https://www.wintun.net/builds/wintun-0.14.1.zip")
-            .map_err(|e| format!("Failed to download wintun.zip: {}", e))?;
-        let bytes = response.bytes().map_err(|e| format!("Failed to read bytes: {}", e))?;
-        let cursor = std::io::Cursor::new(bytes);
-        let mut zip = zip::ZipArchive::new(cursor).map_err(|e| format!("Invalid zip archive: {}", e))?;
-        
-        let arch = if cfg!(target_arch = "x86") {
-            "x86"
-        } else if cfg!(target_arch = "aarch64") {
-            "arm64"
-        } else {
-            "amd64"
-        };
-        let arch_path = format!("wintun/bin/{}/wintun.dll", arch);
-        
-        let mut file = zip.by_name(&arch_path).map_err(|e| format!("wintun.dll not found in zip: {}", e))?;
-        
-        let mut paths_to_write = vec![];
-        if let Ok(cwd) = std::env::current_dir() {
-            paths_to_write.push(cwd.join("wintun.dll"));
+fn get_wintun_install_path() -> String {
+    if let Some(helper) = find_helper_exe() {
+        if let Some(dir) = helper.parent() {
+            return dir.to_string_lossy().into_owned();
         }
-        if let Some(helper) = find_helper_exe() {
-            if let Some(dir) = helper.parent() {
-                paths_to_write.push(dir.join("wintun.dll"));
+    }
+    if let Ok(cwd) = std::env::current_dir() {
+        return cwd.to_string_lossy().into_owned();
+    }
+    String::new()
+}
+
+/// Sets or removes the app from Windows startup (HKCU\...\Run).
+#[tauri::command]
+fn set_autostart(enable: bool) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    {
+        use std::process::Command;
+        let key = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
+        let app_name = "OSTP";
+        if enable {
+            let exe = std::env::current_exe()
+                .map_err(|e| format!("Cannot get exe path: {}", e))?;
+            let exe_str = format!("\"{}\"", exe.to_string_lossy());
+            let out = Command::new("reg")
+                .args(["add", key, "/v", app_name, "/t", "REG_SZ", "/d", &exe_str, "/f"])
+                .output()
+                .map_err(|e| format!("reg add failed: {}", e))?;
+            if !out.status.success() {
+                return Err(String::from_utf8_lossy(&out.stderr).to_string());
             }
+        } else {
+            let _ = Command::new("reg")
+                .args(["delete", key, "/v", app_name, "/f"])
+                .output();
         }
-        
-        if paths_to_write.is_empty() {
-            return Err("Could not determine where to place wintun.dll".to_string());
+    }
+    Ok(())
+}
+
+/// Checks if the app is currently in Windows startup.
+#[tauri::command]
+fn get_autostart() -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        use std::process::Command;
+        let key = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
+        let out = Command::new("reg")
+            .args(["query", key, "/v", "OSTP"])
+            .output();
+        if let Ok(o) = out {
+            return o.status.success();
         }
-        
-        let mut buf = Vec::new();
-        std::io::copy(&mut file, &mut buf).map_err(|e| format!("Failed to read from zip: {}", e))?;
-        
-        for p in paths_to_write {
-            let _ = std::fs::write(&p, &buf);
-        }
-        Ok(true)
-    }).await.map_err(|e| e.to_string())?
+    }
+    false
 }
 
 #[tauri::command]
@@ -300,11 +321,28 @@ async fn get_tunnel_status(state: tauri::State<'_, AppState>) -> Result<u8, Stri
     match &guard.tunnel {
         None => Ok(0),
         Some(TunnelHandle::InProcess(s)) => {
-            if s.handle.is_finished() { return Ok(0); }
-            Ok(s.metrics.connection_state.load(Ordering::Relaxed))
+            let finished = s.handle.is_finished();
+            let conn_state = s.metrics.connection_state.load(Ordering::Relaxed);
+            eprintln!("[OSTP] get_tunnel_status InProcess: finished={} conn_state={}", finished, conn_state);
+            if finished {
+                let mut err_guard = s.error_msg.lock().await;
+                if let Some(e) = err_guard.take() {
+                    eprintln!("[OSTP] get_tunnel_status returning Err: {}", e);
+                    return Err(e);
+                }
+                return Ok(0);
+            }
+            Ok(conn_state)
         }
         Some(TunnelHandle::Helper(h)) => {
-            let ps = h.pipe_state.lock().await;
+            let mut ps = h.pipe_state.lock().await;
+            eprintln!("[OSTP] get_tunnel_status Helper: conn_state={}", ps.connection_state);
+            if ps.connection_state == 0 {
+                if let Some(e) = ps.error_msg.take() {
+                    eprintln!("[OSTP] get_tunnel_status returning Err: {}", e);
+                    return Err(e);
+                }
+            }
             Ok(ps.connection_state)
         }
     }
@@ -422,28 +460,39 @@ async fn start_tunnel(state: tauri::State<'_, AppState>, app: tauri::AppHandle) 
     };
 
     let is_tun_enabled = client_cfg.tun.as_ref().map(|t| t.enable).unwrap_or(false);
+    eprintln!("[OSTP] start_tunnel: is_tun_enabled={}", is_tun_enabled);
 
     #[cfg(target_os = "windows")]
     if is_tun_enabled {
         let mut found = false;
         if let Ok(cwd) = std::env::current_dir() {
-            if cwd.join("wintun.dll").exists() { found = true; }
+            let p = cwd.join("wintun.dll");
+            eprintln!("[OSTP] checking wintun at: {:?} exists={}", p, p.exists());
+            if p.exists() { found = true; }
         }
         if !found {
             if let Some(helper) = find_helper_exe() {
+                eprintln!("[OSTP] helper exe found at: {:?}", helper);
                 if let Some(dir) = helper.parent() {
-                    if dir.join("wintun.dll").exists() { found = true; }
+                    let p = dir.join("wintun.dll");
+                    eprintln!("[OSTP] checking wintun at: {:?} exists={}", p, p.exists());
+                    if p.exists() { found = true; }
                 }
+            } else {
+                eprintln!("[OSTP] helper exe NOT FOUND");
             }
         }
         if !found {
+            eprintln!("[OSTP] WINTUN_MISSING — returning error");
             return Err("WINTUN_MISSING".to_string());
         }
     }
 
     if is_tun_enabled {
+        eprintln!("[OSTP] starting TUN via helper");
         start_tun_via_helper(&mut guard, &client_cfg, app).await
     } else {
+        eprintln!("[OSTP] starting proxy in-process");
         start_proxy_in_process(&mut guard, &client_cfg, app).await
     }
 }
@@ -465,10 +514,15 @@ async fn start_proxy_in_process(
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let metrics_clone = metrics.clone();
+    let error_msg = Arc::new(tokio::sync::Mutex::new(None));
+    let error_msg_clone = error_msg.clone();
+
     let handle = tokio::spawn(async move {
         match ostp_client::runner::run_client_core(mapped, metrics_clone, shutdown_rx, None).await {
             Ok(_) => Ok(()),
             Err(e) => {
+                let mut err_guard = error_msg_clone.lock().await;
+                *err_guard = Some(e.to_string());
                 let _ = app.emit("tunnel-error", e.to_string());
                 Err(e.to_string())
             }
@@ -479,6 +533,7 @@ async fn start_proxy_in_process(
         shutdown_tx: Some(shutdown_tx),
         metrics,
         handle,
+        error_msg,
     }));
     Ok(true)
 }
@@ -517,7 +572,7 @@ async fn start_tun_via_helper(
     }).to_string();
 
     let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::channel::<String>(16);
-    let pipe_state = Arc::new(Mutex::new(HelperPipeState { connection_state: 1, bytes_sent: 0, bytes_recv: 0, rtt_ms: 0 }));
+    let pipe_state = Arc::new(Mutex::new(HelperPipeState { connection_state: 1, bytes_sent: 0, bytes_recv: 0, rtt_ms: 0, error_msg: None }));
     let state_for_task = pipe_state.clone();
 
     tokio::spawn(async move {
@@ -540,6 +595,7 @@ async fn start_tun_via_helper(
                             HelperMsg::Metrics { bytes_sent, bytes_recv, rtt_ms } => { s.bytes_sent = bytes_sent; s.bytes_recv = bytes_recv; s.rtt_ms = rtt_ms; }
                             HelperMsg::Error { message } => { 
                                 s.connection_state = 0; 
+                                s.error_msg = Some(message.clone());
                                 eprintln!("Helper error: {}", message);
                                 let _ = app.emit("tunnel-error", message);
                             }
@@ -564,6 +620,7 @@ struct HelperPipeState {
     bytes_sent: u64,
     bytes_recv: u64,
     rtt_ms: u32,
+    error_msg: Option<String>,
 }
 
 fn find_helper_exe() -> Option<PathBuf> {
@@ -745,7 +802,7 @@ pub fn run() {
             }
             _ => {}
         })
-        .invoke_handler(tauri::generate_handler![start_tunnel, stop_tunnel, reload_tunnel, get_tunnel_status, get_metrics, get_config, save_config, download_wintun])
+        .invoke_handler(tauri::generate_handler![start_tunnel, stop_tunnel, reload_tunnel, get_tunnel_status, get_metrics, get_config, save_config, get_wintun_install_path, set_autostart, get_autostart])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

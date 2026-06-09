@@ -83,7 +83,6 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
     final debugMode = widget.prefs.getBool('debug_mode') ?? false;
     final transportMode = widget.prefs.getString('transport_mode') ?? 'udp';
     final stealthSni = widget.prefs.getString('stealth_sni') ?? 'vk.com';
-    final stealthPort = widget.prefs.getString('stealth_port') ?? '443';
     final wss = widget.prefs.getBool('wss') ?? false;
     final mtu = widget.prefs.getString('mtu') ?? '1140';
     final muxEnabled = widget.prefs.getBool('mux_enabled') ?? false;
@@ -113,7 +112,6 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
       "transport": {
         "mode": transportMode,
         "stealth_sni": stealthSni,
-        "stealth_port": int.tryParse(stealthPort) ?? 443,
         "wss": wss,
       },
       "multiplex": {
@@ -182,7 +180,6 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
       final debugMode = widget.prefs.getBool('debug_mode') ?? false;
       final transportMode = widget.prefs.getString('transport_mode') ?? 'udp';
       final stealthSni = widget.prefs.getString('stealth_sni') ?? 'vk.com';
-      final stealthPort = widget.prefs.getString('stealth_port') ?? '443';
       final wss = widget.prefs.getBool('wss') ?? false;
       final mtu = widget.prefs.getString('mtu') ?? '1140';
       final muxEnabled = widget.prefs.getBool('mux_enabled') ?? false;
@@ -211,7 +208,6 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
         "transport": {
           "mode": transportMode,
           "stealth_sni": stealthSni,
-          "stealth_port": int.tryParse(stealthPort) ?? 443,
           "wss": wss,
         },
         "multiplex": {

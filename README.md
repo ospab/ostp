@@ -119,7 +119,7 @@ graph TD
   "server": "YOUR_SERVER_IP:50000",
   "access_key": "YOUR_SECRET_KEY",
   "socks5_bind": "127.0.0.1:1088",
-  "transport": { "mode": "udp", "stealth_sni": "vk.com", "stealth_port": 443 },
+  "transport": { "mode": "udp", "stealth_sni": "vk.com" },
   "tun": { "enable": false, "dns": "1.1.1.1" }
 }
 ```

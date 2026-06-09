@@ -27,6 +27,7 @@ pub async fn handle_tcp_connection<S>(
     udp_tx: mpsc::Sender<(Bytes, SocketAddr)>,
     tcp_map: Arc<RwLock<HashMap<SocketAddr, mpsc::Sender<Bytes>>>>,
     reality_config: Option<Arc<RealityServerConfig>>,
+    fb_target: Option<String>,
 ) -> Result<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -61,9 +62,16 @@ where
         if let Some(rc) = reality_config {
             return handle_reality_connection(stream, initial_buf[..header_len].to_vec(), peer_addr, shared_keys, udp_tx, tcp_map, rc).await;
         } else {
-            // Received TLS but Reality is not enabled, maybe forward to a default fallback?
-            // For now, just drop
-            anyhow::bail!("received TLS but Reality is not configured");
+            // Received TLS but Reality is not enabled
+            if let Some(target) = fb_target {
+                tracing::info!("Fallback triggered for {} -> {}", peer_addr, target);
+                let mut dest_stream: TcpStream = TcpStream::connect(&target).await?;
+                dest_stream.write_all(&initial_buf[..header_len]).await?;
+                tokio::io::copy_bidirectional(&mut stream, &mut dest_stream).await?;
+                return Ok(());
+            } else {
+                anyhow::bail!("received TLS but Reality is not configured and no fallback target");
+            }
         }
     }
 
@@ -89,10 +97,16 @@ where
     } else if headers_str.starts_with("GET /stream HTTP/1.1\r\n") {
         false
     } else {
-        // Not a valid OSTP path. If Reality fallback was configured but we received plain HTTP, maybe fallback?
-        // Actually fallback is handled above for TLS. For HTTP, we just 404.
-        let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\n\r\n").await;
-        anyhow::bail!("invalid request line");
+        if let Some(target) = fb_target {
+            tracing::info!("Fallback triggered for {} -> {}", peer_addr, target);
+            let mut dest_stream: TcpStream = TcpStream::connect(&target).await?;
+            dest_stream.write_all(&initial_buf[..header_len]).await?;
+            tokio::io::copy_bidirectional(&mut stream, &mut dest_stream).await?;
+            return Ok(());
+        } else {
+            let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\n\r\n").await;
+            anyhow::bail!("invalid request line");
+        }
     };
 
     // Extract Authorization
@@ -107,16 +121,32 @@ where
     let sig_b64 = match signature_base64 {
         Some(s) => s,
         None => {
-            let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\n\r\n").await;
-            anyhow::bail!("missing authorization");
+            if let Some(target) = fb_target {
+                tracing::info!("Fallback triggered for {} -> {}", peer_addr, target);
+                let mut dest_stream: TcpStream = TcpStream::connect(&target).await?;
+                dest_stream.write_all(&initial_buf[..header_len]).await?;
+                tokio::io::copy_bidirectional(&mut stream, &mut dest_stream).await?;
+                return Ok(());
+            } else {
+                let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\n\r\n").await;
+                anyhow::bail!("missing authorization");
+            }
         }
     };
 
     let sig_bytes = match base64::Engine::decode(&base64::engine::general_purpose::STANDARD_NO_PAD, &sig_b64) {
         Ok(b) => b,
         Err(_) => {
-            let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\n\r\n").await;
-            anyhow::bail!("invalid base64 signature");
+            if let Some(target) = fb_target {
+                tracing::info!("Fallback triggered for {} -> {}", peer_addr, target);
+                let mut dest_stream: TcpStream = TcpStream::connect(&target).await?;
+                dest_stream.write_all(&initial_buf[..header_len]).await?;
+                tokio::io::copy_bidirectional(&mut stream, &mut dest_stream).await?;
+                return Ok(());
+            } else {
+                let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\n\r\n").await;
+                anyhow::bail!("invalid base64 signature");
+            }
         }
     };
 
@@ -153,8 +183,16 @@ where
     }
 
     if !authenticated {
-        let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\n\r\n").await;
-        anyhow::bail!("unauthorized (invalid HMAC)");
+        if let Some(target) = fb_target {
+            tracing::info!("Fallback triggered for {} -> {}", peer_addr, target);
+            let mut dest_stream: TcpStream = TcpStream::connect(&target).await?;
+            dest_stream.write_all(&initial_buf[..header_len]).await?;
+            tokio::io::copy_bidirectional(&mut stream, &mut dest_stream).await?;
+            return Ok(());
+        } else {
+            let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\n\r\n").await;
+            anyhow::bail!("unauthorized (invalid HMAC)");
+        }
     }
 
     if wss {

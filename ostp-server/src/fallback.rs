@@ -50,7 +50,7 @@ pub async fn start_fallback_server(config: FallbackConfig) {
     }
 }
 
-async fn proxy_connection(mut client: TcpStream, target: &str) -> anyhow::Result<()> {
+pub async fn proxy_connection(mut client: TcpStream, target: &str) -> anyhow::Result<()> {
     let mut upstream = TcpStream::connect(target).await?;
 
     let (mut client_read, mut client_write) = client.split();

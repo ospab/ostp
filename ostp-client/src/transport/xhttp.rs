@@ -31,8 +31,13 @@ pub async fn connect_xhttp(
     let addr = std::net::SocketAddr::new(target_ip, port);
     
     #[cfg(not(target_os = "android"))]
-    let mut tcp_stream = tokio::net::TcpStream::connect(addr).await
-        .with_context(|| format!("failed to connect to {}", addr))?;
+    let mut tcp_stream = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        tokio::net::TcpStream::connect(addr),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("TCP connect timeout to {}", addr))?
+    .with_context(|| format!("failed to connect to {}", addr))?;
 
     #[cfg(target_os = "android")]
     let mut tcp_stream = {
@@ -44,8 +49,13 @@ pub async fn connect_xhttp(
         
         sock.set_nonblocking(true)?;
         let tcp_socket = tokio::net::TcpSocket::from_std_stream(sock.into());
-        tcp_socket.connect(addr).await
-            .with_context(|| format!("failed to connect to {}", addr))?
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            tcp_socket.connect(addr),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("TCP connect timeout to {}", addr))?
+        .with_context(|| format!("failed to connect to {}", addr))?
     };
 
     tcp_stream.set_nodelay(true)?;

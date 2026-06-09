@@ -29,7 +29,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
   late TextEditingController _ipsCtrl;
   late TextEditingController _processesCtrl;
   late TextEditingController _stealthSniCtrl;
-  late TextEditingController _stealthPortCtrl;
   late TextEditingController _pbkCtrl;
   late TextEditingController _sidCtrl;
 
@@ -56,7 +55,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
     _ipsCtrl = TextEditingController(text: widget.prefs.getString('ex_ips') ?? '');
     _processesCtrl = TextEditingController(text: widget.prefs.getString('ex_processes') ?? '');
     _stealthSniCtrl = TextEditingController(text: widget.prefs.getString('stealth_sni') ?? '');
-    _stealthPortCtrl = TextEditingController(text: widget.prefs.getString('stealth_port') ?? '443');
     _pbkCtrl = TextEditingController(text: widget.prefs.getString('pbk') ?? '');
     _sidCtrl = TextEditingController(text: widget.prefs.getString('sid') ?? '');
     _wss = widget.prefs.getBool('wss') ?? false;
@@ -82,7 +80,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
     _ipsCtrl.dispose();
     _processesCtrl.dispose();
     _stealthSniCtrl.dispose();
-    _stealthPortCtrl.dispose();
     _pbkCtrl.dispose();
     _sidCtrl.dispose();
     _muxSessionsCtrl.dispose();
@@ -104,7 +101,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
     widget.prefs.setString('transport_mode', _transportMode);
     widget.prefs.setString('tun_stack', _tunStack);
     widget.prefs.setString('stealth_sni', _stealthSniCtrl.text.trim());
-    widget.prefs.setString('stealth_port', _stealthPortCtrl.text.trim());
     widget.prefs.setString('pbk', _pbkCtrl.text.trim());
     widget.prefs.setString('sid', _sidCtrl.text.trim());
     widget.prefs.setBool('mux_enabled', _muxEnabled);
@@ -394,7 +390,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
                               if (newValue != null) {
                                 setState(() {
                                   _stealthSniCtrl.text = newValue;
-                                  _stealthPortCtrl.text = '443';
                                   _saveSettings();
                                 });
                               }

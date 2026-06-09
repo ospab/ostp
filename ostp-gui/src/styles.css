@@ -929,12 +929,36 @@ input, textarea { font-family: inherit; }
   border: 1px solid var(--c-card-border);
   padding: 20px;
   border-radius: var(--r-md);
-  width: 280px;
+  width: 300px;
   box-shadow: 0 10px 40px rgba(0,0,0,0.6);
   display: flex;
   flex-direction: column;
-  gap: 12px;
+  gap: 10px;
 }
+
+.modal-steps {
+  margin: 2px 0 0 0;
+  padding-left: 18px;
+  font-size: 0.76rem;
+  color: var(--c-txt-2);
+  line-height: 1.7;
+}
+.modal-steps li { margin-bottom: 2px; }
+.modal-steps code {
+  background: rgba(255,255,255,0.07);
+  border-radius: 3px;
+  padding: 1px 5px;
+  font-family: monospace;
+  font-size: 0.74rem;
+  word-break: break-all;
+  color: var(--c-accent, #a78bfa);
+}
+.modal-actions a.btn {
+  display: inline-block;
+  text-decoration: none;
+  cursor: pointer;
+}
+
 
 .modal-title {
   font-size: 0.9rem;

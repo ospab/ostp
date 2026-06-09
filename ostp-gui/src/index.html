@@ -297,6 +297,33 @@
 
           <div class="toggle-row">
             <div class="toggle-text">
+              <span class="toggle-name" data-i18n="label_launch_startup">Launch at Startup</span>
+              <span class="toggle-hint" data-i18n="launch_startup_hint">Start with Windows</span>
+            </div>
+            <label class="toggle">
+              <input type="checkbox" id="in-launch-startup" />
+              <span class="toggle-track">
+                <span class="toggle-thumb"></span>
+              </span>
+            </label>
+          </div>
+
+          <div class="toggle-row">
+            <div class="toggle-text">
+              <span class="toggle-name" data-i18n="label_autoconnect">Auto-connect</span>
+              <span class="toggle-hint" data-i18n="autoconnect_hint">Connect automatically on startup</span>
+            </div>
+            <label class="toggle">
+              <input type="checkbox" id="in-autoconnect" />
+              <span class="toggle-track">
+                <span class="toggle-thumb"></span>
+              </span>
+            </label>
+          </div>
+
+
+          <div class="toggle-row">
+            <div class="toggle-text">
               <span class="toggle-name" data-i18n="label_debug">Debug Logs</span>
               <span class="toggle-hint" data-i18n="debug_hint">Verbose output</span>
             </div>
@@ -307,6 +334,7 @@
               </span>
             </label>
           </div>
+
 
           <!-- Exclusions -->
           <div class="section-head">
@@ -342,10 +370,16 @@
     <div id="wintun-modal" class="modal-overlay hidden">
       <div class="modal-content">
         <h3 class="modal-title" data-i18n="wintun_missing_title">Wintun Driver Missing</h3>
-        <p class="modal-text" data-i18n="wintun_missing_desc">To use TUN mode, the Wintun driver (wintun.dll) is required. Would you like to download it now?</p>
+        <p class="modal-text" data-i18n="wintun_missing_desc">TUN mode requires the Wintun network driver.</p>
+        <ol class="modal-steps">
+          <li data-i18n="wintun_step1">Download <strong>wintun.zip</strong> from the official site</li>
+          <li data-i18n="wintun_step2">Extract <code>amd64\wintun.dll</code> from the archive</li>
+          <li><span data-i18n="wintun_step3">Place it here:</span> <code id="wintun-install-path">...</code></li>
+          <li data-i18n="wintun_step4">Restart the connection</li>
+        </ol>
         <div class="modal-actions">
-          <button id="btn-wintun-cancel" class="btn secondary">Cancel</button>
-          <button id="btn-wintun-download" class="btn primary">Download</button>
+          <button id="btn-wintun-cancel" class="btn secondary" data-i18n="cancel_btn">Cancel</button>
+          <a id="btn-wintun-open" href="https://www.wintun.net" target="_blank" class="btn primary" data-i18n="wintun_open_btn">Open wintun.net ↗</a>
         </div>
       </div>
     </div>

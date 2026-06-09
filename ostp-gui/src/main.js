@@ -54,14 +54,17 @@ const inTun          = $('in-tun-mode');
 const inKillSwitch   = $('in-kill-switch');
 const inMux          = $('in-mux-mode');
 const inMuxSessions  = $('in-mux-sessions');
-const inDebug        = $('in-debug');
+const inDebug          = $('in-debug');
+const inAutoconnect    = $('in-autoconnect');
+const inLaunchStartup  = $('in-launch-startup');
 const inDomains      = $('in-ex-domains');
 const inIps          = $('in-ex-ips');
 const inProcesses    = $('in-ex-processes');
 
-const wintunModal       = $('wintun-modal');
-const btnWintunCancel   = $('btn-wintun-cancel');
-const btnWintunDownload = $('btn-wintun-download');
+const wintunModal        = $('wintun-modal');
+const btnWintunCancel    = $('btn-wintun-cancel');
+const btnWintunOpen      = $('btn-wintun-open');
+const wintunInstallPath  = $('wintun-install-path');
 
 // ── Utilities ────────────────────────────────────────────────────────────────
 function fmtBytes(b) {
@@ -139,7 +142,6 @@ function setState(next) {
   if (next === 'disconnected') {
     statusLabel.textContent = t('status_disconnected');
     statusSub.textContent   = t('hint_tap');
-    statusLabel.classList.add('');
     connInfo.classList.add('hidden');
     metricDown.textContent  = '0 B';
     metricUp.textContent    = '0 B';
@@ -193,6 +195,7 @@ async function poll() {
   try {
     const code = await invoke('get_tunnel_status');
     if (!pollTimer) return; // Prevent race condition if disconnected during await
+    console.log('[OSTP] poll status code:', code);
     
     if      (code === 0) { setState('disconnected'); return; }
     else if (code === 1)   setState('connecting');
@@ -203,8 +206,13 @@ async function poll() {
       metricDown.textContent = fmtBytes(metrics.bytes_recv);
       metricUp.textContent   = fmtBytes(metrics.bytes_sent);
     }
-  } catch {
-    if (pollTimer) setState('disconnected');
+  } catch (err) {
+    console.error('[OSTP] poll threw:', err);
+    if (pollTimer) {
+      setState('disconnected');
+      showToast(String(err), 'error');
+      alert('[OSTP POLL ERROR] ' + String(err));
+    }
   }
 }
 
@@ -226,21 +234,24 @@ async function handleToggle() {
     setState('connecting');
 
     try {
+      console.log('[OSTP] invoking start_tunnel...');
       const ok = await invoke('start_tunnel');
+      console.log('[OSTP] start_tunnel returned:', ok);
       if (ok) {
         startPolling();
       } else {
         setState('disconnected');
         showToast(t('toast_error') || 'Failed to connect', 'error');
-        alert(t('toast_error') || 'Failed to connect');
+        alert('[OSTP] start_tunnel returned false');
       }
     } catch (err) {
+      console.error('[OSTP] start_tunnel threw:', err);
       setState('disconnected');
-      if (err === "WINTUN_MISSING") {
-        wintunModal.classList.remove('hidden');
+      if (String(err).includes("WINTUN_MISSING")) {
+        if (wintunModal) wintunModal.classList.remove('hidden');
       } else {
         showToast(String(err), 'error');
-        alert(String(err));
+        alert('[OSTP ERROR] ' + String(err));
       }
     }
   } else {
@@ -293,6 +304,9 @@ async function loadConfigIntoForm() {
     updateKillSwitchVisibility();
 
     inDebug.checked = !!c.debug;
+    if (inAutoconnect) inAutoconnect.checked = !!c.gui?.autoconnect;
+    if (inLaunchStartup) inLaunchStartup.checked = !!c.gui?.launch_startup;
+
 
     const ex = c.exclude || {};
     inDomains.value   = (ex.domains   || []).join('\n');
@@ -324,6 +338,17 @@ async function handleSave(silent = false) {
   rawConfig.access_key = key;
   rawConfig.socks5_bind = inSocks.value.trim() || null;
   rawConfig.debug      = inDebug.checked;
+  if (inAutoconnect || inLaunchStartup) {
+    rawConfig.gui = rawConfig.gui || {};
+    if (inAutoconnect) rawConfig.gui.autoconnect = inAutoconnect.checked;
+    if (inLaunchStartup) rawConfig.gui.launch_startup = inLaunchStartup.checked;
+  }
+
+  if (inLaunchStartup) {
+    try { await invoke('set_autostart', { enable: inLaunchStartup.checked }); } catch (err) { console.error('autostart error', err); }
+  }
+
+
 
   rawConfig.transport = rawConfig.transport || {};
   rawConfig.transport.mode = inTransport.value;
@@ -429,9 +454,31 @@ window.addEventListener('DOMContentLoaded', async () => {
   if (window.__TAURI__ && window.__TAURI__.event) {
     window.__TAURI__.event.listen('tunnel-error', (evt) => {
       setState('disconnected');
-      showToast(String(evt.payload), 'error');
-      alert(String(evt.payload));
+      const errStr = String(evt.payload);
+      showToast(errStr, 'error');
+      alert(errStr);
     });
+  }
+
+  // Load wintun install path for modal instruction
+  if (wintunInstallPath) {
+    try {
+      const p = await invoke('get_wintun_install_path');
+      if (p) wintunInstallPath.textContent = p;
+    } catch { /* ignore */ }
+  }
+
+  // Auto-connect on startup
+  try {
+    const raw = await invoke('get_config');
+    rawConfig = JSON.parse(raw);
+    if (rawConfig?.gui?.autoconnect) {
+      setTimeout(() => {
+        if (appState === 'disconnected') handleToggle();
+      }, 800);
+    }
+  } catch (err) {
+    console.error('Failed to load config on startup', err);
   }
 
   btnConnect.addEventListener('click',       handleToggle);
@@ -547,22 +594,18 @@ window.addEventListener('DOMContentLoaded', async () => {
     wintunModal.classList.add('hidden');
   });
 
-  btnWintunDownload.addEventListener('click', async () => {
-    try {
-      btnWintunDownload.disabled = true;
-      btnWintunDownload.textContent = "Downloading...";
-      await invoke('download_wintun');
-      wintunModal.classList.add('hidden');
-      showToast("Wintun driver downloaded successfully!", "ok");
-      handleToggle();
-    } catch (err) {
-      showToast("Failed to download: " + err, "error");
-      alert("Download failed: " + err);
-    } finally {
-      btnWintunDownload.disabled = false;
-      btnWintunDownload.textContent = "Download";
-    }
-  });
+  // Open wintun.net link — handled natively by <a target="_blank">, but also wire as fallback
+  if (btnWintunOpen && window.__TAURI__) {
+    btnWintunOpen.addEventListener('click', (e) => {
+      e.preventDefault();
+      const opener = window.__TAURI__?.opener || window.__TAURI__?.shell;
+      if (opener && opener.open) {
+        opener.open('https://www.wintun.net');
+      } else {
+        window.open('https://www.wintun.net', '_blank');
+      }
+    });
+  }
 
   async function runPingTest() {
     pingValueTxt.textContent = 'Testing...';

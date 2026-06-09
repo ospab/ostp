@@ -284,10 +284,11 @@ pub async fn run_server(
     }
 
     // Spawn Fallback TCP proxy if configured
-    if let Some(fb_cfg) = fallback_config {
+    if let Some(ref fb_cfg) = fallback_config {
         if fb_cfg.enabled {
+            let fb_cfg_clone = fb_cfg.clone();
             tokio::spawn(async move {
-                fallback::start_fallback_server(fb_cfg).await;
+                fallback::start_fallback_server(fb_cfg_clone).await;
             });
         }
     }
@@ -328,9 +329,10 @@ pub async fn run_server(
     tracing::info!(listeners = bind_addrs.len(), keys = key_count, "server started");
     tracing::info!("ARQ config: max_reorder=16384, reorder_buf=8192, sent_history=32768, rto=100ms");
     let reality_config_arc = reality_config.map(std::sync::Arc::new);
+    let fallback_target = fallback_config.as_ref().and_then(|f| if f.enabled { Some(f.target.clone()) } else { None });
 
     tokio::select! {
-        res = run_server_loop(bind_addrs.clone(), primary_socket, sockets, dispatcher, ui_cmd_rx, ui_event_tx, shared_keys, router, reality_config_arc) => {
+        res = run_server_loop(bind_addrs.clone(), primary_socket, sockets, dispatcher, ui_cmd_rx, ui_event_tx, shared_keys, router, reality_config_arc, fallback_target) => {
             if let Err(e) = res {
                 tracing::error!("Server error: {e}");
             }
@@ -355,6 +357,7 @@ async fn run_server_loop(
     shared_keys: std::sync::Arc<std::sync::RwLock<HashMap<String, crate::api::UserMeta>>>,
     router: std::sync::Arc<crate::router::Router>,
     reality_config: Option<std::sync::Arc<RealityServerConfig>>,
+    fallback_target: Option<String>,
 ) -> Result<()> {
     let mut remotes: HashMap<(u32, u16), RemoteState> = HashMap::new();
     let (stream_tx, mut stream_rx) = mpsc::unbounded_channel::<(u32, u16, Vec<u8>)>();
@@ -392,6 +395,7 @@ async fn run_server_loop(
         let shared_keys_clone = shared_keys.clone();
         let udp_tx_clone = udp_tx.clone();
         let reality_config_outer = reality_config.clone();
+        let fb_target_outer = fallback_target.clone();
 
         tokio::spawn(async move {
             if let Ok(listener) = tokio::net::TcpListener::bind(&addr).await {
@@ -431,8 +435,9 @@ async fn run_server_loop(
                         let keys = shared_keys_clone.clone();
                         let tx = udp_tx_clone.clone();
                         let reality = reality_config_outer.clone();
+                        let fb_target = fb_target_outer.clone();
                         tokio::spawn(async move {
-                            if let Err(e) = crate::transport::uot::handle_tcp_connection(stream, peer_addr, keys, tx, tm, reality).await {
+                            if let Err(e) = crate::transport::uot::handle_tcp_connection(stream, peer_addr, keys, tx, tm, reality, fb_target).await {
                                 tracing::warn!("UoT connection from {} closed: {}", peer_addr, e);
                             }
                         });

@@ -9,5 +9,8 @@ allow = [
   "get_tunnel_status",
   "get_metrics",
   "get_config",
-  "save_config"
+  "save_config",
+  "get_wintun_install_path",
+  "set_autostart",
+  "get_autostart"
 ]

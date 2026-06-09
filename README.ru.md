@@ -115,8 +115,7 @@ irm https://raw.githubusercontent.com/ospab/ostp/master/scripts/install.ps1 | ie
   // Настройки транспорта (udp или uot)
   "transport": {
     "mode": "udp",
-    "stealth_sni": "vk.com",
-    "stealth_port": 443
+    "stealth_sni": "vk.com"
   },
   // TUN-режим (полносистемный VPN)
   "tun": {

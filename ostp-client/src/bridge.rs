@@ -66,7 +66,6 @@ pub struct Bridge {
 
     pub transport_mode: String,
     pub stealth_sni: String,
-    pub stealth_port: u16,
     pub wss: bool,
     pub mtu: usize,
     pub reality_enabled: bool,
@@ -103,7 +102,6 @@ impl Bridge {
 
             transport_mode: config.transport.mode.clone(),
             stealth_sni: config.transport.stealth_sni.clone(),
-            stealth_port: config.transport.stealth_port,
             wss: config.transport.wss,
             mtu: config.ostp.mtu,
             reality_enabled: config.reality.enabled,
@@ -337,6 +335,7 @@ impl Bridge {
 
                                 tokio::spawn(async move {
                                     let mut buf = vec![0_u8; 65535];
+                                    let is_uot = matches!(socket_clone, crate::transport::Transport::Uot { .. });
                                     loop {
                                         match socket_clone.recv(&mut buf).await {
                                             Ok(n) => {
@@ -346,8 +345,14 @@ impl Bridge {
                                                 }
                                             }
                                             Err(e) => {
-                                                tracing::warn!("UDP socket recv error (session {}): {}", session_index, e);
-                                                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                                                if is_uot {
+                                                    // TCP is dead — drop sender to signal bridge via channel close
+                                                    tracing::warn!("UoT session {} disconnected: {}", session_index, e);
+                                                    break;
+                                                } else {
+                                                    tracing::warn!("UDP socket recv error (session {}): {}", session_index, e);
+                                                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                                                }
                                             }
                                         }
                                     }
@@ -427,6 +432,7 @@ impl Bridge {
 
                                 tokio::spawn(async move {
                                     let mut buf = vec![0_u8; 65535];
+                                    let is_uot = matches!(socket_clone, crate::transport::Transport::Uot { .. });
                                     loop {
                                         match socket_clone.recv(&mut buf).await {
                                             Ok(n) => {
@@ -434,8 +440,13 @@ impl Bridge {
                                                 if udp_tx_clone.send((session_index, inbound)).await.is_err() { break; }
                                             }
                                             Err(e) => {
-                                                tracing::warn!("UDP recv error (network-change session {}): {}", session_index, e);
-                                                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                                                if is_uot {
+                                                    tracing::warn!("UoT network-change session {} disconnected: {}", session_index, e);
+                                                    break;
+                                                } else {
+                                                    tracing::warn!("UDP recv error (network-change session {}): {}", session_index, e);
+                                                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                                                }
                                             }
                                         }
                                     }
@@ -557,6 +568,7 @@ impl Bridge {
 
                         tokio::spawn(async move {
                             let mut buf = vec![0_u8; 65535];
+                            let is_uot = matches!(socket_clone, crate::transport::Transport::Uot { .. });
                             loop {
                                 match socket_clone.recv(&mut buf).await {
                                     Ok(n) => {
@@ -566,8 +578,13 @@ impl Bridge {
                                         }
                                     }
                                     Err(e) => {
-                                        tracing::warn!("UDP socket recv error (reconnect session {}): {}", session_index, e);
-                                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                                        if is_uot {
+                                            tracing::warn!("UoT reconnect session {} disconnected: {}", session_index, e);
+                                            break;
+                                        } else {
+                                            tracing::warn!("UDP socket recv error (reconnect session {}): {}", session_index, e);
+                                            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                                        }
                                     }
                                 }
                             }
@@ -910,7 +927,10 @@ impl Bridge {
         // and break the Noise state machine (noise-read error).
         // For UDP: retry up to 4x with 1200ms timeout to survive packet loss.
         let is_uot = matches!(socket, crate::transport::Transport::Uot { .. });
-        let (attempt_limit, attempt_timeout_ms) = if is_uot { (1, 4000) } else { (4, 1200) };
+        // UoT (TCP): 1 attempt only — retrying on TCP causes stale Noise frames to queue.
+        // Timeout is generous (8s) to accommodate slow mobile TCP+TLS setup.
+        // UDP: 4 attempts × 1200ms — survives individual packet loss.
+        let (attempt_limit, attempt_timeout_ms) = if is_uot { (1, 8000) } else { (4, 1200) };
 
         for attempt in 0..attempt_limit {
             if attempt > 0 {
@@ -989,7 +1009,7 @@ impl Bridge {
         self.mux_sessions = cfg.multiplex.sessions.max(1);
         self.transport_mode = cfg.transport.mode.clone();
         self.stealth_sni = cfg.transport.stealth_sni.clone();
-        self.stealth_port = cfg.transport.stealth_port;
+        self.wss = cfg.transport.wss; // Fix: wss was not updated on hot-reload
         self.reality_enabled = cfg.reality.enabled;
         self.reality_pbk = cfg.reality.pbk.clone();
         self.reality_sid = cfg.reality.sid.clone();
@@ -1005,16 +1025,8 @@ impl Bridge {
     ) -> Result<crate::transport::Transport> {
         let mode = self.transport_mode.to_lowercase();
         if mode == "uot" || mode == "tcp" {
-            // For UoT, use the stealth_port if it's configured and differs from default 443;
-            // otherwise fall back to the actual server port so the user doesn't need two separate
-            // port fields for the same destination.
-            let uot_port = if self.stealth_port > 0 {
-                self.stealth_port
-            } else {
-                port
-            };
             let (tx, rx) = crate::transport::xhttp::connect_xhttp(
-                target_ip, uot_port, &self.stealth_sni, &self.access_key, self.reality_enabled, self.wss, &self.reality_pbk, &self.reality_sid
+                target_ip, port, &self.stealth_sni, &self.access_key, self.reality_enabled, self.wss, &self.reality_pbk, &self.reality_sid
             ).await?;
             Ok(crate::transport::Transport::Uot { tx, rx })
         } else {
