@@ -130,6 +130,7 @@ fn parse_ostp_link(link: &str) -> Result<ClientConfig> {
         debug: Some(false),
         exclude: None,
         mux: None,
+        gui: None,
     })
 }
 
@@ -340,6 +341,7 @@ struct ClientConfig {
     exclude: Option<ExcludeConfig>,
     mux: Option<MuxConfig>,
     transport: Option<TransportConfigRaw>,
+    gui: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -395,6 +397,7 @@ struct OutboundConfig {
 struct OutboundRule {
     domain_suffix: Option<Vec<String>>,
     ip_cidr: Option<Vec<String>>,
+    protocol: Option<String>,
     action: Option<String>,
 }
 
@@ -1012,6 +1015,7 @@ async fn run_app() -> Result<()> {
                     .map(|r| ostp_server::OutboundRule {
                         domain_suffix: r.domain_suffix.unwrap_or_default(),
                         ip_cidr: r.ip_cidr.unwrap_or_default(),
+                        protocol: r.protocol,
                         action: parse_outbound_action(r.action),
                     })
                     .collect(),
@@ -1208,6 +1212,7 @@ async fn run_client_directly(client_cfg: ClientConfig) -> Result<()> {
         },
         dns_server: client_cfg.tun.as_ref().and_then(|t| t.dns.clone()),
         kill_switch: client_cfg.tun.as_ref().and_then(|t| t.kill_switch).unwrap_or(false),
+        gui: None,
     };
 
     // Run the client implementation
