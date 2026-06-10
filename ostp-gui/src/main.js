@@ -42,7 +42,7 @@ const inServer       = $('in-server');
 const inKey          = $('in-key');
 const inSocks        = $('in-socks');
 const inDns          = $('in-dns');
-const inOwndns       = $('in-owndns');
+
 const groupCustomDns = $('group-custom-dns');
 const inTransport    = $('in-transport');
 const inSni          = $('in-stealth-sni');
@@ -116,10 +116,7 @@ function showToast(msg, variant = '') {
 }
 
 // ── DNS & Kill Switch visibility ──────────────────────────────────────────────
-function updateDnsVisibility() {
-  if (!groupCustomDns || !inOwndns) return;
-  groupCustomDns.style.display = inOwndns.checked ? 'none' : 'block';
-}
+
 
 function updateKillSwitchVisibility() {
   const group = $('group-kill-switch');
@@ -295,12 +292,7 @@ async function loadConfigIntoForm() {
     inMux.checked   = !!c.mux?.enabled;
     inMuxSessions.value = c.mux?.sessions || '';
     
-    // owndns: detect if saved dns is 10.1.0.1
-    const savedDns = c.tun?.dns || '';
-    const isOwndns = savedDns === '10.1.0.1';
-    inOwndns.checked = isOwndns;
-    inDns.value = isOwndns ? '' : savedDns;
-    updateDnsVisibility();
+    inDns.value = c.tun?.dns || '';
     updateKillSwitchVisibility();
 
     inDebug.checked = !!c.debug;
@@ -386,8 +378,7 @@ async function handleSave(silent = false) {
   rawConfig.tun.wintun_path = rawConfig.tun.wintun_path || './wintun.dll';
   rawConfig.tun.ipv4_address = rawConfig.tun.ipv4_address || '10.1.0.2/24';
   rawConfig.tun.stack = 'ostp';
-  // owndns: if toggle is on, always write 10.1.0.1; otherwise use the custom field
-  rawConfig.tun.dns    = inOwndns.checked ? '10.1.0.1' : (inDns.value.trim() || null);
+  rawConfig.tun.dns    = inDns.value.trim() || null;
 
   rawConfig.exclude = {
     domains:   splitLines(inDomains.value),
@@ -447,7 +438,6 @@ function togglePeek() {
 window.addEventListener('DOMContentLoaded', async () => {
   applyTranslations();
   setState('disconnected');
-  updateDnsVisibility(); // initialise field visibility from current checkbox state
   updateKillSwitchVisibility();
 
   // Event wiring
@@ -564,10 +554,7 @@ window.addEventListener('DOMContentLoaded', async () => {
   if (btnThemeToggle) {
     btnThemeToggle.addEventListener('click', toggleTheme);
   }
-  inOwndns.addEventListener('change', () => {
-    updateDnsVisibility();
-    scheduleAutoSave();
-  });
+  scheduleAutoSave();
   inTun.addEventListener('change', () => {
     updateKillSwitchVisibility();
     scheduleAutoSave();

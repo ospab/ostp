@@ -11,7 +11,6 @@ import Wiki from './pages/Wiki';
 import Tools from './pages/Tools';
 import AuditLogs from './pages/AuditLogs';
 import Login from './pages/Login';
-import Dns from './pages/Dns';
 import Routing from './pages/Routing';
 
 // State and Context
@@ -83,10 +82,7 @@ function MainLayout() {
               <RouteIcon className="w-5 h-5 text-orange-400" />
               {isSidebarOpen && <span>Routing</span>}
             </Link>
-            <Link to="/dns" className="flex items-center gap-3 px-3 py-3 rounded-xl hover:bg-white/5 transition-colors text-text-muted hover:text-white">
-              <Globe className="w-5 h-5 text-emerald-400" />
-              {isSidebarOpen && <span>{t('sidebar_dns')}</span>}
-            </Link>
+
             <Link to="/logs" className="flex items-center gap-3 px-3 py-3 rounded-xl hover:bg-white/5 transition-colors text-text-muted hover:text-white">
               <History className="w-5 h-5 text-yellow-400" />
               {isSidebarOpen && <span>{t('sidebar_history')}</span>}
@@ -154,7 +150,6 @@ function MainLayout() {
               <Route path="/wiki" element={<Wiki />} />
               <Route path="/routing" element={<Routing />} />
               <Route path="/tools" element={<Tools />} />
-              <Route path="/dns" element={<Dns />} />
               <Route path="/logs" element={<AuditLogs />} />
             </Routes>
           </div>

@@ -10,6 +10,20 @@ use tokio::sync::mpsc;
 use crate::dispatcher::Dispatcher;
 use crate::{RemoteState, UiEvent};
 
+fn clean_ipv6_mapped_v4(addr: std::net::SocketAddr) -> std::net::SocketAddr {
+    match addr {
+        std::net::SocketAddr::V6(v6) => {
+            if let Some(v4) = v6.ip().to_ipv4() {
+                std::net::SocketAddr::new(std::net::IpAddr::V4(v4), v6.port())
+            } else {
+                addr
+            }
+        }
+        _ => addr,
+    }
+}
+
+
 pub async fn handle_relay_message(
     peer_addr: std::net::SocketAddr,
     session_id: u32,
@@ -112,54 +126,59 @@ pub async fn handle_relay_message(
                 }
             };
             
+            let session_router = std::sync::Arc::new(router.route_udp_associate(server_udp.clone()).await);
+
             let (udp_tx, mut udp_rx) = mpsc::unbounded_channel::<(String, Bytes)>();
             let (cancel_tx, mut cancel_rx) = mpsc::channel::<()>(1);
             let (dummy_data_tx, _) = mpsc::unbounded_channel::<Bytes>();
 
             // Outbound UDP loop (tunnel -> target)
-            let tx_sock = server_udp.clone();
-            let _dns_srv = router.dns_server.clone();
-            let _udp_reply_clone_dns = udp_reply_tx.clone();
-            let _client_ip = peer_addr.ip();
+            let tx_router = session_router.clone();
             tokio::spawn(async move {
                 while let Some((target, data)) = udp_rx.recv().await {
                     let mut forward_target = target.clone();
                     if forward_target.starts_with("10.1.0.1:") {
                         forward_target = forward_target.replace("10.1.0.1:", "127.0.0.1:");
                     }
-                    let _ = tx_sock.send_to(&data, &forward_target).await;
+                    let _ = tx_router.send_to(&data, &forward_target).await;
                 }
             });
 
             // Inbound UDP loop (target -> tunnel)
             let rx_sock = server_udp.clone();
             let udp_reply_clone = udp_reply_tx.clone();
+            let proxy_sock = session_router.get_proxy_sock();
             tokio::spawn(async move {
-                let mut buf = vec![0u8; 65536];
+                let mut direct_buf = vec![0u8; 65536];
+                let mut proxy_buf = vec![0u8; 65536];
                 loop {
-                    tokio::select! {
-                        _ = cancel_rx.recv() => break,
-                        res = rx_sock.recv_from(&mut buf) => {
-                            match res {
-                                Ok((len, addr)) => {
-                                    let clean_addr = match addr {
-                                        std::net::SocketAddr::V6(v6) => {
-                                            if let Some(v4) = v6.ip().to_ipv4() {
-                                                std::net::SocketAddr::new(std::net::IpAddr::V4(v4), v6.port())
-                                            } else {
-                                                addr
-                                            }
-                                        }
-                                        _ => addr,
-                                    };
-                                    let _ = udp_reply_clone.send((session_id, stream_id, clean_addr.to_string(), buf[..len].to_vec()));
+                    if let Some(ref p) = proxy_sock {
+                        tokio::select! {
+                            _ = cancel_rx.recv() => break,
+                            res = rx_sock.recv_from(&mut direct_buf) => {
+                                if let Ok((len, addr)) = res {
+                                    let _ = udp_reply_clone.send((session_id, stream_id, clean_ipv6_mapped_v4(addr).to_string(), direct_buf[..len].to_vec()));
+                                } else { break; }
+                            }
+                            res = p.recv_from(&mut proxy_buf) => {
+                                if let Ok((len, target_str)) = res {
+                                    let _ = udp_reply_clone.send((session_id, stream_id, target_str, proxy_buf[..len].to_vec()));
                                 }
-                                Err(_) => break,
+                            }
+                        }
+                    } else {
+                        tokio::select! {
+                            _ = cancel_rx.recv() => break,
+                            res = rx_sock.recv_from(&mut direct_buf) => {
+                                if let Ok((len, addr)) = res {
+                                    let _ = udp_reply_clone.send((session_id, stream_id, clean_ipv6_mapped_v4(addr).to_string(), direct_buf[..len].to_vec()));
+                                } else { break; }
                             }
                         }
                     }
                 }
             });
+
 
             remotes.insert((session_id, stream_id), RemoteState {
                 data_tx: dummy_data_tx,

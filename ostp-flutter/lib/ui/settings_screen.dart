@@ -40,7 +40,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
   String _tunStack = 'ostp'; // 'system' | 'ostp'
   bool _muxEnabled = false;
   late TextEditingController _muxSessionsCtrl;
-  bool _owndns = false;
+
 
   @override
   void initState() {
@@ -64,8 +64,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
     _debugMode = widget.prefs.getBool('debug_mode') ?? false;
     _muxEnabled = widget.prefs.getBool('mux_enabled') ?? false;
     _muxSessionsCtrl = TextEditingController(text: widget.prefs.getString('mux_sessions') ?? '2');
-    _owndns = widget.prefs.getBool('owndns') ?? false;
-  }
+
 
   @override
   void dispose() {
@@ -105,8 +104,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
     widget.prefs.setString('sid', _sidCtrl.text.trim());
     widget.prefs.setBool('mux_enabled', _muxEnabled);
     widget.prefs.setString('mux_sessions', _muxSessionsCtrl.text.trim());
-    widget.prefs.setBool('owndns', _owndns);
-  }
+
 
   Widget _buildTextField(String label, TextEditingController controller, {String? hint, bool isPassword = false, int maxLines = 1, bool isMono = false}) {
     return Column(
@@ -240,8 +238,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
                       _realityEnabled = uri.queryParameters['reality'] == 'true';
                       final type = uri.queryParameters['type'] ?? 'udp';
                       _transportMode = type == 'tcp' || type == 'http' ? 'uot' : 'udp';
-                      _owndns = uri.queryParameters['owndns'] == 'true';
                       _importCtrl.clear();
+
                       _saveSettings();
                     });
                     ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Imported successfully')));

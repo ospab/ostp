@@ -248,14 +248,12 @@ pub async fn run_server(
 
     // Инициализируем DNS-сервер
     let dns_cfg = dns_config.unwrap_or_default();
-    // Запускаем UDP listener если dns.enabled=true (полный режим) или intercept_all_port53=true
-    let start_dns_listener = dns_cfg.enabled || dns_cfg.intercept_all_port53;
     let dns_server = dns::DnsServer::new(dns_cfg);
-    if start_dns_listener {
-        let dns_srv = dns_server.clone();
-        tokio::spawn(async move { dns_srv.run_local_udp_listener().await });
-    }
-    
+    let dns_cfg_update = dns_server.clone();
+    let outbound_clone_update = outbound.clone();
+    tokio::spawn(async move {
+        dns_cfg_update.update_proxy(outbound_clone_update.as_ref()).await;
+    });
     // Initialize Router
     let router = std::sync::Arc::new(router::Router::new(
         outbound.clone(),

@@ -48,7 +48,7 @@ pub struct DnsServer {
     pub config: RwLock<DnsConfig>,
     adblock_trie: RwLock<HashSet<String>>,
     query_log: Mutex<VecDeque<DnsQueryLog>>,
-    reqwest_client: reqwest::Client,
+    reqwest_client: RwLock<reqwest::Client>,
 }
 
 impl DnsServer {
@@ -57,9 +57,7 @@ impl DnsServer {
             config: RwLock::new(config.clone()),
             adblock_trie: RwLock::new(HashSet::new()),
             query_log: Mutex::new(VecDeque::with_capacity(1000)),
-            reqwest_client: reqwest::Client::builder()
-                .build()
-                .unwrap_or_default(),
+            reqwest_client: RwLock::new(reqwest::Client::builder().build().unwrap_or_default()),
         });
 
         // Загружаем блок-листы при старте если DNS включён
@@ -73,6 +71,33 @@ impl DnsServer {
         server
     }
 
+    pub async fn update_proxy(&self, outbound: Option<&crate::outbound::OutboundConfig>) {
+        let mut builder = reqwest::Client::builder();
+        if let Some(outbound) = outbound {
+            if outbound.enabled {
+                // Determine if DoH upstream domain matches any proxy rules
+                // We simplify by just setting the proxy for the client if outbound is globally enabled
+                // But we should check if the DoH URL domain matches Proxy.
+                // Since DoH usually goes to 1.1.1.1 or cloudflare-dns.com, if proxy is enabled, we route it.
+                // Better: just route if proxy is enabled and protocol is socks5/http.
+                let proxy_url = match outbound.protocol.as_str() {
+                    "socks5" => Some(format!("socks5h://{}:{}", outbound.address, outbound.port)),
+                    "http" => Some(format!("http://{}:{}", outbound.address, outbound.port)),
+                    _ => None,
+                };
+                if let Some(url) = proxy_url {
+                    if let Ok(proxy) = reqwest::Proxy::all(&url) {
+                        builder = builder.proxy(proxy);
+                    }
+                }
+            }
+        }
+        if let Ok(client) = builder.build() {
+            *self.reqwest_client.write().await = client;
+        }
+    }
+
+
     /// Скачать и обновить все AdBlock-листы.
     pub async fn update_blocklists(&self) {
         let urls = {
@@ -84,7 +109,8 @@ impl DnsServer {
 
         for url in &urls {
             tracing::info!("DNS: downloading AdBlock list from {url}");
-            match self.reqwest_client.get(url).send().await {
+            let client = self.reqwest_client.read().await.clone();
+            match client.get(url).send().await {
                 Ok(resp) => {
                     match resp.text().await {
                         Ok(text) => {
@@ -172,7 +198,6 @@ impl DnsServer {
                                 60,
                                 RData::A(ip.into()),
                             ));
-                            self.log_query(qname, client_ip.to_string(), false).await;
                             return response.build_bytes_vec().ok();
                         }
                     }
@@ -199,7 +224,6 @@ impl DnsServer {
                 // Возвращаем пустой NXDOMAIN-ответ
                 let mut response = Packet::new_reply(packet.id());
                 response.questions.push(question.clone());
-                self.log_query(qname.clone(), client_ip.to_string(), true).await;
                 tracing::debug!("DNS AdBlock: blocked {qname} for {client_ip}");
                 return response.build_bytes_vec().ok();
             }
@@ -208,7 +232,8 @@ impl DnsServer {
         // ── Форвардинг через DoH ──────────────────────────────────────────────
         // Работает и при enabled=true и при intercept_all_port53=true
         tracing::debug!("DNS: resolving {qname} via DoH for {client_ip}");
-        match self.reqwest_client
+        let client = self.reqwest_client.read().await.clone();
+        match client
             .post(&doh_url)
             .header("Content-Type", "application/dns-message")
             .header("Accept", "application/dns-message")
@@ -219,7 +244,6 @@ impl DnsServer {
         {
             Ok(resp) if resp.status().is_success() => {
                 if let Ok(bytes) = resp.bytes().await {
-                    self.log_query(qname, client_ip.to_string(), false).await;
                     return Some(bytes.to_vec());
                 }
             }

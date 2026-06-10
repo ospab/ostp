@@ -775,28 +775,7 @@ async fn run_app() -> Result<()> {
     "sni_list": ["www.microsoft.com"]
   }},
 
-  // Built-in DNS server
-  "dns": {{
-    // Full mode: custom domains + AdBlock lists + DoH forwarding
-    "enabled": false,
-    // Intercept ALL UDP port 53 traffic and resolve via DoH (prevents DNS leaks through the server)
-    // Works even if enabled=false — just strips AdBlock/custom domains logic
-    "intercept_all_port53": false,
-    // UDP port the built-in DNS server listens on (clients can use <server_ip>:50053 as DNS)
-    "local_port": 50053,
-    // DoH upstream: Cloudflare, Google, NextDNS, etc.
-    "doh_upstream": "https://cloudflare-dns.com/dns-query",
-    // AdBlock lists (hosts format, ||domain^, or one domain per line)
-    "adblock_urls": [
-      // "https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts",
-      // "https://adguardteam.github.io/AdGuardSDNSFilter/Filters/filter.txt"
-    ],
-    // Custom domains: respond with A record directly (bypasses DoH)
-    "custom_domains": {{
-      // "myserver.internal": "10.0.0.1",
-      // "home.local": "192.168.1.100"
-    }}
-  }},
+
   "debug": false
 }}"#, key, priv_key, pub_key, sid)
         } else if mode_str == "relay" {
@@ -991,11 +970,7 @@ async fn run_app() -> Result<()> {
                         query_params.push("type=udp".to_string());
                     }
 
-                    if let Some(dns) = &server_cfg.dns {
-                        if dns.enabled {
-                            query_params.push("owndns=true".to_string());
-                        }
-                    }
+
 
                     if !query_params.is_empty() {
                         link.push('?');

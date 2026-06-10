@@ -24,6 +24,8 @@ pub struct ClientConfig {
     pub tun_stack: String,
     #[serde(default)]
     pub kill_switch: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gui: Option<serde_json::Value>,
 }
 
 fn default_tun_stack() -> String { "system".to_string() }
@@ -151,6 +153,7 @@ impl Default for ClientConfig {
             dns_server: None,
             tun_stack: "system".to_string(),
             kill_switch: false,
+            gui: None,
         }
     }
 }
@@ -180,6 +183,7 @@ struct RawUnifiedConfig {
     mux: Option<RawMuxSection>,
     reality: Option<RawRealitySection>,
     transport: Option<RawTransportSection>,
+    gui: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -290,6 +294,7 @@ impl ClientConfig {
             dns_server: raw.tun.as_ref().and_then(|t| t.dns.clone()),
             tun_stack: raw.tun.as_ref().and_then(|t| t.stack.clone()).unwrap_or_else(|| "system".to_string()),
             kill_switch: raw.tun.as_ref().and_then(|t| t.kill_switch).unwrap_or(false),
+            gui: raw.gui,
         })
     }
 }

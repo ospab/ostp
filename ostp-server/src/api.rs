@@ -244,9 +244,6 @@ pub fn create_api_router(state: ApiState) -> Router {
         .route("/users/{key}/reset", post(handle_reset_stats))
         .route("/subscribe/{key}", get(handle_subscribe))
         .route("/login", post(handle_login))
-        .route("/dns/config", get(handle_get_dns_config).post(handle_post_dns_config))
-        .route("/dns/queries", get(handle_get_dns_queries))
-        .route("/dns/blocklists/refresh", post(handle_refresh_blocklists))
         .route(
             "/audit",
             get(handle_get_audit)
@@ -444,38 +441,6 @@ fn save_config_keys(state: &ApiState) -> Result<(), String> {
     Ok(())
 }
 
-fn save_dns_config(state: &ApiState, cfg: &crate::dns::DnsConfig) -> Result<(), String> {
-    let Some(ref path) = state.config_path else {
-        return Ok(());
-    };
-
-    let content = std::fs::read_to_string(path)
-        .map_err(|e| format!("failed to read config file: {}", e))?;
-
-    let mut stripped = json_comments::StripComments::new(content.as_bytes());
-    let mut content_str = String::new();
-    use std::io::Read;
-    stripped.read_to_string(&mut content_str)
-        .map_err(|e| format!("failed to strip comments: {}", e))?;
-
-    let mut json_val: serde_json::Value = serde_json::from_str(&content_str)
-        .map_err(|e| format!("failed to parse config JSON: {}", e))?;
-
-    if let Some(obj) = json_val.as_object_mut() {
-        let dns_val = serde_json::to_value(cfg).map_err(|e| e.to_string())?;
-        obj.insert("dns".to_string(), dns_val);
-    } else {
-        return Err("config root is not an object".to_string());
-    }
-
-    let new_content = serde_json::to_string_pretty(&json_val)
-        .map_err(|e| format!("failed to serialize config JSON: {}", e))?;
-
-    std::fs::write(path, new_content)
-        .map_err(|e| format!("failed to write config file: {}", e))?;
-
-    Ok(())
-}
 
 // ── Handlers ─────────────────────────────────────────────────────────────────
 
@@ -895,68 +860,6 @@ async fn handle_subscribe(
     }))).into_response()
 }
 
-// ── DNS API Handlers ──────────────────────────────────────────────────────────
-
-async fn handle_get_dns_config(
-    State(state): State<ApiState>,
-    headers: axum::http::HeaderMap,
-) -> impl IntoResponse {
-    if !check_token(&state, &headers) {
-        return api_unauthorized::<serde_json::Value>();
-    }
-    let cfg = state.dns_server.config.read().await.clone();
-    (StatusCode::OK, ApiResponse::success(serde_json::to_value(cfg).unwrap_or_default()))
-}
-
-async fn handle_post_dns_config(
-    State(state): State<ApiState>,
-    headers: axum::http::HeaderMap,
-    Json(body): Json<crate::dns::DnsConfig>,
-) -> impl IntoResponse {
-    if !check_token(&state, &headers) {
-        return api_unauthorized::<bool>();
-    }
-    // Update in-memory config
-    let should_refresh = body.enabled && !body.adblock_urls.is_empty();
-    {
-        let mut cfg = state.dns_server.config.write().await;
-        *cfg = body.clone();
-    }
-    // Save to disk
-    if let Err(e) = save_dns_config(&state, &body) {
-        tracing::error!("Failed to save DNS config: {}", e);
-    }
-    // Reload blocklists if enabled
-    if should_refresh {
-        let dns = state.dns_server.clone();
-        tokio::spawn(async move { dns.update_blocklists().await; });
-    }
-    (StatusCode::OK, ApiResponse::success(true))
-}
-
-async fn handle_get_dns_queries(
-    State(state): State<ApiState>,
-    headers: axum::http::HeaderMap,
-) -> impl IntoResponse {
-    if !check_token(&state, &headers) {
-        return api_unauthorized::<Vec<serde_json::Value>>();
-    }
-    let queries = state.dns_server.get_queries().await;
-    let data: Vec<serde_json::Value> = queries.iter().map(|q| serde_json::to_value(q).unwrap_or_default()).collect();
-    (StatusCode::OK, ApiResponse::success(data))
-}
-
-async fn handle_refresh_blocklists(
-    State(state): State<ApiState>,
-    headers: axum::http::HeaderMap,
-) -> impl IntoResponse {
-    if !check_token(&state, &headers) {
-        return api_unauthorized::<bool>();
-    }
-    let dns = state.dns_server.clone();
-    tokio::spawn(async move { dns.update_blocklists().await; });
-    (StatusCode::OK, ApiResponse::success(true))
-}
 
 #[cfg(test)]
 mod tests {
@@ -1082,13 +985,19 @@ async fn handle_put_rules(
     if !check_token(&state, &headers) { return api_unauthorized(); }
     
     // Update memory
+    let mut updated_outbound = None;
     {
         let mut lock = state.router.outbound_cfg.write().unwrap();
         if let Some(cfg) = lock.as_mut() {
             cfg.rules = new_rules.clone();
+            updated_outbound = Some(cfg.clone());
         } else {
             return api_error("Outbound routing is not enabled in config");
         }
+    }
+
+    if let Some(cfg) = updated_outbound {
+        state.dns_server.update_proxy(Some(&cfg)).await;
     }
     
     // Save to config.json
