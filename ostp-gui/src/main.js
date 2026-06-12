@@ -284,8 +284,7 @@ async function loadConfigIntoForm() {
     inTransport.value = c.transport?.mode || 'udp';
     inSni.value     = c.transport?.stealth_sni || '';
     inWss.checked   = !!c.transport?.wss;
-    inPbk.value     = c.reality?.pbk           || '';
-    inSid.value     = c.reality?.sid           || '';
+
     inMtu.value     = c.mtu           || '';
     inTun.checked   = !!c.tun?.enable;
     if (inKillSwitch) inKillSwitch.checked = !!c.tun?.kill_switch;
@@ -346,20 +345,6 @@ async function handleSave(silent = false) {
   rawConfig.transport.mode = inTransport.value;
   rawConfig.transport.stealth_sni = inSni.value.trim() || undefined;
   rawConfig.transport.wss = inWss.checked;
-
-  const pbk = inPbk.value.trim();
-  if (pbk) {
-    rawConfig.reality = {
-      enabled: true,
-      dest: '',
-      private_key: '',
-      pbk: pbk,
-      sid: inSid.value.trim(),
-      sni_list: []
-    };
-  } else {
-    delete rawConfig.reality;
-  }
 
   const mtuStr = inMtu.value.trim();
   if (mtuStr) rawConfig.mtu = parseInt(mtuStr, 10);
@@ -508,12 +493,7 @@ window.addEventListener('DOMContentLoaded', async () => {
             rawConfig.transport.mode = mode.t;
             rawConfig.transport.wss = mode.w;
             
-            if (mode.r) {
-              rawConfig.reality = rawConfig.reality || {};
-              rawConfig.reality.enabled = true;
-            } else if (rawConfig.reality) {
-              rawConfig.reality.enabled = false;
-            }
+
 
             await invoke('save_config', { jsonContent: JSON.stringify(rawConfig, null, 2) });
             

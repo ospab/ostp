@@ -119,14 +119,6 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
         "enabled": muxEnabled,
         "sessions": int.tryParse(muxSessions) ?? 2,
       },
-      "reality": {
-        "enabled": widget.prefs.getBool('reality_enabled') ?? false,
-        "dest": "",
-        "private_key": "",
-        "pbk": widget.prefs.getString('pbk') ?? "",
-        "sid": widget.prefs.getString('sid') ?? "",
-        "sni_list": []
-      },
       "tun": {
         "enable": true,
         "stack": tunStack
@@ -214,14 +206,6 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
         "multiplex": {
           "enabled": muxEnabled,
           "sessions": int.tryParse(muxSessions) ?? 2,
-        },
-        "reality": {
-          "enabled": widget.prefs.getBool('reality_enabled') ?? false,
-          "dest": "",
-          "private_key": "",
-          "pbk": widget.prefs.getString('pbk') ?? "",
-          "sid": widget.prefs.getString('sid') ?? "",
-          "sni_list": []
         },
         "tun": {
           "enable": true,
@@ -336,7 +320,6 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
         await widget.prefs.setString('mtu', mtu.toString());
         await widget.prefs.setString('transport_mode', mode['t'] as String);
         await widget.prefs.setBool('wss', mode['w'] as bool);
-        await widget.prefs.setBool('reality_enabled', mode['r'] as bool);
         _updateLatestConfigJson();
 
         setState(() {

@@ -31,8 +31,7 @@ const translations = {
     label_mtu: 'MTU Size',
     label_transport: 'Transport Protocol',
     label_sni: 'Stealth SNI (Fake Host)',
-    label_pbk: 'Reality PublicKey (pbk)',
-    label_sid: 'Reality ShortId (sid)',
+
     label_mtu: 'MTU Size',
     label_mux: 'Multiplexing (Mux)',
     mux_hint: 'Run multiple streams over one connection',
@@ -92,8 +91,7 @@ const translations = {
     label_mtu: 'Размер MTU',
     label_transport: 'Транспортный протокол',
     label_sni: 'Маскировочный SNI',
-    label_pbk: 'Reality PublicKey (pbk)',
-    label_sid: 'Reality ShortId (sid)',
+
     label_mtu: 'Размер MTU',
     label_mux: 'Мультиплексирование (Mux)',
     mux_hint: 'Несколько потоков через одно соединение',
