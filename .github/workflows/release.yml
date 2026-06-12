@@ -1,4 +1,6 @@
-name: Universal CI/CD Release Matrix
+name: CI/CD
+
+run-name: "CI/CD: release version ${{ github.ref_name }}"
 
 on:
   push:
@@ -16,8 +18,41 @@ env:
   RUST_BACKTRACE: short
 
 jobs:
+  check-and-test:
+    name: Check & Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+
+      - name: Restore Cargo cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: cargo-check-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: cargo-check-
+
+      - name: Install musl-tools
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: cargo check
+        run: cargo check --workspace
+
+      - name: cargo test
+        run: cargo test --workspace --lib
+
   publish-release-matrix:
     name: Release for ${{ matrix.target }}
+    needs: check-and-test
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -204,6 +239,7 @@ jobs:
 
   build-windows-gui:
     name: Build Windows GUI (Tauri) - ${{ matrix.arch }}
+    needs: check-and-test
     runs-on: windows-latest
     strategy:
       matrix:
@@ -277,6 +313,7 @@ jobs:
 
   build-linux-gui:
     name: Build Linux GUI (Tauri) - ${{ matrix.arch }}
+    needs: check-and-test
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -336,6 +373,7 @@ jobs:
 
   build-macos-gui:
     name: Build macOS GUI (Tauri) - ${{ matrix.arch }}
+    needs: check-and-test
     runs-on: macos-latest
     strategy:
       matrix:
@@ -392,6 +430,7 @@ jobs:
 
   build-android:
     name: Build Android Client (Flutter) - ${{ matrix.arch }}
+    needs: check-and-test
     runs-on: ubuntu-latest
     strategy:
       matrix:
