@@ -44,6 +44,17 @@ jobs:
       - name: Install musl-tools
         run: sudo apt-get update && sudo apt-get install -y musl-tools
 
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Build Web Panel
+        working-directory: ostp-control
+        run: |
+          npm install
+          npm run build
+
       - name: cargo check
         run: cargo check --workspace
 
@@ -496,5 +507,4 @@ jobs:
           files: ostp-flutter/ostp-android-${{ matrix.arch }}.apk
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
 
