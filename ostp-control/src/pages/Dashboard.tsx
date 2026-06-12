@@ -137,17 +137,7 @@ export default function Dashboard() {
               label={t('db_api_bind')} 
               value={config?.api?.enabled ? config.api.bind : 'Disabled'} 
             />
-            <InfoItem 
-              label={t('db_reality_status')} 
-              value={config?.reality?.enabled ? 'Active' : 'Disabled'} 
-              highlight={config?.reality?.enabled}
-            />
-            {config?.reality?.enabled && (
-              <InfoItem 
-                label={t('db_reality_dest')} 
-                value={config.reality.dest} 
-              />
-            )}
+
             <InfoItem 
               label={t('db_fallback_status')} 
               value={config?.fallback?.enabled ? `Active` : 'Disabled'} 

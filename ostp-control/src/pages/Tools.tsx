@@ -1,5 +1,5 @@
 import { useState, useRef } from 'react';
-import { Wrench, Key, Download, Upload, RefreshCw, CheckCircle, XCircle, AlertTriangle, ShieldAlert, Copy } from 'lucide-react';
+import { Wrench, Download, Upload, RefreshCw, CheckCircle, XCircle, ShieldAlert } from 'lucide-react';
 import { useLanguage } from '../lib/LanguageContext';
 import { api, getApiSettings } from '../lib/api';
 import { addAuditLog } from '../lib/audit';
@@ -7,12 +7,7 @@ import { addAuditLog } from '../lib/audit';
 export default function Tools() {
   const { t, language } = useLanguage();
   
-  // Keygen State
-  const [keys, setKeys] = useState<{ publicKey: string; privateKey: string; sid: string; isFallback?: boolean } | null>(null);
-  const [isGenerating, setIsGenerating] = useState(false);
-  const [isCopied, setIsCopied] = useState(false);
 
-  // Backup State
   const [isExporting, setIsExporting] = useState(false);
   const [isImporting, setIsImporting] = useState(false);
   const [importResult, setImportResult] = useState<{ success: boolean; message: string } | null>(null);
@@ -23,99 +18,6 @@ export default function Tools() {
   const [isPinging, setIsPinging] = useState(false);
   const [pingResult, setPingResult] = useState<{ success: boolean; message: string } | null>(null);
 
-  // Reality X25519 Key Generator using Web Crypto
-  const handleGenerateKeys = async () => {
-    setIsGenerating(true);
-    setKeys(null);
-    setIsCopied(false);
-    
-    // Simulate slight lag for UI satisfaction
-    await new Promise(resolve => setTimeout(resolve, 600));
-
-    try {
-      // Try using modern browser Web Crypto for X25519
-      const keypair = await window.crypto.subtle.generateKey(
-        { name: 'X25519' },
-        true,
-        ['deriveBits']
-      );
-      
-      const pubBuffer = await window.crypto.subtle.exportKey('raw', keypair.publicKey);
-      const priPkcs8 = await window.crypto.subtle.exportKey('pkcs8', keypair.privateKey);
-      
-      // Raw private key bytes are at the end of PKCS#8 ASN.1 wrapper for X25519 (last 32 bytes)
-      const priBuffer = priPkcs8.slice(priPkcs8.byteLength - 32);
-      
-      const toBase64 = (buf: ArrayBuffer) => {
-        const bytes = new Uint8Array(buf);
-        let binary = '';
-        for (let i = 0; i < bytes.byteLength; i++) {
-          binary += String.fromCharCode(bytes[i]);
-        }
-        return btoa(binary)
-          .replace(/\+/g, '-')
-          .replace(/\//g, '_')
-          .replace(/=+$/, ''); // URL-safe base64 unpadded
-      };
-      
-      const pubKey = toBase64(pubBuffer);
-      const priKey = toBase64(priBuffer);
-      
-      // Generate random 8-byte (16-char hex) SID
-      const sidBytes = new Uint8Array(8);
-      window.crypto.getRandomValues(sidBytes);
-      const sid = Array.from(sidBytes).map(b => b.toString(16).padStart(2, '0')).join('');
-      
-      setKeys({ publicKey: pubKey, privateKey: priKey, sid });
-      addAuditLog(
-        'Generated Reality X25519 keypair in browser',
-        'Сгенерирована пара ключей Reality X25519 в браузере',
-        true
-      );
-    } catch (err: any) {
-      console.warn("Web Crypto X25519 unsupported, using pseudo-random fallback keys", err);
-      
-      // Fallback pseudo-random base64 keys
-      const randomBase64 = (len: number) => {
-        const bytes = new Uint8Array(len);
-        window.crypto.getRandomValues(bytes);
-        let binary = '';
-        for (let i = 0; i < len; i++) {
-          binary += String.fromCharCode(bytes[i]);
-        }
-        return btoa(binary)
-          .replace(/\+/g, '-')
-          .replace(/\//g, '_')
-          .replace(/=+$/, '');
-      };
-
-      const sidBytes = new Uint8Array(8);
-      window.crypto.getRandomValues(sidBytes);
-      const sid = Array.from(sidBytes).map(b => b.toString(16).padStart(2, '0')).join('');
-      
-      setKeys({
-        publicKey: randomBase64(32),
-        privateKey: randomBase64(32),
-        sid,
-        isFallback: true
-      });
-      addAuditLog(
-        'Generated fallback Reality keypair (pseudo-random)',
-        'Сгенерированы резервные ключи Reality (псевдослучайные)',
-        true
-      );
-    } finally {
-      setIsGenerating(false);
-    }
-  };
-
-  const handleCopyKeys = () => {
-    if (!keys) return;
-    const text = `private_key: ${keys.privateKey}\npbk: ${keys.publicKey}\nsid: ${keys.sid}`;
-    navigator.clipboard.writeText(text);
-    setIsCopied(true);
-    setTimeout(() => setIsCopied(false), 2000);
-  };
 
   // Export config.json
   const handleExportConfig = async () => {
@@ -210,68 +112,10 @@ export default function Tools() {
         <h1 className="text-3xl font-bold tracking-tight mb-1 flex items-center gap-3">
           <Wrench className="w-8 h-8 text-primary" /> {t('tl_title')}
         </h1>
-        <p className="text-text-muted">{t('tl_subtitle')}</p>
       </div>
 
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
         
-        {/* Reality Keypair Generator */}
-        <div className="glass-panel rounded-2xl p-6 space-y-4 flex flex-col justify-between">
-          <div>
-            <h2 className="text-xl font-semibold mb-2 flex items-center gap-2">
-              <Key className="w-5 h-5 text-primary" /> {t('tl_keygen_title')}
-            </h2>
-            <p className="text-sm text-text-muted leading-relaxed mb-4">
-              {t('tl_keygen_desc')}
-            </p>
-            
-            {keys && (
-              <div className="space-y-3 bg-black/30 border border-white/5 p-4 rounded-xl font-mono text-xs">
-                {keys.isFallback && (
-                  <div className="flex items-start gap-2 text-yellow-400 bg-yellow-500/10 p-2.5 rounded-lg mb-2">
-                    <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5" />
-                    <span>
-                      {language === 'ru' 
-                        ? 'Браузер не поддерживает криптографию Curve25519 (X25519). Ключи сгенерированы в тестовом режиме. Рекомендуется использовать CLI ядра: ostp --generate-key.' 
-                        : 'Web Crypto API does not support Curve25519 (X25519) in this browser. Generated pseudo-random keys. For production, run: ostp --generate-key.'}
-                    </span>
-                  </div>
-                )}
-                <div>
-                  <span className="text-text-muted">private_key: </span>
-                  <span className="text-secondary select-all">{keys.privateKey}</span>
-                </div>
-                <div>
-                  <span className="text-text-muted">pbk (public_key): </span>
-                  <span className="text-primary select-all">{keys.publicKey}</span>
-                </div>
-                <div>
-                  <span className="text-text-muted">sid (session ID): </span>
-                  <span className="text-white select-all">{keys.sid}</span>
-                </div>
-              </div>
-            )}
-          </div>
-
-          <div className="flex gap-3 pt-4 border-t border-white/5">
-            <button
-              onClick={handleGenerateKeys}
-              disabled={isGenerating}
-              className="flex items-center gap-2 bg-primary hover:bg-primary/90 text-white px-5 py-2.5 rounded-xl font-semibold transition-colors disabled:opacity-50"
-            >
-              <RefreshCw className={`w-4 h-4 ${isGenerating ? 'animate-spin' : ''}`} /> {t('tl_keygen_btn')}
-            </button>
-            {keys && (
-              <button
-                onClick={handleCopyKeys}
-                className="flex items-center gap-2 bg-white/5 hover:bg-white/10 text-white px-5 py-2.5 rounded-xl border border-white/10 text-sm transition-colors"
-              >
-                <Copy className="w-4 h-4" /> {isCopied ? t('cl_copied') : t('tl_keygen_copy')}
-              </button>
-            )}
-          </div>
-        </div>
-
         {/* Backup & Restore Configuration */}
         <div className="glass-panel rounded-2xl p-6 space-y-4 flex flex-col justify-between">
           <div>

@@ -625,11 +625,9 @@ fn run_setup_wizard(config_path: &std::path::Path) -> Result<()> {
             // Try import from link first
             let use_link = wizard_yn("Do you have a share link (ostp://...)?", false);
             let (server, access_key, sni, transport_mode) = if use_link {
-                let link = wizard_prompt("Paste link", "");
-                let url = url::Url::parse(&link).unwrap();
                 let mut p = url.query_pairs();
-                let sni = p.find(|(k, _)| k == "sni").map(|(_, v)| v.to_string()).unwrap_or_default();
-                let tm = p.find(|(k, _)| k == "type").map(|(_, v)| v.to_string()).unwrap_or("udp".to_string());
+                let sni = p.find(|(k, _)| k == "sni").map(|(_, v): (&str, std::borrow::Cow<str>)| v.to_string()).unwrap_or_default();
+                let tm = p.find(|(k, _)| k == "type").map(|(_, v): (&str, std::borrow::Cow<str>)| v.to_string()).unwrap_or("udp".to_string());
                 (url.host_str().unwrap().to_string() + ":" + &url.port().unwrap_or(50000).to_string(), url.username().to_string(), sni, tm)
             } else {
                 ("127.0.0.1:50000".to_string(), "".to_string(), "".to_string(), "udp".to_string())
@@ -684,7 +682,7 @@ fn run_setup_wizard(config_path: &std::path::Path) -> Result<()> {
 
             // Build and save config
             let key_for_gen = generate_secure_key("hex"); // unused but needed for init template
-                                    let effective_sni = sni;
+            let effective_sni = sni;
             let _ = key_for_gen;
 
             let client_json = serde_json::json!({
@@ -1369,7 +1367,7 @@ async fn run_app() -> Result<()> {
     "sessions": 1
   }},
   "debug": false
-}}"#, key)
+}}"#, key, pub_key, sid)
         };
         if let Some(parent) = args.config.parent() {
             if !parent.as_os_str().is_empty() {
@@ -1388,30 +1386,13 @@ async fn run_app() -> Result<()> {
                     let mut link = format!("ostp://{}@{}:50000", key.key(), host);
                     let mut query_params = Vec::new();
                     
-
-                    
-                    if let Some(t) = &s.transport {
-                        if let Some(mode) = &t.mode {
-                            if mode == "uot" {
-                                query_params.push("type=tcp".to_string());
-                            } else {
-                                query_params.push("type=udp".to_string());
-                            }
-                        }
-                        if let Some(sni) = &t.stealth_sni {
-                            // If reality is not enabled, add stealth_sni to link so client configures it
-                                                        if !sni.is_empty() {
-                                query_params.push(format!("sni={}", sni));
-                            }
-                        }
-                    } else {
-                        query_params.push("type=udp".to_string());
+                    query_params.push("type=udp".to_string());
                     }
 
                     if !query_params.is_empty() {
                         link.push('?');
                         link.push_str(&query_params.join("&"));
-                    }
+                    
                     println!("\n  Share link for client distribution:");
                     println!("  {}", link);
                 }
@@ -1458,23 +1439,7 @@ async fn run_app() -> Result<()> {
                     let mut link = format!("ostp://{}@{}:{}", key.key(), host, port);
                     let mut query_params = Vec::new();
                     
-
-                    
-                    if let Some(t) = &server_cfg.transport {
-                        if let Some(mode) = &t.mode {
-                            if mode == "uot" {
-                                query_params.push("type=tcp".to_string());
-                            } else {
-                                query_params.push("type=udp".to_string());
-                            }
-                        }
-                        if let Some(sni) = &t.stealth_sni {
-                                                        if !sni.is_empty() {
-                                query_params.push(format!("sni={}", sni));
-                            }
-                        }
-                    } else {
-                        query_params.push("type=udp".to_string());
+                    query_params.push("type=udp".to_string());
                     }
 
 
@@ -1482,7 +1447,7 @@ async fn run_app() -> Result<()> {
                     if !query_params.is_empty() {
                         link.push('?');
                         link.push_str(&query_params.join("&"));
-                    }
+                    
                     println!("  [{}] {}", idx + 1, link);
                 }
                 return Ok(());
