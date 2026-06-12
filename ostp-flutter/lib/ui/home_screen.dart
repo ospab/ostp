@@ -54,6 +54,7 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
       duration: const Duration(seconds: 4),
     );
     _checkInitialState();
+    _startPolling();
   }
 
   Future<void> _checkInitialState() async {
@@ -413,57 +414,65 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
       if (!mounted) return;
       setState(() => _uptimeSecs++);
     });
-
-    _startPollingMetrics();
   }
 
-  void _startPollingMetrics() {
+  void _startPolling() {
     _pollTimer?.cancel();
     _pollTimer = Timer.periodic(const Duration(seconds: 1), (timer) async {
       if (!mounted) return;
       try {
-        final metricsJson = await platform.invokeMethod('getMetrics');
-        if (metricsJson != null && metricsJson.isNotEmpty) {
-          final Map<String, dynamic> parsed = jsonDecode(metricsJson);
-          final bytesSent = parsed['bytes_sent'] as int? ?? 0;
-          final bytesRecv = parsed['bytes_recv'] as int? ?? 0;
-          final connState = parsed['connection_state'] as int? ?? 2;
-          final rttMs = parsed['rtt_ms'] as int? ?? 0;
-          
-          if (connState == 0 && _state != ConnectionStateEnum.disconnected) {
-            try {
-              await platform.invokeMethod('stopTunnel');
-            } catch (e) {
-              debugPrint("Failed to stop background tunnel: $e");
-            }
-            _setDisconnected();
-            if (mounted) {
-              ScaffoldMessenger.of(context).showSnackBar(
-                const SnackBar(content: Text('Connection failed. Check logs for details.')),
-              );
-            }
-            return;
-          }
-          
-          if (mounted) {
-            setState(() {
-              _download = _formatBytes(bytesRecv);
-              _upload = _formatBytes(bytesSent);
-              if (rttMs > 0 && !_isCheckingPing) {
-                _pingText = 'Server Ping: $rttMs ms';
-                if (rttMs < 100) {
-                  _pingColor = const Color(0xFF22D3A5);
-                } else if (rttMs < 250) {
-                  _pingColor = Colors.amberAccent;
-                } else {
-                  _pingColor = Colors.redAccent;
-                }
+        final isRunning = await platform.invokeMethod('isRunning');
+        
+        if (isRunning == true && _state == ConnectionStateEnum.disconnected) {
+          _setConnected();
+        } else if (isRunning == false && _state == ConnectionStateEnum.connected) {
+          _setDisconnected();
+        }
+
+        if (_state == ConnectionStateEnum.connected) {
+          final metricsJson = await platform.invokeMethod('getMetrics');
+          if (metricsJson != null && metricsJson.isNotEmpty) {
+            final Map<String, dynamic> parsed = jsonDecode(metricsJson);
+            final bytesSent = parsed['bytes_sent'] as int? ?? 0;
+            final bytesRecv = parsed['bytes_recv'] as int? ?? 0;
+            final connState = parsed['connection_state'] as int? ?? 2;
+            final rttMs = parsed['rtt_ms'] as int? ?? 0;
+            
+            if (connState == 0) {
+              try {
+                await platform.invokeMethod('stopTunnel');
+              } catch (e) {
+                debugPrint("Failed to stop background tunnel: $e");
               }
-            });
+              _setDisconnected();
+              if (mounted) {
+                ScaffoldMessenger.of(context).showSnackBar(
+                  const SnackBar(content: Text('Connection failed. Check logs for details.')),
+                );
+              }
+              return;
+            }
+            
+            if (mounted) {
+              setState(() {
+                _download = _formatBytes(bytesRecv);
+                _upload = _formatBytes(bytesSent);
+                if (rttMs > 0 && !_isCheckingPing) {
+                  _pingText = 'Server Ping: $rttMs ms';
+                  if (rttMs < 100) {
+                    _pingColor = const Color(0xFF22D3A5);
+                  } else if (rttMs < 250) {
+                    _pingColor = Colors.amberAccent;
+                  } else {
+                    _pingColor = Colors.redAccent;
+                  }
+                }
+              });
+            }
           }
         }
       } catch (e) {
-        debugPrint("Failed to get metrics: $e");
+        debugPrint("Failed to get state/metrics: $e");
       }
     });
   }
@@ -507,7 +516,7 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
     _pulseController.value = 0.0;
     _spinController.stop();
     _uptimeTimer?.cancel();
-    _pollTimer?.cancel();
+    // Do NOT cancel _pollTimer, so we keep checking if VPN starts externally!
   }
 
   String _formatTime(int s) {
@@ -792,7 +801,7 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
               ),
               const SizedBox(height: 16),
               Container(
-                margin: const EdgeInsets.symmetric(horizontal: 32),
+                margin: const EdgeInsets.symmetric(horizontal: 16),
                 padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
                 decoration: BoxDecoration(
                   color: Colors.white.withOpacity(0.03),
@@ -802,29 +811,33 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
                 child: Row(
                   mainAxisAlignment: MainAxisAlignment.spaceBetween,
                   children: [
-                    Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        const Text(
-                          'CONNECTION TEST',
-                          style: TextStyle(
-                            fontSize: 10,
-                            fontWeight: FontWeight.bold,
-                            color: Colors.white38,
-                            letterSpacing: 0.8,
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          const Text(
+                            'CONNECTION TEST',
+                            style: TextStyle(
+                              fontSize: 10,
+                              fontWeight: FontWeight.bold,
+                              color: Colors.white38,
+                              letterSpacing: 0.8,
+                            ),
                           ),
-                        ),
-                        const SizedBox(height: 4),
-                        Text(
-                          _pingText,
-                          style: TextStyle(
-                            fontSize: 15,
-                            fontWeight: FontWeight.bold,
-                            color: _pingColor,
+                          const SizedBox(height: 4),
+                          Text(
+                            _pingText,
+                            overflow: TextOverflow.ellipsis,
+                            style: TextStyle(
+                              fontSize: 15,
+                              fontWeight: FontWeight.bold,
+                              color: _pingColor,
+                            ),
                           ),
-                        ),
-                      ],
+                        ],
+                      ),
                     ),
+                    const SizedBox(width: 8),
                     _isCheckingPing
                         ? const SizedBox(
                             width: 20, height: 20,
@@ -876,42 +889,49 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
   }
 
   Widget _buildMetricItem(IconData icon, String label, String value, Color color) {
-    return Row(
-      children: [
-        Container(
-          padding: const EdgeInsets.all(8),
-          decoration: BoxDecoration(
-            color: color.withOpacity(0.15),
-            borderRadius: BorderRadius.circular(10),
+    return Expanded(
+      child: Row(
+        mainAxisAlignment: MainAxisAlignment.center,
+        children: [
+          Container(
+            padding: const EdgeInsets.all(8),
+            decoration: BoxDecoration(
+              color: color.withOpacity(0.15),
+              borderRadius: BorderRadius.circular(10),
+            ),
+            child: Icon(icon, size: 20, color: color),
           ),
-          child: Icon(icon, size: 20, color: color),
-        ),
-        const SizedBox(width: 12),
-        Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Text(
-              label.toUpperCase(),
-              style: const TextStyle(
-                fontSize: 12,
-                fontWeight: FontWeight.w700,
-                color: Colors.white54,
-                letterSpacing: 0.8,
-              ),
+          const SizedBox(width: 12),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  label.toUpperCase(),
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(
+                    fontSize: 12,
+                    fontWeight: FontWeight.w700,
+                    color: Colors.white54,
+                    letterSpacing: 0.8,
+                  ),
+                ),
+                const SizedBox(height: 4),
+                Text(
+                  value,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(
+                    fontFamily: 'monospace',
+                    fontSize: 16,
+                    fontWeight: FontWeight.w700,
+                    color: Colors.white,
+                  ),
+                ),
+              ],
             ),
-            const SizedBox(height: 4),
-            Text(
-              value,
-              style: const TextStyle(
-                fontFamily: 'monospace',
-                fontSize: 16,
-                fontWeight: FontWeight.w700,
-                color: Colors.white,
-              ),
-            ),
-          ],
-        )
-      ],
+          )
+        ],
+      ),
     );
   }
 }

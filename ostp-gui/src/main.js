@@ -252,8 +252,8 @@ async function handleToggle() {
       }
     }
   } else {
-    try { await invoke('stop_tunnel'); } catch { /* ignore */ }
     setState('disconnected');
+    try { await invoke('stop_tunnel'); } catch { /* ignore */ }
     showToast(t('toast_disconnected') || 'Disconnected');
   }
 }

@@ -50,7 +50,6 @@ pub struct ApiState {
     /// Server address for subscription links (e.g. "example.com")
     pub server_host: String,
     pub server_port: u16,
-    pub reality_query: String,
     pub config_path: Option<std::path::PathBuf>,
     pub dns_server: std::sync::Arc<crate::dns::DnsServer>,
     pub audit_logs: Arc<RwLock<Vec<AuditLogEntry>>>,
@@ -78,14 +77,6 @@ pub struct CreateAuditLogRequest {
 }
 
 // ── API configuration ────────────────────────────────────────────────────────
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct RealityConfig {
-    pub private_key: String,
-    pub short_ids: Vec<String>,
-    pub dest: String,
-    pub sni_list: Vec<String>,
-}
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ApiConfig {
@@ -287,7 +278,6 @@ pub async fn start_api_server(
     user_stats: Arc<RwLock<HashMap<String, Arc<UserStats>>>>,
     server_host: String,
     server_port: u16,
-    reality_query: String,
     config_path: Option<std::path::PathBuf>,
     dns_server: std::sync::Arc<crate::dns::DnsServer>,
     router: std::sync::Arc<crate::router::Router>,
@@ -303,7 +293,6 @@ pub async fn start_api_server(
         password_hash: config.password_hash.clone(),
         server_host,
         server_port,
-        reality_query,
         config_path,
         dns_server,
         audit_logs: Arc::new(RwLock::new(Vec::new())),
@@ -814,14 +803,11 @@ async fn handle_subscribe(
     // If client requests plain text, return ostp:// share link
     if accept.contains("text/plain") {
         let dns_enabled = state.dns_server.config.read().await.enabled;
-        let mut rq = state.reality_query.clone();
-        if dns_enabled {
-            if rq.is_empty() {
-                rq = "?owndns=true".to_string();
-            } else {
-                rq = format!("{}&owndns=true", rq);
-            }
-        }
+        let rq = if dns_enabled {
+            "?type=udp&owndns=true".to_string()
+        } else {
+            "?type=udp".to_string()
+        };
         let link = format!("ostp://{}@{}:{}{}", key, state.server_host, state.server_port, rq);
         return (StatusCode::OK, Json(serde_json::json!({
             "ok": true,
@@ -877,7 +863,6 @@ mod tests {
             password_hash: "hash".to_string(),
             server_host: "127.0.0.1".to_string(),
             server_port: 50000,
-            reality_query: "".to_string(),
             config_path: None,
             dns_server: crate::dns::DnsServer::new(Default::default()),
             audit_logs: Arc::new(RwLock::new(Vec::new())),

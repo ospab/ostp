@@ -160,6 +160,10 @@ impl ProtocolMachine {
         self.cc.cwnd_packets() as usize
     }
 
+    pub fn on_send(&mut self, bytes: u64) {
+        self.cc.on_send(bytes);
+    }
+
     pub fn state(&self) -> OstpState {
         self.state
     }
@@ -677,6 +681,9 @@ impl ProtocolMachine {
     }
 
     fn push_sent_frame(&mut self, nonce: u64, bytes: Bytes, is_retransmittable: bool) {
+        if is_retransmittable {
+            self.cc.on_send(bytes.len() as u64);
+        }
         self.sent_history.push_back(SentFrame {
             nonce,
             bytes,

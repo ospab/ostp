@@ -16,7 +16,7 @@ LEGACY_PATHS=(
 )
 
 echo "========================================================"
-echo " OSTP Installer v2"
+echo " OSTP Installer v3"
 echo "========================================================"
 
 # Verify root
@@ -46,8 +46,6 @@ migrate_legacy() {
         cp "$old_dir/ostp" "$INSTALL_DIR/ostp"
     fi
 
-
-
     echo "[migrate] Legacy files preserved at $old_dir (remove manually if no longer needed)"
 }
 
@@ -55,7 +53,6 @@ migrate_legacy() {
 if [ -f "$INSTALL_DIR/config.json" ] && [ ! -f "$CONFIG_FILE" ]; then
     echo "[migrate] Moving config from $INSTALL_DIR/config.json -> $CONFIG_FILE"
     cp "$INSTALL_DIR/config.json" "$CONFIG_FILE"
-    # Keep old file as backup
     mv "$INSTALL_DIR/config.json" "$INSTALL_DIR/config.json.bak"
 fi
 
@@ -106,9 +103,7 @@ if [ -z "$LATEST_RELEASE" ] || [[ "$LATEST_RELEASE" == *"null"* ]]; then
     fi
 else
     ARCHIVE_NAME="ostp-linux-${ARCH}.tar.gz"
-    GUI_ARCHIVE_NAME="ostp-gui-linux-${ARCH}.tar.gz"
     DOWNLOAD_URL="https://github.com/${GITHUB_REPO}/releases/download/${LATEST_RELEASE}/${ARCHIVE_NAME}"
-    GUI_DOWNLOAD_URL="https://github.com/${GITHUB_REPO}/releases/download/${LATEST_RELEASE}/${GUI_ARCHIVE_NAME}"
     echo "Downloading: $ARCHIVE_NAME ($LATEST_RELEASE)"
 
     TEMP_TAR="/tmp/ostp_temp.tar.gz"
@@ -134,21 +129,10 @@ else
     exit 1
 fi
 
-# We don't download GUI binary immediately, we will do it if the user selects Client + GUI mode
-
-
 # ── Create global symlink ────────────────────────────────────────────
 
 ln -sf "$INSTALL_DIR/ostp" "$BIN_LINK"
 echo "Symlink created: $BIN_LINK -> $INSTALL_DIR/ostp"
-echo "You can now run 'ostp' from anywhere."
-
-# ── Detect public IP ─────────────────────────────────────────────────
-
-SERVER_IP=$(curl -4s https://ifconfig.me 2>/dev/null \
-    || curl -4s https://api.ipify.org 2>/dev/null \
-    || curl -4s https://icanhazip.com 2>/dev/null \
-    || hostname -I | awk '{print $1}')
 
 # ── Update detection ─────────────────────────────────────────────────
 
@@ -234,72 +218,6 @@ EOF
         fi
     fi
 
-    # ── Panel setup prompt (if not yet configured) ──
-    PANEL_USERNAME=$(python3 -c "
-import json
-with open('$CONFIG_FILE') as f:
-    raw = f.read()
-lines = [l for l in raw.split('\n') if not l.strip().startswith('//')]
-cfg = json.loads('\n'.join(lines))
-print(cfg.get('api', {}).get('username', ''))
-" 2>/dev/null)
-
-    if [ -z "$PANEL_USERNAME" ] && python3 -c "
-import json
-with open('$CONFIG_FILE') as f:
-    raw = f.read()
-lines = [l for l in raw.split('\n') if not l.strip().startswith('//')]
-cfg = json.loads('\n'.join(lines))
-exit(0 if cfg.get('mode') == 'server' else 1)
-" 2>/dev/null; then
-        echo ""
-        echo "Web panel is not configured."
-        read -p "Set up web panel now? [y/N]: " SETUP_PANEL
-        if [[ "$SETUP_PANEL" =~ ^[Yy]$ ]]; then
-            read -p "Panel port [default: 9090]: " PANEL_PORT
-            PANEL_PORT=${PANEL_PORT:-9090}
-
-            RANDOM_PATH=$(tr -dc 'a-zA-Z0-9' < /dev/urandom | head -c 8)
-            read -p "WebPath [leave empty for random: $RANDOM_PATH]: " WEBPATH
-            WEBPATH=${WEBPATH:-$RANDOM_PATH}
-
-            read -p "Username [default: admin]: " USERNAME
-            USERNAME=${USERNAME:-admin}
-
-            RANDOM_PASS=$(tr -dc 'a-zA-Z0-9' < /dev/urandom | head -c 12)
-            read -p "Password [leave empty for random: $RANDOM_PASS]: " PASSWORD
-            PASSWORD=${PASSWORD:-$RANDOM_PASS}
-
-            PASS_HASH=$(python3 -c "import hashlib; print(hashlib.sha256('$PASSWORD'.encode()).hexdigest())")
-
-            python3 << PYEOF
-import json
-with open('$CONFIG_FILE') as f:
-    raw = f.read()
-lines = [l for l in raw.split('\n') if not l.strip().startswith('//')]
-cfg = json.loads('\n'.join(lines))
-if 'api' not in cfg:
-    cfg['api'] = {}
-cfg['api']['enabled'] = True
-cfg['api']['bind'] = '0.0.0.0:$PANEL_PORT'
-cfg['api']['webpath'] = '$WEBPATH'
-cfg['api']['username'] = '$USERNAME'
-cfg['api']['password_hash'] = '$PASS_HASH'
-with open('$CONFIG_FILE', 'w') as f:
-    json.dump(cfg, f, indent=2, ensure_ascii=False)
-print('[ok] Panel configured.')
-PYEOF
-
-            echo ""
-            echo "========================================================"
-            echo "Panel configured!"
-            echo "URL:      http://$SERVER_IP:$PANEL_PORT/$WEBPATH/"
-            echo "Username: $USERNAME"
-            echo "Password: $PASSWORD"
-            echo "========================================================"
-        fi
-    fi
-
     if systemctl is-active --quiet ostp.service 2>/dev/null; then
         echo "Restarting ostp service..."
         systemctl restart ostp.service
@@ -313,246 +231,11 @@ PYEOF
     exit 0
 fi
 
+# ── First install: delegate to the built-in setup wizard ─────────────
 
-# ── Interactive setup (first install) ────────────────────────────────
-
-echo "--------------------------------------------------------"
-echo "Select mode:"
-echo "  1) Server"
-echo "  2) Client"
-echo "  3) Relay"
-echo "  4) Server + Web Panel"
-echo "  5) Client + GUI"
-echo "--------------------------------------------------------"
-read -p "Choice [1-5]: " NODE_MODE
+echo ""
+echo "No configuration found. Launching setup wizard..."
+echo ""
 
 cd "$INSTALL_DIR"
-
-if [ "$NODE_MODE" == "1" ]; then
-    echo "Initializing server configuration..."
-    ./ostp --init server --config "$CONFIG_FILE"
-
-    read -p "Listen address [default: 0.0.0.0:50000]: " LISTEN_ADDR
-    if [ -n "$LISTEN_ADDR" ]; then
-        sed -i "s/\"listen\": \".*\"/\"listen\": \"$LISTEN_ADDR\"/g" "$CONFIG_FILE"
-    fi
-
-    read -p "Number of access keys [default: 1]: " KEYS_COUNT
-    KEYS_COUNT=${KEYS_COUNT:-1}
-
-    if [ "$KEYS_COUNT" -gt 1 ]; then
-        echo "Generating $KEYS_COUNT access keys..."
-        NEW_KEYS=$(./ostp -g -c "$KEYS_COUNT" | sed 's/^/      "/;s/$/"/' | paste -sd ',' | sed 's/,/,\n/g')
-        # Replace the access_keys array
-        python3 -c "
-import json, subprocess, sys
-with open('$CONFIG_FILE') as f:
-    content = f.read()
-    # Strip comments for parsing
-    lines = [l for l in content.split('\n') if not l.strip().startswith('//')]
-    cfg = json.loads('\n'.join(lines))
-keys = subprocess.check_output(['$INSTALL_DIR/ostp', '-g', '-c', '$KEYS_COUNT']).decode().strip().split('\n')
-cfg['access_keys'] = keys
-with open('$CONFIG_FILE', 'w') as f:
-    json.dump(cfg, f, indent=2)
-" 2>/dev/null || echo "[warn] Key injection via python3 failed. Edit config manually."
-    fi
-
-    echo ""
-    echo "Server access key(s):"
-    grep -oP '"[0-9a-f]{32}"' "$CONFIG_FILE" | tr -d '"' | while read key; do
-        echo "  $key"
-    done
-    echo ""
-    echo "Server configuration saved: $CONFIG_FILE"
-
-elif [ "$NODE_MODE" == "4" ]; then
-    echo "Initializing server configuration..."
-    ./ostp --init server --config "$CONFIG_FILE"
-
-    read -p "Listen address [default: 0.0.0.0:50000]: " LISTEN_ADDR
-    if [ -n "$LISTEN_ADDR" ]; then
-        sed -i "s/\"listen\": \".*\"/\"listen\": \"$LISTEN_ADDR\"/g" "$CONFIG_FILE"
-    fi
-
-    # Panel Setup
-    echo "--- Web Panel Setup ---"
-    read -p "Panel port [default: 9090]: " PANEL_PORT
-    PANEL_PORT=${PANEL_PORT:-9090}
-    
-    RANDOM_PATH=$(tr -dc 'a-zA-Z0-9' < /dev/urandom | head -c 8)
-    read -p "WebPath (leave empty for random: /$RANDOM_PATH/): " WEBPATH
-    WEBPATH=${WEBPATH:-$RANDOM_PATH}
-    
-    read -p "Username [default: admin]: " USERNAME
-    USERNAME=${USERNAME:-admin}
-    
-    RANDOM_PASS=$(tr -dc 'a-zA-Z0-9' < /dev/urandom | head -c 12)
-    read -p "Password (leave empty for random: $RANDOM_PASS): " PASSWORD
-    PASSWORD=${PASSWORD:-$RANDOM_PASS}
-    
-    # Hash password with python
-    PASS_HASH=$(python3 -c "import hashlib; print(hashlib.sha256('$PASSWORD'.encode()).hexdigest())")
-    
-    # Inject into config
-    python3 -c "
-import json
-with open('$CONFIG_FILE') as f:
-    lines = [l for l in f.read().split('\n') if not l.strip().startswith('//')]
-    cfg = json.loads('\n'.join(lines))
-if 'api' not in cfg:
-    cfg['api'] = {}
-cfg['api']['enabled'] = True
-cfg['api']['bind'] = '0.0.0.0:' + str('$PANEL_PORT')
-cfg['api']['webpath'] = '$WEBPATH'
-cfg['api']['username'] = '$USERNAME'
-cfg['api']['password_hash'] = '$PASS_HASH'
-with open('$CONFIG_FILE', 'w') as f:
-    json.dump(cfg, f, indent=2)
-" 2>/dev/null || echo "[warn] Failed to configure panel via python. Edit config manually."
-
-    echo ""
-    echo "========================================================"
-    echo "Panel installed successfully!"
-    echo "URL: http://$SERVER_IP:$PANEL_PORT/$WEBPATH/"
-    echo "Username: $USERNAME"
-    echo "Password: $PASSWORD"
-    echo "========================================================"
-
-elif [ "$NODE_MODE" == "2" ] || [ "$NODE_MODE" == "5" ]; then
-    echo "Initializing client configuration..."
-    ./ostp --init client --config "$CONFIG_FILE"
-
-    read -p "Server address (host:port): " REMOTE_SERVER
-    if [ -n "$REMOTE_SERVER" ]; then
-        sed -i "s/\"server\": \"127.0.0.1:50000\"/\"server\": \"$REMOTE_SERVER\"/g" "$CONFIG_FILE"
-    else
-        echo "[warn] No server address provided. Using default (127.0.0.1:50000)."
-    fi
-
-    read -p "Access key: " ACCESS_KEY
-    if [ -z "$ACCESS_KEY" ]; then
-        ACCESS_KEY=$(./ostp -g)
-        echo "Generated key: $ACCESS_KEY"
-    fi
-    sed -i "s/\"access_key\": \"[^\"]*\"/\"access_key\": \"$ACCESS_KEY\"/g" "$CONFIG_FILE"
-
-    read -p "Local proxy address [default: 127.0.0.1:1088]: " SOCKS_BIND
-    if [ -n "$SOCKS_BIND" ]; then
-        sed -i "s/\"socks5_bind\": \"127.0.0.1:1088\"/\"socks5_bind\": \"$SOCKS_BIND\"/g" "$CONFIG_FILE"
-    fi
-    echo "Client configuration saved: $CONFIG_FILE"
-
-    if [ "$NODE_MODE" == "5" ]; then
-        echo "Installing GUI..."
-        if [ -n "$LATEST_RELEASE" ]; then
-            TEMP_GUI_TAR="/tmp/ostp_gui_temp.tar.gz"
-            echo "Downloading GUI: $GUI_ARCHIVE_NAME ($LATEST_RELEASE)"
-            HTTP_CODE_GUI=$(curl -sL -w "%{http_code}" "$GUI_DOWNLOAD_URL" -o "$TEMP_GUI_TAR")
-            if [ "$HTTP_CODE_GUI" -eq 200 ]; then
-                tar -xzf "$TEMP_GUI_TAR" -C "$INSTALL_DIR" ostp-gui 2>/dev/null || tar -xzf "$TEMP_GUI_TAR" -C "$INSTALL_DIR"
-                rm -f "$TEMP_GUI_TAR"
-                if [ -f "$INSTALL_DIR/ostp-gui" ]; then
-                    chmod +x "$INSTALL_DIR/ostp-gui"
-                    ln -sf "$INSTALL_DIR/ostp-gui" "/usr/local/bin/ostp-gui"
-                    echo "GUI binary installed at $INSTALL_DIR/ostp-gui"
-                    
-                    # Create desktop entry
-                    DESKTOP_FILE="/usr/share/applications/ostp-gui.desktop"
-                    cat <<EOF > "$DESKTOP_FILE"
-[Desktop Entry]
-Name=OSTP Client
-Comment=Ospab Stealth Transport Protocol Client
-Exec=/usr/local/bin/ostp-gui
-Icon=utilities-terminal
-Terminal=false
-Type=Application
-Categories=Network;Utility;
-EOF
-                    echo "Desktop entry created at $DESKTOP_FILE"
-                else
-                    echo "[error] GUI binary not found in archive."
-                fi
-            else
-                echo "[error] Download failed for GUI (HTTP $HTTP_CODE_GUI)."
-                rm -f "$TEMP_GUI_TAR"
-            fi
-        else
-            echo "[notice] Automatic download not possible. Install GUI manually."
-        fi
-    fi
-
-elif [ "$NODE_MODE" == "3" ]; then
-    echo "Initializing relay configuration..."
-    ./ostp --init relay --config "$CONFIG_FILE"
-
-    read -p "Listen address [default: 0.0.0.0:50000]: " LISTEN_ADDR
-    if [ -n "$LISTEN_ADDR" ]; then
-        sed -i "s/\"listen\": \".*\"/\"listen\": \"$LISTEN_ADDR\"/g" "$CONFIG_FILE"
-    fi
-
-    read -p "Upstream server IP/port (e.g. 1.2.3.4:50000): " UPSTREAM_ADDR
-    if [ -n "$UPSTREAM_ADDR" ]; then
-        sed -i "s/\"upstream_tcp\": \".*\"/\"upstream_tcp\": \"$UPSTREAM_ADDR\"/g" "$CONFIG_FILE"
-        sed -i "s/\"upstream_udp\": \".*\"/\"upstream_udp\": \"$UPSTREAM_ADDR\"/g" "$CONFIG_FILE"
-    fi
-
-    read -p "Upstream API URL (e.g. http://1.2.3.4:9090): " UPSTREAM_API
-    if [ -n "$UPSTREAM_API" ]; then
-        sed -i "s|\"upstream_api_url\": \".*\"|\"upstream_api_url\": \"$UPSTREAM_API\"|g" "$CONFIG_FILE"
-    fi
-
-    read -p "Upstream API token: " UPSTREAM_TOKEN
-    if [ -n "$UPSTREAM_TOKEN" ]; then
-        sed -i "s/\"upstream_api_token\": \".*\"/\"upstream_api_token\": \"$UPSTREAM_TOKEN\"/g" "$CONFIG_FILE"
-    fi
-    echo "Relay configuration saved: $CONFIG_FILE"
-
-else
-    echo "[error] Invalid selection."
-    exit 1
-fi
-
-# ── Register systemd service ─────────────────────────────────────────
-
-echo "Registering systemd service..."
-cat <<EOF > /etc/systemd/system/ostp.service
-[Unit]
-Description=OSTP Stealth Transport Protocol
-After=network.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-User=root
-WorkingDirectory=$INSTALL_DIR
-ExecStart=$INSTALL_DIR/ostp --config $CONFIG_FILE
-Restart=always
-RestartSec=5
-LimitNOFILE=65535
-Environment=RUST_LOG=info
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-systemctl daemon-reload
-systemctl enable ostp.service >/dev/null 2>&1
-
-echo ""
-echo "========================================================"
-echo " Installation complete"
-echo "========================================================"
-echo ""
-echo "  Binary:  $INSTALL_DIR/ostp"
-echo "  Command: ostp (available globally)"
-echo "  Config:  $CONFIG_FILE"
-echo "  Service: systemctl start ostp"
-echo "  Logs:    journalctl -u ostp -f"
-echo ""
-echo "  Quick commands:"
-echo "    ostp --check              Validate configuration"
-echo "    ostp --generate-key       Generate access key"
-echo "    ostp --links              Print client share links"
-echo "    systemctl status ostp     Service status"
-echo ""
+exec ./ostp --setup --config "$CONFIG_FILE"

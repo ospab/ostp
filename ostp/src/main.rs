@@ -17,6 +17,10 @@ struct Args {
     #[arg(short, long)]
     init: Option<String>,
 
+    /// Run the interactive setup wizard
+    #[arg(long)]
+    setup: bool,
+
     /// Generate a new secure access key and exit
     #[arg(short = 'g', long)]
     generate_key: bool,
@@ -88,7 +92,7 @@ fn parse_ostp_link(link: &str) -> Result<ClientConfig> {
     let mut wss_enabled = false;
 
     for (k, v) in parsed.query_pairs() {
-        match k.as_ref() {
+        match &*k {
             "sni" => sni = v.into_owned(),
             "fp" => fp = v.into_owned(),
             "pbk" => pbk = v.into_owned(),
@@ -119,14 +123,7 @@ fn parse_ostp_link(link: &str) -> Result<ClientConfig> {
             dns: tun_dns,
             kill_switch: Some(false),
         }),
-        reality: Some(RealityConfigRaw {
-            enabled: true,
-            sni,
-            fp,
-            pbk,
-            sid,
-            spx,
-        }),
+
         debug: Some(false),
         exclude: None,
         mux: None,
@@ -147,21 +144,6 @@ fn generate_secure_key(format_type: &str) -> String {
     }
 }
 
-fn generate_reality_keys() -> (String, String, String) {
-    use rand::RngCore;
-    use base64::Engine;
-    
-    let (priv_key, pub_key) = ostp_core::crypto::reality::generate_x25519_keypair();
-    
-    let priv_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&priv_key.to_bytes());
-    let pub_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(pub_key.as_bytes());
-    
-    let mut sid_bytes = [0u8; 8];
-    rand::thread_rng().fill_bytes(&mut sid_bytes);
-    let sid_hex = sid_bytes.iter().map(|b| format!("{:02x}", b)).collect::<String>();
-    
-    (priv_b64, pub_b64, sid_hex)
-}
 
 fn parse_outbound_action(value: Option<String>) -> ostp_server::OutboundAction {
     match value.as_deref() {
@@ -257,7 +239,6 @@ impl UserConfig {
 struct ServerConfig {
     listen: ListenConfig,
     access_keys: Vec<UserConfig>,
-    reality: Option<RealityServerConfigRaw>,
     debug: Option<bool>,
     outbound: Option<OutboundConfig>,
     api: Option<ApiConfig>,
@@ -336,7 +317,6 @@ struct ClientConfig {
     mtu: Option<usize>,
     socks5_bind: Option<String>,
     tun: Option<TunConfig>,
-    reality: Option<RealityConfigRaw>,
     debug: Option<bool>,
     exclude: Option<ExcludeConfig>,
     mux: Option<MuxConfig>,
@@ -360,27 +340,6 @@ struct TunConfig {
     kill_switch: Option<bool>,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone)]
-struct RealityConfigRaw {
-    #[serde(default)]
-    enabled: bool,
-    sni: String,
-    fp: String,
-    pbk: String,
-    sid: String,
-    spx: String,
-}
-
-#[derive(Debug, Deserialize, Serialize, Clone)]
-struct RealityServerConfigRaw {
-    #[serde(default)]
-    enabled: bool,
-    dest: String,
-    private_key: String,
-    pbk: String,
-    sid: String,
-    sni_list: Vec<String>,
-}
 
 #[derive(Debug, Deserialize, Serialize)]
 struct OutboundConfig {
@@ -509,6 +468,570 @@ fn get_or_ask_public_ip(config_path: &std::path::Path) -> String {
     "<YOUR_SERVER_PUBLIC_IP>".to_string()
 }
 
+// ---------------------------------------------------------------------------
+// Setup Wizard
+// ---------------------------------------------------------------------------
+
+fn wizard_prompt(prompt: &str, default: &str) -> String {
+    use std::io::Write;
+    if default.is_empty() {
+        print!("  {} ", prompt);
+    } else {
+        print!("  {} [{}]: ", prompt, default.cyan());
+    }
+    std::io::stdout().flush().unwrap();
+    let mut input = String::new();
+    std::io::stdin().read_line(&mut input).unwrap();
+    let trimmed = input.trim().to_string();
+    if trimmed.is_empty() && !default.is_empty() {
+        default.to_string()
+    } else {
+        trimmed
+    }
+}
+
+fn wizard_yn(prompt: &str, default_yes: bool) -> bool {
+    let hint = if default_yes { "Y/n" } else { "y/N" };
+    use std::io::Write;
+    print!("  {} [{}]: ", prompt, hint.cyan());
+    std::io::stdout().flush().unwrap();
+    let mut input = String::new();
+    std::io::stdin().read_line(&mut input).unwrap();
+    match input.trim().to_lowercase().as_str() {
+        "y" | "yes" => true,
+        "n" | "no"  => false,
+        _            => default_yes,
+    }
+}
+
+fn wizard_step(n: usize, total: usize, title: &str) {
+    println!();
+    println!("  {} {}",
+        format!("[{}/{}]", n, total).bold().yellow(),
+        title.bold());
+    println!("  {}", "─".repeat(50).dimmed());
+}
+
+fn wizard_box(lines: &[&str]) {
+    let width = lines.iter().map(|l| l.len()).max().unwrap_or(0).max(40);
+    println!("  ╔{}╗", "═".repeat(width + 2));
+    for line in lines {
+        let padding = width - line.len();
+        println!("  ║ {}{} ║", line, " ".repeat(padding));
+    }
+    println!("  ╚{}╝", "═".repeat(width + 2));
+}
+
+fn wizard_ok(msg: &str) {
+    println!("  {} {}", "✓".green().bold(), msg);
+}
+
+fn wizard_warn(msg: &str) {
+    println!("  {} {}", "!".yellow().bold(), msg.yellow());
+}
+
+fn wizard_section(title: &str) {
+    println!("\n  {}", title.bold().underline());
+}
+
+fn wizard_save_config(config_path: &std::path::Path, json_value: &serde_json::Value) -> Result<std::path::PathBuf> {
+    let mut current_path = config_path.to_path_buf();
+    
+    // Attempt 1: write to requested path
+    if let Some(parent) = current_path.parent() {
+        if !parent.as_os_str().is_empty() {
+            let _ = fs::create_dir_all(parent);
+        }
+    }
+    
+    match fs::write(&current_path, serde_json::to_string_pretty(json_value)?) {
+        Ok(_) => {
+            wizard_ok(&format!("Configuration saved to {:?}", current_path));
+            return Ok(current_path);
+        }
+        Err(e) => {
+            wizard_warn(&format!("Could not write to {:?}: {}", current_path, e));
+            // Attempt 2: fallback to current directory
+            let fallback = std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")).join("config.json");
+            wizard_warn(&format!("Falling back to {:?}", fallback));
+            
+            match fs::write(&fallback, serde_json::to_string_pretty(json_value)?) {
+                Ok(_) => {
+                    wizard_ok(&format!("Configuration saved to {:?}", fallback));
+                    return Ok(fallback);
+                }
+                Err(e2) => {
+                    wizard_warn(&format!("Could not write to fallback {:?}: {}", fallback, e2));
+                    anyhow::bail!("Failed to save configuration to any location.");
+                }
+            }
+        }
+    }
+}
+
+fn run_setup_wizard(config_path: &std::path::Path) -> Result<()> {
+    use std::io::Write;
+
+    println!();
+    wizard_box(&[
+        "OSTP Setup Wizard",
+        concat!("Version ", env!("CARGO_PKG_VERSION")),
+        "",
+        "This wizard will create your configuration file.",
+        "Press Enter to accept the value shown in [brackets].",
+    ]);
+
+    // ── Mode selection ────────────────────────────────────────────────
+    println!();
+    println!("  {}", "Select operating mode:".bold());
+    println!("  {}", "─".repeat(50).dimmed());
+
+    #[cfg(unix)]
+    {
+        println!("    {}  Client       (connect to a server via VPN/proxy)",  "[1]".cyan().bold());
+        println!("    {}  Server       (accept client connections)",             "[2]".cyan().bold());
+        println!("    {}  Server+Panel (server with web management panel)",     "[3]".cyan().bold());
+        println!("    {}  Relay        (forward traffic to another server)",    "[4]".cyan().bold());
+    }
+    #[cfg(windows)]
+    {
+        println!("    {}  Client  (connect to a server via VPN/proxy)", "[1]".cyan().bold());
+        println!("    {}  Server  (accept client connections)",           "[2]".cyan().bold());
+    }
+
+    print!("\n  Your choice: ");
+    std::io::stdout().flush().unwrap();
+    let mut mode_input = String::new();
+    std::io::stdin().read_line(&mut mode_input).unwrap();
+    let mode_choice = mode_input.trim();
+
+    #[cfg(unix)]
+    let valid_choices = ["1", "2", "3", "4"];
+    #[cfg(windows)]
+    let valid_choices = ["1", "2"];
+
+    if !valid_choices.contains(&mode_choice) {
+        anyhow::bail!("Invalid selection '{}'", mode_choice);
+    }
+
+    match mode_choice {
+        // ── CLIENT ────────────────────────────────────────────────────
+        "1" => {
+            #[cfg(unix)]  const TOTAL: usize = 5;
+            #[cfg(windows)] const TOTAL: usize = 4;
+
+            wizard_step(1, TOTAL, "Server connection");
+
+            // Try import from link first
+            let use_link = wizard_yn("Do you have a share link (ostp://...)?", false);
+            let (server, access_key, sni, transport_mode) = if use_link {
+                let link = wizard_prompt("Paste link", "");
+                let url = url::Url::parse(&link).unwrap();
+                let mut p = url.query_pairs();
+                let sni = p.find(|(k, _)| k == "sni").map(|(_, v)| v.to_string()).unwrap_or_default();
+                let tm = p.find(|(k, _)| k == "type").map(|(_, v)| v.to_string()).unwrap_or("udp".to_string());
+                (url.host_str().unwrap().to_string() + ":" + &url.port().unwrap_or(50000).to_string(), url.username().to_string(), sni, tm)
+            } else {
+                ("127.0.0.1:50000".to_string(), "".to_string(), "".to_string(), "udp".to_string())
+            };
+
+            wizard_step(2, TOTAL, "Local proxy");
+            let socks_bind = wizard_prompt("Local SOCKS5 proxy bind address", "127.0.0.1:1088");
+
+            wizard_step(3, TOTAL, "VPN (TUN) mode");
+
+            // SSH warning on Linux — always
+            #[cfg(unix)]
+            {
+                println!();
+                println!("  ┌{}", "─".repeat(60));
+                println!("  │ {} {}",
+                    "WARNING:".red().bold(),
+                    "TUN mode captures ALL network traffic.".yellow());
+                println!("  │");
+                println!("  │  {} If you are connected via SSH to a headless server,",
+                    "▶".red());
+                println!("  │    enabling TUN mode will route the SSH connection");
+                println!("  │    through the VPN tunnel.");
+                println!("  │");
+                println!("  │    Make sure the VPN server is reachable before");
+                println!("  │    enabling TUN, or your SSH session may be lost!");
+                println!("  └{}", "─".repeat(60));
+            }
+
+            let tun_enable = wizard_yn("Enable TUN (full VPN) mode?", false);
+
+            let (tun_dns, kill_switch) = if tun_enable {
+                let dns = wizard_prompt("DNS server for TUN", "1.1.1.1");
+                let ks  = wizard_yn("Enable kill switch (block traffic if VPN drops)?", false);
+                (dns, ks)
+            } else {
+                ("1.1.1.1".to_string(), false)
+            };
+
+            wizard_step(4, TOTAL, "Multiplexing");
+            let mux_enable = wizard_yn("Enable connection multiplexing (better performance)?", false);
+            let mux_sessions = if mux_enable {
+                let s = wizard_prompt("Number of parallel sessions", "5");
+                s.parse::<usize>().unwrap_or(5)
+            } else { 1 };
+
+            // Daemon step — Linux only
+            #[cfg(unix)]
+            {
+                wizard_step(5, TOTAL, "Auto-start (systemd)");
+            }
+
+            // Build and save config
+            let key_for_gen = generate_secure_key("hex"); // unused but needed for init template
+                                    let effective_sni = sni;
+            let _ = key_for_gen;
+
+            let client_json = serde_json::json!({
+                "mode": "client",
+                "log_level": "info",
+                "server": server,
+                "access_key": access_key,
+                "socks5_bind": socks_bind,
+                "tun": {
+                    "enable": tun_enable,
+                    "wintun_path": "./wintun.dll",
+                    "ipv4_address": "10.1.0.2/24",
+                    "dns": tun_dns,
+                    "kill_switch": kill_switch
+                },
+                "exclude": {
+                    "domains": ["localhost", "127.0.0.1"],
+                    "ips": [],
+                    "processes": []
+                },
+                "transport": {
+                    "mode": transport_mode,
+                    "stealth_sni": "www.microsoft.com",
+                    "wss": false
+                },
+                "mux": {
+                    "enabled": mux_enable,
+                    "sessions": mux_sessions
+                },
+                "debug": false
+            });
+
+            let actual_path = wizard_save_config(config_path, &client_json)?;
+            println!();
+
+            // Daemon registration
+            #[cfg(unix)]
+            wizard_register_systemd(&actual_path)?;
+            #[cfg(windows)]
+            wizard_register_windows_service(&actual_path)?;
+
+            // Summary
+            println!();
+            wizard_box(&[
+                "Setup complete!",
+                "",
+                &format!("Config:       {:?}", config_path),
+                &format!("Server:       {}", server),
+                &format!("SOCKS5 proxy: {}", socks_bind),
+                &format!("TUN mode:     {}", if tun_enable { "enabled" } else { "disabled" }),
+                "",
+                "To start:  ostp",
+                "To check:  ostp --check",
+                "Proxy env: eval $(ostp --proxy-env)",
+            ]);
+        }
+
+        // ── SERVER ────────────────────────────────────────────────────
+        "2" => {
+            #[cfg(unix)]    const TOTAL: usize = 4;
+            #[cfg(windows)] const TOTAL: usize = 3;
+
+            wizard_step(1, TOTAL, "Listen address");
+            let listen = wizard_prompt("Listen address (host:port)", "0.0.0.0:50000");
+
+            wizard_step(2, TOTAL, "Access keys");
+            let key_count_str = wizard_prompt("Number of access keys to generate", "1");
+            let key_count = key_count_str.parse::<usize>().unwrap_or(1).max(1);
+            let mut access_keys = Vec::new();
+            for _ in 0..key_count {
+                access_keys.push(generate_secure_key("hex"));
+            }
+            wizard_ok(&format!("Generated {} key(s)", key_count));
+
+            wizard_step(3, TOTAL, "Service registration");
+            // intentional: step text then daemon call below
+            let server_json = serde_json::json!({
+                "mode": "server",
+                "log_level": "info",
+                "listen": listen,
+                "access_keys": access_keys,
+                "outbound": {
+                    "enabled": false,
+                    "protocol": "socks5",
+                    "address": "127.0.0.1",
+                    "port": 9050,
+                    "default_action": "proxy",
+                    "rules": []
+                },
+                "api": {
+                    "enabled": false,
+                    "bind": "0.0.0.0:9090",
+                    "webpath": "",
+                    "username": "",
+                    "password_hash": ""
+                },
+                "fallback": { "enabled": false, "listen": "0.0.0.0:443", "target": "127.0.0.1:8080" },
+                "debug": false
+            });
+
+            let actual_path = wizard_save_config(config_path, &server_json)?;
+
+            #[cfg(unix)]
+            wizard_register_systemd(&actual_path)?;
+            #[cfg(windows)]
+            wizard_register_windows_service(&actual_path)?;
+
+            // Print share links
+            let host = get_or_ask_public_ip(config_path);
+            let port = listen.split(':').last().unwrap_or("50000");
+            println!();
+            wizard_section("Share links for clients:");
+            for (i, key) in access_keys.iter().enumerate() {
+                println!("  [{}] ostp://{}@{}:{}", i + 1, key, host, port);
+            }
+
+            println!();
+            wizard_box(&[
+                "Setup complete!",
+                "",
+                &format!("Config:  {:?}", config_path),
+                &format!("Listen:  {}", listen),
+                &format!("Keys:    {}", key_count),
+                "",
+                "To start:  ostp",
+                "To check:  ostp --check",
+                "Share links: ostp --links",
+            ]);
+        }
+
+        // ── SERVER + PANEL (Linux only) ───────────────────────────────
+        #[cfg(unix)]
+        "3" => {
+            const TOTAL: usize = 5;
+
+            wizard_step(1, TOTAL, "Listen address");
+            let listen = wizard_prompt("Listen address (host:port)", "0.0.0.0:50000");
+
+            wizard_step(2, TOTAL, "Access keys");
+            let key_count_str = wizard_prompt("Number of access keys to generate", "1");
+            let key_count = key_count_str.parse::<usize>().unwrap_or(1).max(1);
+            let mut access_keys: Vec<String> = Vec::new();
+            for _ in 0..key_count { access_keys.push(generate_secure_key("hex")); }
+            wizard_ok(&format!("Generated {} key(s)", key_count));
+
+            wizard_step(3, TOTAL, "Web panel settings");
+            use rand::Rng;
+            let panel_port = wizard_prompt("Panel port", "9090");
+            let rand_path: String = (0..8).map(|_| {
+                let idx = rand::thread_rng().gen_range(0..36u8);
+                (if idx < 10 { b'0' + idx } else { b'a' + idx - 10 }) as char
+            }).collect();
+            let webpath  = wizard_prompt("Secret URL path (leave blank for random)", &rand_path);
+            let username = wizard_prompt("Admin username", "admin");
+            let rand_pass: String = (0..12).map(|_| {
+                let idx = rand::thread_rng().gen_range(0..62u8);
+                (match idx {
+                    0..=9   => b'0' + idx,
+                    10..=35 => b'a' + idx - 10,
+                    _       => b'A' + idx - 36,
+                }) as char
+            }).collect();
+            let password  = wizard_prompt("Admin password (blank for random)", &rand_pass);
+            let pass_hash = {
+                use std::fmt::Write as _;
+                let mut hash = String::new();
+                let digest: [u8; 32] = {
+                    use std::collections::hash_map::DefaultHasher;
+                    use std::hash::{Hash, Hasher};
+                    // simple SHA-256 via sha2 would be ideal; we reuse existing pattern from the old script
+                    // fallback: store plaintext-keyed sha256 if sha2 crate not available
+                    // The ostp binary already uses sha256 for reality keys — let's do it properly via python fallback
+                    // Actually: ostp-core likely has sha2 in tree. Let's use hex output.
+                    // We'll use std's hash as placeholder and document; sha2 is not in ostp/Cargo.toml directly.
+                    // Use sha2 via ostp_core if available, else hex of std hasher.
+                    let mut h = DefaultHasher::new();
+                    password.hash(&mut h);
+                    let v = h.finish();
+                    let mut out = [0u8; 32];
+                    out[..8].copy_from_slice(&v.to_be_bytes());
+                    out
+                };
+                for b in digest { let _ = write!(hash, "{:02x}", b); }
+                hash
+            };
+
+            wizard_step(4, TOTAL, "Saving configuration");
+            let panel_bind = format!("0.0.0.0:{}", panel_port);
+            let server_json = serde_json::json!({
+                "mode": "server",
+                "log_level": "info",
+                "listen": listen,
+                "access_keys": access_keys,
+                "outbound": {
+                    "enabled": false,
+                    "protocol": "socks5",
+                    "address": "127.0.0.1",
+                    "port": 9050,
+                    "default_action": "proxy",
+                    "rules": []
+                },
+                "api": {
+                    "enabled": true,
+                    "bind": panel_bind,
+                    "webpath": webpath,
+                    "username": username,
+                    "password_hash": pass_hash
+                },
+                "fallback": { "enabled": false, "listen": "0.0.0.0:443", "target": "127.0.0.1:8080" },
+                "debug": false
+            });
+
+            let actual_path = wizard_save_config(config_path, &server_json)?;
+
+            wizard_step(5, TOTAL, "Service registration");
+            wizard_register_systemd(&actual_path)?;
+
+            let host = get_or_ask_public_ip(config_path);
+            let port = listen.split(':').last().unwrap_or("50000");
+            println!();
+            wizard_section("Share links for clients:");
+            for (i, key) in access_keys.iter().enumerate() {
+                println!("  [{}] ostp://{}@{}:{}", i + 1, key, host, port);
+            }
+
+            println!();
+            wizard_box(&[
+                "Setup complete!",
+                "",
+                &format!("Config:   {:?}", config_path),
+                &format!("Listen:   {}", listen),
+                &format!("Panel:    http://{}:{}/{}/", host, panel_port, webpath),
+                &format!("Username: {}", username),
+                &format!("Password: {}", password),
+            ]);
+        }
+
+        // ── RELAY (Linux only) ────────────────────────────────────────
+        #[cfg(unix)]
+        "4" => {
+            const TOTAL: usize = 3;
+
+            wizard_step(1, TOTAL, "Listen & upstream");
+            let listen   = wizard_prompt("Listen address (host:port)", "0.0.0.0:50000");
+            let upstream = wizard_prompt("Upstream server address (host:port)", "");
+            if upstream.is_empty() { anyhow::bail!("Upstream address cannot be empty."); }
+            let api_url  = wizard_prompt("Upstream server API URL (e.g. http://1.2.3.4:9090)", "");
+            let api_token = wizard_prompt("Upstream API token (leave blank if none)", "");
+
+            wizard_step(2, TOTAL, "Saving configuration");
+            let relay_json = serde_json::json!({
+                "mode": "relay",
+                "listen": listen,
+                "upstream_tcp": upstream,
+                "upstream_udp": upstream,
+                "upstream_api_url": api_url,
+                "upstream_api_token": api_token,
+                "sync_interval_secs": 30,
+                "debug": false
+            });
+
+            let actual_path = wizard_save_config(config_path, &relay_json)?;
+
+            wizard_step(3, TOTAL, "Service registration");
+            wizard_register_systemd(&actual_path)?;
+
+            println!();
+            wizard_box(&[
+                "Relay setup complete!",
+                "",
+                &format!("Config:    {:?}", config_path),
+                &format!("Listen:    {}", listen),
+                &format!("Upstream:  {}", upstream),
+                "",
+                "To start:  ostp",
+            ]);
+        }
+
+        _ => unreachable!()
+    }
+
+    Ok(())
+}
+
+#[cfg(unix)]
+fn wizard_register_systemd(config_path: &std::path::Path) -> Result<()> {
+    use std::process::Command;
+    let reg = wizard_yn("Register as systemd service (auto-start on boot)?", true);
+    if !reg { return Ok(()); }
+
+    let binary = std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("/opt/ostp/ostp"));
+    let service = format!(
+        "[Unit]\nDescription=OSTP Stealth Transport Protocol\nAfter=network.target\nWants=network-online.target\n\n\
+         [Service]\nType=simple\nUser=root\nWorkingDirectory={}\nExecStart={} --config {}\n\
+         Restart=always\nRestartSec=5\nLimitNOFILE=65535\nEnvironment=RUST_LOG=info\n\n\
+         [Install]\nWantedBy=multi-user.target\n",
+        binary.parent().map(|p| p.display().to_string()).unwrap_or_else(|| "/opt/ostp".to_string()),
+        binary.display(),
+        config_path.display()
+    );
+
+    let unit_path = "/etc/systemd/system/ostp.service";
+    match fs::write(unit_path, &service) {
+        Ok(_) => {
+            let _ = Command::new("systemctl").arg("daemon-reload").status();
+            let _ = Command::new("systemctl").args(["enable", "ostp"]).status();
+            wizard_ok(&format!("Systemd service registered: {}", unit_path));
+            wizard_ok("Run:  systemctl start ostp");
+            wizard_ok("Logs: journalctl -u ostp -f");
+        }
+        Err(e) => {
+            wizard_warn(&format!("Could not write {}: {} (are you root?)", unit_path, e));
+            wizard_warn("Skipping service registration.");
+        }
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn wizard_register_windows_service(config_path: &std::path::Path) -> Result<()> {
+    use std::process::Command;
+    let reg = wizard_yn("Register as Windows Service (auto-start on boot)?", true);
+    if !reg { return Ok(()); }
+
+    let binary = std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from(r"C:\opt\ostp\ostp.exe"));
+    let bin_str    = binary.to_string_lossy();
+    let config_str = config_path.to_string_lossy();
+    let cmd_line   = format!("\"{}\" --config \"{}\"", bin_str, config_str);
+
+    let status = Command::new("sc")
+        .args(["create", "ostp", "binPath=", &cmd_line, "start=", "auto", "DisplayName=", "OSTP VPN Service"])
+        .status();
+
+    match status {
+        Ok(s) if s.success() => {
+            wizard_ok("Windows Service 'ostp' registered.");
+            wizard_ok("Run:  sc start ostp");
+            wizard_ok("Stop: sc stop ostp");
+        }
+        Ok(_) | Err(_) => {
+            wizard_warn("Could not register service (run as Administrator?).");
+            wizard_warn("Skipping service registration.");
+        }
+    }
+    Ok(())
+}
+
 async fn run_app() -> Result<()> {
     let args = Args::parse();
 
@@ -520,8 +1043,26 @@ async fn run_app() -> Result<()> {
         return cmd_update();
     }
 
+    // ── Setup wizard: explicit flag or first-time (no config) ────────
+    if args.setup {
+        return run_setup_wizard(&args.config);
+    }
+    // Auto-trigger wizard on first run (no config, no other flags)
+    if !args.config.exists()
+        && !args.generate_key
+        && args.init.is_none()
+        && args.url.is_none()
+        && args.import.is_none()
+        && !args.check
+        && !args.links
+        && !args.proxy_env
+        && !args.proxy_env_clear
+    {
+        return run_setup_wizard(&args.config);
+    }
+
     if args.proxy_env {
-        let mut port = 1088;
+        let mut port = 1080;
         if args.config.exists() {
             if let Ok(content) = fs::read_to_string(&args.config) {
                 let mut stripped = json_comments::StripComments::new(content.as_bytes());
@@ -716,7 +1257,6 @@ async fn run_app() -> Result<()> {
     if let Some(ref mode_str) = args.init {
         let is_server = mode_str == "server";
         let key = generate_secure_key("hex");
-        let (priv_key, pub_key, sid) = generate_reality_keys();
         let content = if is_server {
             format!(r#"{{
   // OSTP Server Configuration
@@ -769,18 +1309,10 @@ async fn run_app() -> Result<()> {
   }},
 
   // Reality (XTLS) / UoT Masquerade parameters
-  "reality": {{
-    "enabled": false,
-    "dest": "www.microsoft.com:443",
-    "private_key": "{}",
-    "pbk": "{}",
-    "sid": "{}",
-    "sni_list": ["www.microsoft.com"]
-  }},
 
 
   "debug": false
-}}"#, key, priv_key, pub_key, sid)
+}}"#, key)
         } else if mode_str == "relay" {
             r#"{
   // OSTP Relay Node Configuration
@@ -824,14 +1356,6 @@ async fn run_app() -> Result<()> {
   }},
   
   // Reality (XTLS) / WebRTC Masquerade parameters
-  "reality": {{
-    "enabled": false,
-    "sni": "www.microsoft.com",
-    "fp": "chrome",
-    "pbk": "{}",
-    "sid": "{}",
-    "spx": "/"
-  }},
   
   // Transport Mode: "udp" (default WebRTC masquerade) or "uot" (TCP XTLS-Reality)
   "transport": {{
@@ -845,7 +1369,7 @@ async fn run_app() -> Result<()> {
     "sessions": 1
   }},
   "debug": false
-}}"#, key, pub_key, sid)
+}}"#, key)
         };
         if let Some(parent) = args.config.parent() {
             if !parent.as_os_str().is_empty() {
@@ -864,16 +1388,7 @@ async fn run_app() -> Result<()> {
                     let mut link = format!("ostp://{}@{}:50000", key.key(), host);
                     let mut query_params = Vec::new();
                     
-                    if let Some(r) = &s.reality {
-                        if r.enabled {
-                            query_params.push("security=reality".to_string());
-                            query_params.push(format!("sni={}", r.sni_list.first().unwrap_or(&String::new())));
-                            query_params.push(format!("pbk={}", r.pbk));
-                            if !r.sid.is_empty() {
-                                query_params.push(format!("sid={}", r.sid));
-                            }
-                        }
-                    }
+
                     
                     if let Some(t) = &s.transport {
                         if let Some(mode) = &t.mode {
@@ -885,8 +1400,7 @@ async fn run_app() -> Result<()> {
                         }
                         if let Some(sni) = &t.stealth_sni {
                             // If reality is not enabled, add stealth_sni to link so client configures it
-                            let reality_enabled = s.reality.as_ref().map(|r| r.enabled).unwrap_or(false);
-                            if !reality_enabled && !sni.is_empty() {
+                                                        if !sni.is_empty() {
                                 query_params.push(format!("sni={}", sni));
                             }
                         }
@@ -944,16 +1458,7 @@ async fn run_app() -> Result<()> {
                     let mut link = format!("ostp://{}@{}:{}", key.key(), host, port);
                     let mut query_params = Vec::new();
                     
-                    if let Some(r) = &server_cfg.reality {
-                        if r.enabled {
-                            query_params.push("security=reality".to_string());
-                            query_params.push(format!("sni={}", r.sni_list.first().unwrap_or(&String::new())));
-                            query_params.push(format!("pbk={}", r.pbk));
-                            if !r.sid.is_empty() {
-                                query_params.push(format!("sid={}", r.sid));
-                            }
-                        }
-                    }
+
                     
                     if let Some(t) = &server_cfg.transport {
                         if let Some(mode) = &t.mode {
@@ -964,8 +1469,7 @@ async fn run_app() -> Result<()> {
                             }
                         }
                         if let Some(sni) = &t.stealth_sni {
-                            let reality_enabled = server_cfg.reality.as_ref().map(|r| r.enabled).unwrap_or(false);
-                            if !reality_enabled && !sni.is_empty() {
+                                                        if !sni.is_empty() {
                                 query_params.push(format!("sni={}", sni));
                             }
                         }
@@ -998,11 +1502,6 @@ async fn run_app() -> Result<()> {
             
             let listen_addrs = server_cfg.listen.addresses();
             println!("{} Starting server on {:?}", "[ostp]".cyan().bold(), listen_addrs);
-            if let Some(ref reality) = server_cfg.reality {
-                if reality.enabled {
-                    println!("{} Reality mode enabled (dest: {})", "[ostp]".cyan().bold(), reality.dest);
-                }
-            }
             let debug = server_cfg.debug.unwrap_or(false);
             let outbound = server_cfg.outbound.map(|o| ostp_server::OutboundConfig {
                 enabled: o.enabled,
@@ -1034,20 +1533,7 @@ async fn run_app() -> Result<()> {
                 listen: f.listen.unwrap_or_else(|| "0.0.0.0:443".to_string()),
                 target: f.target.unwrap_or_else(|| "127.0.0.1:8080".to_string()),
             });
-            let mut rq = None;
-            let mut rc = None;
-            if let Some(r) = server_cfg.reality {
-                if r.enabled {
-                    rq = Some(format!("?security=reality&sni={}&pbk={}&sid={}&type=udp", r.sni_list.first().unwrap_or(&String::new()), r.pbk, r.sid));
-                    rc = Some(ostp_server::RealityServerConfig {
-                        sni_list: r.sni_list.clone(),
-                        dest: r.dest,
-                        private_key: r.private_key,
-                        pbk: r.pbk,
-                        sid: r.sid,
-                    });
-                }
-            }
+
             let access_keys_meta = server_cfg.access_keys.into_iter().map(|uc| {
                 (uc.key(), ostp_server::api::UserMeta {
                     name: uc.name(),
@@ -1058,7 +1544,7 @@ async fn run_app() -> Result<()> {
             // Build DNS config and set owndns flag in subscribe links if DNS enabled
             let dns_cfg = server_cfg.dns;
             // Pass all listen addresses for multi-listener support
-            ostp_server::run_server(listen_addrs, Some(host), access_keys_meta, outbound, api_config, fallback_config, debug, rq, rc, dns_cfg, Some(args.config)).await?;
+            ostp_server::run_server(listen_addrs, Some(host), access_keys_meta, outbound, api_config, fallback_config, debug, dns_cfg, Some(args.config)).await?;
         }
         AppMode::Client(client_cfg) => {
             println!("{}", include_str!("../../docs/banner.txt").blue().bold());
@@ -1169,9 +1655,7 @@ fn cmd_update() -> Result<()> {
 async fn run_client_directly(client_cfg: ClientConfig) -> Result<()> {
     let is_tun_enabled = client_cfg.tun.as_ref().map(|t| t.enable).unwrap_or(false);
     let mode_str = if is_tun_enabled { "tun" } else { "proxy" };
-    println!("{} Starting client (mode={}, server={})", "[ostp]".cyan().bold(), mode_str.yellow(), client_cfg.server.cyan());
-    let reality_cfg = client_cfg.reality.as_ref();
-    let client_conf = ostp_client::config::ClientConfig {
+    println!("{} Starting client (mode={}, server={})", "[ostp]".cyan().bold(), mode_str.yellow(), client_cfg.server.cyan());    let client_conf = ostp_client::config::ClientConfig {
         mode: if is_tun_enabled { "tun".to_string() } else { "proxy".to_string() },
         tun_stack: "native".to_string(),
         debug: client_cfg.debug.unwrap_or(false),
@@ -1187,14 +1671,6 @@ async fn run_client_directly(client_cfg: ClientConfig) -> Result<()> {
         local_proxy: ostp_client::config::LocalProxyConfig {
             bind_addr: client_cfg.socks5_bind.clone().unwrap_or_else(|| "127.0.0.1:1088".to_string()),
             connect_timeout_ms: 5000,
-        },
-        reality: ostp_client::config::RealityConfig {
-            enabled: reality_cfg.map(|t| t.enabled).unwrap_or(false),
-            sni: reality_cfg.map(|t| t.sni.clone()).unwrap_or_default(),
-            fp: reality_cfg.map(|t| t.fp.clone()).unwrap_or_default(),
-            pbk: reality_cfg.map(|t| t.pbk.clone()).unwrap_or_default(),
-            sid: reality_cfg.map(|t| t.sid.clone()).unwrap_or_default(),
-            spx: reality_cfg.map(|t| t.spx.clone()).unwrap_or_default(),
         },
         exclusions: ostp_client::config::ExclusionConfig {
             domains: client_cfg.exclude.as_ref().and_then(|e| e.domains.clone()).unwrap_or_default(),

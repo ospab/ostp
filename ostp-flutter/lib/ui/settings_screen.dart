@@ -64,7 +64,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
     _debugMode = widget.prefs.getBool('debug_mode') ?? false;
     _muxEnabled = widget.prefs.getBool('mux_enabled') ?? false;
     _muxSessionsCtrl = TextEditingController(text: widget.prefs.getString('mux_sessions') ?? '2');
-
+  }
 
   @override
   void dispose() {
@@ -104,8 +104,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
     widget.prefs.setString('sid', _sidCtrl.text.trim());
     widget.prefs.setBool('mux_enabled', _muxEnabled);
     widget.prefs.setString('mux_sessions', _muxSessionsCtrl.text.trim());
-
-
+  }
   Widget _buildTextField(String label, TextEditingController controller, {String? hint, bool isPassword = false, int maxLines = 1, bool isMono = false}) {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,

@@ -12,7 +12,6 @@ pub struct ClientConfig {
     pub debug: bool,
     pub ostp: OstpConfig,
     pub local_proxy: LocalProxyConfig,
-    pub reality: RealityConfig,
     #[serde(default)]
     pub transport: TransportConfig,
     #[serde(default)]
@@ -98,21 +97,7 @@ impl Default for TransportConfig {
 }
 
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct RealityConfig {
-    #[serde(default)]
-    pub enabled: bool,
-    #[serde(default)]
-    pub sni: String,
-    #[serde(default)]
-    pub fp: String,
-    #[serde(default)]
-    pub pbk: String,
-    #[serde(default)]
-    pub sid: String,
-    #[serde(default)]
-    pub spx: String,
-}
+
 
 
 impl Default for OstpConfig {
@@ -146,7 +131,6 @@ impl Default for ClientConfig {
             debug: false,
             ostp: OstpConfig::default(),
             local_proxy: LocalProxyConfig::default(),
-            reality: RealityConfig::default(),
             transport: TransportConfig::default(),
             exclusions: ExclusionConfig::default(),
             multiplex: MultiplexConfig::default(),
@@ -181,7 +165,6 @@ struct RawUnifiedConfig {
     tun: Option<RawTunSection>,
     exclude: Option<RawExcludeSection>,
     mux: Option<RawMuxSection>,
-    reality: Option<RawRealitySection>,
     transport: Option<RawTransportSection>,
     gui: Option<serde_json::Value>,
 }
@@ -214,15 +197,7 @@ struct RawMuxSection {
     sessions: Option<usize>,
 }
 
-#[derive(Debug, Deserialize)]
-struct RawRealitySection {
-    enabled: Option<bool>,
-    sni: Option<String>,
-    fp: Option<String>,
-    pbk: Option<String>,
-    sid: Option<String>,
-    spx: Option<String>,
-}
+
 
 impl ClientConfig {
     /// Hot-reload from `config.json` placed next to the running binary.
@@ -268,14 +243,6 @@ impl ClientConfig {
             local_proxy: LocalProxyConfig {
                 bind_addr: socks5,
                 connect_timeout_ms: 15000,
-            },
-            reality: RealityConfig {
-                enabled: raw.reality.as_ref().and_then(|t| t.enabled).unwrap_or(false),
-                sni: raw.reality.as_ref().and_then(|t| t.sni.clone()).unwrap_or_default(),
-                fp: raw.reality.as_ref().and_then(|t| t.fp.clone()).unwrap_or_default(),
-                pbk: raw.reality.as_ref().and_then(|t| t.pbk.clone()).unwrap_or_default(),
-                sid: raw.reality.as_ref().and_then(|t| t.sid.clone()).unwrap_or_default(),
-                spx: raw.reality.as_ref().and_then(|t| t.spx.clone()).unwrap_or_default(),
             },
             transport: TransportConfig {
                 mode: raw.transport.as_ref().and_then(|t| t.mode.clone()).unwrap_or_else(default_transport_mode),

@@ -1,4 +1,3 @@
-pub mod xhttp;
 
 use std::sync::Arc;
 use tokio::net::UdpSocket;

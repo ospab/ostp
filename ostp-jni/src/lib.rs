@@ -214,7 +214,8 @@ pub extern "system" fn Java_net_ostp_client_OstpClientSdk_nativeStartClient(
     let proxy_shutdown_rx = shutdown_tx.subscribe();
     
     // Create exclusions channel
-    let (_, exclusions_rx) = watch::channel(config.exclusions.clone());
+    let (exclusions_tx, exclusions_rx) = watch::channel(config.exclusions.clone());
+    let exclusions_rx_tun = exclusions_tx.subscribe();
 
     let metrics_clone = Arc::clone(&metrics);
 

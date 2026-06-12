@@ -206,7 +206,7 @@ pub async fn run_local_socks5_proxy(
         .await
         .with_context(|| format!("failed to bind local HTTP/SOCKS5 proxy at {}", cfg.bind_addr))?;
 
-    if debug {
+    if true {
         tracing::info!("local HTTP/SOCKS5 proxy listening at {}", cfg.bind_addr);
         tracing::info!("Windows system proxy: set HTTP proxy to {}. tun2socks: SOCKS5 on same address.", cfg.bind_addr);
     }
@@ -239,7 +239,7 @@ pub async fn run_local_socks5_proxy(
             Ok(_) = exclusions_rx.changed() => {
                 current_exclusions = exclusions_rx.borrow().clone();
                 matcher = ExclusionMatcher::new(&current_exclusions, physical_if_index, physical_if_name.clone());
-                if debug {
+                if true {
                     tracing::info!("Local proxy exclusions hot-reloaded");
                 }
             }
@@ -286,7 +286,7 @@ pub async fn run_local_socks5_proxy(
             Some((stream_id, msg)) = client_msgs_rx.recv() => {
                 if stream_id == 0 {
                     if let ProxyToClientMsg::Close = msg {
-                        if debug {
+                        if true {
                             tracing::info!("Resetting all active proxy streams on reconnect");
                         }
                         for (_, tx) in active_streams.drain() {
@@ -421,8 +421,8 @@ async fn handle_udp_associate(
                 let target_port = match split_host_port(&target) { Some((_, p)) => p, None => 0 };
                 // Check if target should bypass the tunnel
                 if matcher.should_bypass_target(&target_host, target_port, connect_timeout).await {
-                    if debug {
-                        tracing::info!("proxy UDP BYPASS target={}", target);
+                    if true {
+                        tracing::debug!("proxy UDP BYPASS target={}", target);
                     }
                     // Resolve target to find if it is IPv4 or IPv6
                     if let Ok(resolved_addrs) = tokio::net::lookup_host(&target).await {
@@ -460,7 +460,7 @@ async fn handle_udp_associate(
 
                             if let Some(s) = direct_socket {
                                 if let Err(e) = s.send_to(&payload, target_addr).await {
-                                    if debug {
+                                    if true {
                                         tracing::warn!("failed to send bypass UDP packet to {}: {}", target_addr, e);
                                     }
                                 }
@@ -545,14 +545,14 @@ fn spawn_direct_udp_reader(
                         packet.extend_from_slice(&target_addr.port().to_be_bytes());
                         packet.extend_from_slice(&buf[..len]);
                         if let Err(e) = sock_tx.send_to(&packet, client_addr).await {
-                            if debug {
+                            if true {
                                 tracing::warn!("failed to send direct UDP response to client: {e}");
                             }
                         }
                     }
                 }
                 Err(e) => {
-                    if debug {
+                    if true {
                         tracing::debug!("direct UDP socket read loop exiting: {e}");
                     }
                     break;
@@ -642,7 +642,7 @@ async fn handle_proxy_client(
         };
 
         if is_udp {
-            if debug { tracing::info!("proxy UDP ASSOCIATE stream_id={stream_id}"); }
+            if true { tracing::debug!("proxy UDP ASSOCIATE stream_id={stream_id}"); }
             let udp_socket = UdpSocket::bind("127.0.0.1:0").await?;
             let port = udp_socket.local_addr()?.port();
             let mut reply = vec![0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1];
@@ -663,7 +663,7 @@ async fn handle_proxy_client(
             ).await;
         }
 
-        if debug {
+        if true {
             tracing::info!("proxy CONNECT stream_id={stream_id} target={target}");
         }
         let target_host = if let Some((host, _)) = split_host_port(&target) { host } else { target.clone() };
@@ -750,7 +750,7 @@ async fn handle_proxy_client(
             extract_host_port(raw_uri, default_port)
         };
 
-        if debug {
+        if true {
             tracing::info!("proxy CONNECT stream_id={stream_id} target={target}");
         }
         let target_host = if let Some((host, _)) = split_host_port(&target) { host } else { target.clone() };
@@ -810,7 +810,7 @@ async fn handle_proxy_client(
                 match read_res {
                     Ok(0) => {
                         let _ = event_tx.send(ProxyEvent::Close { stream_id }).await;
-                        if debug {
+                        if true {
                             tracing::info!("proxy CLOSE stream_id={stream_id}");
                         }
                         break;
@@ -828,7 +828,7 @@ async fn handle_proxy_client(
                     }
                     Err(_) => {
                         let _ = event_tx.send(ProxyEvent::Close { stream_id }).await;
-                        if debug {
+                        if true {
                             tracing::info!("proxy CLOSE stream_id={stream_id}");
                         }
                         break;
@@ -882,7 +882,7 @@ async fn direct_connect_socks5(
     close_tx: mpsc::Sender<u16>,
     debug: bool,
 ) -> Result<()> {
-    if debug {
+    if true {
         tracing::info!("proxy BYPASS stream_id={stream_id} target={target}");
     }
     let mut remote = connect_bypassing_tun(target, physical_if_index, physical_if_name).await?;
@@ -904,7 +904,7 @@ async fn direct_connect_http(
     close_tx: mpsc::Sender<u16>,
     debug: bool,
 ) -> Result<()> {
-    if debug {
+    if true {
         tracing::info!("proxy BYPASS stream_id={stream_id} target={target}");
     }
     let mut remote = connect_bypassing_tun(target, physical_if_index, physical_if_name).await?;

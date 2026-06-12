@@ -46,4 +46,8 @@ object OstpClientSdk {
     @Keep
     @JvmStatic
     external fun addLog(logMsg: String)
+
+    @Keep
+    @JvmStatic
+    external fun notifyNetworkChanged()
 }

@@ -26,15 +26,6 @@ pub use api::ApiConfig;
 pub use fallback::FallbackConfig;
 pub use relay_node::RelayConfig;
 
-#[derive(Debug, Clone)]
-pub struct RealityServerConfig {
-    pub dest: String,
-    pub private_key: String,
-    pub pbk: String,
-    pub sid: String,
-    pub sni_list: Vec<String>,
-}
-
 // ── Internal event types ─────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
@@ -76,8 +67,6 @@ pub async fn run_server(
     api_config: Option<ApiConfig>,
     fallback_config: Option<FallbackConfig>,
     debug: bool,
-    reality_query: Option<String>,
-    reality_config: Option<RealityServerConfig>,
     dns_config: Option<dns::DnsConfig>,
     config_path: Option<std::path::PathBuf>,
 ) -> Result<()> {
@@ -271,12 +260,11 @@ pub async fn run_server(
             let parts: Vec<&str> = primary.rsplitn(2, ':').collect();
             let server_port: u16 = parts.first().and_then(|p| p.parse().ok()).unwrap_or(50000);
             let server_host = server_public_ip.unwrap_or_else(|| parts.get(1).unwrap_or(&"0.0.0.0").to_string());
-            let rq = reality_query.clone().unwrap_or_default();
             let config_path_api = config_path.clone();
             let dns_server_api = dns_server.clone();
             let router_api = router.clone();
             tokio::spawn(async move {
-                api::start_api_server(api_cfg, api_keys, api_stats, server_host, server_port, rq, config_path_api, dns_server_api, router_api).await;
+                api::start_api_server(api_cfg, api_keys, api_stats, server_host, server_port, config_path_api, dns_server_api, router_api).await;
             });
         }
     }
@@ -326,11 +314,8 @@ pub async fn run_server(
     let key_count = shared_keys.read().unwrap_or_else(|e| e.into_inner()).len();
     tracing::info!(listeners = bind_addrs.len(), keys = key_count, "server started");
     tracing::info!("ARQ config: max_reorder=16384, reorder_buf=8192, sent_history=32768, rto=100ms");
-    let reality_config_arc = reality_config.map(std::sync::Arc::new);
-    let fallback_target = fallback_config.as_ref().and_then(|f| if f.enabled { Some(f.target.clone()) } else { None });
-
     tokio::select! {
-        res = run_server_loop(bind_addrs.clone(), primary_socket, sockets, dispatcher, ui_cmd_rx, ui_event_tx, shared_keys, router, reality_config_arc, fallback_target) => {
+        res = run_server_loop(bind_addrs.clone(), primary_socket, sockets, dispatcher, ui_cmd_rx, ui_event_tx, shared_keys, router) => {
             if let Err(e) = res {
                 tracing::error!("Server error: {e}");
             }
@@ -354,8 +339,6 @@ async fn run_server_loop(
     ui_event_tx: mpsc::UnboundedSender<UiEvent>,
     shared_keys: std::sync::Arc<std::sync::RwLock<HashMap<String, crate::api::UserMeta>>>,
     router: std::sync::Arc<crate::router::Router>,
-    reality_config: Option<std::sync::Arc<RealityServerConfig>>,
-    fallback_target: Option<String>,
 ) -> Result<()> {
     let mut remotes: HashMap<(u32, u16), RemoteState> = HashMap::new();
     let (stream_tx, mut stream_rx) = mpsc::unbounded_channel::<(u32, u16, Vec<u8>)>();
@@ -392,8 +375,6 @@ async fn run_server_loop(
         let tcp_map_clone = tcp_map.clone();
         let shared_keys_clone = shared_keys.clone();
         let udp_tx_clone = udp_tx.clone();
-        let reality_config_outer = reality_config.clone();
-        let fb_target_outer = fallback_target.clone();
 
         tokio::spawn(async move {
             if let Ok(listener) = tokio::net::TcpListener::bind(&addr).await {
@@ -430,12 +411,9 @@ async fn run_server_loop(
                         }
 
                         let tm = tcp_map_clone.clone();
-                        let keys = shared_keys_clone.clone();
                         let tx = udp_tx_clone.clone();
-                        let reality = reality_config_outer.clone();
-                        let fb_target = fb_target_outer.clone();
                         tokio::spawn(async move {
-                            if let Err(e) = crate::transport::uot::handle_tcp_connection(stream, peer_addr, keys, tx, tm, reality, fb_target).await {
+                            if let Err(e) = crate::transport::uot::handle_tcp_connection(stream, peer_addr, tm, tx).await {
                                 tracing::warn!("UoT connection from {} closed: {}", peer_addr, e);
                             }
                         });

@@ -34,6 +34,19 @@ class OstpTileService : TileService() {
             val configJson = prefs.getString("latest_config_json", null)
             
             if (configJson != null) {
+                // Check if VPN consent is needed
+                val vpnIntent = android.net.VpnService.prepare(this)
+                if (vpnIntent != null) {
+                    // Consent needed, launch app
+                    val appIntent = packageManager.getLaunchIntentForPackage(packageName)?.apply {
+                        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP)
+                    }
+                    if (appIntent != null) {
+                        startActivityAndCollapse(appIntent)
+                    }
+                    return
+                }
+
                 val startIntent = Intent(this, OstpVpnService::class.java).apply {
                     action = "START"
                     putExtra("configJson", configJson)

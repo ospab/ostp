@@ -1,7 +1,6 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::{watch, Mutex};
-use tokio::task::JoinHandle;
 use serde::{Deserialize, Serialize};
 use anyhow::Result;
 use ostp_client::bridge::BridgeMetrics;
@@ -30,7 +29,6 @@ struct ClientConfigRaw {
     access_key: String,
     socks5_bind: Option<String>,
     tun: Option<TunConfig>,
-    reality: Option<RealityConfigRaw>,
     transport: Option<TransportConfigRaw>,
     debug: Option<bool>,
     exclude: Option<ExcludeConfig>,
@@ -54,15 +52,6 @@ struct TunConfig {
     kill_switch: Option<bool>,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone)]
-struct RealityConfigRaw {
-    enabled: Option<bool>,
-    sni: Option<String>,
-    fp: Option<String>,
-    pbk: Option<String>,
-    sid: Option<String>,
-    spx: Option<String>,
-}
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 struct TransportConfigRaw {
@@ -170,14 +159,7 @@ fn map_to_client_config(raw: &ClientConfigRaw, mode: &str) -> ostp_client::confi
             bind_addr: raw.socks5_bind.clone().unwrap_or_else(|| "127.0.0.1:1088".to_string()),
             connect_timeout_ms: 5000,
         },
-        reality: ostp_client::config::RealityConfig {
-            enabled: raw.reality.as_ref().and_then(|t| t.enabled).unwrap_or(false),
-            sni: raw.reality.as_ref().and_then(|t| t.sni.clone()).unwrap_or_default(),
-            fp: raw.reality.as_ref().and_then(|t| t.fp.clone()).unwrap_or_default(),
-            pbk: raw.reality.as_ref().and_then(|t| t.pbk.clone()).unwrap_or_default(),
-            sid: raw.reality.as_ref().and_then(|t| t.sid.clone()).unwrap_or_default(),
-            spx: raw.reality.as_ref().and_then(|t| t.spx.clone()).unwrap_or_default(),
-        },
+
         transport: ostp_client::config::TransportConfig {
             mode: raw.transport.as_ref().and_then(|t| t.mode.clone()).unwrap_or_else(|| "udp".to_string()),
             stealth_sni: raw.transport.as_ref().and_then(|t| t.stealth_sni.clone()).unwrap_or_else(|| "microsoft.com".to_string()),
@@ -195,6 +177,7 @@ fn map_to_client_config(raw: &ClientConfigRaw, mode: &str) -> ostp_client::confi
         dns_server: raw.tun.as_ref().and_then(|t| t.dns.clone()),
         tun_stack: raw.tun.as_ref().and_then(|t| t.stack.clone()).unwrap_or_else(|| "system".to_string()),
         kill_switch: raw.tun.as_ref().and_then(|t| t.kill_switch).unwrap_or(false),
+        gui: raw.gui.as_ref().map(|g| serde_json::to_value(g).unwrap()),
     }
 }
 

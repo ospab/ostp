@@ -198,8 +198,8 @@ pub async fn run_native_tunnel(
             let current = exclusions_rx.borrow().clone();
             let new_matcher = crate::tunnel::exclusion::ExclusionMatcher::new(&current, None, None);
             *matcher_clone.write().await = new_matcher;
-            if debug {
-                tracing::info!("Desktop TUN exclusions hot-reloaded");
+            if true {
+                tracing::debug!("Desktop TUN exclusions hot-reloaded");
             }
         }
     });
@@ -228,8 +228,8 @@ pub async fn run_native_tunnel(
 
             tokio::spawn(async move {
                 let matcher = matcher_arc.read().await.clone();
-                if debug {
-                    tracing::info!("TUN TCP {local} → {remote}");
+                if true {
+                    tracing::debug!("TUN TCP {local} → {remote}");
                 }
 
                 // ── Sniff TLS ClientHello for SNI ─────────────────────────────
@@ -253,12 +253,12 @@ pub async fn run_native_tunnel(
                     if let Some(sni) =
                         crate::tunnel::sni_sniff::extract_sni(&sniff_buf[..sniff_len])
                     {
-                        if debug {
-                            tracing::info!("TUN SNI: {sni}");
+                        if true {
+                            tracing::debug!("TUN SNI: {sni}");
                         }
                         if matcher.match_domain(&sni) {
-                            if debug {
-                                tracing::info!("TUN BYPASS (SNI domain): {sni} → {remote}");
+                            if true {
+                                tracing::debug!("TUN BYPASS (SNI domain): {sni} → {remote}");
                             }
                             should_bypass = true;
                         }
@@ -267,8 +267,8 @@ pub async fn run_native_tunnel(
 
                 // 2. Destination IP CIDR check (for IPs not in routing table / IPv6)
                 if !should_bypass && matcher.match_ip(&remote.ip()) {
-                    if debug {
-                        tracing::info!("TUN BYPASS (IP match): {remote}");
+                    if true {
+                        tracing::debug!("TUN BYPASS (IP match): {remote}");
                     }
                     should_bypass = true;
                 }
@@ -556,8 +556,8 @@ pub async fn run_native_tunnel_from_fd(
             let current = exclusions_rx.borrow().clone();
             let new_matcher = crate::tunnel::exclusion::ExclusionMatcher::new(&current, None, None);
             *matcher_clone.write().await = new_matcher;
-            if debug {
-                tracing::info!("Android TUN exclusions hot-reloaded");
+            if true {
+                tracing::debug!("Android TUN exclusions hot-reloaded");
             }
         }
     });
@@ -572,8 +572,8 @@ pub async fn run_native_tunnel_from_fd(
             tokio::spawn(async move {
                 let matcher = matcher_arc.read().await.clone();
 
-                if debug {
-                    tracing::info!("Android TUN TCP {local} → {remote}");
+                if true {
+                    tracing::debug!("Android TUN TCP {local} → {remote}");
                 }
 
                 // Sniff SNI
@@ -596,7 +596,7 @@ pub async fn run_native_tunnel_from_fd(
                     if let Some(sni) =
                         crate::tunnel::sni_sniff::extract_sni(&sniff_buf[..sniff_len])
                     {
-                        if debug { tracing::info!("Android TUN SNI: {sni}"); }
+                        if true { tracing::debug!("Android TUN SNI: {sni}"); }
                         if matcher.match_domain(&sni) {
                             should_bypass = true;
                         }
@@ -608,8 +608,8 @@ pub async fn run_native_tunnel_from_fd(
                     if let Some(exe) =
                         crate::tunnel::process_lookup::get_process_name_from_port(local.port())
                     {
-                        if debug {
-                            tracing::info!("Android TUN port {} → EXE: {}", local.port(), exe);
+                        if true {
+                            tracing::debug!("Android TUN port {} → EXE: {}", local.port(), exe);
                         }
                         if matcher.match_process(&exe) {
                             should_bypass = true;
@@ -625,8 +625,8 @@ pub async fn run_native_tunnel_from_fd(
                 // Bypass: connect directly (Android VPN service already protects the socket
                 // from re-entering the TUN through VpnService.protect())
                 if should_bypass {
-                    if debug {
-                        tracing::info!("Android TUN BYPASS: {remote}");
+                    if true {
+                        tracing::debug!("Android TUN BYPASS: {remote}");
                     }
                     let socket = match remote {
                         std::net::SocketAddr::V4(_) => tokio::net::TcpSocket::new_v4(),

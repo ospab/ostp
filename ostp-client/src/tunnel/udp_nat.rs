@@ -17,28 +17,42 @@ pub async fn run_udp_nat(
     // map from internal client src to a channel that sends (payload, external_dst)
     let mut sessions: HashMap<SocketAddr, mpsc::Sender<(Vec<u8>, SocketAddr)>> = HashMap::new();
 
-    while let Some((payload, src, dst)) = rx.next().await {
-        if payload.is_empty() { continue; }
+    let mut cleanup_tick = tokio::time::interval(std::time::Duration::from_secs(60));
 
-        if !sessions.contains_key(&src) {
-            let (session_tx, mut session_rx) = mpsc::channel::<(Vec<u8>, SocketAddr)>(100000);
-            sessions.insert(src, session_tx);
+    loop {
+        tokio::select! {
+            packet = rx.next() => {
+                match packet {
+                    Some((payload, src, dst)) => {
+                        if payload.is_empty() { continue; }
 
-            let proxy_addr_clone = proxy_addr.clone();
-            let tx_clone = tx.clone();
-            
-            tokio::spawn(async move {
-                if debug { tracing::info!("Starting UDP NAT session for {}", src); }
-                let res = start_udp_session(src, proxy_addr_clone, &mut session_rx, tx_clone).await;
-                if debug && res.is_err() {
-                    tracing::info!("UDP NAT session for {} ended: {:?}", src, res.err());
+                        if !sessions.contains_key(&src) {
+                            let (session_tx, mut session_rx) = mpsc::channel::<(Vec<u8>, SocketAddr)>(100000);
+                            sessions.insert(src, session_tx);
+
+                            let proxy_addr_clone = proxy_addr.clone();
+                            let tx_clone = tx.clone();
+                            
+                            tokio::spawn(async move {
+                                tracing::debug!("Starting UDP NAT session for {}", src);
+                                let res = start_udp_session(src, proxy_addr_clone, &mut session_rx, tx_clone).await;
+                                if res.is_err() {
+                                    tracing::debug!("UDP NAT session for {} ended: {:?}", src, res.err());
+                                }
+                            });
+                        }
+
+                        if let Some(sender) = sessions.get(&src) {
+                            if sender.send((payload, dst)).await.is_err() {
+                                sessions.remove(&src);
+                            }
+                        }
+                    }
+                    None => break,
                 }
-            });
-        }
-
-        if let Some(sender) = sessions.get(&src) {
-            if sender.send((payload, dst)).await.is_err() {
-                sessions.remove(&src);
+            }
+            _ = cleanup_tick.tick() => {
+                sessions.retain(|_, sender| !sender.is_closed());
             }
         }
     }
@@ -98,6 +112,15 @@ async fn start_udp_session(
 
     // Local SOCKS5 proxy always returns 127.0.0.1 (IPv4), so always bind IPv4
     let udp = UdpSocket::bind("127.0.0.1:0").await?;
+
+    // CRITICAL for Android: protect this UDP socket so it goes out via the
+    // real physical interface, not back into the TUN (which would cause an
+    // infinite routing loop for DNS and all other UDP traffic).
+    #[cfg(target_os = "android")]
+    {
+        use std::os::unix::io::AsRawFd;
+        crate::bridge::protect_socket(udp.as_raw_fd());
+    }
     
     let mut buf = vec![0u8; 65536];
     

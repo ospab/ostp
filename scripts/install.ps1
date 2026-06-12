@@ -25,7 +25,7 @@ if (Test-Path "config.json") {
 }
 
 Write-Host "========================================================"
-Write-Host " OSTP Installer"
+Write-Host " OSTP Installer v3"
 Write-Host "========================================================"
 Write-Host "Install directory: $InstallDir"
 
@@ -110,74 +110,7 @@ if ($extractedFiles.Count -gt 0) {
 Remove-Item $zipPath -Force
 Remove-Item $extractPath -Recurse -Force
 
-# 5. Update detection
-$configPath = Join-Path $InstallDir "config.json"
-if (Test-Path $configPath) {
-    Write-Host "--------------------------------------------------------"
-    Write-Host "Existing configuration found. Binary updated to $tag."
-    Write-Host "--------------------------------------------------------"
-    exit 0
-}
-
-# 6. Interactive setup
-Write-Host "--------------------------------------------------------"
-Write-Host "Select mode:"
-Write-Host "  1) Server"
-Write-Host "  2) Client"
-Write-Host "--------------------------------------------------------"
-$mode = Read-Host "Choice [1-2]"
-
-Push-Location $InstallDir
-
-if ($mode -eq "1") {
-    Write-Host "Initializing server configuration..."
-    & .\ostp.exe --init server --config config.json
-
-    $config = Get-Content "config.json" -Raw | ConvertFrom-Json
-    $listen = Read-Host "Listen address [default: 0.0.0.0:50000]"
-    if ($listen) { $config.listen = $listen }
-
-    $keyCount = Read-Host "Number of access keys [default: 1]"
-    if (-not $keyCount) { $keyCount = 1 }
-
-    if ([int]$keyCount -gt 1) {
-        Write-Host "Generating $keyCount access keys..."
-        $keys = & .\ostp.exe -g -c $keyCount
-        $config.access_keys = $keys -split "`r`n" | Where-Object { $_ -ne "" }
-    }
-
-    $config | ConvertTo-Json -Depth 10 | Set-Content "config.json"
-    Write-Host "Server configuration saved: $(Join-Path $InstallDir 'config.json')"
-
-} elseif ($mode -eq "2") {
-    Write-Host "Initializing client configuration..."
-    & .\ostp.exe --init client --config config.json
-
-    $config = Get-Content "config.json" -Raw | ConvertFrom-Json
-    $server = Read-Host "Server address (host:port)"
-    if ($server) { $config.server = $server }
-
-    $key = Read-Host "Access key (blank to generate)"
-    if (-not $key) {
-        $key = & .\ostp.exe -g
-        Write-Host "Generated key: $key"
-    }
-    $config.access_key = $key.Trim()
-
-    $socks = Read-Host "Local proxy address [default: 127.0.0.1:1088]"
-    if ($socks) { $config.socks5_bind = $socks }
-
-    $config | ConvertTo-Json -Depth 10 | Set-Content "config.json"
-    Write-Host "Client configuration saved: $(Join-Path $InstallDir 'config.json')"
-} else {
-    Write-Error "Invalid selection."
-    Pop-Location
-    exit 1
-}
-
-Pop-Location
-
-# 7. PATH registration
+# 5. PATH registration
 Write-Host "--------------------------------------------------------"
 Write-Host "Registering in system PATH..."
 $targetScope = if ($isAdmin) { [EnvironmentVariableTarget]::Machine } else { [EnvironmentVariableTarget]::User }
@@ -190,8 +123,20 @@ if ($sysPath -notlike "*$InstallDir*") {
     Write-Host "$InstallDir already in PATH."
 }
 
-Write-Host "--------------------------------------------------------"
-Write-Host "Installation complete."
-Write-Host "  Binary: ostp"
-Write-Host "  Config: $(Join-Path $InstallDir 'config.json')"
-Write-Host "--------------------------------------------------------"
+# 6. Update detection
+$configPath = Join-Path $InstallDir "config.json"
+if (Test-Path $configPath) {
+    Write-Host "--------------------------------------------------------"
+    Write-Host "Existing configuration found. Binary updated to $tag."
+    Write-Host "--------------------------------------------------------"
+    exit 0
+}
+
+# 7. First install: delegate to the built-in setup wizard
+Write-Host ""
+Write-Host "No configuration found. Launching setup wizard..."
+Write-Host ""
+
+Push-Location $InstallDir
+& .\ostp.exe --setup
+Pop-Location

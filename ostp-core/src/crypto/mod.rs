@@ -1,7 +1,7 @@
 pub mod aead;
 pub mod noise;
 pub mod obfuscation;
-pub mod reality;
+
 
 pub use aead::SessionCipher;
 pub use noise::{NoiseRole, NoiseSession};

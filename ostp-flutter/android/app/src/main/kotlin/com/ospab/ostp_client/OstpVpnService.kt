@@ -43,6 +43,7 @@ class OstpVpnService : VpnService() {
 
     private var vpnInterface: ParcelFileDescriptor? = null
     private var wakeLock: PowerManager.WakeLock? = null
+    private var networkCallback: android.net.ConnectivityManager.NetworkCallback? = null
 
     override fun onCreate() {
         super.onCreate()
@@ -144,6 +145,41 @@ class OstpVpnService : VpnService() {
         }
     }
 
+    private fun registerNetworkCallback() {
+        if (networkCallback != null) return
+        try {
+            val cm = getSystemService(android.content.Context.CONNECTIVITY_SERVICE) as android.net.ConnectivityManager
+            networkCallback = object : android.net.ConnectivityManager.NetworkCallback() {
+                override fun onAvailable(network: android.net.Network) {
+                    super.onAvailable(network)
+                    OstpClientSdk.notifyNetworkChanged()
+                }
+                override fun onLost(network: android.net.Network) {
+                    super.onLost(network)
+                    OstpClientSdk.notifyNetworkChanged()
+                }
+            }
+            val request = android.net.NetworkRequest.Builder()
+                .addCapability(android.net.NetworkCapabilities.NET_CAPABILITY_INTERNET)
+                .build()
+            cm.registerNetworkCallback(request, networkCallback!!)
+        } catch (e: Throwable) {
+            Log.e("OstpVpnService", "Failed to register NetworkCallback", e)
+        }
+    }
+
+    private fun unregisterNetworkCallback() {
+        try {
+            if (networkCallback != null) {
+                val cm = getSystemService(android.content.Context.CONNECTIVITY_SERVICE) as android.net.ConnectivityManager
+                cm.unregisterNetworkCallback(networkCallback!!)
+                networkCallback = null
+            }
+        } catch (e: Throwable) {
+            Log.e("OstpVpnService", "Failed to unregister NetworkCallback", e)
+        }
+    }
+
     private fun startVpn(configJson: String) {
         if (vpnInterface != null) return
 
@@ -162,8 +198,13 @@ class OstpVpnService : VpnService() {
                 .addRoute("::", 0)
                 .addDnsServer(dnsServer)
                 .setMtu(Math.max(1280, json.optJSONObject("ostp")?.optInt("mtu", 1140) ?: 1140))
-                
+
+            // Always add fallback IPv4 DNS servers
+            try { builder.addDnsServer("1.1.1.1") } catch (e: Throwable) {}
             try { builder.addDnsServer("8.8.8.8") } catch (e: Throwable) {}
+            // NOTE: Do NOT add IPv6 DNS servers here — Android would send DNS
+            // queries over IPv6, but our smoltcp TUN stack processes them as
+            // IPv4 only, causing all DNS to silently fail on LTE (IPv6-only networks).
 
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                 builder.allowBypass()
@@ -232,6 +273,8 @@ class OstpVpnService : VpnService() {
             Log.e("OstpVpnService", "Error starting VPN", e)
             stopVpn()
         }
+        
+        registerNetworkCallback()
     }
 
     private fun stopVpn() {
@@ -248,6 +291,7 @@ class OstpVpnService : VpnService() {
 
         stopForeground(true)
         OstpTileService.requestListeningState(applicationContext)
+        unregisterNetworkCallback()
         stopSelf()
     }
 

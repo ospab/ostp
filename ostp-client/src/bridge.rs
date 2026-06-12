@@ -68,9 +68,6 @@ pub struct Bridge {
     pub stealth_sni: String,
     pub wss: bool,
     pub mtu: usize,
-    pub reality_enabled: bool,
-    pub reality_pbk: String,
-    pub reality_sid: String,
     pub kill_switch: bool,
     pub reload_tx: Option<watch::Sender<crate::config::ExclusionConfig>>,
 
@@ -104,9 +101,6 @@ impl Bridge {
             stealth_sni: config.transport.stealth_sni.clone(),
             wss: config.transport.wss,
             mtu: config.ostp.mtu,
-            reality_enabled: config.reality.enabled,
-            reality_pbk: config.reality.pbk.clone(),
-            reality_sid: config.reality.sid.clone(),
             kill_switch: config.kill_switch,
             reload_tx: None,
 
@@ -862,139 +856,161 @@ impl Bridge {
 
         let secrets = ostp_core::crypto::derive_all_secrets(&self.access_key);
 
-        let mut machine = ProtocolMachine::new(ProtocolConfig {
-            role: NoiseRole::Initiator,
-            psk: secrets.psk,
-            session_id,
-            handshake_payload,
-            // max_padding computed dynamically below from mtu
-            padding_strategy: PaddingStrategy::Profile(self.profile),
-            obfuscation_key: secrets.obfuscation_key,
-            max_reorder: 16384,          // Max gap between expected and received nonce
-            max_reorder_buffer: 8192,    // Max buffered out-of-order frames
-            ack_delay_ms: 5,
-            rto_ms: 100,
-            max_retries: 8,
-            max_sent_history: 32768,     // Reduced: gap recovery handles unrecoverable frames
-            handshake_pad_min: secrets.handshake_pad_min,
-            handshake_pad_max: secrets.handshake_pad_max,
-            mtu: self.mtu,
-            max_padding: self.mtu.saturating_sub(48).max(256), // leave room for UDP/IP/ostp headers
-        })?;
-
-        let resolved_addrs: Vec<std::net::SocketAddr> = match tokio::net::lookup_host(&self.server_addr).await {
+        let mut resolved_addrs: Vec<std::net::SocketAddr> = match tokio::net::lookup_host(&self.server_addr).await {
             Ok(addrs) => addrs.collect(),
             Err(e) => return Err(anyhow::anyhow!("failed to resolve server address {}: {}", self.server_addr, e)),
         };
-        let target_addr = resolved_addrs.first().ok_or_else(|| anyhow::anyhow!("no IP addresses resolved for {}", self.server_addr))?;
-        let target_ip = target_addr.ip();
-        let port = target_addr.port();
+        resolved_addrs.sort_by_key(|addr| if addr.is_ipv6() { 0 } else { 1 });
 
-        tx.send(UiEvent::Log(format!("Connecting to remote server: {}...", target_addr))).await.ok();
+        let mut last_err = anyhow::anyhow!("no IP addresses resolved for {}", self.server_addr);
 
-        let socket = match self.try_connect_transport(target_ip, port).await {
-            Ok(sock) => sock,
-            Err(e) => {
+        for target_addr in resolved_addrs {
+            let target_ip = target_addr.ip();
+            let port = target_addr.port();
+
+            tx.send(UiEvent::Log(format!("Connecting to remote server: {}...", target_addr))).await.ok();
+
+            let socket = match self.try_connect_transport(target_ip, port).await {
+                Ok(sock) => sock,
+                Err(e) => {
+                    if let std::net::IpAddr::V4(ipv4) = target_ip {
+                        tx.send(UiEvent::Log(format!("Direct IPv4 connection failed: {}. Trying NAT64 fallback...", e))).await.ok();
+                        let nat64_ipv6 = synthesize_nat64(ipv4).await;
+                        match self.try_connect_transport(std::net::IpAddr::V6(nat64_ipv6), port).await {
+                            Ok(sock) => sock,
+                            Err(fallback_err) => {
+                                last_err = anyhow::anyhow!("Direct IPv4 failed: {}. NAT64 fallback failed: {}", e, fallback_err);
+                                continue;
+                            }
+                        }
+                    } else {
+                        last_err = anyhow::anyhow!("Connection to {} failed: {}", target_addr, e);
+                        continue;
+                    }
+                }
+            };
+
+            let mut machine = ProtocolMachine::new(ProtocolConfig {
+                role: NoiseRole::Initiator,
+                psk: secrets.psk,
+                session_id,
+                handshake_payload: handshake_payload.clone(),
+                padding_strategy: PaddingStrategy::Profile(self.profile),
+                obfuscation_key: secrets.obfuscation_key,
+                max_reorder: 16384,
+                max_reorder_buffer: 8192,
+                ack_delay_ms: 5,
+                rto_ms: 100,
+                max_retries: 8,
+                max_sent_history: 32768,
+                handshake_pad_min: secrets.handshake_pad_min,
+                handshake_pad_max: secrets.handshake_pad_max,
+                mtu: self.mtu,
+                max_padding: self.mtu.saturating_sub(48).max(256),
+            })?;
+
+            let start = Instant::now();
+            let action = match machine.on_event(OstpEvent::Start) {
+                Ok(a) => a,
+                Err(e) => {
+                    last_err = anyhow::anyhow!("protocol start error: {}", e);
+                    continue;
+                }
+            };
+
+            let handshake_frame = match action {
+                ProtocolAction::SendDatagram(frame) => frame,
+                _ => {
+                    last_err = anyhow::anyhow!("protocol did not emit handshake datagram");
+                    continue;
+                }
+            };
+            
+            let mut buf = vec![0_u8; 4096];
+            let mut size = 0;
+            let mut success = false;
+
+            let is_uot = matches!(socket, crate::transport::Transport::Uot { .. });
+            let (attempt_limit, attempt_timeout_ms) = if is_uot { (1, 8000) } else { (4, 1200) };
+
+            for attempt in 0..attempt_limit {
+                if attempt > 0 {
+                    tx.send(UiEvent::Log(format!("Handshake attempt {} lost. Retransmitting...", attempt))).await.ok();
+                }
+                if send_datagram(&socket, &handshake_frame, self.transport_mode == "udp").await.is_ok() {
+                    self.metrics.bytes_sent.fetch_add(handshake_frame.len() as u64, Ordering::Relaxed);
+                }
+
+                match timeout(Duration::from_millis(attempt_timeout_ms), socket.recv(&mut buf)).await {
+                    Ok(Ok(n)) => {
+                        size = n;
+                        success = true;
+                        break;
+                    }
+                    _ => {} 
+                }
+            }
+
+            let (final_socket, size) = if success {
+                (socket, size)
+            } else {
                 if let std::net::IpAddr::V4(ipv4) = target_ip {
-                    tx.send(UiEvent::Log(format!("Direct IPv4 connection failed: {}. Trying NAT64 fallback...", e))).await.ok();
-                    let nat64_ipv6 = synthesize_nat64(ipv4);
+                    tx.send(UiEvent::Log("Direct IPv4 handshake timed out. Trying NAT64 fallback...".to_string())).await.ok();
+                    let nat64_ipv6 = synthesize_nat64(ipv4).await;
                     match self.try_connect_transport(std::net::IpAddr::V6(nat64_ipv6), port).await {
-                        Ok(sock) => sock,
-                        Err(fallback_err) => {
-                            return Err(anyhow::anyhow!("Direct IPv4 failed: {}. NAT64 fallback failed: {}", e, fallback_err));
+                        Ok(fallback_socket) => {
+                            let mut fallback_success = false;
+                            for attempt in 0..4 {
+                                if attempt > 0 {
+                                    tx.send(UiEvent::Log(format!("NAT64 handshake attempt {} lost. Retransmitting...", attempt))).await.ok();
+                                }
+                                if send_datagram(&fallback_socket, &handshake_frame, self.transport_mode == "udp").await.is_ok() {
+                                    self.metrics.bytes_sent.fetch_add(handshake_frame.len() as u64, Ordering::Relaxed);
+                                }
+                                match timeout(Duration::from_millis(1200), fallback_socket.recv(&mut buf)).await {
+                                    Ok(Ok(n)) => {
+                                        size = n;
+                                        fallback_success = true;
+                                        break;
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            if fallback_success {
+                                tx.send(UiEvent::Log("NAT64 fallback handshake successful!".to_string())).await.ok();
+                                (fallback_socket, size)
+                            } else {
+                                last_err = anyhow::anyhow!("NAT64 handshake failed after 4 attempts");
+                                continue;
+                            }
+                        }
+                        Err(e) => {
+                            last_err = anyhow::anyhow!("NAT64 fallback socket creation failed: {}", e);
+                            continue;
                         }
                     }
                 } else {
-                    return Err(e);
+                    last_err = anyhow::anyhow!("Direct handshake failed after attempts");
+                    continue;
                 }
+            };
+
+            let socket = final_socket;
+            self.metrics.bytes_recv.fetch_add(size as u64, Ordering::Relaxed);
+            tracing::info!("Handshake response received: {} bytes", size);
+
+            let inbound = Bytes::copy_from_slice(&buf[..size]);
+            if let Err(e) = machine.on_event(OstpEvent::Inbound(inbound)) {
+                last_err = anyhow::anyhow!("Protocol invalid response: {}", e);
+                continue;
             }
-        };
+            let rtt_ms = start.elapsed().as_secs_f64() * 1000.0;
+            tracing::info!("Handshake complete: session={:#010x} rtt={:.1}ms", session_id, rtt_ms);
 
-        // Connection to remote is handled inside try_connect_transport
-
-        let start = Instant::now();
-        let action = machine.on_event(OstpEvent::Start)?;
-        let handshake_frame = match action {
-            ProtocolAction::SendDatagram(frame) => frame,
-            _ => anyhow::bail!("protocol did not emit handshake datagram"),
-        };
-        let mut buf = vec![0_u8; 4096];
-        let mut size = 0;
-        let mut success = false;
-
-        // For UoT: TCP is reliable so we don't retry on the same connection.
-        // Multiple retries would cause stale Noise responses to queue in the mpsc channel
-        // and break the Noise state machine (noise-read error).
-        // For UDP: retry up to 4x with 1200ms timeout to survive packet loss.
-        let is_uot = matches!(socket, crate::transport::Transport::Uot { .. });
-        // UoT (TCP): 1 attempt only — retrying on TCP causes stale Noise frames to queue.
-        // Timeout is generous (8s) to accommodate slow mobile TCP+TLS setup.
-        // UDP: 4 attempts × 1200ms — survives individual packet loss.
-        let (attempt_limit, attempt_timeout_ms) = if is_uot { (1, 8000) } else { (4, 1200) };
-
-        for attempt in 0..attempt_limit {
-            if attempt > 0 {
-                tx.send(UiEvent::Log(format!("Handshake attempt {} lost. Retransmitting...", attempt))).await.ok();
-            }
-            send_datagram(&socket, &handshake_frame, self.transport_mode == "udp" ).await?;
-            self.metrics.bytes_sent.fetch_add(handshake_frame.len() as u64, Ordering::Relaxed);
-
-            match timeout(Duration::from_millis(attempt_timeout_ms), socket.recv(&mut buf)).await {
-                Ok(Ok(n)) => {
-                    size = n;
-                    success = true;
-                    break;
-                }
-                _ => {} // retry on timeout or error
-            }
+            return Ok((socket, machine, rtt_ms));
         }
 
-        let (final_socket, size) = if success {
-            (socket, size)
-        } else {
-            if let std::net::IpAddr::V4(ipv4) = target_ip {
-                tx.send(UiEvent::Log("Direct IPv4 handshake timed out. Trying NAT64 fallback...".to_string())).await.ok();
-                let nat64_ipv6 = synthesize_nat64(ipv4);
-                match self.try_connect_transport(std::net::IpAddr::V6(nat64_ipv6), port).await {
-                    Ok(fallback_socket) => {
-                        let mut fallback_success = false;
-                        for attempt in 0..4 {
-                            if attempt > 0 {
-                                tx.send(UiEvent::Log(format!("NAT64 handshake attempt {} lost. Retransmitting...", attempt))).await.ok();
-                            }
-                            send_datagram(&fallback_socket, &handshake_frame, self.transport_mode == "udp" ).await?;
-                            match timeout(Duration::from_millis(1200), fallback_socket.recv(&mut buf)).await {
-                                Ok(Ok(n)) => {
-                                    size = n;
-                                    fallback_success = true;
-                                    break;
-                                }
-                                _ => {}
-                            }
-                        }
-                        if fallback_success {
-                            tx.send(UiEvent::Log("NAT64 fallback handshake successful!".to_string())).await.ok();
-                            (fallback_socket, size)
-                        } else {
-                            return Err(anyhow::anyhow!("NAT64 handshake failed after 3 attempts"));
-                        }
-                    }
-                    Err(e) => return Err(anyhow::anyhow!("NAT64 fallback socket creation failed: {}", e)),
-                }
-            } else {
-                return Err(anyhow::anyhow!("Direct handshake failed after 3 attempts"));
-            }
-        };
-        let socket = final_socket;
-        self.metrics.bytes_recv.fetch_add(size as u64, Ordering::Relaxed);
-        tracing::info!("Handshake response received: {} bytes", size);
-
-        let inbound = Bytes::copy_from_slice(&buf[..size]);
-        machine.on_event(OstpEvent::Inbound(inbound))?;
-        let rtt_ms = start.elapsed().as_secs_f64() * 1000.0;
-        tracing::info!("Handshake complete: session={:#010x} rtt={:.1}ms", session_id, rtt_ms);
-
-        Ok((socket, machine, rtt_ms))
+        Err(last_err)
     }
 
     fn apply_runtime_config(&mut self, cfg: &ClientConfig) {
@@ -1010,9 +1026,6 @@ impl Bridge {
         self.transport_mode = cfg.transport.mode.clone();
         self.stealth_sni = cfg.transport.stealth_sni.clone();
         self.wss = cfg.transport.wss; // Fix: wss was not updated on hot-reload
-        self.reality_enabled = cfg.reality.enabled;
-        self.reality_pbk = cfg.reality.pbk.clone();
-        self.reality_sid = cfg.reality.sid.clone();
         self.mtu = cfg.ostp.mtu;
         self.keepalive_interval_sec = cfg.ostp.keepalive_interval_sec;
         self.kill_switch = cfg.kill_switch;
@@ -1025,10 +1038,39 @@ impl Bridge {
     ) -> Result<crate::transport::Transport> {
         let mode = self.transport_mode.to_lowercase();
         if mode == "uot" || mode == "tcp" {
-            let (tx, rx) = crate::transport::xhttp::connect_xhttp(
-                target_ip, port, &self.stealth_sni, &self.access_key, self.reality_enabled, self.wss, &self.reality_pbk, &self.reality_sid
-            ).await?;
-            Ok(crate::transport::Transport::Uot { tx, rx })
+            let stream = tokio::net::TcpStream::connect((target_ip, port)).await?;
+            let _ = stream.set_nodelay(true);
+            let (mut read_half, mut write_half) = stream.into_split();
+            
+            let (tx_out, mut rx_out) = tokio::sync::mpsc::channel::<bytes::Bytes>(1024);
+            let (tx_in, rx_in) = tokio::sync::mpsc::channel::<bytes::Bytes>(1024);
+            
+            // Task to write from rx_out to tcp stream
+            tokio::spawn(async move {
+                use tokio::io::AsyncWriteExt;
+                while let Some(data) = rx_out.recv().await {
+                    let mut len_buf = [0u8; 2];
+                    len_buf.copy_from_slice(&(data.len() as u16).to_be_bytes());
+                    if write_half.write_all(&len_buf).await.is_err() { break; }
+                    if write_half.write_all(&data).await.is_err() { break; }
+                }
+            });
+            
+            // Task to read from tcp stream to tx_in
+            let tx_in_clone = tx_in.clone();
+            tokio::spawn(async move {
+                use tokio::io::AsyncReadExt;
+                loop {
+                    let mut len_buf = [0u8; 2];
+                    if read_half.read_exact(&mut len_buf).await.is_err() { break; }
+                    let len = u16::from_be_bytes(len_buf) as usize;
+                    let mut data = vec![0u8; len];
+                    if read_half.read_exact(&mut data).await.is_err() { break; }
+                    if tx_in_clone.send(bytes::Bytes::from(data)).await.is_err() { break; }
+                }
+            });
+            
+            Ok(crate::transport::Transport::Uot { tx: tx_out, rx: std::sync::Arc::new(tokio::sync::Mutex::new(rx_in)) })
         } else {
             let is_ipv6 = target_ip.is_ipv6();
             let domain = if is_ipv6 { socket2::Domain::IPV6 } else { socket2::Domain::IPV4 };
@@ -1068,10 +1110,25 @@ fn next_profile(current: TrafficProfile) -> TrafficProfile {
     }
 }
 
-fn synthesize_nat64(ip: std::net::Ipv4Addr) -> std::net::Ipv6Addr {
+async fn synthesize_nat64(ip: std::net::Ipv4Addr) -> std::net::Ipv6Addr {
+    let mut prefix = [0x00, 0x64, 0xff, 0x9b, 0, 0, 0, 0, 0, 0, 0, 0];
+    if let Ok(addrs) = tokio::net::lookup_host("ipv4only.arpa:80").await {
+        for addr in addrs {
+            if let std::net::SocketAddr::V6(v6) = addr {
+                let octets = v6.ip().octets();
+                prefix.copy_from_slice(&octets[0..12]);
+                break;
+            }
+        }
+    }
     let octets = ip.octets();
     std::net::Ipv6Addr::new(
-        0x0064, 0xff9b, 0, 0, 0, 0,
+        ((prefix[0] as u16) << 8) | prefix[1] as u16,
+        ((prefix[2] as u16) << 8) | prefix[3] as u16,
+        ((prefix[4] as u16) << 8) | prefix[5] as u16,
+        ((prefix[6] as u16) << 8) | prefix[7] as u16,
+        ((prefix[8] as u16) << 8) | prefix[9] as u16,
+        ((prefix[10] as u16) << 8) | prefix[11] as u16,
         ((octets[0] as u16) << 8) | octets[1] as u16,
         ((octets[2] as u16) << 8) | octets[3] as u16,
     )
