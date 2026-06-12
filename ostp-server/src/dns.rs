@@ -310,6 +310,7 @@ impl DnsServer {
         }
     }
 
+    #[allow(dead_code)]
     async fn log_query(&self, domain: String, client_ip: String, blocked: bool) {
         let mut log = self.query_log.lock().await;
         if log.len() >= 1000 {

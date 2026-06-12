@@ -119,7 +119,7 @@ fn match_domain_rule(host: &str, suffixes: &[String]) -> bool {
     })
 }
 
-async fn match_ip_rule(host: &str, port: u16, cidrs: &[String]) -> bool {
+async fn match_ip_rule(host: &str, _port: u16, cidrs: &[String]) -> bool {
     if cidrs.is_empty() {
         return false;
     }

@@ -3,7 +3,7 @@ use jni::sys::{jboolean, jstring};
 use jni::JNIEnv;
 
 use std::collections::VecDeque;
-use std::sync::{atomic::Ordering, Arc, Mutex, RwLock};
+use std::sync::{atomic::Ordering, Arc, RwLock};
 use tokio::runtime::Runtime;
 use tokio::sync::{mpsc, watch};
 use ostp_client::bridge::{Bridge, BridgeMetrics};
@@ -215,7 +215,7 @@ pub extern "system" fn Java_net_ostp_client_OstpClientSdk_nativeStartClient(
     
     // Create exclusions channel
     let (exclusions_tx, exclusions_rx) = watch::channel(config.exclusions.clone());
-    let exclusions_rx_tun = exclusions_tx.subscribe();
+    let _exclusions_rx_tun = exclusions_tx.subscribe();
 
     let metrics_clone = Arc::clone(&metrics);
 

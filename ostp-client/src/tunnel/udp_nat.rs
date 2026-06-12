@@ -9,7 +9,7 @@ use futures::StreamExt;
 pub async fn run_udp_nat(
     udp_socket: netstack_smoltcp::UdpSocket,
     proxy_addr: String,
-    debug: bool,
+    _debug: bool,
 ) {
     let (mut rx, tx) = udp_socket.split();
     let tx = Arc::new(Mutex::new(tx));

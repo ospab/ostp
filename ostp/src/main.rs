@@ -82,10 +82,6 @@ fn parse_ostp_link(link: &str) -> Result<ClientConfig> {
     let port = parsed.port().ok_or_else(|| anyhow!("Missing port in share link"))?;
     let server = format!("{host}:{port}");
     let mut sni = String::new();
-    let mut fp = String::new();
-    let mut pbk = String::new();
-    let mut sid = String::new();
-    let mut spx = String::new();
     let mut transport_mode = String::from("udp");
     let mut tun_enabled = false;
     let mut tun_dns = None;
@@ -94,10 +90,6 @@ fn parse_ostp_link(link: &str) -> Result<ClientConfig> {
     for (k, v) in parsed.query_pairs() {
         match &*k {
             "sni" => sni = v.into_owned(),
-            "fp" => fp = v.into_owned(),
-            "pbk" => pbk = v.into_owned(),
-            "sid" => sid = v.into_owned(),
-            "spx" => spx = v.into_owned(),
             "type" => transport_mode = v.into_owned(),
             "tun" => tun_enabled = v == "true",
             "dns" => tun_dns = Some(v.into_owned()),
@@ -535,7 +527,7 @@ fn wizard_section(title: &str) {
 }
 
 fn wizard_save_config(config_path: &std::path::Path, json_value: &serde_json::Value) -> Result<std::path::PathBuf> {
-    let mut current_path = config_path.to_path_buf();
+    let current_path = config_path.to_path_buf();
     
     // Attempt 1: write to requested path
     if let Some(parent) = current_path.parent() {
@@ -625,10 +617,12 @@ fn run_setup_wizard(config_path: &std::path::Path) -> Result<()> {
             // Try import from link first
             let use_link = wizard_yn("Do you have a share link (ostp://...)?", false);
             let (server, access_key, sni, transport_mode) = if use_link {
-                let mut p = url.query_pairs();
-                let sni = p.find(|(k, _)| k == "sni").map(|(_, v): (&str, std::borrow::Cow<str>)| v.to_string()).unwrap_or_default();
-                let tm = p.find(|(k, _)| k == "type").map(|(_, v): (&str, std::borrow::Cow<str>)| v.to_string()).unwrap_or("udp".to_string());
-                (url.host_str().unwrap().to_string() + ":" + &url.port().unwrap_or(50000).to_string(), url.username().to_string(), sni, tm)
+                let link_str = wizard_prompt("Paste link", "");
+                let parsed = url::Url::parse(&link_str).unwrap();
+                let mut p = parsed.query_pairs();
+                let sni = p.find(|(k, _)| k == "sni").map(|(_, v)| v.to_string()).unwrap_or_default();
+                let tm = p.find(|(k, _)| k == "type").map(|(_, v)| v.to_string()).unwrap_or("udp".to_string());
+                (parsed.host_str().unwrap().to_string() + ":" + &parsed.port().unwrap_or(50000).to_string(), parsed.username().to_string(), sni, tm)
             } else {
                 ("127.0.0.1:50000".to_string(), "".to_string(), "".to_string(), "udp".to_string())
             };
@@ -681,9 +675,9 @@ fn run_setup_wizard(config_path: &std::path::Path) -> Result<()> {
             }
 
             // Build and save config
-            let key_for_gen = generate_secure_key("hex"); // unused but needed for init template
-            let effective_sni = sni;
+            let key_for_gen = generate_secure_key("hex");
             let _ = key_for_gen;
+            let _ = &sni;
 
             let client_json = serde_json::json!({
                 "mode": "client",
@@ -1367,7 +1361,7 @@ async fn run_app() -> Result<()> {
     "sessions": 1
   }},
   "debug": false
-}}"#, key, pub_key, sid)
+}}"#, key)
         };
         if let Some(parent) = args.config.parent() {
             if !parent.as_os_str().is_empty() {
@@ -1383,16 +1377,14 @@ async fn run_app() -> Result<()> {
                 if let AppMode::Server(s) = &config.mode {
                     let key = &s.access_keys[0];
                     let host = get_or_ask_public_ip(&args.config);
-                    let mut link = format!("ostp://{}@{}:50000", key.key(), host);
-                    let mut query_params = Vec::new();
-                    
+                    let mut query_params = Vec::<String>::new();
                     query_params.push("type=udp".to_string());
-                    }
 
+                    let mut link = format!("ostp://{}@{}:50000", key.key(), host);
                     if !query_params.is_empty() {
                         link.push('?');
                         link.push_str(&query_params.join("&"));
-                    
+                    }
                     println!("\n  Share link for client distribution:");
                     println!("  {}", link);
                 }
@@ -1436,18 +1428,14 @@ async fn run_app() -> Result<()> {
                 
                 println!("\n  Client share links from {:?}:", args.config);
                 for (idx, key) in server_cfg.access_keys.iter().enumerate() {
-                    let mut link = format!("ostp://{}@{}:{}", key.key(), host, port);
-                    let mut query_params = Vec::new();
-                    
+                    let mut query_params = Vec::<String>::new();
                     query_params.push("type=udp".to_string());
-                    }
 
-
-
+                    let mut link = format!("ostp://{}@{}:{}", key.key(), host, port);
                     if !query_params.is_empty() {
                         link.push('?');
                         link.push_str(&query_params.join("&"));
-                    
+                    }
                     println!("  [{}] {}", idx + 1, link);
                 }
                 return Ok(());

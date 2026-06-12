@@ -970,6 +970,7 @@ async fn handle_put_rules(
     if !check_token(&state, &headers) { return api_unauthorized(); }
     
     // Update memory
+    #[allow(unused_assignments)]
     let mut updated_outbound = None;
     {
         let mut lock = state.router.outbound_cfg.write().unwrap();

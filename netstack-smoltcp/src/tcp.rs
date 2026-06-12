@@ -22,7 +22,7 @@ use spin::Mutex as SpinMutex;
 use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
     sync::{
-        mpsc::{channel, unbounded_channel, Receiver, Sender, UnboundedReceiver, UnboundedSender},
+        mpsc::{channel, Receiver, Sender, UnboundedSender},
         Notify,
     },
 };

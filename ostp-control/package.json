@@ -1,7 +1,7 @@
 {
   "name": "ostp-control",
   "private": true,
-  "version": "0.2.87",
+  "version": "0.2.92",
   "type": "module",
   "scripts": {
     "dev": "vite",

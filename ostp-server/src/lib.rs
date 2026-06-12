@@ -143,6 +143,7 @@ pub async fn run_server(
         tracing::info!("Watching configuration file for hot-reload: {:?}", path_to_watch);
 
         let mut last_mtime = None;
+        let mut _updated_outbound: Option<OutboundConfig> = None;
         loop {
             tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
             if let Ok(metadata) = std::fs::metadata(&path_to_watch) {
@@ -373,7 +374,7 @@ async fn run_server_loop(
     for bind_addr in &bind_addrs {
         let addr = bind_addr.parse::<std::net::SocketAddr>().unwrap();
         let tcp_map_clone = tcp_map.clone();
-        let shared_keys_clone = shared_keys.clone();
+        let _shared_keys_clone = shared_keys.clone();
         let udp_tx_clone = udp_tx.clone();
 
         tokio::spawn(async move {

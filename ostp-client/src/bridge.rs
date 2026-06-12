@@ -144,7 +144,8 @@ impl Bridge {
                     if *shutdown.borrow() {
                         self.running = false;
                         self.metrics.connection_state.store(0, Ordering::Relaxed);
-                        proxy_guard = None;
+                        #[allow(unused_assignments)]
+                        { proxy_guard = None; }
                         stream_map.clear();
                         self.reset_proxy_streams(&tx, &proxy_tx, "manual stop");
                         break;
@@ -195,7 +196,7 @@ impl Bridge {
         udp_msg: Option<(usize, Bytes)>,
         sessions_opt: &mut Option<Vec<SessionState>>,
         udp_rx_opt: &mut Option<mpsc::Receiver<(usize, Bytes)>>,
-        proxy_guard: &mut Option<crate::sysproxy::SystemProxyGuard>,
+        _proxy_guard: &mut Option<crate::sysproxy::SystemProxyGuard>,
         stream_map: &mut std::collections::HashMap<u16, usize>,
         tx: &mpsc::Sender<UiEvent>,
         proxy_tx: &mpsc::UnboundedSender<(u16, ProxyToClientMsg)>,

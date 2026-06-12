@@ -520,7 +520,7 @@ fn spawn_direct_udp_reader(
     direct_socket: Arc<UdpSocket>,
     sock_tx: Arc<UdpSocket>,
     client_udp_addr: Arc<std::sync::Mutex<Option<std::net::SocketAddr>>>,
-    debug: bool,
+    _debug: bool,
 ) {
     tokio::spawn(async move {
         let mut buf = vec![0u8; 65536];
@@ -880,7 +880,7 @@ async fn direct_connect_socks5(
     physical_if_index: Option<u32>,
     physical_if_name: &Option<String>,
     close_tx: mpsc::Sender<u16>,
-    debug: bool,
+    _debug: bool,
 ) -> Result<()> {
     if true {
         tracing::info!("proxy BYPASS stream_id={stream_id} target={target}");
@@ -902,7 +902,7 @@ async fn direct_connect_http(
     physical_if_index: Option<u32>,
     physical_if_name: &Option<String>,
     close_tx: mpsc::Sender<u16>,
-    debug: bool,
+    _debug: bool,
 ) -> Result<()> {
     if true {
         tracing::info!("proxy BYPASS stream_id={stream_id} target={target}");
