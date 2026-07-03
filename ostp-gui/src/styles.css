@@ -634,6 +634,7 @@ html[data-theme="light"] .watermark {
 /* ── Settings screen layout ───────────────────────────────────────────────── */
 .settings-body {
   flex: 1;
+  min-height: 0; /* allow this flex child to shrink so its scrollable child can scroll */
   display: flex;
   flex-direction: column;
   gap: 10px;
@@ -696,10 +697,15 @@ html[data-theme="light"] .watermark {
 
 .card.scrollable {
   flex: 1;
+  min-height: 0; /* required so overflow-y:auto actually scrolls inside the flex column */
   overflow-y: auto;
   overflow-x: hidden;
   scrollbar-width: thin;
   scrollbar-color: rgba(255,255,255,0.08) transparent;
+}
+
+.card.scrollable > * {
+  flex-shrink: 0;
 }
 
 .card.scrollable::-webkit-scrollbar { width: 3px; }
