@@ -417,6 +417,20 @@ async fn stop_tunnel(state: tauri::State<'_, AppState>) -> Result<bool, String> 
 }
 
 #[tauri::command]
+fn generate_qr(text: String) -> Result<String, String> {
+    // Render the share link to an SVG QR locally — the access key never leaves
+    // the device (unlike an online QR service).
+    let code = qrcode::QrCode::new(text.as_bytes()).map_err(|e| e.to_string())?;
+    let svg = code
+        .render::<qrcode::render::svg::Color>()
+        .min_dimensions(220, 220)
+        .dark_color(qrcode::render::svg::Color("#000000"))
+        .light_color(qrcode::render::svg::Color("#ffffff"))
+        .build();
+    Ok(svg)
+}
+
+#[tauri::command]
 async fn start_tunnel(state: tauri::State<'_, AppState>, app: tauri::AppHandle) -> Result<bool, String> {
     let mut guard = state.0.lock().await;
 
@@ -888,7 +902,7 @@ pub fn run() {
             }
             _ => {}
         })
-        .invoke_handler(tauri::generate_handler![start_tunnel, stop_tunnel, reload_tunnel, get_tunnel_status, get_metrics, get_config, save_config, get_wintun_install_path, set_autostart, get_autostart, list_running_processes, dns_prober::run_dns_prober])
+        .invoke_handler(tauri::generate_handler![start_tunnel, stop_tunnel, reload_tunnel, get_tunnel_status, get_metrics, get_config, save_config, get_wintun_install_path, set_autostart, get_autostart, list_running_processes, dns_prober::run_dns_prober, generate_qr])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

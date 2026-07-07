@@ -89,6 +89,7 @@ pub async fn run_tun_inbound(
                 let async_fd_shared = std::sync::Arc::new(async_fd);
                 
                 let afd1 = async_fd_shared.clone();
+                let m_sent = metrics.clone();
                 let tun_to_stack = tokio::spawn(async move {
                     let mut frame = vec![0u8; 65535];
                     loop {
@@ -104,6 +105,8 @@ pub async fn run_tun_inbound(
                             } else { Ok(res as isize) }
                         }) {
                             Ok(Ok(n)) if n > 0 => {
+                                // Bytes leaving the device toward the tunnel = upload.
+                                m_sent.bytes_sent.fetch_add(n as u64, Ordering::Relaxed);
                                 if let Err(_) = stack_sink.send(frame[..n as usize].to_vec()).await { break; }
                             }
                             Ok(Ok(_)) => break,
@@ -114,8 +117,11 @@ pub async fn run_tun_inbound(
                 });
 
                 let afd2 = async_fd_shared.clone();
+                let m_recv = metrics.clone();
                 let stack_to_tun = tokio::spawn(async move {
                     while let Some(Ok(frame)) = stack_stream.next().await {
+                        // Bytes arriving from the tunnel toward the device = download.
+                        m_recv.bytes_recv.fetch_add(frame.len() as u64, Ordering::Relaxed);
                         let mut written = 0;
                         while written < frame.len() {
                             let mut guard = match afd2.writable().await {

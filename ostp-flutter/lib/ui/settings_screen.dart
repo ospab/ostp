@@ -141,6 +141,62 @@ class _SettingsScreenState extends State<SettingsScreen> {
     }
   }
 
+  String _buildShareLink(OstpProfile p) {
+    final type = p.transportMode == 'uot' ? 'tcp' : 'udp';
+    final key = Uri.encodeComponent(p.accessKey);
+    final name = Uri.encodeComponent(p.name);
+    return 'ostp://$key@${p.serverAddr}?type=$type#$name';
+  }
+
+  void _shareProfile(OstpProfile p) {
+    final link = _buildShareLink(p);
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: Theme.of(ctx).colorScheme.surface,
+        title: const Text('Share profile'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Container(
+              padding: const EdgeInsets.all(12),
+              decoration: BoxDecoration(
+                color: Colors.white,
+                borderRadius: BorderRadius.circular(12),
+              ),
+              child: QrImageView(
+                data: link,
+                size: 200,
+                backgroundColor: Colors.white,
+              ),
+            ),
+            const SizedBox(height: 16),
+            SelectableText(
+              link,
+              textAlign: TextAlign.center,
+              style: const TextStyle(fontFamily: 'monospace', fontSize: 11),
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () {
+              Clipboard.setData(ClipboardData(text: link));
+              ScaffoldMessenger.of(ctx).showSnackBar(
+                const SnackBar(content: Text('Copied')),
+              );
+            },
+            child: const Text('Copy link'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('Close'),
+          ),
+        ],
+      ),
+    );
+  }
+
   void _showAddProfileMenu() {
     showModalBottomSheet(
       context: context,
@@ -395,9 +451,19 @@ class _SettingsScreenState extends State<SettingsScreen> {
                 ),
                 title: Text(p.name, style: const TextStyle(fontWeight: FontWeight.bold)),
                 subtitle: Text('${p.serverAddr} (${p.transportMode.toUpperCase()})', style: const TextStyle(fontSize: 12)),
-                trailing: IconButton(
-                  icon: const Icon(Icons.edit, size: 20, color: Colors.white54),
-                  onPressed: () => _showEditProfileDialog(p),
+                trailing: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    IconButton(
+                      icon: const Icon(Icons.qr_code_2, size: 20, color: Colors.white54),
+                      tooltip: 'Share',
+                      onPressed: () => _shareProfile(p),
+                    ),
+                    IconButton(
+                      icon: const Icon(Icons.edit, size: 20, color: Colors.white54),
+                      onPressed: () => _showEditProfileDialog(p),
+                    ),
+                  ],
                 ),
                 onTap: () {
                   setState(() {

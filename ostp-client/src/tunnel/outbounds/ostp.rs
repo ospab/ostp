@@ -289,6 +289,7 @@ pub async fn handle_udp(
     }
 
     // Send handshake first
+    let hs_start = std::time::Instant::now();
     if let Ok(action) = machine.on_event(OstpEvent::Start) {
         handle_udp_action(action, &transport).await;
     }
@@ -300,6 +301,14 @@ pub async fn handle_udp(
         transport.recv(&mut buf),
     ).await {
         Ok(Ok(n)) => {
+            // Real round-trip to the server over the already-protected transport.
+            // On Android the separate health-probe socket is NOT VPN-protected
+            // (it would route into the tunnel and never reach the server), so this
+            // handshake timing is the only reliable RTT source on mobile. We only
+            // set rtt here; connection_state stays owned by the health probe.
+            if let Some(m) = &metrics {
+                m.rtt_ms.store(hs_start.elapsed().as_millis() as u32, std::sync::atomic::Ordering::Relaxed);
+            }
             let _ = machine.on_event(OstpEvent::Inbound(bytes::Bytes::copy_from_slice(&buf[..n])));
         }
         _ => {

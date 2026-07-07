@@ -432,7 +432,16 @@ async function handleToggle() {
       serverAddr = cfg.server || '';
     } catch { serverAddr = ''; }
 
+    const activeProfiles = profiles.filter(p => p.active);
+    if (activeProfiles.length === 0) {
+      showToast('Select at least one profile in Settings', 'error');
+      return;
+    }
+
     setState('connecting');
+    // Rebuild config.json from the current active profiles so a freshly added,
+    // edited or toggled profile actually takes effect on connect.
+    await handleSave(true);
 
     try {
       console.log('[OSTP] invoking start_tunnel...');
@@ -482,82 +491,40 @@ async function loadConfigIntoForm() {
     const c = rawConfig.mode === 'client' ? rawConfig : null;
     if (!c) return;
 
-    if (c.version === '0.3.1' || c.outbounds !== undefined) {
-      // NEW FORMAT
-      const ostpOut = (c.outbounds || []).find(o => o.type === 'ostp');
-      if (ostpOut) {
-        inServer.value = ostpOut.server ? `${ostpOut.server}:${ostpOut.port || 50000}` : '';
-        inKey.value = ostpOut.access_key || '';
-        inTransport.value = ostpOut.transport?.type || 'udp';
-        if (inTransport.value === 'dns') {
-          groupDnsProxy.style.display = 'flex';
-          inDnsDomain.value = ostpOut.transport?.domain || '';
-          inDnsRegion.value = ostpOut.transport?.resolver || 'Global';
-        } else {
-          groupDnsProxy.style.display = 'none';
-        }
-        inMux.checked   = !!ostpOut.multiplex?.enabled;
-        inMuxSessions.value = ostpOut.multiplex?.sessions || '';
-      }
+    // Restore the profile list from persisted GUI state.
+    profiles = rawConfig.gui?.profiles || [];
+    renderProfiles();
 
-      const tunIn = (c.inbounds || []).find(i => i.type === 'tun');
-      if (tunIn) {
-        inTun.checked = true;
-        inMtu.value = tunIn.mtu || '';
-      } else {
-        inTun.checked = false;
-      }
-      
-      const socksIn = (c.inbounds || []).find(i => i.type === 'local_proxy');
-      if (socksIn) {
-        inSocks.value = `${socksIn.listen || '127.0.0.1'}:${socksIn.port || 1088}`;
-      }
-
-      inDns.value = ''; // DNS handling is manual in routing now, ignore here
-      if (inKillSwitch) inKillSwitch.checked = !!c.gui?.kill_switch;
-      inDebug.checked = c.log?.level === 'debug';
-      
-      const ex = c.routing?.rules || [];
-      const doms = new Set();
-      const ips = new Set();
-      const procs = new Set();
-      ex.forEach(r => {
-         if (r.outbound === 'direct') {
-             if (r.domain_suffix) r.domain_suffix.forEach(d => doms.add(d));
-             if (r.ip_cidr) r.ip_cidr.forEach(ip => ips.add(ip));
-             if (r.process_name) r.process_name.forEach(p => procs.add(p));
-         }
-      });
-      tagState.domains = doms;
-      tagState.ips = ips;
-      tagState.processes = procs;
-
+    const tunIn = (c.inbounds || []).find(i => i.type === 'tun');
+    if (tunIn) {
+      inTun.checked = true;
+      inMtu.value = tunIn.mtu || '';
     } else {
-      // OLD FORMAT
-      inServer.value  = c.server        || '';
-      inKey.value     = c.access_key    || '';
-      inSocks.value   = c.socks5_bind   || '127.0.0.1:1088';
-      inTransport.value = c.transport?.mode || 'udp';
-      if (inTransport.value === 'dns') {
-        groupDnsProxy.style.display = 'block';
-      } else {
-        groupDnsProxy.style.display = 'none';
-      }
-
-      inMtu.value     = c.mtu           || '';
-      inTun.checked   = !!c.tun?.enable;
-      if (inKillSwitch) inKillSwitch.checked = !!c.tun?.kill_switch;
-      inMux.checked   = !!c.mux?.enabled;
-      inMuxSessions.value = c.mux?.sessions || '';
-      
-      inDns.value = c.tun?.dns || '';
-      inDebug.checked = !!c.debug;
-
-      const ex = c.exclude || {};
-      tagState.domains   = new Set(ex.domains   || []);
-      tagState.ips       = new Set(ex.ips       || []);
-      tagState.processes = new Set(ex.processes || []);
+      inTun.checked = false;
     }
+    
+    const socksIn = (c.inbounds || []).find(i => i.type === 'local_proxy');
+    if (socksIn) {
+      inSocks.value = `${socksIn.listen || '127.0.0.1'}:${socksIn.port || 1088}`;
+    }
+
+    if (inKillSwitch) inKillSwitch.checked = !!c.gui?.kill_switch;
+    inDebug.checked = c.log?.level === 'debug';
+    
+    const ex = c.routing?.rules || [];
+    const doms = new Set();
+    const ips = new Set();
+    const procs = new Set();
+    ex.forEach(r => {
+       if (r.outbound === 'direct') {
+           if (r.domain_suffix) r.domain_suffix.forEach(d => doms.add(d));
+           if (r.ip_cidr) r.ip_cidr.forEach(ip => ips.add(ip));
+           if (r.process_name) r.process_name.forEach(p => procs.add(p));
+       }
+    });
+    tagState.domains = doms;
+    tagState.ips = ips;
+    tagState.processes = procs;
 
     if (inAutoconnect) inAutoconnect.checked = !!c.gui?.autoconnect;
     if (inLaunchStartup) inLaunchStartup.checked = !!c.gui?.launch_startup;
@@ -581,18 +548,15 @@ function scheduleAutoSave() {
 async function handleSave(silent = false) {
   if (!rawConfig) rawConfig = { mode: 'client', log_level: 'info' };
 
-  const server = inServer.value.trim();
-  const key    = inKey.value.trim();
-
-  if (!server) { if (!silent) showToast(t('err_server_req') || 'Server address required', 'error'); return; }
-  if (!key)    { if (!silent) showToast(t('err_key_req')    || 'Access key required',     'error'); return; }
-
   if (inLaunchStartup) {
     try { await invoke('set_autostart', { enable: inLaunchStartup.checked }); } catch (err) { console.error('autostart error', err); }
   }
 
-  const sHost = server.includes(':') ? server.substring(0, server.lastIndexOf(':')) : server;
-  const sPort = server.includes(':') ? parseInt(server.substring(server.lastIndexOf(':') + 1), 10) : 50000;
+  const activeProfiles = profiles.filter(p => p.active);
+  if (activeProfiles.length === 0) {
+    if (!silent) showToast('Please select at least one profile in Settings', 'error');
+    return;
+  }
 
   const socksStr = inSocks.value.trim() || '127.0.0.1:1088';
   const socksHost = socksStr.includes(':') ? socksStr.substring(0, socksStr.lastIndexOf(':')) : '127.0.0.1';
@@ -616,26 +580,42 @@ async function handleSave(silent = false) {
     });
   }
 
-  const outbounds = [
-    {
+  const outbounds = [];
+  const ostpTags = [];
+
+  activeProfiles.forEach((p, i) => {
+    const tag = activeProfiles.length > 1 ? `proxy-${i}` : 'proxy';
+    ostpTags.push(tag);
+    
+    const parts = p.serverAddr.split(':');
+    const host = parts[0] || '127.0.0.1';
+    const port = parseInt(parts[1]) || 50000;
+    
+    outbounds.push({
       type: "ostp",
-      tag: "proxy",
-      server: sHost,
-      port: sPort,
-      access_key: key,
-      transport: {
-        type: inTransport.value,
-        domain: inTransport.value === 'dns' ? inDnsDomain.value.trim() : undefined,
-        resolver: inTransport.value === 'dns' ? inDnsRegion.value : undefined
-      },
+      tag: tag,
+      server: host,
+      port: port,
+      access_key: p.accessKey,
+      transport: { type: p.transportMode },
       multiplex: inMux.checked ? {
         enabled: true,
         sessions: parseInt(inMuxSessions.value, 10) || 1
       } : { enabled: false, sessions: 1 }
-    },
-    { type: "direct", tag: "direct" },
-    { type: "block", tag: "block" }
-  ];
+    });
+  });
+
+  if (activeProfiles.length > 1) {
+    outbounds.push({
+      type: "urltest",
+      tag: "proxy",
+      outbounds: ostpTags,
+      url: "http://cp.cloudflare.com",
+      interval: "3m"
+    });
+  }
+
+  outbounds.push({ type: "direct", tag: "direct" }, { type: "block", tag: "block" });
 
   const rules = [];
   if (tagState.domains.size > 0) rules.push({ domain_suffix: Array.from(tagState.domains), outbound: "direct" });
@@ -660,42 +640,36 @@ async function handleSave(silent = false) {
   if (inAutoconnect) rawConfig.gui.autoconnect = inAutoconnect.checked;
   if (inLaunchStartup) rawConfig.gui.launch_startup = inLaunchStartup.checked;
   if (inKillSwitch) rawConfig.gui.kill_switch = inKillSwitch.checked;
+  // Persist the full profile list (including inactive ones) so it survives restarts.
+  rawConfig.gui.profiles = profiles;
 
   try {
     const ok = await invoke('save_config', { jsonContent: JSON.stringify(rawConfig, null, 2) });
     if (!ok && !silent) {
       showToast(t('toast_error'), 'error');
     } else if (ok && appState === 'connected') {
-      // Hot-reload exclusions into the running tunnel (no reconnect needed)
-      try { await invoke('reload_tunnel'); } catch { /* ignore */ }
+      try { await invoke('reload_tunnel'); } catch { }
     }
   } catch (err) {
     if (!silent) showToast(String(err), 'error');
   }
 }
 
+// Called by profile add/edit/toggle/delete. saveSettings() was referenced but
+// never defined — every profile mutation threw ReferenceError, so nothing
+// persisted and the list never re-rendered. It rebuilds config.json (outbounds
+// from active profiles) and persists the profile list via handleSave.
+function saveSettings() { handleSave(true); }
+
+
 // ── Import share link ─────────────────────────────────────────────────────────
 function handleImport() {
   const raw = importInput.value.trim();
   if (!raw) return;
   try {
-    if (!raw.startsWith('ostp://')) throw new Error('Link must start with ostp://');
-    const url = new URL(raw);
-    const key  = decodeURIComponent(url.username);
-    const host = url.host;
-    if (!key || !host) throw new Error('Incomplete link parameters');
-    inServer.value = host;
-    inKey.value    = key;
-    inTransport.value = 'udp';
-    groupDnsProxy.style.display = 'none';
-    
-    const type = url.searchParams.get('type');
-    if (type === 'tcp' || type === 'http') inTransport.value = 'uot';
-    else inTransport.value = 'udp';
-    
+    createProfileFromLink(raw);
     importInput.value = '';
-    showToast(t('toast_imported'), 'ok');
-    handleSave(false);
+    showToast(t('toast_imported') || 'Profile added', 'ok');
   } catch (err) {
     showToast(err.message, 'error');
   }
@@ -736,10 +710,10 @@ window.addEventListener('DOMContentLoaded', async () => {
     } catch { /* ignore */ }
   }
 
-  // Auto-connect on startup
+  // Load persisted config (form fields + profiles) so connect has the right
+  // inbounds/outbounds even if the user never opens Settings, then auto-connect.
   try {
-    const raw = await invoke('get_config');
-    rawConfig = parseJsonc(raw);
+    await loadConfigIntoForm();
     if (rawConfig?.gui?.autoconnect) {
       setTimeout(() => {
         if (appState === 'disconnected') handleToggle();
@@ -829,8 +803,10 @@ window.addEventListener('DOMContentLoaded', async () => {
 
   btnGoSettings.addEventListener('click',    () => showScreen('settings'));
   btnBack.addEventListener('click',          () => showScreen('home'));
-  btnImport.addEventListener('click',        handleImport);
-  btnPeekKey.addEventListener('click',       togglePeek);
+  if (btnImport) btnImport.addEventListener('click', handleImport);
+  // btn-peek-key / in-key etc. were removed with the old single-server UI.
+  // Guard so a missing element can't throw and abort the rest of init wiring.
+  if (btnPeekKey) btnPeekKey.addEventListener('click', togglePeek);
 
   // Theme toggle
   const btnThemeToggle = $('btn-theme-toggle');
@@ -928,23 +904,29 @@ window.addEventListener('DOMContentLoaded', async () => {
 });
 
 
+function escapeHtml(s) {
+  return String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+
 function renderProfiles() {
-  if (profiles.length === 0) {
-    profilesList.innerHTML = '';
-    profilesEmpty.style.display = 'block';
-  } else {
-    profilesEmpty.style.display = 'none';
-    profilesList.innerHTML = profiles.map(p => `
+  const hasProfiles = profiles.length > 0;
+  const rowsHtml = profiles.map(p => `
       <div class="profile-item">
         <input type="checkbox" ${p.active ? 'checked' : ''} onchange="toggleProfile('${p.id}')">
         <div class="profile-info">
-          <div class="profile-name">${p.name}</div>
-          <div class="profile-addr">${p.serverAddr}</div>
+          <div class="profile-name">${escapeHtml(p.name)}</div>
+          <div class="profile-addr">${escapeHtml(p.serverAddr)}</div>
         </div>
-        <button class="icon-btn" onclick="editProfile('${p.id}')" style="width:24px;height:24px;">✎</button>
-      </div>
-    `).join('');
-  }
+        <button class="icon-btn" onclick="shareProfile('${p.id}')" title="Share" style="width:26px;height:26px;">⤴</button>
+        <button class="icon-btn" onclick="editProfile('${p.id}')" title="Edit" style="width:26px;height:26px;">✎</button>
+      </div>`).join('');
+
+  // Profiles live on the Settings page.
+  if (profilesList) profilesList.innerHTML = rowsHtml;
+  if (profilesEmpty) profilesEmpty.style.display = hasProfiles ? 'none' : 'block';
+  // Settings page shows only "Create a new profile" + "+" until a profile exists.
+  const csb = $('client-settings-block');
+  if (csb) csb.style.display = hasProfiles ? '' : 'none';
 }
 
 window.toggleProfile = function(id) {
@@ -964,18 +946,99 @@ window.editProfile = function(id) {
   profileModal.classList.remove('hidden');
 };
 
-if (btnAddProfile) {
-  btnAddProfile.addEventListener('click', () => {
-    editingProfileId = null;
-    $('profile-modal-title').innerText = 'New Profile';
-    inProfName.value = '';
-    inProfServer.value = '';
-    inProfKey.value = '';
-    inProfTransport.value = 'udp';
-    btnProfDelete.style.display = 'none';
-    profileModal.classList.remove('hidden');
-  });
+function openProfileModalNew() {
+  editingProfileId = null;
+  $('profile-modal-title').innerText = 'New Profile';
+  inProfName.value = '';
+  inProfServer.value = '';
+  inProfKey.value = '';
+  inProfTransport.value = 'udp';
+  if (btnProfDelete) btnProfDelete.style.display = 'none';
+  profileModal.classList.remove('hidden');
 }
+if (btnAddProfile) btnAddProfile.addEventListener('click', () => { const m = $('add-menu'); if (m) m.classList.remove('hidden'); });
+
+// Build / parse the ostp:// share link (key in userinfo, host:port authority,
+// transport in ?type, name in #fragment).
+function buildShareLink(p) {
+  const type = p.transportMode === 'uot' ? 'tcp' : 'udp';
+  return `ostp://${encodeURIComponent(p.accessKey)}@${p.serverAddr}?type=${type}#${encodeURIComponent(p.name || '')}`;
+}
+function createProfileFromLink(raw) {
+  if (!raw.startsWith('ostp://')) throw new Error('Link must start with ostp://');
+  const url = new URL(raw);
+  const key = decodeURIComponent(url.username || '');
+  const host = url.host;
+  if (!key || !host) throw new Error('Incomplete link');
+  const type = url.searchParams.get('type');
+  const transportMode = (type === 'tcp' || type === 'http') ? 'uot' : 'udp';
+  let name = url.searchParams.get('name');
+  if (!name && url.hash) { try { name = decodeURIComponent(url.hash.slice(1)); } catch {} }
+  profiles.push({
+    id: Date.now().toString(),
+    name: name || host,
+    serverAddr: host,
+    accessKey: key,
+    transportMode,
+    active: profiles.length === 0,
+  });
+  saveSettings();
+  renderProfiles();
+}
+
+// Share a profile: show its link + a scannable QR (QR rendered by the Rust
+// `generate_qr` command so the access key never leaves the device).
+window.shareProfile = async function(id) {
+  const p = profiles.find(x => x.id === id);
+  if (!p) return;
+  const link = buildShareLink(p);
+  const linkInput = $('share-link');
+  if (linkInput) linkInput.value = link;
+  const qrBox = $('share-qr');
+  if (qrBox) {
+    qrBox.innerHTML = '<div style="color:var(--c-txt-3);font-size:0.8rem;">Generating…</div>';
+    try {
+      qrBox.innerHTML = await invoke('generate_qr', { text: link });
+    } catch {
+      qrBox.innerHTML = '<div style="color:var(--c-red);font-size:0.8rem;">QR unavailable — rebuild app</div>';
+    }
+  }
+  const m = $('share-modal');
+  if (m) m.classList.remove('hidden');
+};
+
+// ── Add-profile menu + link/share modal wiring ────────────────────
+(function wireProfileMenus() {
+  const addMenu = $('add-menu');
+  const closeAddMenu = () => { if (addMenu) addMenu.classList.add('hidden'); };
+  // Clicking the overlay (outside the card) closes the menu.
+  if (addMenu) addMenu.addEventListener('click', (e) => { if (e.target === addMenu) closeAddMenu(); });
+  if ($('btn-add-cancel')) $('btn-add-cancel').addEventListener('click', closeAddMenu);
+
+  const linkModal = $('link-modal');
+  if ($('btn-add-from-link')) $('btn-add-from-link').addEventListener('click', () => {
+    closeAddMenu();
+    if ($('in-link')) $('in-link').value = '';
+    if (linkModal) linkModal.classList.remove('hidden');
+  });
+  if ($('btn-add-manual')) $('btn-add-manual').addEventListener('click', () => {
+    closeAddMenu();
+    openProfileModalNew();
+  });
+  if ($('btn-link-cancel')) $('btn-link-cancel').addEventListener('click', () => { if (linkModal) linkModal.classList.add('hidden'); });
+  if ($('btn-link-import')) $('btn-link-import').addEventListener('click', () => {
+    const raw = ($('in-link')?.value || '').trim();
+    if (!raw) return;
+    try { createProfileFromLink(raw); if (linkModal) linkModal.classList.add('hidden'); showToast(t('toast_imported') || 'Profile added', 'ok'); }
+    catch (err) { showToast(err.message, 'error'); }
+  });
+  // Share modal
+  if ($('btn-share-close')) $('btn-share-close').addEventListener('click', () => { const m = $('share-modal'); if (m) m.classList.add('hidden'); });
+  if ($('btn-share-copy')) $('btn-share-copy').addEventListener('click', () => {
+    const v = $('share-link')?.value || '';
+    if (v) { navigator.clipboard?.writeText(v); showToast('Copied', 'ok'); }
+  });
+})();
 
 if (btnProfCancel) btnProfCancel.addEventListener('click', () => profileModal.classList.add('hidden'));
 

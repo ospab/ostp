@@ -183,7 +183,21 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
     outbounds.add({"type": "direct", "tag": "direct"});
     outbounds.add({"type": "block", "tag": "block"});
 
+    // Exclusions → "direct". Keys MUST match the Rust RoutingRule fields
+    // (domain_suffix / ip_cidr / process_name). The old "domains/ips/processes"
+    // keys did not match the struct and were silently dropped, so exclusions
+    // never applied. Only push a rule that actually has entries — a rule with an
+    // empty list never matches anyway.
+    final exDomainsList = exDomains.split('\n').where((s) => s.trim().isNotEmpty).toList();
+    final exIpsList = exIps.split('\n').where((s) => s.trim().isNotEmpty).toList();
+    final exProcessesList = exProcesses.split('\n').where((s) => s.trim().isNotEmpty).toList();
+    final List<Map<String, dynamic>> routingRules = [];
+    if (exDomainsList.isNotEmpty) routingRules.add({"domain_suffix": exDomainsList, "outbound": "direct"});
+    if (exIpsList.isNotEmpty) routingRules.add({"ip_cidr": exIpsList, "outbound": "direct"});
+    if (exProcessesList.isNotEmpty) routingRules.add({"process_name": exProcessesList, "outbound": "direct"});
+
     final configMap = {
+      "mode": "client",
       "version": "0.3.20",
       "log": {
         "level": debugMode ? "debug" : "info"
@@ -191,14 +205,8 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
       "inbounds": inbounds,
       "outbounds": outbounds,
       "routing": {
-        "rules": [
-          {
-            "domains": exDomains.split('\n').where((s) => s.trim().isNotEmpty).toList(),
-            "ips": exIps.split('\n').where((s) => s.trim().isNotEmpty).toList(),
-            "processes": exProcesses.split('\n').where((s) => s.trim().isNotEmpty).toList(),
-            "outbound": "direct"
-          }
-        ]
+        "rules": routingRules,
+        "default_outbound": "proxy"
       },
       "app_rules": {
         "mode": appRoutingMode,
