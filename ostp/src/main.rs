@@ -11,74 +11,92 @@ mod dns_prober;
 #[command(author, version, about = "OSTP Core - Ospab Stealth Transport Protocol", long_about = None)]
 struct Args {
     /// Path to the JSON configuration file
-    #[cfg_attr(unix, arg(long, default_value = "/etc/ostp/config.json", help_heading = "Common Commands"))]
-    #[cfg_attr(windows, arg(long, default_value = "config.json", help_heading = "Common Commands"))]
+    #[cfg_attr(unix, arg(short, long, default_value = "/etc/ostp/config.json", global = true))]
+    #[cfg_attr(windows, arg(short, long, default_value = "config.json", global = true))]
     config: PathBuf,
 
-    /// Optional mode to initialize the config for (client or server)
-    #[arg(short, long, help_heading = "Common Commands")]
-    init: Option<String>,
+    #[command(subcommand)]
+    command: Option<Commands>,
+}
 
+#[derive(clap::Subcommand, Debug)]
+enum Commands {
     /// Run the interactive setup wizard
-    #[arg(long, help_heading = "Common Commands")]
+    Setup {
+        /// Optional mode to initialize the config for (client or server)
+        #[arg(short, long)]
+        init: Option<String>,
+    },
+    /// Initialize config
+    Init {
+        mode: String,
+    },
+    /// Generate a new secure access key
+    GenerateKey {
+        /// Format for generated key (hex, base64)
+        #[arg(long, default_value = "hex")]
+        format: String,
+        /// Number of keys to generate
+        #[arg(short = 'c', long, default_value_t = 1)]
+        count: usize,
+    },
+    /// Output ready-to-use client sharing links
+    Links,
+    /// Validate configuration file
+    Check,
+    /// Connect using a share link
+    Connect {
+        url: String,
+    },
+    /// Uninstall OSTP
+    Uninstall,
+    /// Update OSTP
+    Update {
+        /// Specify the release branch to update from (stable, pre-release, nightly)
+        #[arg(short, long, default_value = "stable")]
+        branch: String,
+        
+        /// Specify a specific target version to update to (e.g., 0.2.98)
+        #[arg(short, long)]
+        version: Option<String>,
+    },
+    /// Import a share link
+    Import {
+        url: String,
+    },
+    /// Output shell export commands for proxy
+    ProxyEnv,
+    /// Output shell export commands to clear proxy
+    ProxyEnvClear,
+    /// Force migration of the configuration file
+    Migrate,
+    /// Run the network prober
+    Prober,
+    /// Run daemon
+    Run,
+}
+
+struct LegacyArgs {
+    config: PathBuf,
+    init: Option<String>,
     setup: bool,
-
-    /// Generate a new secure access key and exit
-    #[arg(short = 'g', long, help_heading = "Common Commands")]
     generate_key: bool,
-
-    /// Format for generated key (hex, base64)
-    #[arg(long, default_value = "hex", help_heading = "Common Commands")]
     format: String,
-
-    /// Number of keys to generate
-    #[arg(short = 'c', long, default_value_t = 1, help_heading = "Common Commands")]
     count: usize,
-
-    /// Output ready-to-use client sharing links (ostp://...) from the server configuration
-    #[arg(long, help_heading = "Server Commands")]
     links: bool,
-
-    /// Validate configuration file and exit
-    #[arg(long, help_heading = "Common Commands")]
     check: bool,
-
-    /// Optional client connection share link (ostp://ACCESS_KEY@HOST:PORT) to run instantly
-    #[arg(help_heading = "Client Commands")]
     url: Option<String>,
-
-    /// Uninstall OSTP: stop service, remove binary and configuration files
-    #[arg(long, help_heading = "Common Commands")]
     uninstall: bool,
-
-    /// Update OSTP: re-run the install script to fetch and install the latest version
-    #[arg(long, help_heading = "Common Commands")]
     update: bool,
-
-    /// Specify a target version for the update command (e.g., -v 0.2.98)
-    #[arg(short = 'v', long = "target-version", help_heading = "Common Commands")]
+    update_branch: String,
     target_version: Option<String>,
-
-    /// Import a share link (ostp://...) into the configuration file and exit
-    #[arg(long, help_heading = "Client Commands")]
     import: Option<String>,
-
-    /// Output shell export commands for proxy (eval $(ostp --proxy-env))
-    #[arg(long, help_heading = "Client Commands")]
     proxy_env: bool,
-
-    /// Output shell export commands to clear proxy (eval $(ostp --proxy-env-clear))
-    #[arg(long, help_heading = "Client Commands")]
     proxy_env_clear: bool,
-
-    /// Force migration of the configuration file to the latest format and exit
-    #[arg(long, help_heading = "Common Commands")]
     migrate: bool,
-
-    /// Run the network prober to find the fastest DNS resolver for the DNS Transport
-    #[arg(long, help_heading = "Client Commands")]
     prober: bool,
 }
+
 
 fn patch_existing_client_config(config_path: &std::path::Path, new_client_inner: serde_json::Value) -> serde_json::Value {
     let unified_new = serde_json::to_value(UnifiedConfig {
@@ -465,7 +483,7 @@ struct FallbackCfg {
 async fn main() -> Result<()> {
     let _ = rlimit::increase_nofile_limit(1048576);
     ostp_client::logging::setup_panic_hook();
-    let _log_guard = ostp_client::logging::init_tracing("info", "ostp-cli", env!("CARGO_PKG_VERSION"));
+    // Tracing init moved to run_app
 
     let res = run_app().await;
     if let Err(e) = res {
@@ -1192,15 +1210,120 @@ fn wizard_register_windows_service(config_path: &std::path::Path) -> Result<()> 
     Ok(())
 }
 
+fn apply_interactive_prompts(client_cfg: &mut serde_json::Value) {
+    use std::io::Write;
+    
+    print!("{} Enable TUN (VPN) mode? [y/N]: ", "?".blue().bold());
+    std::io::stdout().flush().unwrap();
+    let mut input = String::new();
+    std::io::stdin().read_line(&mut input).unwrap();
+    if input.trim().eq_ignore_ascii_case("y") {
+        if let Some(i_val) = client_cfg.get_mut("inbounds") {
+            if let Some(inbounds) = i_val.as_array_mut() {
+                for inbound in inbounds.iter_mut() {
+                    if inbound.get("type").and_then(|t| t.as_str()) == Some("tun") {
+                        inbound["auto_route"] = serde_json::json!(true);
+                    }
+                }
+            }
+        }
+    }
+    
+    print!("{} Enable connection multiplexing (mux)? [y/N]: ", "?".blue().bold());
+    std::io::stdout().flush().unwrap();
+    input.clear();
+    std::io::stdin().read_line(&mut input).unwrap();
+    if input.trim().eq_ignore_ascii_case("y") {
+        print!("How many sessions? [5]: ");
+        std::io::stdout().flush().unwrap();
+        input.clear();
+        std::io::stdin().read_line(&mut input).unwrap();
+        let mut sessions = 5;
+        if !input.trim().is_empty() {
+            if let Ok(s) = input.trim().parse() {
+                sessions = s;
+            }
+        }
+        if let Some(o_val) = client_cfg.get_mut("outbounds") {
+            if let Some(outbounds) = o_val.as_array_mut() {
+                for outbound in outbounds.iter_mut() {
+                    if outbound.get("type").and_then(|t| t.as_str()) == Some("ostp") {
+                        outbound["multiplex"] = serde_json::json!({
+                            "enabled": true,
+                            "sessions": sessions
+                        });
+                    }
+                }
+            }
+        }
+    }
+    
+    print!("Enable debug mode? [y/N]: ");
+    std::io::stdout().flush().unwrap();
+    input.clear();
+    std::io::stdin().read_line(&mut input).unwrap();
+    if input.trim().eq_ignore_ascii_case("y") {
+        client_cfg["log"]["level"] = serde_json::json!("debug");
+    }
+}
+
 async fn run_app() -> Result<()> {
-    let args = Args::parse();
+    let raw_args = Args::parse();
+    let mut args = LegacyArgs {
+        config: raw_args.config.clone(),
+        init: None,
+        setup: false,
+        generate_key: false,
+        format: "hex".to_string(),
+        count: 1,
+        links: false,
+        check: false,
+        url: None,
+        uninstall: false,
+        update: false,
+        update_branch: "stable".to_string(),
+        target_version: None,
+        import: None,
+        proxy_env: false,
+        proxy_env_clear: false,
+        migrate: false,
+        prober: false,
+    };
+    
+    let mut enable_logging = true;
+
+    if let Some(cmd) = &raw_args.command {
+        match cmd {
+            Commands::Setup { init } => { args.setup = true; args.init = init.clone(); }
+            Commands::Init { mode } => { args.init = Some(mode.clone()); enable_logging = false; }
+            Commands::GenerateKey { format, count } => { args.generate_key = true; args.format = format.clone(); args.count = *count; enable_logging = false; }
+            Commands::Links => { args.links = true; enable_logging = false; }
+            Commands::Check => { args.check = true; enable_logging = false; }
+            Commands::Connect { url } => { args.url = Some(url.clone()); }
+            Commands::Uninstall => { args.uninstall = true; enable_logging = false; }
+            Commands::Update { branch, version } => { args.update = true; args.update_branch = branch.clone(); args.target_version = version.clone(); enable_logging = false; }
+            Commands::Import { url } => { args.import = Some(url.clone()); enable_logging = false; }
+            Commands::ProxyEnv => { args.proxy_env = true; enable_logging = false; }
+            Commands::ProxyEnvClear => { args.proxy_env_clear = true; enable_logging = false; }
+            Commands::Migrate => { args.migrate = true; enable_logging = false; }
+            Commands::Prober => { args.prober = true; enable_logging = false; }
+            Commands::Run => { }
+        }
+    }
+    
+    let _log_guard = if enable_logging {
+        Some(ostp_client::logging::init_tracing("info", "ostp-cli", env!("CARGO_PKG_VERSION")))
+    } else {
+        None
+    };
+
 
     if args.uninstall {
         return cmd_uninstall();
     }
 
     if args.update {
-        return cmd_update(args.target_version);
+        return cmd_update(args.update_branch, args.target_version);
     }
 
     if args.migrate {
@@ -1300,8 +1423,11 @@ async fn run_app() -> Result<()> {
 
     if let Some(import_url) = args.import {
         println!("{} Importing configuration from share link...", "[ostp]".cyan().bold());
-        let client_cfg = parse_ostp_link(&import_url)
+        let mut client_cfg = parse_ostp_link(&import_url)
             .map_err(|e| anyhow!("Share Link Error: {e}"))?;
+            
+        apply_interactive_prompts(&mut client_cfg);
+            
         let patched = patch_existing_client_config(&args.config, client_cfg);
         let content = serde_json::to_string_pretty(&patched)?;
         if let Some(parent) = args.config.parent() {
@@ -1319,61 +1445,7 @@ async fn run_app() -> Result<()> {
         let mut client_cfg = parse_ostp_link(&url)
             .map_err(|e| anyhow!("Share Link Error: {e}"))?;
         
-        // Interactive prompt for URL launch
-        use std::io::Write;
-        
-        print!("{} Enable TUN (VPN) mode? [y/N]: ", "?".blue().bold());
-        std::io::stdout().flush().unwrap();
-        let mut input = String::new();
-        std::io::stdin().read_line(&mut input).unwrap();
-        if input.trim().eq_ignore_ascii_case("y") {
-            if let Some(i_val) = client_cfg.get_mut("inbounds") {
-                if let Some(inbounds) = i_val.as_array_mut() {
-                    for inbound in inbounds.iter_mut() {
-                        if inbound.get("type").and_then(|t| t.as_str()) == Some("tun") {
-                            inbound["auto_route"] = serde_json::json!(true);
-                        }
-                    }
-                }
-            }
-        }
-        
-        print!("{} Enable connection multiplexing (mux)? [y/N]: ", "?".blue().bold());
-        std::io::stdout().flush().unwrap();
-        input.clear();
-        std::io::stdin().read_line(&mut input).unwrap();
-        if input.trim().eq_ignore_ascii_case("y") {
-            print!("How many sessions? [5]: ");
-            std::io::stdout().flush().unwrap();
-            input.clear();
-            std::io::stdin().read_line(&mut input).unwrap();
-            let mut sessions = 5;
-            if !input.trim().is_empty() {
-                if let Ok(s) = input.trim().parse() {
-                    sessions = s;
-                }
-            }
-            if let Some(o_val) = client_cfg.get_mut("outbounds") {
-                if let Some(outbounds) = o_val.as_array_mut() {
-                    for outbound in outbounds.iter_mut() {
-                        if outbound.get("type").and_then(|t| t.as_str()) == Some("ostp") {
-                            outbound["multiplex"] = serde_json::json!({
-                                "enabled": true,
-                                "sessions": sessions
-                            });
-                        }
-                    }
-                }
-            }
-        }
-        
-        print!("Enable debug mode? [y/N]: ");
-        std::io::stdout().flush().unwrap();
-        input.clear();
-        std::io::stdin().read_line(&mut input).unwrap();
-        if input.trim().eq_ignore_ascii_case("y") {
-            client_cfg["log"]["level"] = serde_json::json!("debug");
-        }
+        apply_interactive_prompts(&mut client_cfg);
 
         let patched = patch_existing_client_config(&args.config, client_cfg);
         return run_client_directly(patched).await;
@@ -1986,16 +2058,16 @@ fn cmd_uninstall() -> Result<()> {
 // Update command
 // ---------------------------------------------------------------------------
 #[cfg(unix)]
-fn cmd_update(version: Option<String>) -> Result<()> {
+fn cmd_update(branch: String, version: Option<String>) -> Result<()> {
     use std::process::Command;
 
     println!("[ostp] Updating OSTP...");
     
     let mut script_args = vec!["-c".to_string()];
     if let Some(v) = version {
-        script_args.push(format!("bash <(curl -Ls https://raw.githubusercontent.com/ospab/ostp/master/scripts/install.sh) -v {}", v));
+        script_args.push(format!("bash <(curl -Ls https://raw.githubusercontent.com/ospab/ostp/master/scripts/install.sh) --branch {} -v {}", branch, v));
     } else {
-        script_args.push("bash <(curl -Ls https://raw.githubusercontent.com/ospab/ostp/master/scripts/install.sh)".to_string());
+        script_args.push(format!("bash <(curl -Ls https://raw.githubusercontent.com/ospab/ostp/master/scripts/install.sh) --branch {}", branch));
     }
 
     let status = Command::new("bash")
@@ -2010,7 +2082,7 @@ fn cmd_update(version: Option<String>) -> Result<()> {
 }
 
 #[cfg(not(unix))]
-fn cmd_update(_version: Option<String>) -> Result<()> {
+fn cmd_update(branch: String, version: Option<String>) -> Result<()> {
     anyhow::bail!("The 'update' command is only supported on Linux/Unix systems.");
 }
 
@@ -2085,7 +2157,7 @@ fn ensure_elevated_for_tun() -> Result<()> {
     };
 
     if ret <= 32 {
-        anyhow::bail!("UAC elevation was denied or failed. Please run as Administrator.");
+        anyhow::bail!("UAC elevation was denied or failed (ret={}). Please run as Administrator.", ret);
     }
     std::process::exit(0);
 }

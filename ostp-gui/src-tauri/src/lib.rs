@@ -741,9 +741,9 @@ fn launch_as_admin(exe: &std::path::PathBuf, token: &str, port: u16) -> anyhow::
     let cwd_path = std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("."));
     let dir_wstr: Vec<u16> = cwd_path.parent().unwrap_or(std::path::Path::new(".")).as_os_str().encode_wide().chain(Some(0)).collect();
     
-    let ret = unsafe { ShellExecuteW(null_mut(), verb_wstr.as_ptr(), exe_wstr.as_ptr(), params_wstr.as_ptr(), dir_wstr.as_ptr(), 0) };
+    let ret = unsafe { ShellExecuteW(null_mut(), verb_wstr.as_ptr(), exe_wstr.as_ptr(), params_wstr.as_ptr(), dir_wstr.as_ptr(), 1) };
     
-    if ret <= 32 { anyhow::bail!("UAC denied or helper missing."); }
+    if ret <= 32 { anyhow::bail!("UAC denied or helper missing (ret={}).", ret); }
     Ok(())
 }
 

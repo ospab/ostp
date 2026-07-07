@@ -87,10 +87,15 @@ echo "Platform: linux/$ARCH"
 
 # ── Parse arguments ────────────────────────────────────────────────────
 TARGET_VERSION=""
+TARGET_BRANCH="stable"
 while [[ $# -gt 0 ]]; do
   case $1 in
     -v|--version)
       TARGET_VERSION="$2"
+      shift 2
+      ;;
+    -b|--branch)
+      TARGET_BRANCH="$2"
       shift 2
       ;;
     *)
@@ -104,13 +109,21 @@ done
 if [ -n "$TARGET_VERSION" ]; then
     LATEST_RELEASE="$TARGET_VERSION"
     # Ensure it starts with 'v' if it's supposed to
-    if [[ ! "$LATEST_RELEASE" =~ ^v ]]; then
+    if [[ ! "$LATEST_RELEASE" =~ ^v ]] && [ "$TARGET_BRANCH" == "stable" ]; then
         LATEST_RELEASE="v$LATEST_RELEASE"
     fi
     echo "Fetching requested release $LATEST_RELEASE..."
 else
-    echo "Fetching latest release..."
-    LATEST_RELEASE=$(curl -s "https://api.github.com/repos/${GITHUB_REPO}/releases/latest" | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
+    if [ "$TARGET_BRANCH" == "nightly" ]; then
+        echo "Fetching nightly release..."
+        LATEST_RELEASE="nightly"
+    elif [ "$TARGET_BRANCH" == "pre-release" ]; then
+        echo "Fetching pre-release..."
+        LATEST_RELEASE="pre-release"
+    else
+        echo "Fetching latest stable release..."
+        LATEST_RELEASE=$(curl -s "https://api.github.com/repos/${GITHUB_REPO}/releases/latest" | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
+    fi
 fi
 
 if [ -z "$LATEST_RELEASE" ] || [[ "$LATEST_RELEASE" == *"null"* ]]; then

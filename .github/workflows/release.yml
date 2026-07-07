@@ -6,6 +6,9 @@ on:
   push:
     tags:
       - "v*"
+    branches:
+      - master
+      - pre-release
   workflow_dispatch:
 
 permissions:
@@ -227,9 +230,10 @@ jobs:
 
       # ── Upload ─────────────────────────────────────────────────────────────
       - name: Upload to GitHub Release
-        if: ${{ startsWith(github.ref, 'refs/tags/') }}
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ github.ref_name == 'master' && 'nightly' || (github.ref_name == 'pre-release' && 'pre-release' || github.ref_name) }}
+          prerelease: ${{ !startsWith(github.ref, 'refs/tags/') }}
           files: ${{ matrix.release_name }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -305,9 +309,10 @@ jobs:
           Compress-Archive -Path "$dir/*" -DestinationPath "ostp-windows-gui-${{ matrix.arch }}.zip" -Force
 
       - name: Upload to GitHub Release
-        if: ${{ startsWith(github.ref, 'refs/tags/') }}
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ github.ref_name == 'master' && 'nightly' || (github.ref_name == 'pre-release' && 'pre-release' || github.ref_name) }}
+          prerelease: ${{ !startsWith(github.ref, 'refs/tags/') }}
           files: ostp-windows-gui-${{ matrix.arch }}.zip
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -369,9 +374,10 @@ jobs:
           tar -czf ostp-linux-gui-${{ matrix.arch }}.tar.gz ostp-linux-gui-${{ matrix.arch }}
 
       - name: Upload to GitHub Release
-        if: ${{ startsWith(github.ref, 'refs/tags/') }}
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ github.ref_name == 'master' && 'nightly' || (github.ref_name == 'pre-release' && 'pre-release' || github.ref_name) }}
+          prerelease: ${{ !startsWith(github.ref, 'refs/tags/') }}
           files: ostp-linux-gui-${{ matrix.arch }}.tar.gz
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -430,9 +436,10 @@ jobs:
           tar -czf ostp-macos-gui-${{ matrix.arch }}.tar.gz ostp-macos-gui-${{ matrix.arch }}
 
       - name: Upload to GitHub Release
-        if: ${{ startsWith(github.ref, 'refs/tags/') }}
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ github.ref_name == 'master' && 'nightly' || (github.ref_name == 'pre-release' && 'pre-release' || github.ref_name) }}
+          prerelease: ${{ !startsWith(github.ref, 'refs/tags/') }}
           files: ostp-macos-gui-${{ matrix.arch }}.tar.gz
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -503,9 +510,10 @@ jobs:
           cp build/app/outputs/flutter-apk/app-release.apk ostp-android-${{ matrix.arch }}.apk
 
       - name: Upload to GitHub Release
-        if: ${{ startsWith(github.ref, 'refs/tags/') }}
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ github.ref_name == 'master' && 'nightly' || (github.ref_name == 'pre-release' && 'pre-release' || github.ref_name) }}
+          prerelease: ${{ !startsWith(github.ref, 'refs/tags/') }}
           files: ostp-flutter/ostp-android-${{ matrix.arch }}.apk
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
