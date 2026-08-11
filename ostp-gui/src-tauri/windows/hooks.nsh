@@ -49,7 +49,29 @@
   Pop $R0
 
   ${If} $R0 == 0
-    DetailPrint "Helper task registered; connecting will not ask for consent."
+    ; Registering the task is not enough to make it usable. The principal above
+    ; decides WHO THE TASK RUNS AS; the task's security descriptor decides who
+    ; is allowed to START it, and they are not the same thing. A task created by
+    ; an elevated installer defaults to a DACL granting execution to
+    ; Administrators only, so the unprivileged GUI got
+    ;   schtasks /Run -> ERROR: Access is denied
+    ; and fell back to prompting on every single connect. Running it by hand
+    ; from an elevated console worked, which is what made this look for a while
+    ; like the app was at fault.
+    ;
+    ; Register-ScheduledTask cannot set a descriptor, so this goes through the
+    ; Task Scheduler COM object. GA for Administrators and SYSTEM, GR+GX —
+    ; read and execute — for BUILTIN\Users (BU), which is what lets a normal
+    ; user start it without being elevated.
+    DetailPrint "Granting users permission to start the task..."
+    nsExec::ExecToLog `powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "$$svc = New-Object -ComObject Schedule.Service; $$svc.Connect(); $$t = $$svc.GetFolder('\').GetTask('OSTP TUN Helper'); $$t.SetSecurityDescriptor('D:(A;;GA;;;BA)(A;;GA;;;SY)(A;;GRGX;;;BU)', 0)"`
+    Pop $R1
+    ${If} $R1 == 0
+      DetailPrint "Helper task registered; connecting will not ask for consent."
+    ${Else}
+      DetailPrint "Task registered but its permissions could not be set (exit $R1)."
+      DetailPrint "Every connect will ask for consent."
+    ${EndIf}
   ${Else}
     ; Not fatal: the app still works, it just falls back to an elevated launch
     ; that asks for consent on each connect.
