@@ -134,16 +134,84 @@ struct AppState(Mutex<AppStateInner>);
 
 // ── Config helpers ────────────────────────────────────────────────────────────
 
+/// Per-user config location, used whenever the config cannot live next to the
+/// executable.
+fn user_config_path() -> PathBuf {
+    let base = std::env::var_os(if cfg!(windows) { "APPDATA" } else { "HOME" })
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    let dir = if cfg!(windows) { base.join("OSTP") } else { base.join(".config").join("ostp") };
+    dir.join("config.json")
+}
+
+/// Where the GUI reads and writes its configuration.
+///
+/// Portable installs keep the config beside the executable, which is what the
+/// zip has always done, and that is preserved wherever the directory is
+/// actually writable.
+///
+/// What it must never do again is fall back to a bare relative `config.json`.
+/// That resolves against the process working directory, which for a Start Menu
+/// shortcut is whatever Windows chose — often `C:\Windows\System32`. Reading
+/// and saving settings then failed with "Access is denied" (os error 5), and on
+/// a writable working directory it would have been worse still: settings would
+/// silently persist somewhere unrelated and appear to vanish.
+///
+/// Writability is measured rather than inferred from the install location. An
+/// installer can put the app anywhere — a per-machine install onto a data drive
+/// may well be writable, while Program Files is not — so the location alone
+/// says nothing.
 fn get_config_path() -> PathBuf {
     if let Ok(exe_path) = std::env::current_exe() {
         if let Some(parent) = exe_path.parent() {
-            let path = parent.join("config.json");
-            if path.exists() {
-                return path;
+            let portable = parent.join("config.json");
+            if portable.exists() {
+                if is_file_writable(&portable) {
+                    return portable;
+                }
+                // Read-only beside the exe: unusable as the live file, but its
+                // contents are still worth carrying over once.
+                let user = user_config_path();
+                if !user.exists() {
+                    if let Some(dir) = user.parent() {
+                        let _ = std::fs::create_dir_all(dir);
+                    }
+                    let _ = std::fs::copy(&portable, &user);
+                }
+            } else if is_dir_writable(parent) {
+                // No config yet and the directory takes writes: a portable
+                // unzip, so keep the config travelling with the folder.
+                return portable;
             }
         }
     }
-    PathBuf::from("config.json")
+
+    let path = user_config_path();
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    path
+}
+
+/// Whether an existing file can actually be written to.
+///
+/// Answered by opening it, not by reading permission bits: on Windows the
+/// effective answer depends on the ACL and on virtualization, and `readonly()`
+/// reflects neither.
+fn is_file_writable(path: &std::path::Path) -> bool {
+    std::fs::OpenOptions::new().append(true).open(path).is_ok()
+}
+
+/// Whether new files can be created in a directory, tested by doing it.
+fn is_dir_writable(dir: &std::path::Path) -> bool {
+    let probe = dir.join(format!(".ostp-write-test-{}", std::process::id()));
+    match std::fs::File::create(&probe) {
+        Ok(_) => {
+            let _ = std::fs::remove_file(&probe);
+            true
+        }
+        Err(_) => false,
+    }
 }
 
 fn map_to_client_config(raw: &ClientConfigRaw, mode: &str) -> ostp_client::config::ClientConfig {
@@ -836,21 +904,8 @@ fn helper_args_file() -> PathBuf {
     base.join("OSTP").join("helper-args.json")
 }
 
-/// Minimal XML text escaping for the values interpolated into the task
-/// definition. Paths and usernames are attacker-irrelevant here but can easily
-/// contain `&`, which would otherwise produce invalid XML and a confusing
-/// schtasks parse failure.
-#[cfg(target_os = "windows")]
-fn xml_escape(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&apos;")
-}
-
-/// Reverse of [`xml_escape`]. `&amp;` must be undone last or `&amp;lt;` would
-/// come back as `<`.
+/// Undoes XML entity escaping. `&amp;` must be handled last, or `&amp;lt;`
+/// would come back as `<`.
 #[cfg(target_os = "windows")]
 fn xml_unescape(s: &str) -> String {
     s.replace("&quot;", "\"")
@@ -923,151 +978,6 @@ fn helper_task_matches(exe: &std::path::Path) -> bool {
     }
 }
 
-/// Register the Scheduled Task. This is the ONLY step that needs elevation, and
-/// it happens once per machine; every later tunnel start reuses the task.
-///
-/// RunLevel=HIGHEST makes the task run elevated, and because a task launch is
-/// not an elevation request, Windows shows no consent dialog for it.
-#[cfg(target_os = "windows")]
-fn install_helper_task(exe: &std::path::Path) -> anyhow::Result<()> {
-    let args_file = helper_args_file();
-    if let Some(dir) = args_file.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-
-    // Register from an XML definition rather than /TR. The command line would
-    // otherwise need the exe path and the args path quoted INSIDE an already
-    // quoted /TR value, escaped again through ShellExecuteW — a notoriously
-    // brittle chain when either path contains a space, which both of these do
-    // by default (Program Files, and usernames with spaces). XML also lets the
-    // battery and time-limit settings below be stated explicitly.
-    let user = format!(
-        "{}\\{}",
-        std::env::var("USERDOMAIN").unwrap_or_else(|_| "%COMPUTERNAME%".into()),
-        std::env::var("USERNAME").unwrap_or_default()
-    );
-    let xml = format!(
-        r#"<?xml version="1.0" encoding="UTF-16"?>
-<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
-  <RegistrationInfo>
-    <Description>Runs the OSTP TUN helper elevated so enabling the tunnel does not prompt for consent every time.</Description>
-  </RegistrationInfo>
-  <Principals>
-    <Principal id="Author">
-      <UserId>{user}</UserId>
-      <LogonType>InteractiveToken</LogonType>
-      <RunLevel>HighestAvailable</RunLevel>
-    </Principal>
-  </Principals>
-  <Settings>
-    <MultipleInstancesPolicy>Parallel</MultipleInstancesPolicy>
-    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
-    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
-    <StartWhenAvailable>false</StartWhenAvailable>
-    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>
-    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
-    <Enabled>true</Enabled>
-    <Hidden>false</Hidden>
-    <AllowHardTerminate>true</AllowHardTerminate>
-  </Settings>
-  <Actions Context="Author">
-    <Exec>
-      <Command>{exe}</Command>
-      <Arguments>--args-file "{args}"</Arguments>
-    </Exec>
-  </Actions>
-</Task>
-"#,
-        user = xml_escape(&user),
-        exe = xml_escape(&exe.display().to_string()),
-        args = xml_escape(&args_file.display().to_string()),
-    );
-
-    // schtasks /Create /XML expects UTF-16LE with a BOM.
-    let xml_path = std::env::temp_dir().join(format!("ostp_task_{}.xml", rand::random::<u32>()));
-    let mut utf16: Vec<u8> = vec![0xFF, 0xFE];
-    for unit in xml.encode_utf16() {
-        utf16.extend_from_slice(&unit.to_le_bytes());
-    }
-    std::fs::write(&xml_path, &utf16)?;
-
-    // Registering a HighestAvailable task is itself privileged: this is the one
-    // prompt, and it happens once per machine.
-    //
-    // Elevate through PowerShell's Start-Process -Wait rather than
-    // ShellExecuteW. ShellExecuteW returns as soon as the elevated process is
-    // LAUNCHED, so the XML below was being deleted while schtasks was still
-    // starting up — registration then failed, leaving the user with a consent
-    // prompt that accomplished nothing, followed by a second prompt from the
-    // fallback path. -Wait makes the deletion safe and lets the exit code be
-    // checked instead of guessed at by polling.
-    //
-    // ArgumentList takes an array, so the task name and XML path never need
-    // quoting or escaping through a command line, only PowerShell's own
-    // single-quote doubling.
-    let ps = format!(
-        "$p = Start-Process -FilePath 'schtasks.exe' -Verb RunAs -Wait -PassThru \
-         -WindowStyle Hidden -ArgumentList @('/Create','/TN','{}','/XML','{}','/F'); \
-         exit $p.ExitCode",
-        ps_quote(HELPER_TASK_NAME),
-        ps_quote(&xml_path.display().to_string()),
-    );
-
-    let status = quiet_command("powershell")
-        .args(["-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", &ps])
-        .status();
-
-    // 1223 is ERROR_CANCELLED: the consent prompt was declined. Nothing was
-    // launched, so there is no point waiting for a task to appear.
-    if let Ok(s) = &status {
-        if s.code() == Some(1223) {
-            let _ = std::fs::remove_file(&xml_path);
-            anyhow::bail!("the consent prompt was declined");
-        }
-    }
-
-    // The exit code is advisory only, never proof of success. `-Verb RunAs`
-    // launches through ShellExecute, and a non-elevated parent frequently
-    // cannot read the elevated child's exit code — `$p.ExitCode` then yields
-    // $null, and `exit $null` leaves PowerShell reporting 0. A failed
-    // registration would sail straight through a `s.success()` check.
-    //
-    // Worse, -Wait does not reliably block until the elevated process exits.
-    // Deleting the XML right after the call raced schtasks reading it — the
-    // exact bug that made the previous attempt fail — so wait for the task
-    // itself to show up. These queries are windowless, so unlike the earlier
-    // polling loop they cost the user nothing to watch.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
-    let mut registered = false;
-    while std::time::Instant::now() < deadline {
-        if helper_task_matches(exe) {
-            registered = true;
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(250));
-    }
-
-    // Only now is deleting it safe.
-    let _ = std::fs::remove_file(&xml_path);
-
-    if registered {
-        return Ok(());
-    }
-    match status {
-        Ok(s) => anyhow::bail!(
-            "the scheduled task did not appear after registration (powershell exit {:?})",
-            s.code()
-        ),
-        Err(e) => anyhow::bail!("could not run powershell to register the task: {e}"),
-    }
-}
-
-/// Escape a value for embedding in a PowerShell single-quoted string.
-#[cfg(target_os = "windows")]
-fn ps_quote(s: &str) -> String {
-    s.replace('\'', "''")
-}
-
 #[cfg(target_os = "windows")]
 fn launch_as_admin(exe: &std::path::PathBuf, token: &str, port: u16) -> anyhow::Result<()> {
     // Preferred path: hand the parameters over in a file and trigger the
@@ -1083,11 +993,12 @@ fn launch_as_admin(exe: &std::path::PathBuf, token: &str, port: u16) -> anyhow::
     let wrote_args = std::fs::write(&args_file, payload.to_string()).is_ok();
 
     if wrote_args {
-        if !helper_task_matches(exe) {
-            if let Err(e) = install_helper_task(exe) {
-                eprintln!("[OSTP] could not register the helper task ({e}); falling back to a direct elevated launch");
-            }
-        }
+        // Deliberately does NOT create the task when it is missing. Registering
+        // one is privileged, so the app could only do it by raising the very
+        // prompt this exists to avoid — and it would then charge the user two
+        // prompts for the privilege. Creating it belongs to the installer,
+        // which is already elevated. Without it we simply fall through to the
+        // direct elevated launch, which prompts once per connect as before.
         if helper_task_matches(exe) {
             let run = quiet_command("schtasks")
                 .args(["/Run", "/TN", HELPER_TASK_NAME])
