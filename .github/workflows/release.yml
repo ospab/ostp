@@ -426,9 +426,10 @@ jobs:
       # first, and fail the build script when it is not.
       - name: Build NSIS Installer
         working-directory: ostp-gui
-        run: |
-          node stage-sidecar.js --release --target ${{ matrix.target }}
-          npx tauri build --bundles nsis --target ${{ matrix.target }} --config src-tauri/tauri.installer.conf.json
+        # Chained, not two lines: pwsh does not abort a run block when a native
+        # command fails, so a staging failure would otherwise be reported far
+        # downstream as a missing sidecar rather than as itself.
+        run: node stage-sidecar.cjs --release --target ${{ matrix.target }} && npx tauri build --bundles nsis --target ${{ matrix.target }} --config src-tauri/tauri.installer.conf.json
 
       - name: Collect installer
         shell: pwsh
