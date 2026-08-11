@@ -1,0 +1,13 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "bundle": {
+    "externalBin": ["binaries/ostp-tun-helper"],
+    "resources": { "binaries/wintun.dll": "wintun.dll" },
+    "windows": {
+      "nsis": {
+        "installMode": "perMachine",
+        "installerHooks": "./windows/hooks.nsh"
+      }
+    }
+  }
+}

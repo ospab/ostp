@@ -404,6 +404,7 @@ jobs:
         run: |
           npm install
           cargo build -p ostp-tun-helper --release --target ${{ matrix.target }}
+          node stage-sidecar.js --release --target ${{ matrix.target }}
           npx tauri build --no-bundle --target ${{ matrix.target }}
 
       - name: Package Portable ZIP
@@ -414,8 +415,24 @@ jobs:
           Copy-Item "ostp-gui/src-tauri/target/${{ matrix.target }}/release/ostp-gui.exe" $dir
           Copy-Item "target/${{ matrix.target }}/release/ostp-tun-helper.exe" $dir
           Copy-Item "target/${{ matrix.target }}/release/wintun.dll" $dir
-          
+
           Compress-Archive -Path "$dir/*" -DestinationPath "ostp-windows-gui-${{ matrix.arch }}.zip" -Force
+
+      # The installer is what removes the per-connect consent prompt: it runs
+      # elevated, so its hook can register the helper's Scheduled Task once.
+      # The portable zip above cannot, and falls back to asking on first connect.
+      - name: Build NSIS Installer
+        working-directory: ostp-gui
+        run: npx tauri build --bundles nsis --target ${{ matrix.target }}
+
+      - name: Collect installer
+        shell: pwsh
+        run: |
+          $nsis = Get-ChildItem -Path "ostp-gui/src-tauri/target/${{ matrix.target }}/release/bundle/nsis" -Filter *-setup.exe -ErrorAction SilentlyContinue |
+                  Select-Object -First 1
+          if (-not $nsis) { Write-Error "NSIS installer was not produced"; exit 1 }
+          Copy-Item $nsis.FullName "ostp-windows-gui-${{ matrix.arch }}-setup.exe"
+          Write-Host "installer: $($nsis.Name) -> ostp-windows-gui-${{ matrix.arch }}-setup.exe"
 
       - name: Upload to GitHub Release
         uses: softprops/action-gh-release@v2
@@ -426,7 +443,9 @@ jobs:
           # real stable release.
           tag_name: ${{ needs.resolve-channel.outputs.tag_name }}
           prerelease: ${{ needs.resolve-channel.outputs.prerelease }}
-          files: ostp-windows-gui-${{ matrix.arch }}.zip
+          files: |
+            ostp-windows-gui-${{ matrix.arch }}.zip
+            ostp-windows-gui-${{ matrix.arch }}-setup.exe
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 

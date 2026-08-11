@@ -57,3 +57,6 @@ ostp-control/
 netstack-smoltcp/
 dnstt/
 ostp-web/
+
+# Tauri sidecar staging area (copied from target/ at build time)
+ostp-gui/src-tauri/binaries/

@@ -864,8 +864,12 @@ fn xml_unescape(s: &str) -> String {
 ///
 /// Queried as XML rather than `/FO LIST /V`: the list format's field labels are
 /// localized (on a Russian Windows "Task To Run" is "Задача для запуска"),
-/// whereas XML tag names are fixed. schtasks writes UTF-16LE with a BOM here,
-/// but tolerate UTF-8 in case that ever changes.
+/// whereas XML tag names are fixed.
+///
+/// Encoding depends on where the output goes, which is measured rather than
+/// assumed: to a console schtasks writes UTF-16LE with a BOM, but into a
+/// redirected pipe — our case — it writes UTF-8 with no BOM. Both are handled,
+/// keyed off the BOM, so this keeps working if that ever flips.
 #[cfg(target_os = "windows")]
 fn helper_task_command() -> Option<String> {
     let out = quiet_command("schtasks")
@@ -1013,23 +1017,48 @@ fn install_helper_task(exe: &std::path::Path) -> anyhow::Result<()> {
         .args(["-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", &ps])
         .status();
 
-    // schtasks has exited by now, so this is safe.
+    // 1223 is ERROR_CANCELLED: the consent prompt was declined. Nothing was
+    // launched, so there is no point waiting for a task to appear.
+    if let Ok(s) = &status {
+        if s.code() == Some(1223) {
+            let _ = std::fs::remove_file(&xml_path);
+            anyhow::bail!("the consent prompt was declined");
+        }
+    }
+
+    // The exit code is advisory only, never proof of success. `-Verb RunAs`
+    // launches through ShellExecute, and a non-elevated parent frequently
+    // cannot read the elevated child's exit code — `$p.ExitCode` then yields
+    // $null, and `exit $null` leaves PowerShell reporting 0. A failed
+    // registration would sail straight through a `s.success()` check.
+    //
+    // Worse, -Wait does not reliably block until the elevated process exits.
+    // Deleting the XML right after the call raced schtasks reading it — the
+    // exact bug that made the previous attempt fail — so wait for the task
+    // itself to show up. These queries are windowless, so unlike the earlier
+    // polling loop they cost the user nothing to watch.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    let mut registered = false;
+    while std::time::Instant::now() < deadline {
+        if helper_task_matches(exe) {
+            registered = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+
+    // Only now is deleting it safe.
     let _ = std::fs::remove_file(&xml_path);
 
+    if registered {
+        return Ok(());
+    }
     match status {
-        Ok(s) if s.success() => {}
         Ok(s) => anyhow::bail!(
-            "registering the scheduled task failed (exit code {:?}). A declined consent prompt \
-             reports 1223.",
+            "the scheduled task did not appear after registration (powershell exit {:?})",
             s.code()
         ),
         Err(e) => anyhow::bail!("could not run powershell to register the task: {e}"),
-    }
-
-    if helper_task_matches(exe) {
-        Ok(())
-    } else {
-        anyhow::bail!("schtasks reported success but the task does not point at {}", exe.display())
     }
 }
 
