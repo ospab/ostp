@@ -5,9 +5,9 @@
   "type": "module",
   "scripts": {
     "tauri": "tauri",
-    "dev": "cargo build -p ostp-tun-helper && node stage-sidecar.js && npx tauri dev",
-    "build": "cargo build -p ostp-tun-helper --release && node stage-sidecar.js --release && npx tauri build --no-bundle",
-    "build:installer": "cargo build -p ostp-tun-helper --release && node stage-sidecar.js --release && npx tauri build --bundles nsis",
+    "dev": "cargo build -p ostp-tun-helper && npx tauri dev",
+    "build": "cargo build -p ostp-tun-helper --release && npx tauri build --no-bundle",
+    "build:installer": "cargo build -p ostp-tun-helper --release && node stage-sidecar.js --release && npx tauri build --bundles nsis --config src-tauri/tauri.installer.conf.json",
     "build:dist": "npm run build && node build_dist.js",
     "sidecar": "node stage-sidecar.js"
   },

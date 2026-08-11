@@ -404,7 +404,6 @@ jobs:
         run: |
           npm install
           cargo build -p ostp-tun-helper --release --target ${{ matrix.target }}
-          node stage-sidecar.js --release --target ${{ matrix.target }}
           npx tauri build --no-bundle --target ${{ matrix.target }}
 
       - name: Package Portable ZIP
@@ -421,9 +420,15 @@ jobs:
       # The installer is what removes the per-connect consent prompt: it runs
       # elevated, so its hook can register the helper's Scheduled Task once.
       # The portable zip above cannot, and falls back to asking on first connect.
+      # The sidecar and its config are confined to this step: declaring
+      # externalBin in an auto-merged tauri.windows.conf.json would force every
+      # Windows build, down to a bare `cargo check`, to have the helper staged
+      # first, and fail the build script when it is not.
       - name: Build NSIS Installer
         working-directory: ostp-gui
-        run: npx tauri build --bundles nsis --target ${{ matrix.target }}
+        run: |
+          node stage-sidecar.js --release --target ${{ matrix.target }}
+          npx tauri build --bundles nsis --target ${{ matrix.target }} --config src-tauri/tauri.installer.conf.json
 
       - name: Collect installer
         shell: pwsh

@@ -1,13 +1,16 @@
 // Stages ostp-tun-helper where Tauri expects a sidecar.
 //
-// tauri.windows.conf.json declares `externalBin: ["binaries/ostp-tun-helper"]`,
+// tauri.installer.conf.json declares `externalBin: ["binaries/ostp-tun-helper"]`,
 // and Tauri resolves that to `binaries/ostp-tun-helper-<target-triple>.exe` at
 // build time, failing the build outright when the file is absent. Cargo writes
-// the plain name instead, so every Windows build — dev, portable zip and
-// installer alike — has to copy it across first.
+// the plain name instead, so it has to be copied across first.
 //
-// A no-op off Windows: externalBin lives in the Windows-only config, so the
-// Linux and macOS GUI builds neither need nor have a helper sidecar.
+// Only the installer build needs this. That config is passed explicitly with
+// --config rather than being named tauri.windows.conf.json, which Tauri would
+// merge into every Windows build automatically — and then even a bare
+// `cargo check` would fail on the missing sidecar.
+//
+// A no-op off Windows: the Linux and macOS GUI builds have no helper sidecar.
 
 const fs = require('fs');
 const path = require('path');
