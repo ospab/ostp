@@ -962,19 +962,47 @@ fn helper_task_command() -> Option<String> {
 #[cfg(target_os = "windows")]
 fn helper_task_matches(exe: &std::path::Path) -> bool {
     let Some(registered) = helper_task_command() else {
+        diag_log("task: schtasks /Query returned nothing usable — no task, or its XML had no <Command>");
         return false;
     };
     let registered = registered.trim().trim_matches('"');
+    let path = std::path::Path::new(registered);
 
-    // Canonicalize both sides when possible so `..`, short 8.3 names and
-    // casing differences do not read as a mismatch. A missing file cannot be
-    // canonicalized — which is itself a mismatch worth re-registering over.
-    match (
-        std::fs::canonicalize(registered),
-        std::fs::canonicalize(exe),
-    ) {
-        (Ok(a), Ok(b)) => a == b,
-        _ => registered.eq_ignore_ascii_case(&exe.display().to_string()),
+    // Requiring the registered path to equal the helper we would have launched
+    // was too strict, and bought nothing. What the check exists to catch is a
+    // task left pointing at a binary that is gone — `schtasks /Run` reports
+    // success merely for accepting such a request, so the app would then wait
+    // on a helper that never starts. Testing that the file exists catches
+    // exactly that, while a task registered by the installer against an
+    // equivalent copy of the helper no longer costs the user a prompt.
+    let same_program = path
+        .file_name()
+        .map(|n| n.eq_ignore_ascii_case(HELPER_EXE_NAME))
+        .unwrap_or(false);
+    let exists = path.is_file();
+
+    diag_log(&format!(
+        "task: registered={registered:?} exists={exists} same_program={same_program} wanted={:?}",
+        exe.display().to_string()
+    ));
+    exists && same_program
+}
+
+/// Appends a line to a small log beside the helper's argument file.
+///
+/// The GUI is a windowed binary with no console, so every `eprintln!` on this
+/// path went nowhere — which left the one decision that matters, whether the
+/// scheduled task gets used or the user gets a consent prompt, completely
+/// unobservable from a user's machine.
+#[cfg(target_os = "windows")]
+fn diag_log(msg: &str) {
+    let path = helper_args_file().with_file_name("helper-launch.log");
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        use std::io::Write;
+        let _ = writeln!(f, "{msg}");
     }
 }
 
@@ -1004,18 +1032,24 @@ fn launch_as_admin(exe: &std::path::PathBuf, token: &str, port: u16) -> anyhow::
                 .args(["/Run", "/TN", HELPER_TASK_NAME])
                 .output();
             match run {
-                Ok(o) if o.status.success() => return Ok(()),
-                Ok(o) => eprintln!(
-                    "[OSTP] schtasks /Run failed: {}",
+                Ok(o) if o.status.success() => {
+                    diag_log("run: schtasks /Run accepted — no consent prompt");
+                    return Ok(());
+                }
+                Ok(o) => diag_log(&format!(
+                    "run: schtasks /Run failed ({:?}): {} {}",
+                    o.status.code(),
+                    String::from_utf8_lossy(&o.stdout).trim(),
                     String::from_utf8_lossy(&o.stderr).trim()
-                ),
-                Err(e) => eprintln!("[OSTP] schtasks /Run could not start: {e}"),
+                )),
+                Err(e) => diag_log(&format!("run: schtasks /Run could not start: {e}")),
             }
         }
         // Falling through: remove the file so a stale token is not left behind.
         let _ = std::fs::remove_file(&args_file);
     }
 
+    diag_log("falling back to a direct elevated launch — this is the consent prompt");
     launch_as_admin_direct(exe, token, port)
 }
 
