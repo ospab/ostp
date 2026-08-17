@@ -349,11 +349,18 @@ impl UnifiedConfig {
                 }
             }
             AppMode::Relay(cfg) => {
+                // The relay forwards to a fixed next hop on both carriers, so it
+                // needs both upstream addresses. It does NOT need upstream_api_url:
+                // that field belonged to the old design where the relay
+                // authenticated clients itself, which it no longer does. Requiring
+                // it here was the bug that made every generated relay config
+                // (wizard and template alike write no api_url) fail to load with
+                // "must specify upstream_api_url" — a relay that could never start.
                 if cfg.upstream_tcp.is_empty() {
-                    anyhow::bail!("Relay configuration must specify upstream_tcp address.");
+                    anyhow::bail!("Relay configuration must specify upstream_tcp (the next hop's TCP/UoT address).");
                 }
-                if cfg.upstream_api_url.is_empty() {
-                    anyhow::bail!("Relay configuration must specify upstream_api_url.");
+                if cfg.upstream_udp.is_empty() {
+                    anyhow::bail!("Relay configuration must specify upstream_udp (the next hop's UDP address).");
                 }
             }
         }
@@ -535,4 +542,77 @@ pub struct ExcludeConfig {
 pub struct MuxConfig {
     pub enabled: Option<bool>,
     pub sessions: Option<usize>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Loads a config.json exactly as the daemon does: parse the JSON into the
+    /// canonical `UnifiedConfig`, then validate. This is the real drift-catcher —
+    /// if the wizard/template and the validator ever disagree on required fields,
+    /// this fails instead of a user's relay refusing to start.
+    fn load(json: &str) -> Result<UnifiedConfig> {
+        let cfg: UnifiedConfig = serde_json::from_str(json)?;
+        cfg.validate()?;
+        Ok(cfg)
+    }
+
+    /// Regression: the relay used to authenticate clients and so its config
+    /// carried `upstream_api_url`. The relay is a transparent pipe now and both
+    /// the wizard and the `init` template write NO api_url — yet validation kept
+    /// demanding it, so every generated relay config failed to load with
+    /// "must specify upstream_api_url". A relay that could never start.
+    #[test]
+    fn relay_config_without_api_url_loads() {
+        // Byte-for-byte the shape the wizard (main.rs) emits.
+        let json = r#"{
+            "mode": "relay",
+            "listen": "0.0.0.0:50000",
+            "upstream_tcp": "203.0.113.10:50000",
+            "upstream_udp": "203.0.113.10:50000",
+            "debug": false
+        }"#;
+        load(json).expect("a transparent-relay config must load without upstream_api_url");
+    }
+
+    /// A relay still needs somewhere to forward to on both carriers, so an
+    /// incomplete relay config must fail loudly at load, not connect-to-empty
+    /// per session at runtime.
+    #[test]
+    fn relay_config_missing_upstream_udp_is_rejected() {
+        let json = r#"{
+            "mode": "relay",
+            "listen": "0.0.0.0:50000",
+            "upstream_tcp": "203.0.113.10:50000",
+            "upstream_udp": "",
+            "debug": false
+        }"#;
+        assert!(load(json).is_err(), "a relay with no UDP upstream must be rejected");
+    }
+
+    /// A deprecated api_url left in an OLD config must not break loading — it is
+    /// ignored, not required and not forbidden.
+    #[test]
+    fn relay_config_with_leftover_api_url_still_loads() {
+        let json = r#"{
+            "mode": "relay",
+            "listen": "0.0.0.0:50000",
+            "upstream_tcp": "203.0.113.10:50000",
+            "upstream_udp": "203.0.113.10:50000",
+            "upstream_api_url": "http://old.example:8080",
+            "debug": false
+        }"#;
+        load(json).expect("a stale api_url must be tolerated, not rejected");
+    }
+
+    /// The minimal client and server shapes the template emits must also load,
+    /// so this test guards all three modes against generator/validator drift.
+    #[test]
+    fn minimal_client_and_server_configs_load() {
+        load(r#"{"mode":"client","server":"127.0.0.1:50000","access_key":"k"}"#)
+            .expect("minimal client config must load");
+        load(r#"{"mode":"server","listen":"0.0.0.0:50000","access_keys":["k"]}"#)
+            .expect("minimal server config must load");
+    }
 }
