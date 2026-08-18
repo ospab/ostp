@@ -17,7 +17,7 @@ pub mod sys {
     use winapi::shared::minwindef::{DWORD, ULONG};
     use winapi::shared::winerror::{ERROR_INSUFFICIENT_BUFFER, NO_ERROR};
     use winapi::um::iphlpapi::{
-        CreateIpForwardEntry, DeleteIpForwardEntry, GetAdaptersAddresses, GetIpForwardTable,
+        DeleteIpForwardEntry, GetAdaptersAddresses, GetIpForwardTable,
     };
     use winapi::um::iptypes::{
         GAA_FLAG_SKIP_ANYCAST, GAA_FLAG_SKIP_DNS_SERVER, GAA_FLAG_SKIP_MULTICAST, IP_ADAPTER_ADDRESSES,
@@ -88,20 +88,47 @@ pub mod sys {
         if_index: u32,
         metric: u32,
     ) -> Result<(), String> {
-        let mut row: MIB_IPFORWARDROW = unsafe { mem::zeroed() };
-        row.dwForwardDest = ipv4_to_dword(dest);
-        row.dwForwardMask = ipv4_to_dword(mask);
-        row.dwForwardNextHop = ipv4_to_dword(nexthop);
-        row.dwForwardIfIndex = if_index;
-        row.ForwardType = if nexthop == Ipv4Addr::UNSPECIFIED || dest == nexthop { 3 } else { 4 };
-        row.ForwardProto = 3; // MIB_IPPROTO_NETMGMT
-        row.dwForwardMetric1 = metric;
+        // Installed through route.exe rather than CreateIpForwardEntry.
+        //
+        // The legacy CreateIpForwardEntry API was failing here with error 160
+        // (ERROR_BAD_ARGUMENTS) on every single route — server-IP bypass and TUN
+        // default route alike — which left the server IP routed INTO the tunnel
+        // (a loop that froze the link for seconds under load) and the default
+        // route uninstalled. route.exe resolves the interface and validates the
+        // gateway itself, and is what the teardown path already uses, so it
+        // succeeds where the hand-built MIB_IPFORWARDROW did not.
+        use std::os::windows::process::CommandExt;
+        use std::process::Command;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
-        let ret = unsafe { CreateIpForwardEntry(&mut row) };
-        if ret == NO_ERROR {
+        // route add <dest> mask <mask> <gateway> metric <m> if <ifindex>
+        let out = Command::new("route")
+            .args([
+                "add",
+                &dest.to_string(),
+                "mask",
+                &mask.to_string(),
+                &nexthop.to_string(),
+                "metric",
+                &metric.to_string(),
+                "if",
+                &if_index.to_string(),
+            ])
+            .creation_flags(CREATE_NO_WINDOW)
+            .output()
+            .map_err(|e| format!("could not run route.exe: {e}"))?;
+
+        if out.status.success() {
             Ok(())
         } else {
-            Err(format!("CreateIpForwardEntry failed: {}", ret))
+            // route.exe prints its diagnostics to stdout, not stderr.
+            let msg = String::from_utf8_lossy(&out.stdout);
+            let msg = msg.trim();
+            Err(format!(
+                "route add failed (exit {:?}): {}",
+                out.status.code(),
+                if msg.is_empty() { "no output" } else { msg }
+            ))
         }
     }
 

@@ -99,18 +99,34 @@ pub async fn create(opts: OstpTunOptions) -> Result<OstpTunInterface> {
 
     let current_exe = std::env::current_exe()?.to_string_lossy().into_owned();
 
-    // A freshly created WinTun adapter can take several seconds to appear in
-    // GetAdaptersAddresses (it only shows up once it has an operational IPv4
-    // binding). The default route via the TUN is what actually captures
-    // traffic, so this lookup is critical — give it a generous window (~15s).
-    let mut tun_index = None;
-    for _ in 0..75 {
-        if let Some(idx) = windows_route::sys::get_interface_index("ostp_tun") {
-            tun_index = Some(idx);
-            break;
+    // Take the interface index straight from the adapter WinTun just created,
+    // via the tun crate. The old code looked it up by FriendlyName == "ostp_tun"
+    // through GetAdaptersAddresses — but WinTun does NOT set the FriendlyName to
+    // the adapter name, so that match never succeeded: on every single connect
+    // it spun the full 15s and then gave up with "traffic will NOT be captured",
+    // leaving the default route (and, above, the server-IP bypass) uninstalled.
+    // get_adapter_index() is instant and correct.
+    use tun::AbstractDevice;
+    let tun_index = match dev.tun_index() {
+        Ok(idx) if idx > 0 => Some(idx as u32),
+        Ok(idx) => {
+            tracing::error!("WinTun reported a non-positive interface index ({idx})");
+            None
         }
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-    }
+        Err(e) => {
+            // Fall back to the old name lookup rather than fail outright.
+            tracing::warn!("Could not read TUN index from the adapter ({e}); falling back to name lookup");
+            let mut idx = None;
+            for _ in 0..75 {
+                if let Some(i) = windows_route::sys::get_interface_index("ostp_tun") {
+                    idx = Some(i);
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+            idx
+        }
+    };
 
     if let Some(idx) = tun_index {
         match windows_route::sys::add_ipv4_route(
