@@ -23,6 +23,7 @@ class OstpProfile {
   int junkPcMax;
   int junkPsMin;
   int junkPsMax;
+  bool ttlDesync; // TTL-desync decoys (UDP), auto-calibrated in the engine
 
   OstpProfile({
     required this.id,
@@ -38,6 +39,7 @@ class OstpProfile {
     this.junkPcMax = 5,
     this.junkPsMin = 100,
     this.junkPsMax = 1000,
+    this.ttlDesync = false,
   });
 
   Map<String, dynamic> toJson() {
@@ -55,6 +57,7 @@ class OstpProfile {
       'junkPcMax': junkPcMax,
       'junkPsMin': junkPsMin,
       'junkPsMax': junkPsMax,
+      'ttlDesync': ttlDesync,
     };
   }
 
@@ -73,6 +76,7 @@ class OstpProfile {
       junkPcMax: json['junkPcMax'] as int? ?? 5,
       junkPsMin: json['junkPsMin'] as int? ?? 100,
       junkPsMax: json['junkPsMax'] as int? ?? 1000,
+      ttlDesync: json['ttlDesync'] as bool? ?? false,
     );
   }
 }

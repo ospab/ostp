@@ -224,6 +224,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
     final junkPsMaxCtrl = TextEditingController(text: (profile?.junkPsMax ?? 1000).toString());
     String transportMode = profile?.transportMode ?? 'udp';
     bool tcpFragmentation = profile?.tcpFragmentation ?? false;
+    bool ttlDesync = profile?.ttlDesync ?? false;
     bool obscureKey = true;
 
     showDialog(
@@ -301,6 +302,13 @@ class _SettingsScreenState extends State<SettingsScreen> {
                       ],
                     ),
                   ],
+                  SwitchListTile(
+                    contentPadding: EdgeInsets.zero,
+                    title: const Text('TTL Desync', style: TextStyle(fontSize: 14)),
+                    subtitle: const Text('Decoy packets that die before the server (UDP, auto-tuned)', style: TextStyle(fontSize: 12, color: Colors.white54)),
+                    value: ttlDesync,
+                    onChanged: (v) => setDialogState(() => ttlDesync = v),
+                  ),
                 ],
               ),
             ),
@@ -348,6 +356,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                         junkPcMax: int.tryParse(junkPcMaxCtrl.text) ?? 5,
                         junkPsMin: int.tryParse(junkPsMinCtrl.text) ?? 100,
                         junkPsMax: int.tryParse(junkPsMaxCtrl.text) ?? 1000,
+                        ttlDesync: ttlDesync,
                       ));
                     } else {
                       profile.name = nameCtrl.text.trim().isNotEmpty ? nameCtrl.text.trim() : server;
@@ -361,6 +370,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                       profile.junkPcMax = int.tryParse(junkPcMaxCtrl.text) ?? 5;
                       profile.junkPsMin = int.tryParse(junkPsMinCtrl.text) ?? 100;
                       profile.junkPsMax = int.tryParse(junkPsMaxCtrl.text) ?? 1000;
+                      profile.ttlDesync = ttlDesync;
                     }
                     _saveProfiles();
                   });

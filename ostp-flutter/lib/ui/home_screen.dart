@@ -138,6 +138,8 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
         "frag_sleep": p?.fragSleep ?? 2,
         "junk_pc": [p?.junkPcMin ?? 2, p?.junkPcMax ?? 5],
         "junk_ps": [p?.junkPsMin ?? 100, p?.junkPsMax ?? 1000],
+        "ttl_desync": p?.ttlDesync ?? false,
+        "ttl_desync_auto": true,
       },
       "multiplex": {
         "enabled": muxEnabled,
