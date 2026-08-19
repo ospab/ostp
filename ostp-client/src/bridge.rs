@@ -1165,7 +1165,10 @@ impl Bridge {
             let mut success = false;
 
             let is_uot = matches!(socket, crate::transport::Transport::Uot { .. });
-            let (attempt_limit, attempt_timeout_ms) = if is_uot { (1, 8000) } else { (4, 1200) };
+            // UDP: more, shorter retransmit windows over the SAME total budget
+            // (6×800ms ≈ the old 4×1200ms), so a lost handshake on a mobile link
+            // recovers faster and there are more chances before giving up.
+            let (attempt_limit, attempt_timeout_ms) = if is_uot { (1, 8000) } else { (6, 800) };
 
             // TTL-desync (UDP only, opt-in): fire decoy datagrams that reach an
             // on-path DPI box but expire before the server, so the box classifies
@@ -1224,8 +1227,17 @@ impl Bridge {
                 if attempt > 0 {
                     tx.send(UiEvent::Log(format!("Handshake attempt {} lost. Retransmitting...", attempt))).await.ok();
                 }
-                if send_datagram(&socket, &handshake_frame, self.transport_mode == "udp").await.is_ok() {
-                    self.metrics.bytes_sent.fetch_add(handshake_frame.len() as u64, Ordering::Relaxed);
+                // Send the handshake twice on UDP: a single dropped datagram
+                // otherwise costs a whole retransmit window, which on a lossy
+                // mobile link is the gap between a sub-second connect and a
+                // multi-second one. The duplicate is harmless — whichever copy
+                // arrives first is processed, and the server's anti-replay drops
+                // the other. UoT rides reliable TCP, so one send there.
+                let sends = if is_uot { 1 } else { 2 };
+                for _ in 0..sends {
+                    if send_datagram(&socket, &handshake_frame, self.transport_mode == "udp").await.is_ok() {
+                        self.metrics.bytes_sent.fetch_add(handshake_frame.len() as u64, Ordering::Relaxed);
+                    }
                 }
 
                 match timeout(Duration::from_millis(attempt_timeout_ms), socket.recv(&mut buf)).await {
