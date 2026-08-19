@@ -105,7 +105,14 @@ pub struct TransportConfig {
     /// How many decoy datagrams to send per handshake.
     #[serde(default = "default_ttl_desync_count")]
     pub ttl_desync_count: u8,
+    /// Auto-calibrate the decoy TTL by measuring the hop distance to the server
+    /// (see ttl_probe). On by default, so turning desync on "just works"; the
+    /// measured value overrides ttl_desync_ttl. Turn off to pin ttl_desync_ttl.
+    #[serde(default = "default_true")]
+    pub ttl_desync_auto: bool,
 }
+
+fn default_true() -> bool { true }
 
 fn default_transport_mode() -> String { "udp".to_string() }
 fn default_frag_chunk() -> usize { 2 }
@@ -127,6 +134,7 @@ impl Default for TransportConfig {
             ttl_desync: false,
             ttl_desync_ttl: default_ttl_desync_ttl(),
             ttl_desync_count: default_ttl_desync_count(),
+            ttl_desync_auto: true,
         }
     }
 }
@@ -215,6 +223,7 @@ struct RawTransportSection {
     ttl_desync: Option<bool>,
     ttl_desync_ttl: Option<u8>,
     ttl_desync_count: Option<u8>,
+    ttl_desync_auto: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -295,6 +304,7 @@ impl ClientConfig {
                 ttl_desync: raw.transport.as_ref().and_then(|t| t.ttl_desync).unwrap_or(false),
                 ttl_desync_ttl: raw.transport.as_ref().and_then(|t| t.ttl_desync_ttl).unwrap_or_else(default_ttl_desync_ttl),
                 ttl_desync_count: raw.transport.as_ref().and_then(|t| t.ttl_desync_count).unwrap_or_else(default_ttl_desync_count),
+                ttl_desync_auto: raw.transport.as_ref().and_then(|t| t.ttl_desync_auto).unwrap_or(true),
             },
             exclusions: ExclusionConfig {
                 domains: exclusions.domains.unwrap_or_default(),

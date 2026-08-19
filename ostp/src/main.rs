@@ -1716,6 +1716,7 @@ async fn run_client_directly(client_cfg: ClientConfig) -> Result<()> {
             ttl_desync: false,
             ttl_desync_ttl: 8,
             ttl_desync_count: 2,
+            ttl_desync_auto: true,
         },
         dns_server: client_cfg.tun.as_ref().and_then(|t| t.dns.clone()),
         kill_switch: client_cfg.tun.as_ref().and_then(|t| t.kill_switch).unwrap_or(false),

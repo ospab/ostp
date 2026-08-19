@@ -75,6 +75,53 @@ impl Drop for SessionState {
 
 /// Spawn the per-session receiver loop that reads inbound datagrams from the
 /// transport and forwards them to the bridge, returning an AbortHandle so the
+/// Build a fresh, valid handshake datagram for the TTL-desync hop probe. Each
+/// call uses a new session id and timestamp so the server's anti-replay does not
+/// drop it as a duplicate. Returns an empty vec on the (unexpected) construction
+/// error — the probe simply treats that TTL step as unanswered.
+fn build_probe_handshake(
+    secrets: &ostp_core::crypto::DerivedSecrets,
+    access_key: &[u8],
+    profile: TrafficProfile,
+    mtu: usize,
+) -> Vec<u8> {
+    let session_id: u32 = rand::random();
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let mut handshake_payload = Vec::with_capacity(8 + 4 + access_key.len());
+    handshake_payload.extend_from_slice(&timestamp.to_be_bytes());
+    handshake_payload.extend_from_slice(&session_id.to_be_bytes());
+    handshake_payload.extend_from_slice(access_key);
+
+    let mut machine = match ProtocolMachine::new(ProtocolConfig {
+        role: NoiseRole::Initiator,
+        psk: secrets.psk,
+        session_id,
+        handshake_payload,
+        padding_strategy: PaddingStrategy::Profile(profile),
+        obfuscation_key: secrets.obfuscation_key,
+        max_reorder: 16384,
+        max_reorder_buffer: 8192,
+        ack_delay_ms: 5,
+        rto_ms: 100,
+        max_retries: 8,
+        max_sent_history: 32768,
+        handshake_pad_min: secrets.handshake_pad_min,
+        handshake_pad_max: secrets.handshake_pad_max,
+        mtu,
+        max_padding: mtu.saturating_sub(48).max(256),
+    }) {
+        Ok(m) => m,
+        Err(_) => return Vec::new(),
+    };
+    match machine.on_event(OstpEvent::Start) {
+        Ok(ProtocolAction::SendDatagram(frame)) => frame.to_vec(),
+        _ => Vec::new(),
+    }
+}
+
 /// task is torn down when its `SessionState` is dropped. Consolidates the three
 /// previously-duplicated inline copies (initial connect, network-change, and
 /// keepalive reconnect).
@@ -136,6 +183,10 @@ pub struct Bridge {
     pub ttl_desync: bool,
     pub ttl_desync_ttl: u8,
     pub ttl_desync_count: u8,
+    pub ttl_desync_auto: bool,
+    /// Cached result of the hop-distance measurement, so the TTL sweep runs once
+    /// rather than on every (re)connect. Cleared on a network change.
+    ttl_desync_measured: Option<u8>,
     pub mtu: usize,
     pub kill_switch: bool,
     pub reload_tx: Option<watch::Sender<crate::config::ExclusionConfig>>,
@@ -190,6 +241,8 @@ impl Bridge {
             ttl_desync: config.transport.ttl_desync,
             ttl_desync_ttl: config.transport.ttl_desync_ttl,
             ttl_desync_count: config.transport.ttl_desync_count,
+            ttl_desync_auto: config.transport.ttl_desync_auto,
+            ttl_desync_measured: None,
             mtu: config.ostp.mtu,
             kill_switch: config.kill_switch,
             reload_tx: None,
@@ -1120,6 +1173,31 @@ impl Bridge {
             // Each carries the key's junk marker, so any decoy that does reach
             // the server is dropped there silently.
             if self.ttl_desync && !is_uot && self.ttl_desync_count > 0 {
+                // Auto-calibrate the decoy TTL to the hop distance to this server,
+                // measured once (cached). The server answers only a valid
+                // handshake, so the sweep is inherently key-gated and needs no
+                // server-side probe endpoint. On measurement failure we fall back
+                // to the configured fixed TTL rather than skipping desync.
+                let effective_ttl = if self.ttl_desync_auto {
+                    if self.ttl_desync_measured.is_none() {
+                        let sec = secrets.clone();
+                        let key = self.access_key.clone();
+                        let profile = self.profile;
+                        let mtu = self.mtu;
+                        let make_hs = move || build_probe_handshake(&sec, &key, profile, mtu);
+                        if let Some(hops) = crate::ttl_probe::measure_hops(target_addr, make_hs).await {
+                            let t = crate::ttl_probe::decoy_ttl_for(hops);
+                            self.ttl_desync_measured = Some(t);
+                            tx.send(UiEvent::Log(format!(
+                                "TTL-desync: server ~{hops} hops, decoy TTL {t}"
+                            ))).await.ok();
+                        }
+                    }
+                    self.ttl_desync_measured.unwrap_or(self.ttl_desync_ttl)
+                } else {
+                    self.ttl_desync_ttl
+                };
+
                 let marker = ostp_core::crypto::derive_junk_marker(
                     &self.access_key,
                     ostp_core::crypto::current_junk_window(),
@@ -1139,7 +1217,7 @@ impl Bridge {
                         })
                         .collect()
                 };
-                socket.send_ttl_decoys(&decoys, self.ttl_desync_ttl).await;
+                socket.send_ttl_decoys(&decoys, effective_ttl).await;
             }
 
             for attempt in 0..attempt_limit {
@@ -1242,6 +1320,8 @@ impl Bridge {
         self.ttl_desync = cfg.transport.ttl_desync;
         self.ttl_desync_ttl = cfg.transport.ttl_desync_ttl;
         self.ttl_desync_count = cfg.transport.ttl_desync_count;
+        self.ttl_desync_auto = cfg.transport.ttl_desync_auto;
+        self.ttl_desync_measured = None; // re-measure after a config change
         self.mtu = cfg.ostp.mtu;
         self.keepalive_interval_sec = cfg.ostp.keepalive_interval_sec;
         self.kill_switch = cfg.kill_switch;
