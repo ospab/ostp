@@ -123,12 +123,18 @@ pub async fn run_native_tunnel(
     let (mut tun_read, mut tun_write) = tokio::io::split(dev);
 
     let mut tun_to_stack = tokio::spawn(async move {
+        // Reassemble IPv4 fragments before the netstack sees them: smoltcp drops
+        // UDP fragments with a wire::Error, which silently kills any >MTU UDP
+        // datagram (game traffic in particular). See ip_reasm for the details.
+        let mut reasm = super::ip_reasm::Reassembler::new();
         let mut buf = vec![0u8; 65536];
         loop {
             match tun_read.read(&mut buf).await {
                 Ok(0) => break,
                 Ok(n) => {
-                    let frame = buf[..n].to_vec();
+                    let Some(frame) = reasm.process(&buf[..n]) else {
+                        continue; // fragment buffered; nothing to forward yet
+                    };
                     if let Err(e) = stack_sink.send(frame).await {
                         if e.kind() == std::io::ErrorKind::BrokenPipe {
                             break;
@@ -471,6 +477,9 @@ pub async fn run_native_tunnel_from_fd(
     let (mut stack_sink, mut stack_stream) = stack.split();
 
     let _tun_to_stack = tokio::spawn(async move {
+        // See the Windows path above: reassemble IPv4 fragments so smoltcp does
+        // not drop >MTU UDP datagrams.
+        let mut reasm = super::ip_reasm::Reassembler::new();
         let mut buf = vec![0u8; 65536];
         loop {
             let mut guard = match tun_stream.readable().await {
@@ -502,7 +511,9 @@ pub async fn run_native_tunnel_from_fd(
                 Err(_) => continue,
             };
 
-            let frame = buf[..n].to_vec();
+            let Some(frame) = reasm.process(&buf[..n]) else {
+                continue; // fragment buffered; nothing to forward yet
+            };
             if let Err(e) = stack_sink.send(frame).await {
                 if e.kind() == std::io::ErrorKind::BrokenPipe {
                     break;
