@@ -161,6 +161,7 @@ const btnJunkDone     = $('btn-junk-done');
 
 const inTcpFrag       = $('cs-tcp-frag');
 const btnFragSettings = $('btn-frag-settings');
+const inTtlDesync     = $('cs-ttl-desync');
 const fragModal       = $('frag-modal');
 const inFragChunk     = $('cs-frag-chunk');
 const inFragSleep     = $('cs-frag-sleep');
@@ -318,7 +319,9 @@ function buildConfig() {
       frag_chunk: s.tcpFrag ? (s.fragChunk || 2) : (active.frag_chunk || 2),
       frag_sleep: s.tcpFrag ? (!isNaN(parseInt(s.fragSleep)) ? s.fragSleep : 2) : (active.frag_sleep !== undefined ? active.frag_sleep : 2),
       junk_pc: s.junkEnabled ? [s.junkPcMin || 2, s.junkPcMax || 5] : (active.junk_pc || [2, 5]),
-      junk_ps: s.junkEnabled ? [s.junkPsMin || 100, s.junkPsMax || 1000] : (active.junk_ps || [100, 1000])
+      junk_ps: s.junkEnabled ? [s.junkPsMin || 100, s.junkPsMax || 1000] : (active.junk_ps || [100, 1000]),
+      ttl_desync: !!s.ttlDesync,
+      ttl_desync_auto: true
     },
     tun: {
       enable: !!s.tun,
@@ -657,6 +660,7 @@ function loadSettingsIntoForm() {
   inTcpFrag.checked     = !!s.tcpFrag;
   inFragChunk.value     = s.fragChunk || 2;
   inFragSleep.value     = !isNaN(parseInt(s.fragSleep)) ? s.fragSleep : 2;
+  if (inTtlDesync) inTtlDesync.checked = !!s.ttlDesync;
   updateClientVisibility();
 }
 
@@ -692,6 +696,7 @@ function collectAndSaveSettings() {
     tcpFrag:      inTcpFrag.checked,
     fragChunk:    parseInt(inFragChunk.value) || 2,
     fragSleep:    !isNaN(parseInt(inFragSleep.value)) ? parseInt(inFragSleep.value) : 2,
+    ttlDesync:    inTtlDesync ? inTtlDesync.checked : false,
   };
   // Cheap and local: safe to run on every debounced keystroke.
   saveClientSettings(s);
@@ -715,7 +720,7 @@ function collectAndSaveSettings() {
     const tunnelRelevant = JSON.stringify([
       s.tun, s.killSwitch, s.mux, s.muxSessions, s.mtu, s.dns, s.socks,
       s.exDomains, s.exIps, s.exProcs, s.junkEnabled, s.junkPcMin, s.junkPcMax,
-      s.junkPsMin, s.junkPsMax, s.tcpFrag, s.fragChunk, s.fragSleep,
+      s.junkPsMin, s.junkPsMax, s.tcpFrag, s.fragChunk, s.fragSleep, s.ttlDesync,
     ]);
     if (tunnelRelevant !== lastAppliedTunnelConfig) {
       clearTimeout(hotReloadTimer);
@@ -901,7 +906,8 @@ window.addEventListener('DOMContentLoaded', async () => {
   wintunModal.addEventListener('click', e => { if (e.target === wintunModal) wintunModal.classList.add('hidden'); });
 
   // Client settings — wire all inputs
-  [inTun, inKillSwitch, inMux, inAutoconnect, inLaunchStartup, inDebug, inShowRtt, inShowSpeed, inJunkEnabled, inTcpFrag]
+  [inTun, inKillSwitch, inMux, inAutoconnect, inLaunchStartup, inDebug, inShowRtt, inShowSpeed, inJunkEnabled, inTcpFrag, inTtlDesync]
+    .filter(Boolean)
     .forEach(el => el.addEventListener('change', collectAndSaveSettings));
   [inMuxSessions, inMtu, inDns, inSocks, inExDomains, inExIps, inExProcs, inJunkPcMin, inJunkPcMax, inJunkPsMin, inJunkPsMax, inFragChunk, inFragSleep]
     .forEach(el => {
