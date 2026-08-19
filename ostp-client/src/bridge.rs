@@ -133,6 +133,9 @@ pub struct Bridge {
     pub frag_sleep: u64,
     pub junk_pc: [usize; 2],
     pub junk_ps: [usize; 2],
+    pub ttl_desync: bool,
+    pub ttl_desync_ttl: u8,
+    pub ttl_desync_count: u8,
     pub mtu: usize,
     pub kill_switch: bool,
     pub reload_tx: Option<watch::Sender<crate::config::ExclusionConfig>>,
@@ -184,6 +187,9 @@ impl Bridge {
             frag_sleep: config.transport.frag_sleep,
             junk_pc: config.transport.junk_pc,
             junk_ps: config.transport.junk_ps,
+            ttl_desync: config.transport.ttl_desync,
+            ttl_desync_ttl: config.transport.ttl_desync_ttl,
+            ttl_desync_count: config.transport.ttl_desync_count,
             mtu: config.ostp.mtu,
             kill_switch: config.kill_switch,
             reload_tx: None,
@@ -1108,6 +1114,34 @@ impl Bridge {
             let is_uot = matches!(socket, crate::transport::Transport::Uot { .. });
             let (attempt_limit, attempt_timeout_ms) = if is_uot { (1, 8000) } else { (4, 1200) };
 
+            // TTL-desync (UDP only, opt-in): fire decoy datagrams that reach an
+            // on-path DPI box but expire before the server, so the box classifies
+            // the flow on the decoys rather than the real handshake that follows.
+            // Each carries the key's junk marker, so any decoy that does reach
+            // the server is dropped there silently.
+            if self.ttl_desync && !is_uot && self.ttl_desync_count > 0 {
+                let marker = ostp_core::crypto::derive_junk_marker(
+                    &self.access_key,
+                    ostp_core::crypto::current_junk_window(),
+                );
+                let decoys: Vec<bytes::Bytes> = {
+                    let mut rng = rand::thread_rng();
+                    let [min_s, max_s] = self.junk_ps;
+                    let min_s = min_s.max(4);
+                    let max_s = max_s.max(min_s);
+                    (0..self.ttl_desync_count)
+                        .map(|_| {
+                            let len = rng.gen_range(min_s..=max_s);
+                            let mut b = vec![0u8; len];
+                            rng.fill(&mut b[..]);
+                            b[..4].copy_from_slice(&marker);
+                            bytes::Bytes::from(b)
+                        })
+                        .collect()
+                };
+                socket.send_ttl_decoys(&decoys, self.ttl_desync_ttl).await;
+            }
+
             for attempt in 0..attempt_limit {
                 if attempt > 0 {
                     tx.send(UiEvent::Log(format!("Handshake attempt {} lost. Retransmitting...", attempt))).await.ok();
@@ -1205,6 +1239,9 @@ impl Bridge {
         self.frag_sleep = cfg.transport.frag_sleep;
         self.junk_pc = cfg.transport.junk_pc;
         self.junk_ps = cfg.transport.junk_ps;
+        self.ttl_desync = cfg.transport.ttl_desync;
+        self.ttl_desync_ttl = cfg.transport.ttl_desync_ttl;
+        self.ttl_desync_count = cfg.transport.ttl_desync_count;
         self.mtu = cfg.ostp.mtu;
         self.keepalive_interval_sec = cfg.ostp.keepalive_interval_sec;
         self.kill_switch = cfg.kill_switch;

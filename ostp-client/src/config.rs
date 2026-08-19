@@ -92,6 +92,19 @@ pub struct TransportConfig {
     /// [min, max] junk packet size in bytes
     #[serde(default = "default_junk_size")]
     pub junk_ps: [usize; 2],
+    /// TTL-desync (UDP only): before the handshake, send decoy datagrams with a
+    /// lowered IP TTL so they reach an on-path DPI box but expire before the
+    /// server, poisoning the box's classification of the flow. Off by default —
+    /// it needs the TTL calibrated to the network, and the wrong value is inert.
+    #[serde(default)]
+    pub ttl_desync: bool,
+    /// TTL the decoy datagrams are sent with. Set it to one or two hops past the
+    /// injector distance the prober reports, so decoys die just beyond the DPI.
+    #[serde(default = "default_ttl_desync_ttl")]
+    pub ttl_desync_ttl: u8,
+    /// How many decoy datagrams to send per handshake.
+    #[serde(default = "default_ttl_desync_count")]
+    pub ttl_desync_count: u8,
 }
 
 fn default_transport_mode() -> String { "udp".to_string() }
@@ -99,6 +112,8 @@ fn default_frag_chunk() -> usize { 2 }
 fn default_frag_sleep() -> u64 { 2 }
 fn default_junk_count() -> [usize; 2] { [2, 5] }
 fn default_junk_size() -> [usize; 2] { [100, 1000] }
+fn default_ttl_desync_ttl() -> u8 { 8 }
+fn default_ttl_desync_count() -> u8 { 2 }
 
 impl Default for TransportConfig {
     fn default() -> Self {
@@ -109,6 +124,9 @@ impl Default for TransportConfig {
             frag_sleep: default_frag_sleep(),
             junk_pc: default_junk_count(),
             junk_ps: default_junk_size(),
+            ttl_desync: false,
+            ttl_desync_ttl: default_ttl_desync_ttl(),
+            ttl_desync_count: default_ttl_desync_count(),
         }
     }
 }
@@ -194,6 +212,9 @@ struct RawTransportSection {
     frag_sleep: Option<u64>,
     junk_pc: Option<[usize; 2]>,
     junk_ps: Option<[usize; 2]>,
+    ttl_desync: Option<bool>,
+    ttl_desync_ttl: Option<u8>,
+    ttl_desync_count: Option<u8>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -271,6 +292,9 @@ impl ClientConfig {
                 frag_sleep: raw.transport.as_ref().and_then(|t| t.frag_sleep).unwrap_or_else(default_frag_sleep),
                 junk_pc: raw.transport.as_ref().and_then(|t| t.junk_pc).unwrap_or_else(default_junk_count),
                 junk_ps: raw.transport.as_ref().and_then(|t| t.junk_ps).unwrap_or_else(default_junk_size),
+                ttl_desync: raw.transport.as_ref().and_then(|t| t.ttl_desync).unwrap_or(false),
+                ttl_desync_ttl: raw.transport.as_ref().and_then(|t| t.ttl_desync_ttl).unwrap_or_else(default_ttl_desync_ttl),
+                ttl_desync_count: raw.transport.as_ref().and_then(|t| t.ttl_desync_count).unwrap_or_else(default_ttl_desync_count),
             },
             exclusions: ExclusionConfig {
                 domains: exclusions.domains.unwrap_or_default(),

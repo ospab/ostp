@@ -61,6 +61,9 @@ struct TransportConfigRaw {
     frag_sleep: Option<u64>,
     junk_pc: Option<[usize; 2]>,
     junk_ps: Option<[usize; 2]>,
+    ttl_desync: Option<bool>,
+    ttl_desync_ttl: Option<u8>,
+    ttl_desync_count: Option<u8>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -239,6 +242,9 @@ fn map_to_client_config(raw: &ClientConfigRaw, mode: &str) -> ostp_client::confi
             frag_sleep: raw.transport.as_ref().and_then(|t| t.frag_sleep).unwrap_or(2),
             junk_pc: raw.transport.as_ref().and_then(|t| t.junk_pc).unwrap_or([2, 5]),
             junk_ps: raw.transport.as_ref().and_then(|t| t.junk_ps).unwrap_or([100, 1000]),
+            ttl_desync: raw.transport.as_ref().and_then(|t| t.ttl_desync).unwrap_or(false),
+            ttl_desync_ttl: raw.transport.as_ref().and_then(|t| t.ttl_desync_ttl).unwrap_or(8),
+            ttl_desync_count: raw.transport.as_ref().and_then(|t| t.ttl_desync_count).unwrap_or(2),
         },
         exclusions: ostp_client::config::ExclusionConfig {
             domains: raw.exclude.as_ref().and_then(|e| e.domains.clone()).unwrap_or_default(),

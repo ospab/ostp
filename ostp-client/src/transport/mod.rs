@@ -53,4 +53,29 @@ impl Transport {
             Self::Uot { .. } => Ok("0.0.0.0:0".parse().unwrap()),
         }
     }
+
+    /// TTL-desync: send `decoys` as datagrams with the IP TTL lowered to `ttl`,
+    /// then restore the socket's original TTL. The decoys are meant to reach an
+    /// on-path DPI box and expire before the server — poisoning the box's view
+    /// of the flow (it classifies on the decoy) while the server never sees
+    /// them. Calibrate `ttl` to the injector hop distance the prober reports.
+    ///
+    /// UDP only: this manipulates individual datagrams' TTL. On UoT the carrier
+    /// is one TCP stream, so a socket-level TTL change would apply to the real
+    /// traffic too — proper TCP desync needs injected packets (a driver), which
+    /// this deliberately does not attempt. No-op there.
+    pub async fn send_ttl_decoys(&self, decoys: &[Bytes], ttl: u8) {
+        let Self::Udp(sock) = self else { return };
+        if decoys.is_empty() {
+            return;
+        }
+        let restore = sock.ttl().unwrap_or(128);
+        if sock.set_ttl(ttl as u32).is_err() {
+            return;
+        }
+        for d in decoys {
+            let _ = sock.send(d).await;
+        }
+        let _ = sock.set_ttl(restore);
+    }
 }
