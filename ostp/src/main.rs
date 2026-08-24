@@ -1372,6 +1372,7 @@ async fn run_app() -> Result<()> {
                         ip_cidr: r.ip_cidr.unwrap_or_default(),
                         protocol: r.protocol,
                         action: parse_outbound_action(r.action),
+                        send_from: r.send_from,
                     })
                     .collect(),
                 default_action: parse_outbound_action(o.default_action),
@@ -1407,8 +1408,9 @@ async fn run_app() -> Result<()> {
                 .map(serde_json::from_value)
                 .transpose()
                 .map_err(|e| anyhow!("Invalid 'dns' section in server config: {e}"))?;
+            let bind_ip = server_cfg.bind_ip;
             // Pass all listen addresses for multi-listener support
-            ostp_server::run_server(listen_addrs, Some(host), access_keys_meta, outbound, api_config, fallback_config, debug, dns_cfg, Some(args.config)).await?;
+            ostp_server::run_server(listen_addrs, Some(host), bind_ip, access_keys_meta, outbound, api_config, fallback_config, debug, dns_cfg, Some(args.config)).await?;
         }
         AppMode::Client(client_cfg) => {
             println!("{}", include_str!("../../docs/banner.txt").blue().bold());

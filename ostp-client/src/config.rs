@@ -437,6 +437,7 @@ impl UserConfig {
 #[derive(Debug, Deserialize, Serialize)]
 pub struct ServerConfig {
     pub listen: ListenConfig,
+    pub bind_ip: Option<String>,
     pub access_keys: Vec<UserConfig>,
     pub debug: Option<bool>,
     pub outbound: Option<OutboundConfig>,
@@ -570,6 +571,10 @@ pub struct OutboundRule {
     pub ip_cidr: Option<Vec<String>>,
     pub protocol: Option<String>,
     pub action: Option<String>,
+    /// Local source IP to egress from when this rule matches (overrides the
+    /// server's global `bind_ip` for this rule). Lets one destination leave via
+    /// one address and another via a different one.
+    pub send_from: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]

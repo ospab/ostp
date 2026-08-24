@@ -20,6 +20,13 @@ pub struct OutboundRule {
     #[serde(default)]
     pub protocol: Option<String>,
     pub action: OutboundAction,
+    /// Local source IP to egress from when this rule matches. Overrides the
+    /// server's global `bind_ip` for this rule only, so different destinations
+    /// can leave the machine from different addresses — e.g. one clean IP
+    /// direct to a picky site, another via the proxy for everything else. None
+    /// falls back to the global `bind_ip`.
+    #[serde(default)]
+    pub send_from: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -41,12 +48,15 @@ pub struct OutboundConfig {
 pub async fn connect_target(
     target: &str,
     outbound: Option<&OutboundConfig>,
+    bind_ip: Option<&str>,
     debug: bool,
 ) -> Result<TcpStream> {
     let connect_timeout = Duration::from_secs(10);
     if let Some(outbound) = outbound {
         if outbound.enabled {
-            let action = select_outbound_action(target, "tcp", outbound, debug).await;
+            let (action, rule_src) = select_outbound_action(target, "tcp", outbound, debug).await;
+            // Per-rule source wins; otherwise the server's global bind_ip.
+            let eff_bind = rule_src.as_deref().or(bind_ip);
             if action == OutboundAction::Block {
                 return Err(anyhow::anyhow!("blocked by outbound rule: {}", target));
             }
@@ -55,8 +65,8 @@ pub async fn connect_target(
                 // Case-insensitive: a config saying "SOCKS5" means the same thing
                 // as "socks5", and silently treating it as unknown is a trap.
                 return match outbound.protocol.to_ascii_lowercase().as_str() {
-                    "socks5" => connect_via_socks5(&proxy_addr, target, &outbound.username, &outbound.password).await,
-                    "http" => connect_via_http(&proxy_addr, target).await,
+                    "socks5" => connect_via_socks5(&proxy_addr, target, eff_bind, &outbound.username, &outbound.password).await,
+                    "http" => connect_via_http(&proxy_addr, target, eff_bind).await,
                     // FAIL CLOSED. This used to fall through to a direct
                     // connection, so any unrecognised protocol string — a typo,
                     // a case difference, an empty value — silently sent ALL TCP
@@ -71,10 +81,14 @@ pub async fn connect_target(
                     )),
                 };
             }
+            // action == Direct: egress directly, but still honour this rule's
+            // send_from (falling back to the global bind_ip) — that is the whole
+            // point of "direct from THIS ip to that destination".
+            return connect_direct(target, connect_timeout, eff_bind).await;
         }
     }
 
-    connect_direct(target, connect_timeout).await
+    connect_direct(target, connect_timeout, bind_ip).await
 }
 
 /// Per-candidate-address connect attempt, tried in turn (see `connect_direct`
@@ -96,7 +110,23 @@ const PER_ADDR_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 /// attempted: every dual-stack destination (i.e. most popular sites) never
 /// loads, while IPv4-only destinations work fine - exactly the "traffic
 /// counter moves but sites don't open" symptom this fixes.
-async fn connect_direct(target: &str, connect_timeout: Duration) -> Result<TcpStream> {
+async fn connect_tcp_with_bind(addr: std::net::SocketAddr, bind_ip: Option<&str>) -> Result<TcpStream> {
+    if let Some(ip_str) = bind_ip {
+        let ip: std::net::IpAddr = ip_str.parse().map_err(|e| anyhow::anyhow!("invalid bind_ip: {}", e))?;
+        let socket = match addr {
+            std::net::SocketAddr::V4(_) => tokio::net::TcpSocket::new_v4()?,
+            std::net::SocketAddr::V6(_) => tokio::net::TcpSocket::new_v6()?,
+        };
+        if (addr.is_ipv4() && ip.is_ipv4()) || (addr.is_ipv6() && ip.is_ipv6()) {
+            socket.bind(std::net::SocketAddr::new(ip, 0))?;
+        }
+        Ok(socket.connect(addr).await?)
+    } else {
+        Ok(TcpStream::connect(addr).await?)
+    }
+}
+
+async fn connect_direct(target: &str, connect_timeout: Duration, bind_ip: Option<&str>) -> Result<TcpStream> {
     tokio::time::timeout(connect_timeout, async {
         let mut addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host(target)
             .await
@@ -109,7 +139,7 @@ async fn connect_direct(target: &str, connect_timeout: Duration) -> Result<TcpSt
 
         let mut last_err = None;
         for addr in addrs {
-            match tokio::time::timeout(PER_ADDR_CONNECT_TIMEOUT, TcpStream::connect(addr)).await {
+            match tokio::time::timeout(PER_ADDR_CONNECT_TIMEOUT, connect_tcp_with_bind(addr, bind_ip)).await {
                 Ok(Ok(stream)) => return Ok(stream),
                 Ok(Err(e)) => last_err = Some(anyhow::anyhow!("{}: {}", addr, e)),
                 Err(_) => last_err = Some(anyhow::anyhow!("{}: connect timeout ({}s)", addr, PER_ADDR_CONNECT_TIMEOUT.as_secs())),
@@ -134,39 +164,35 @@ pub async fn select_outbound_action(
     protocol: &str,
     outbound: &OutboundConfig,
     debug: bool,
-) -> OutboundAction {
+) -> (OutboundAction, Option<String>) {
     let (host, port) = match split_host_port(target) {
         Some(v) => v,
-        None => return outbound.default_action,
+        None => return (outbound.default_action, None),
     };
 
-    let mut matched = None;
+    // Capture the matched rule's action AND its per-rule source IP together, so
+    // the caller egresses from the address that rule asked for.
+    let mut matched: Option<(OutboundAction, Option<String>)> = None;
     for rule in &outbound.rules {
         if let Some(ref rule_proto) = rule.protocol {
             if !rule_proto.is_empty() && rule_proto.to_lowercase() != protocol {
                 continue;
             }
         }
-        if rule.domain_suffix.is_empty() && rule.ip_cidr.is_empty() {
-            // Protocol-only rule match
-            matched = Some(rule.action);
-            break;
-        }
-        if match_domain_rule(&host, &rule.domain_suffix) {
-            matched = Some(rule.action);
-            break;
-        }
-        if match_ip_rule(&host, port, &rule.ip_cidr).await {
-            matched = Some(rule.action);
+        let hit = (rule.domain_suffix.is_empty() && rule.ip_cidr.is_empty())
+            || match_domain_rule(&host, &rule.domain_suffix)
+            || match_ip_rule(&host, port, &rule.ip_cidr).await;
+        if hit {
+            matched = Some((rule.action, rule.send_from.clone()));
             break;
         }
     }
 
-    let action = matched.unwrap_or(outbound.default_action);
+    let (action, send_from) = matched.unwrap_or((outbound.default_action, None));
     if debug {
-        tracing::debug!("Outbound routing: target={target} action={action:?}");
+        tracing::debug!("Outbound routing: target={target} action={action:?} send_from={send_from:?}");
     }
-    action
+    (action, send_from)
 }
 
 fn match_domain_rule(host: &str, suffixes: &[String]) -> bool {
@@ -250,12 +276,18 @@ where
 async fn connect_via_socks5(
     proxy_addr: &str,
     target: &str,
+    bind_ip: Option<&str>,
     username: &str,
     password: &str,
 ) -> Result<TcpStream> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    let mut stream = TcpStream::connect(proxy_addr).await?;
+    let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host(proxy_addr).await?.collect();
+    let mut stream = if let Some(addr) = addrs.into_iter().next() {
+        connect_tcp_with_bind(addr, bind_ip).await?
+    } else {
+        anyhow::bail!("could not resolve proxy address");
+    };
     socks5_negotiate_auth(&mut stream, username, password).await?;
 
     let (host, port) = split_host_port(target).ok_or_else(|| anyhow::anyhow!("invalid target"))?;
@@ -304,10 +336,15 @@ async fn connect_via_socks5(
     Ok(stream)
 }
 
-async fn connect_via_http(proxy_addr: &str, target: &str) -> Result<TcpStream> {
+async fn connect_via_http(proxy_addr: &str, target: &str, bind_ip: Option<&str>) -> Result<TcpStream> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    let mut stream = TcpStream::connect(proxy_addr).await?;
+    let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host(proxy_addr).await?.collect();
+    let mut stream = if let Some(addr) = addrs.into_iter().next() {
+        connect_tcp_with_bind(addr, bind_ip).await?
+    } else {
+        anyhow::bail!("could not resolve proxy address");
+    };
     let request = format!("CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n\r\n");
     stream.write_all(request.as_bytes()).await?;
 
@@ -426,19 +463,21 @@ impl UdpProxySocket {
 pub async fn connect_udp_target(
     target: &str,
     outbound: Option<&OutboundConfig>,
+    bind_ip: Option<&str>,
     debug: bool,
     server_udp: std::sync::Arc<tokio::net::UdpSocket>,
 ) -> Result<UdpProxySocket> {
     if let Some(outbound) = outbound {
         if outbound.enabled {
-            let action = select_outbound_action(target, "udp", outbound, debug).await;
+            let (action, rule_src) = select_outbound_action(target, "udp", outbound, debug).await;
+            let eff_bind = rule_src.as_deref().or(bind_ip);
             if action == OutboundAction::Block {
                 return Err(anyhow::anyhow!("blocked by outbound udp rule: {}", target));
             }
             if action == OutboundAction::Proxy {
                 let proxy_addr = format!("{}:{}", outbound.address, outbound.port);
                 if outbound.protocol.eq_ignore_ascii_case("socks5") {
-                    return connect_udp_via_socks5(&proxy_addr, server_udp, &outbound.username, &outbound.password).await;
+                    return connect_udp_via_socks5(&proxy_addr, server_udp, eff_bind, &outbound.username, &outbound.password).await;
                 }
                 // FAIL CLOSED. HTTP CONNECT genuinely cannot carry UDP — but the
                 // answer to that is not to send the datagrams in the clear. The
@@ -462,12 +501,18 @@ pub async fn connect_udp_target(
 pub async fn connect_udp_via_socks5(
     proxy_addr: &str,
     server_udp: std::sync::Arc<tokio::net::UdpSocket>,
+    bind_ip: Option<&str>,
     username: &str,
     password: &str,
 ) -> Result<UdpProxySocket> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    let mut stream = TcpStream::connect(proxy_addr).await?;
+    let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host(proxy_addr).await?.collect();
+    let mut stream = if let Some(addr) = addrs.into_iter().next() {
+        connect_tcp_with_bind(addr, bind_ip).await?
+    } else {
+        anyhow::bail!("could not resolve proxy address");
+    };
     socks5_negotiate_auth(&mut stream, username, password).await?;
 
     // Send UDP Associate request
@@ -688,7 +733,7 @@ mod tests {
             let _ = listener.accept().await;
         });
 
-        let result = connect_direct(&addr.to_string(), Duration::from_secs(2)).await;
+        let result = connect_direct(&addr.to_string(), Duration::from_secs(2), None).await;
         assert!(result.is_ok(), "expected connect_direct to reach a live local listener: {:?}", result.err());
     }
 
@@ -701,7 +746,7 @@ mod tests {
         drop(listener);
 
         let start = std::time::Instant::now();
-        let result = connect_direct(&addr.to_string(), Duration::from_secs(5)).await;
+        let result = connect_direct(&addr.to_string(), Duration::from_secs(5), None).await;
         assert!(result.is_err(), "connecting to a closed port should fail");
         assert!(start.elapsed() < Duration::from_secs(4), "a refused connection must not wait out the full timeout");
     }

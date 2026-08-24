@@ -155,10 +155,16 @@ pub async fn handle_relay_message(
             if router.debug {
                 let _ = ui_event_tx.send(UiEvent::Log(format!("Relay UDP ASSOCIATE stream_id={stream_id}")));
             }
-            let udp_bind_result = match UdpSocket::bind("[::]:0").await {
-                Ok(s) => Ok(s),
-                Err(_) => UdpSocket::bind("0.0.0.0:0").await,
+            
+            let udp_bind_result = if let Some(ref bind_ip) = router.bind_ip {
+                tokio::net::UdpSocket::bind(format!("{}:0", bind_ip)).await
+            } else {
+                match tokio::net::UdpSocket::bind("[::]:0").await {
+                    Ok(s) => Ok(s),
+                    Err(_) => tokio::net::UdpSocket::bind("0.0.0.0:0").await,
+                }
             };
+            
             let server_udp = match udp_bind_result {
                 Ok(s) => std::sync::Arc::new(s),
                 Err(e) => {

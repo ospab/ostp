@@ -7,14 +7,16 @@ use crate::dns::DnsServer;
 #[derive(Clone)]
 pub struct Router {
     pub outbound_cfg: Arc<RwLock<Option<OutboundConfig>>>,
+    pub bind_ip: Option<String>,
     pub dns_server: Arc<DnsServer>,
     pub debug: bool,
 }
 
 impl Router {
-    pub fn new(outbound_cfg: Option<OutboundConfig>, dns_server: Arc<DnsServer>, debug: bool) -> Self {
+    pub fn new(outbound_cfg: Option<OutboundConfig>, bind_ip: Option<String>, dns_server: Arc<DnsServer>, debug: bool) -> Self {
         Self {
             outbound_cfg: Arc::new(RwLock::new(outbound_cfg)),
+            bind_ip,
             dns_server,
             debug,
         }
@@ -26,7 +28,7 @@ impl Router {
             let lock = self.outbound_cfg.read().unwrap();
             lock.clone()
         };
-        connect_target(target, cfg.as_ref(), self.debug).await
+        connect_target(target, cfg.as_ref(), self.bind_ip.as_deref(), self.debug).await
     }
 
     /// UDP Target Routing
@@ -35,7 +37,7 @@ impl Router {
             let lock = self.outbound_cfg.read().unwrap();
             lock.clone()
         };
-        crate::outbound::connect_udp_target(target, cfg.as_ref(), self.debug, server_udp).await
+        crate::outbound::connect_udp_target(target, cfg.as_ref(), self.bind_ip.as_deref(), self.debug, server_udp).await
     }
     
     /// Establish a UDP session router that can dynamically route packets
@@ -50,7 +52,7 @@ impl Router {
             if c.enabled {
                 if c.protocol == "socks5" {
                     let proxy_addr = format!("{}:{}", c.address, c.port);
-                    match crate::outbound::connect_udp_via_socks5(&proxy_addr, server_udp.clone(), &c.username, &c.password).await {
+                    match crate::outbound::connect_udp_via_socks5(&proxy_addr, server_udp.clone(), self.bind_ip.as_deref(), &c.username, &c.password).await {
                         Ok(p) => proxy = Some(Arc::new(p)),
                         // Warn unconditionally, not only under `debug`. Every UDP
                         // flow the rules want proxied is now dropped instead of
@@ -99,7 +101,7 @@ impl UdpSessionRouter {
     pub async fn send_to(&self, data: &[u8], target: &str) -> Result<usize> {
         if let Some(cfg) = &self.cfg {
             if cfg.enabled {
-                let action = crate::outbound::select_outbound_action(target, "udp", cfg, self.debug).await;
+                let (action, _rule_src) = crate::outbound::select_outbound_action(target, "udp", cfg, self.debug).await;
                 if action == crate::outbound::OutboundAction::Block {
                     return Err(anyhow::anyhow!("blocked by outbound udp rule: {}", target));
                 }

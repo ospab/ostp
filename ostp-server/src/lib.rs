@@ -70,6 +70,7 @@ pub(crate) struct RemoteState {
 pub async fn run_server(
     bind_addrs: Vec<String>,
     server_public_ip: Option<String>,
+    bind_ip: Option<String>,
     access_keys: Vec<(String, crate::api::UserMeta)>,
     outbound: Option<OutboundConfig>,
     api_config: Option<ApiConfig>,
@@ -255,6 +256,7 @@ pub async fn run_server(
     // Initialize Router
     let router = std::sync::Arc::new(router::Router::new(
         outbound.clone(),
+        bind_ip,
         dns_server.clone(),
         debug,
     ));
