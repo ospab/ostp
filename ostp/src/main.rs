@@ -1556,7 +1556,7 @@ fn cmd_migrate(config_path: &std::path::Path) -> Result<()> {
     let kind = ostp_client::migrate::detect_kind(&parsed)
         .ok_or_else(|| anyhow!("Could not determine whether {:?} is a client, server, or relay config.", config_path))?;
 
-    let (migrated, report) = match kind {
+    let (mut migrated, mut report) = match kind {
         ostp_client::migrate::ConfigKind::Client => {
             let (mut v, r) = ostp_client::migrate::migrate_client_json(parsed);
             if v.get("mode").is_none() { v["mode"] = serde_json::json!("client"); }
@@ -1572,6 +1572,16 @@ fn cmd_migrate(config_path: &std::path::Path) -> Result<()> {
             (parsed, ostp_client::migrate::MigrationReport::default())
         }
     };
+
+    // Uniform final pass for every kind: strip null "unset" keys so the written
+    // config is concise. Key order is already canonical (serde_json sorts keys
+    // on write), so together with the kind-specific rules above this turns any
+    // disordered, noisy config.json into a clean canonical one — without losing
+    // any real data.
+    if ostp_client::migrate::normalize(&mut migrated) {
+        report.changed = true;
+        report.notes.push("Removed unset (null) keys and wrote the config in canonical order.".to_string());
+    }
 
     if !report.changed {
         println!("{} Config is already up to date, nothing to migrate.", "[ostp]".green().bold());

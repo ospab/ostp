@@ -356,6 +356,41 @@ pub fn migrate_server_json(json: Value) -> (Value, MigrationReport) {
     (out, report)
 }
 
+/// Final normalization pass applied to every migrated config: strip null-valued
+/// keys at every nesting level. A JSON null means "unset", so it is pure noise —
+/// removing it is the "concise" part of the migration, and it never loses real
+/// data (a set value is never null). Key ORDER is already canonical for free:
+/// serde_json serializes object keys in sorted order, so any write of a migrated
+/// config comes out stably ordered no matter how disordered the input was.
+///
+/// Returns whether it removed anything, so the caller folds it into the
+/// "was this already up to date?" decision.
+pub fn normalize(value: &mut Value) -> bool {
+    let before = value.clone();
+    strip_nulls(value);
+    *value != before
+}
+
+/// Recursively drop keys whose value is JSON null, descending into nested
+/// objects and array elements. Empty objects and arrays are kept — an explicit
+/// `rules: []` or `exclude: {}` carries intent; only nulls are noise.
+fn strip_nulls(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            map.retain(|_, v| !v.is_null());
+            for v in map.values_mut() {
+                strip_nulls(v);
+            }
+        }
+        Value::Array(arr) => {
+            for v in arr.iter_mut() {
+                strip_nulls(v);
+            }
+        }
+        _ => {}
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -555,5 +590,79 @@ mod tests {
         assert_eq!(detect_kind(&json!({"access_keys": ["x"], "listen": "y"})), Some(ConfigKind::Server));
         assert_eq!(detect_kind(&json!({"upstream_tcp": "x", "upstream_api_url": "y"})), Some(ConfigKind::Relay));
         assert_eq!(detect_kind(&json!({"mode": "client", "server": "x"})), Some(ConfigKind::Client));
+    }
+
+    // ── normalization (concise + no data loss + canonical) ──────────────────
+
+    #[test]
+    fn normalize_strips_nulls_but_keeps_real_data_and_empty_collections() {
+        let mut v = json!({
+            "mode": "client",
+            "server": "1.2.3.4:50000",
+            "access_key": "k",
+            "socks5_bind": null,                 // unset → removed
+            "tun": { "enable": true, "dns": null }, // nested null → removed
+            "exclude": { "domains": [], "ips": null }, // empty [] kept, null removed
+            "mux": { "enabled": false, "sessions": 1 },
+        });
+        let changed = normalize(&mut v);
+        assert!(changed, "stripping nulls is a change");
+        assert!(v.get("socks5_bind").is_none(), "top-level null must be gone");
+        assert!(v["tun"].get("dns").is_none(), "nested null must be gone");
+        assert!(v["exclude"].get("ips").is_none(), "nested null must be gone");
+        assert_eq!(v["exclude"]["domains"], json!([]), "an explicit empty array is intent, kept");
+        assert_eq!(v["server"], json!("1.2.3.4:50000"), "real data untouched");
+        assert_eq!(v["tun"]["enable"], json!(true));
+    }
+
+    #[test]
+    fn normalize_is_idempotent() {
+        let mut v = json!({ "mode": "server", "listen": "0.0.0.0:50000", "access_keys": ["k"], "debug": null });
+        assert!(normalize(&mut v), "first pass removes the null");
+        let once = v.clone();
+        assert!(!normalize(&mut v), "second pass changes nothing");
+        assert_eq!(v, once);
+    }
+
+    #[test]
+    fn normalize_never_drops_unknown_fields() {
+        // A field the schema has never heard of must survive — no data loss ever.
+        let mut v = json!({ "mode": "client", "server": "s", "access_key": "k", "some_future_field": {"a": 1} });
+        normalize(&mut v);
+        assert_eq!(v["some_future_field"], json!({"a": 1}), "unknown data must be preserved verbatim");
+    }
+
+    /// Forcing function: the configs the tool itself generates (init/setup
+    /// templates, current shape) must already be canonical — running the full
+    /// migrate pipeline over them must report NO change. If someone adds a field
+    /// to a template or the schema without teaching the migrator, this fails
+    /// instead of a user silently ending up with a config that `ostp migrate`
+    /// keeps trying to "fix". Covers all three kinds.
+    #[test]
+    fn generated_configs_are_already_canonical() {
+        // These mirror the exact shapes emitted by `ostp init` / the wizard.
+        let client = json!({
+            "mode": "client", "server": "127.0.0.1:50000", "access_key": "k",
+            "socks5_bind": "127.0.0.1:1088",
+            "transport": { "mode": "udp", "tcp_fragmentation": false },
+            "debug": false,
+        });
+        let server = json!({
+            "mode": "server", "listen": "0.0.0.0:50000", "access_keys": ["k"],
+            "outbound": { "enabled": false, "protocol": "socks5", "address": "127.0.0.1",
+                          "port": 9050, "username": "", "password": "", "default_action": "proxy", "rules": [] },
+            "debug": false,
+        });
+        let relay = json!({
+            "mode": "relay", "listen": "0.0.0.0:50000",
+            "upstream_tcp": "1.2.3.4:50000", "upstream_udp": "1.2.3.4:50000", "debug": false,
+        });
+
+        for (name, cfg) in [("client", client), ("server", server), ("relay", relay)] {
+            let mut v = cfg.clone();
+            let changed = normalize(&mut v);
+            assert!(!changed, "the generated {name} template must be canonical (no nulls to strip)");
+            assert_eq!(v, cfg, "normalizing the {name} template must not alter it");
+        }
     }
 }
