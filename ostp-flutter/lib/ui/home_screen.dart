@@ -4,6 +4,7 @@ import 'dart:ui';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:package_info_plus/package_info_plus.dart';
 import '../models/connection_state_enum.dart';
 import '../models/ostp_profile.dart';
 import 'settings_screen.dart';
@@ -55,10 +56,15 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
   String _pingText = '-- ms';
   Color _pingColor = Colors.white54;
 
+  // App version, shown at the bottom of the home screen. Read from the build
+  // (pubspec) via package_info rather than hardcoded, so it never drifts.
+  String _version = '';
+
   @override
   void initState() {
     super.initState();
     _loadSettings();
+    _loadVersion();
     _pulseController = AnimationController(
       vsync: this,
       duration: const Duration(seconds: 2),
@@ -69,6 +75,17 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
     );
     _checkInitialState();
     _startPolling();
+  }
+
+  Future<void> _loadVersion() async {
+    try {
+      final info = await PackageInfo.fromPlatform();
+      if (mounted) {
+        setState(() => _version = 'v${info.version} (${info.buildNumber})');
+      }
+    } catch (_) {
+      // Non-fatal: just leave the version line blank if it can't be read.
+    }
   }
 
   Future<void> _checkInitialState() async {
@@ -517,6 +534,17 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
                           _buildTopBar(theme),
                           Expanded(child: _buildStage(theme)),
                           _buildMetricsBar(theme),
+                          Padding(
+                            padding: const EdgeInsets.only(top: 8, bottom: 10),
+                            child: Text(
+                              _version.isEmpty ? 'OSTP' : 'OSTP · $_version',
+                              style: TextStyle(
+                                fontSize: 11,
+                                letterSpacing: 0.5,
+                                color: Colors.white.withOpacity(0.28),
+                              ),
+                            ),
+                          ),
                         ],
                       ),
                     ),
