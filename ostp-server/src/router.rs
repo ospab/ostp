@@ -50,7 +50,7 @@ impl Router {
             if c.enabled {
                 if c.protocol == "socks5" {
                     let proxy_addr = format!("{}:{}", c.address, c.port);
-                    match crate::outbound::connect_udp_via_socks5(&proxy_addr, server_udp.clone()).await {
+                    match crate::outbound::connect_udp_via_socks5(&proxy_addr, server_udp.clone(), &c.username, &c.password).await {
                         Ok(p) => proxy = Some(Arc::new(p)),
                         // Warn unconditionally, not only under `debug`. Every UDP
                         // flow the rules want proxied is now dropped instead of

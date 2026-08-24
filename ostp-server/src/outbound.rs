@@ -28,6 +28,10 @@ pub struct OutboundConfig {
     pub protocol: String,
     pub address: String,
     pub port: u16,
+    /// SOCKS5 credentials for an upstream proxy that requires auth (e.g. a
+    /// residential-proxy service). Empty = no-auth SOCKS5.
+    pub username: String,
+    pub password: String,
     pub rules: Vec<OutboundRule>,
     pub default_action: OutboundAction,
 }
@@ -51,7 +55,7 @@ pub async fn connect_target(
                 // Case-insensitive: a config saying "SOCKS5" means the same thing
                 // as "socks5", and silently treating it as unknown is a trap.
                 return match outbound.protocol.to_ascii_lowercase().as_str() {
-                    "socks5" => connect_via_socks5(&proxy_addr, target).await,
+                    "socks5" => connect_via_socks5(&proxy_addr, target, &outbound.username, &outbound.password).await,
                     "http" => connect_via_http(&proxy_addr, target).await,
                     // FAIL CLOSED. This used to fall through to a direct
                     // connection, so any unrecognised protocol string — a typo,
@@ -193,16 +197,66 @@ async fn match_ip_rule(host: &str, _port: u16, cidrs: &[String]) -> bool {
 
 // ── SOCKS5 / HTTP CONNECT upstream proxy ─────────────────────────────────────
 
-async fn connect_via_socks5(proxy_addr: &str, target: &str) -> Result<TcpStream> {
+/// SOCKS5 method negotiation plus RFC 1929 username/password auth when
+/// credentials are supplied. Shared by the TCP-connect and UDP-associate paths
+/// so both authenticate identically to an upstream that requires it.
+async fn socks5_negotiate_auth<S>(stream: &mut S, username: &str, password: &str) -> Result<()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let use_auth = !username.is_empty();
+    if use_auth && (username.len() > 255 || password.len() > 255) {
+        anyhow::bail!("SOCKS5 username/password must each be at most 255 bytes");
+    }
+    // Offer username/password (0x02) alongside no-auth (0x00) when we have
+    // credentials, so a residential-proxy service that demands auth is satisfied
+    // while a plain proxy still works.
+    if use_auth {
+        stream.write_all(&[0x05, 0x02, 0x00, 0x02]).await?;
+    } else {
+        stream.write_all(&[0x05, 0x01, 0x00]).await?;
+    }
+    let mut reply = [0u8; 2];
+    stream.read_exact(&mut reply).await?;
+    if reply[0] != 0x05 {
+        anyhow::bail!("SOCKS5: unexpected version 0x{:02x} in method reply", reply[0]);
+    }
+    match reply[1] {
+        0x00 => {} // no authentication required
+        0x02 => {
+            let mut auth = vec![0x01u8];
+            auth.push(username.len() as u8);
+            auth.extend_from_slice(username.as_bytes());
+            auth.push(password.len() as u8);
+            auth.extend_from_slice(password.as_bytes());
+            stream.write_all(&auth).await?;
+            let mut ar = [0u8; 2];
+            stream.read_exact(&mut ar).await?;
+            if ar[1] != 0x00 {
+                anyhow::bail!("SOCKS5 username/password auth rejected (status 0x{:02x})", ar[1]);
+            }
+        }
+        0xFF => anyhow::bail!(
+            "SOCKS5 proxy rejected all offered auth methods — it likely requires \
+             credentials; set outbound.username / outbound.password"
+        ),
+        other => anyhow::bail!("SOCKS5 proxy chose unsupported auth method 0x{:02x}", other),
+    }
+    Ok(())
+}
+
+async fn connect_via_socks5(
+    proxy_addr: &str,
+    target: &str,
+    username: &str,
+    password: &str,
+) -> Result<TcpStream> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let mut stream = TcpStream::connect(proxy_addr).await?;
-    stream.write_all(&[0x05, 0x01, 0x00]).await?;
-    let mut reply = [0u8; 2];
-    stream.read_exact(&mut reply).await?;
-    if reply != [0x05, 0x00] {
-        anyhow::bail!("SOCKS5 auth not accepted");
-    }
+    socks5_negotiate_auth(&mut stream, username, password).await?;
 
     let (host, port) = split_host_port(target).ok_or_else(|| anyhow::anyhow!("invalid target"))?;
     let mut req = Vec::new();
@@ -384,7 +438,7 @@ pub async fn connect_udp_target(
             if action == OutboundAction::Proxy {
                 let proxy_addr = format!("{}:{}", outbound.address, outbound.port);
                 if outbound.protocol.eq_ignore_ascii_case("socks5") {
-                    return connect_udp_via_socks5(&proxy_addr, server_udp).await;
+                    return connect_udp_via_socks5(&proxy_addr, server_udp, &outbound.username, &outbound.password).await;
                 }
                 // FAIL CLOSED. HTTP CONNECT genuinely cannot carry UDP — but the
                 // answer to that is not to send the datagrams in the clear. The
@@ -408,16 +462,13 @@ pub async fn connect_udp_target(
 pub async fn connect_udp_via_socks5(
     proxy_addr: &str,
     server_udp: std::sync::Arc<tokio::net::UdpSocket>,
+    username: &str,
+    password: &str,
 ) -> Result<UdpProxySocket> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let mut stream = TcpStream::connect(proxy_addr).await?;
-    stream.write_all(&[0x05, 0x01, 0x00]).await?;
-    let mut reply = [0u8; 2];
-    stream.read_exact(&mut reply).await?;
-    if reply != [0x05, 0x00] {
-        anyhow::bail!("SOCKS5 auth not accepted");
-    }
+    socks5_negotiate_auth(&mut stream, username, password).await?;
 
     // Send UDP Associate request
     let local_addr = server_udp.local_addr()?;

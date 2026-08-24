@@ -552,6 +552,13 @@ pub struct OutboundConfig {
     pub protocol: String,
     pub address: String,
     pub port: u16,
+    /// SOCKS5 username, for an upstream proxy that requires authentication
+    /// (e.g. a residential-proxy service). Empty/absent = no-auth SOCKS5.
+    #[serde(default)]
+    pub username: String,
+    /// SOCKS5 password (paired with `username`).
+    #[serde(default)]
+    pub password: String,
     #[serde(default)]
     pub rules: Vec<OutboundRule>,
     pub default_action: Option<String>,

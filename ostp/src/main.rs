@@ -649,6 +649,8 @@ fn run_setup_wizard(config_path: &std::path::Path) -> Result<()> {
                     "protocol": "socks5",
                     "address": "127.0.0.1",
                     "port": 9050,
+                    "username": "",
+                    "password": "",
                     "default_action": "proxy",
                     "rules": []
                 },
@@ -751,6 +753,8 @@ fn run_setup_wizard(config_path: &std::path::Path) -> Result<()> {
                     "protocol": "socks5",
                     "address": "127.0.0.1",
                     "port": 9050,
+                    "username": "",
+                    "password": "",
                     "default_action": "proxy",
                     "rules": []
                 },
@@ -1358,6 +1362,8 @@ async fn run_app() -> Result<()> {
                 protocol: o.protocol,
                 address: o.address,
                 port: o.port,
+                username: o.username,
+                password: o.password,
                 rules: o
                     .rules
                     .into_iter()
