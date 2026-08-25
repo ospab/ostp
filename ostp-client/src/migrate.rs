@@ -353,6 +353,22 @@ pub fn migrate_server_json(json: Value) -> (Value, MigrationReport) {
         }
     }
 
+    // Backfill the SOCKS5 credential fields on `outbound`, added after some
+    // server configs already existed. These are plain strings that default to
+    // "" (no-auth), so making them explicit is safe and concise. The optional
+    // `bind_ip` (top level) and per-rule `send_from` are deliberately NOT
+    // backfilled: absent means "use the default source", which is correct — and
+    // a placeholder would either be stripped (null) or, worse, parse as an
+    // invalid source IP ("").
+    if let Some(outbound) = obj.get_mut("outbound").and_then(|o| o.as_object_mut()) {
+        for key in ["username", "password"] {
+            if !outbound.contains_key(key) {
+                report.note(format!("Added outbound.{key} = \"\" (missing default)"));
+                outbound.insert(key.to_string(), json!(""));
+            }
+        }
+    }
+
     (out, report)
 }
 
@@ -582,6 +598,31 @@ mod tests {
         assert_eq!(new["api"]["bind"], "0.0.0.0:9090");
         assert!(new["api"].get("token").is_none());
         assert!(report.notes.iter().any(|n| n.contains("api.token")));
+    }
+
+    /// A server config whose `outbound` predates the SOCKS5 credential fields
+    /// must get them backfilled — this is exactly the "migrate said nothing to
+    /// migrate but the new fields were missing" gap. The optional bind_ip /
+    /// send_from must NOT be injected (absent = correct).
+    #[test]
+    fn server_migrate_backfills_outbound_credentials() {
+        let old = json!({
+            "listen": "0.0.0.0:50000",
+            "access_keys": ["k1"],
+            "api": { "enabled": true, "bind": "0.0.0.0:9090", "webpath": "", "username": "", "password_hash": "" },
+            "outbound": {
+                "enabled": false, "protocol": "socks5", "address": "127.0.0.1", "port": 40000,
+                "default_action": "proxy",
+                "rules": [{ "action": "proxy", "domain_suffix": [".onion"] }]
+            }
+        });
+        let (new, report) = migrate_server_json(old);
+        assert!(report.changed, "adding the missing credential fields is a change");
+        assert_eq!(new["outbound"]["username"], "");
+        assert_eq!(new["outbound"]["password"], "");
+        // Optional fields are left absent, not injected.
+        assert!(new.get("bind_ip").is_none());
+        assert!(new["outbound"]["rules"][0].get("send_from").is_none());
     }
 
     #[test]
