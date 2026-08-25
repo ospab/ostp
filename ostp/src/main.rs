@@ -314,15 +314,90 @@ fn detect_local_public_ip() -> Option<String> {
     None
 }
 
+/// All global (non-private) IPv4 addresses the machine holds. A VPS with a
+/// second address — bought to escape a burned IP — shows up here as more than
+/// one entry, which is what the multi-address egress feature (bind_ip /
+/// send_from) routes over.
+fn detect_all_public_ipv4() -> Vec<String> {
+    let mut ips = Vec::new();
+    #[cfg(not(target_os = "windows"))]
+    {
+        if let Ok(out) = std::process::Command::new("ip")
+            .args(["-4", "addr", "show", "scope", "global"])
+            .output()
+        {
+            let text = String::from_utf8_lossy(&out.stdout);
+            for line in text.lines() {
+                if let Some(idx) = line.find("inet ") {
+                    let substr = &line[idx + 5..];
+                    let ip = substr
+                        .split(|c: char| c == '/' || c.is_whitespace())
+                        .next()
+                        .unwrap_or("");
+                    if !ip.is_empty() && !is_private_ip(ip) && !ips.contains(&ip.to_string()) {
+                        ips.push(ip.to_string());
+                    }
+                }
+            }
+        }
+    }
+    ips
+}
+
+/// Detect the machine's public IPv4 address(es), record them one per line in
+/// `.ostp_public_ip`, and — when there is more than one — offer to set up
+/// multi-address egress. Called from the server setup wizard.
+///
+/// Returns `Some(primary_ip)` to be used as the config's global `bind_ip` when
+/// the operator opts into multi-address egress; `None` when there is a single
+/// address or they decline (leave egress on the OS default). The file is always
+/// written regardless, so the addresses are on hand for editing send_from later.
+fn setup_public_ips(config_dir: &std::path::Path) -> Option<String> {
+    let cache_path = config_dir.join(".ostp_public_ip");
+    let detected = detect_all_public_ipv4();
+    if detected.is_empty() {
+        return None;
+    }
+
+    // Record every detected address, one per line, so it is available later for
+    // configuring bind_ip / send_from. The first line stays the primary.
+    let _ = std::fs::write(&cache_path, detected.join("\n") + "\n");
+
+    if detected.len() == 1 {
+        println!("  {} Detected public IP: {}", "[ostp]".green().bold(), detected[0].cyan());
+        return None;
+    }
+
+    println!("  {} Detected {} public IPs (saved to {}):", "[ostp]".green().bold(), detected.len(), cache_path.display());
+    for ip in &detected {
+        println!("      • {}", ip.cyan());
+    }
+    let multi = wizard_yn(
+        "Set up multi-address egress (route different destinations out of different IPs)?",
+        true,
+    );
+    if !multi {
+        return None;
+    }
+    println!(
+        "      Global source set to {}. Per-destination sources go in outbound rules, e.g.\n      \
+         {{ \"domain_suffix\": [\"youtube.com\"], \"action\": \"direct\", \"send_from\": \"{}\" }}",
+        detected[0].cyan(),
+        detected.last().unwrap()
+    );
+    detected.into_iter().next()
+}
+
 fn get_or_ask_public_ip(config_path: &std::path::Path) -> String {
     let config_dir = config_path.parent().unwrap_or_else(|| std::path::Path::new("."));
     let cache_path = config_dir.join(".ostp_public_ip");
 
     if cache_path.exists() {
         if let Ok(cached) = std::fs::read_to_string(&cache_path) {
-            let ip = cached.trim().to_string();
-            if !ip.is_empty() {
-                return ip;
+            // The file may hold several addresses (one per line); the first
+            // non-empty line is the primary that links advertise.
+            if let Some(ip) = cached.lines().map(|l| l.trim()).find(|l| !l.is_empty()) {
+                return ip.to_string();
             }
         }
     }
@@ -637,9 +712,14 @@ fn run_setup_wizard(config_path: &std::path::Path) -> Result<()> {
             }
             wizard_ok(&format!("Generated {} key(s)", key_count));
 
+            // Auto-detect the machine's public IPs and, when there is more than
+            // one, offer multi-address egress (records them in .ostp_public_ip).
+            let config_dir = config_path.parent().unwrap_or_else(|| std::path::Path::new("."));
+            let bind_ip = setup_public_ips(config_dir);
+
             wizard_step(3, TOTAL, "Service registration");
             // intentional: step text then daemon call below
-            let server_json = serde_json::json!({
+            let mut server_json = serde_json::json!({
                 "mode": "server",
                 "log_level": "info",
                 "listen": listen,
@@ -664,6 +744,9 @@ fn run_setup_wizard(config_path: &std::path::Path) -> Result<()> {
                 "fallback": { "enabled": false, "listen": "0.0.0.0:443", "target": "127.0.0.1:8080" },
                 "debug": false
             });
+            if let Some(ip) = &bind_ip {
+                server_json["bind_ip"] = serde_json::json!(ip);
+            }
 
             let actual_path = wizard_save_config(config_path, &server_json)?;
 
@@ -741,9 +824,13 @@ fn run_setup_wizard(config_path: &std::path::Path) -> Result<()> {
                 <sha2::Sha256 as sha2::Digest>::digest(password.as_bytes())
             );
 
+            // Auto-detect public IPs and offer multi-address egress.
+            let config_dir = config_path.parent().unwrap_or_else(|| std::path::Path::new("."));
+            let bind_ip = setup_public_ips(config_dir);
+
             wizard_step(4, TOTAL, "Saving configuration");
             let panel_bind = format!("0.0.0.0:{}", panel_port);
-            let server_json = serde_json::json!({
+            let mut server_json = serde_json::json!({
                 "mode": "server",
                 "log_level": "info",
                 "listen": listen,
@@ -768,6 +855,9 @@ fn run_setup_wizard(config_path: &std::path::Path) -> Result<()> {
                 "fallback": { "enabled": false, "listen": "0.0.0.0:443", "target": "127.0.0.1:8080" },
                 "debug": false
             });
+            if let Some(ip) = &bind_ip {
+                server_json["bind_ip"] = serde_json::json!(ip);
+            }
 
             let actual_path = wizard_save_config(config_path, &server_json)?;
 
