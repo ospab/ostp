@@ -152,5 +152,24 @@ class MainActivity : FlutterActivity() {
             intent.putExtra("configJson", pendingConfigJson)
         }
         androidx.core.content.ContextCompat.startForegroundService(this, intent)
+        // Ask to be exempt from battery optimization so Doze does not freeze the
+        // service (which drops the tunnel AND stops the in-process reconnect from
+        // ever running). Only prompts if not already exempt; runs after the VPN
+        // consent so the two system dialogs do not stack.
+        requestBatteryExemptionIfNeeded()
+    }
+
+    private fun requestBatteryExemptionIfNeeded() {
+        try {
+            val pm = getSystemService(android.content.Context.POWER_SERVICE) as android.os.PowerManager
+            if (!pm.isIgnoringBatteryOptimizations(packageName)) {
+                val intent = Intent(android.provider.Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS)
+                intent.data = android.net.Uri.parse("package:$packageName")
+                intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                startActivity(intent)
+            }
+        } catch (e: Throwable) {
+            android.util.Log.e("MainActivity", "Battery exemption request failed", e)
+        }
     }
 }
