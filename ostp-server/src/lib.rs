@@ -295,15 +295,23 @@ pub async fn run_server(params: ServerParams) -> Result<()> {
         }
     }
 
-    // Spawn Fallback TCP proxy if configured
-    if let Some(ref fb_cfg) = fallback_config {
-        if fb_cfg.enabled {
-            let fb_cfg_clone = fb_cfg.clone();
-            tokio::spawn(async move {
-                fallback::start_fallback_server(fb_cfg_clone).await;
-            });
+    // Every TCP listener sniffs; the fallback target (if any) is where
+    // non-OSTP traffic goes, and its listen address is one more listener.
+    let fallback = fallback_config.filter(|f| f.enabled);
+    let mut tcp_listen = bind_addrs.clone();
+    if let Some(fb) = &fallback {
+        if !tcp_listen.contains(&fb.listen) {
+            tcp_listen.push(fb.listen.clone());
         }
     }
+    let sniff = SniffSettings {
+        tcp_listen,
+        ws_path: None,
+        decoy: match &fallback {
+            Some(fb) => transport::sniff::Decoy::Proxy(fb.target.clone()),
+            None => transport::sniff::Decoy::NotFound,
+        },
+    };
 
     let (_ui_cmd_tx, ui_cmd_rx) = mpsc::unbounded_channel::<UiCommand>();
     let (ui_event_tx, mut ui_event_rx) = mpsc::unbounded_channel::<UiEvent>();
@@ -362,7 +370,7 @@ pub async fn run_server(params: ServerParams) -> Result<()> {
     tracing::info!(listeners = bind_addrs.len(), keys = key_count, "server started");
     tracing::info!("ARQ config: max_reorder=16384, reorder_buf=8192, sent_history=32768, rto=100ms");
     tokio::select! {
-        res = run_server_loop(bind_addrs.clone(), primary_socket, sockets, dispatcher, ui_cmd_rx, ui_event_tx, shared_keys, router) => {
+        res = run_server_loop(sniff, primary_socket, sockets, dispatcher, ui_cmd_rx, ui_event_tx, shared_keys, router) => {
             if let Err(e) = res {
                 tracing::error!("Server error: {e}");
             }
@@ -377,8 +385,15 @@ pub async fn run_server(params: ServerParams) -> Result<()> {
 
 // ── Server main loop ─────────────────────────────────────────────────────────
 
+/// TCP-side settings for the sniffing listeners.
+struct SniffSettings {
+    tcp_listen: Vec<String>,
+    ws_path: Option<String>,
+    decoy: transport::sniff::Decoy,
+}
+
 async fn run_server_loop(
-    bind_addrs: Vec<String>,
+    sniff: SniffSettings,
     primary_socket: std::sync::Arc<UdpSocket>,
     sockets: Vec<std::sync::Arc<UdpSocket>>,
     mut dispatcher: Dispatcher,
@@ -416,49 +431,25 @@ async fn run_server_loop(
         });
     }
 
-    // Spawn UoT (TCP) listeners
-    for bind_addr in &bind_addrs {
-        let addr = bind_addr.parse::<std::net::SocketAddr>().unwrap();
-        let tcp_map_clone = tcp_map.clone();
-        let _shared_keys_clone = shared_keys.clone();
-        let udp_tx_clone = udp_tx.clone();
-
-        tokio::spawn(async move {
-            if let Ok(listener) = tokio::net::TcpListener::bind(&addr).await {
-                tracing::info!("TCP (UoT) listener bound to {}", addr);
-
-                let limiter = crate::transport::limiter::ConnLimiter::new();
-
-                loop {
-                    if let Ok((stream, peer_addr)) = listener.accept().await {
-                        // Disable Nagle's algorithm on the UoT carrier. Without
-                        // this the server→client (download) direction batches
-                        // small writes and interacts with the client's delayed
-                        // ACKs, adding tens-to-hundreds of ms of stall per burst
-                        // — which throttles throughput badly for streaming/video.
-                        // The client already sets nodelay on its end; the server
-                        // must match. (Every TCP-tunnel proxy sets TCP_NODELAY.)
-                        let _ = stream.set_nodelay(true);
-
-                        if !limiter.check(peer_addr.ip()) {
-                            tracing::debug!("UoT rate limit exceeded for {}, dropping connection", peer_addr.ip());
-                            continue;
-                        }
-
-                        let tm = tcp_map_clone.clone();
-                        let tx = udp_tx_clone.clone();
-                        tokio::spawn(async move {
-                            if let Err(e) = crate::transport::uot::handle_tcp_connection(stream, peer_addr, tm, tx).await {
-                                tracing::warn!("UoT connection from {} closed: {}", peer_addr, e);
-                            }
-                        });
-                    }
-                }
-            } else {
-                tracing::warn!("Failed to bind TCP (UoT) listener to {}", addr);
+    // TCP listeners (UoT, plus HTTP upgrade and decoy on the same ports)
+    let sniff_ctx = Arc::new(transport::sniff::SniffCtx {
+        ws_path: sniff.ws_path,
+        decoy: sniff.decoy,
+        limiter: Arc::new(transport::limiter::ConnLimiter::new()),
+        pending: Arc::new(tokio::sync::Semaphore::new(transport::sniff::MAX_PENDING)),
+        tcp_map: tcp_map.clone(),
+        udp_tx: udp_tx.clone(),
+    });
+    for addr in &sniff.tcp_listen {
+        match tokio::net::TcpListener::bind(addr).await {
+            Ok(listener) => {
+                tracing::info!("TCP listener bound to {}", addr);
+                tokio::spawn(transport::sniff::serve_listener(listener, sniff_ctx.clone()));
             }
-        });
+            Err(e) => tracing::warn!("Failed to bind TCP listener to {}: {}", addr, e),
+        }
     }
+    drop(sniff_ctx);
 
     drop(udp_tx); // Drop the original sender so the channel closes when all tasks end
 

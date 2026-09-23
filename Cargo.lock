@@ -1488,6 +1488,7 @@ dependencies = [
  "futures-util",
  "hex",
  "hmac",
+ "httparse",
  "json_comments",
  "mime_guess",
  "ostp-core",
