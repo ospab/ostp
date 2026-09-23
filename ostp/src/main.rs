@@ -1,7 +1,7 @@
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use clap::Parser;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use colored::Colorize;
 
 mod cert_cmd;
@@ -51,8 +51,15 @@ enum Commands {
         #[arg(short = 'n', long, default_value_t = 1)]
         count: usize,
     },
-    /// Output ready-to-use client sharing links (ostp://...) from the server configuration
-    Links,
+    /// Output ready-to-use client sharing links (ostp://...) from the server configuration.
+    /// `ostp links qr` shows a QR code per client, one client at a time.
+    Links {
+        #[arg(value_parser = ["qr"])]
+        view: Option<String>,
+        /// With qr: a code for every link, not just the best one
+        #[arg(long)]
+        all: bool,
+    },
     /// Validate configuration file
     Check,
     /// Connect using a share link (ostp://ACCESS_KEY@HOST:PORT)
@@ -71,7 +78,7 @@ enum Commands {
         #[arg(short = 'v', long, value_name = "VERSION")]
         version: Option<String>,
     },
-    /// Import a share link (ostp://...) into the configuration file
+    /// Import a share link (ostp://...) or a subscription URL (https://...) into the configuration file
     Import {
         url: String,
     },
@@ -241,6 +248,71 @@ fn subscription_url_for(server_cfg: &ostp_client::config::ServerConfig, key: &st
         p => format!(":{p}"),
     };
     Some(format!("https://{domain}{port}{}/{}", sub.path(), ostp_core::subscription::token_for_key(key)))
+}
+
+/// Terminal QR code; light modules drawn as blocks so it scans on the usual
+/// dark terminal background.
+fn qr_text(data: &str) -> Result<String> {
+    use qrcode::render::unicode::Dense1x2;
+    let code = qrcode::QrCode::with_error_correction_level(data.as_bytes(), qrcode::EcLevel::L)
+        .map_err(|e| anyhow!("cannot encode a QR code: {e}"))?;
+    Ok(code
+        .render::<Dense1x2>()
+        .dark_color(Dense1x2::Light)
+        .light_color(Dense1x2::Dark)
+        .quiet_zone(true)
+        .build())
+}
+
+fn cmd_links_qr(config_path: &Path, all: bool) -> Result<()> {
+    let content = fs::read_to_string(config_path).with_context(|| format!("cannot read {}", config_path.display()))?;
+    let stripped = json_comments::StripComments::new(content.as_bytes());
+    let config: UnifiedConfig = serde_json::from_reader(stripped)?;
+    let AppMode::Server(server_cfg) = config.mode else {
+        anyhow::bail!("`ostp links qr` needs a server configuration");
+    };
+    let interactive = std::io::IsTerminal::is_terminal(&std::io::stdin());
+    let total = server_cfg.access_keys.len();
+    for (idx, user) in server_cfg.access_keys.iter().enumerate() {
+        let key = user.key();
+        // Best first: the subscription carries every link and follows changes.
+        let mut entries: Vec<(String, String)> = Vec::new();
+        if let Some(url) = subscription_url_for(&server_cfg, &key) {
+            entries.push(("SUB".into(), url));
+        }
+        for (label, link) in share_links_for(&server_cfg, &key, config_path) {
+            entries.push((label.to_string(), link.to_uri()));
+        }
+        let who = user.name().filter(|n| !n.is_empty()).unwrap_or_else(|| format!("key {}", idx + 1));
+        println!("
+  {} {}/{total}: {}", "Client".bold(), idx + 1, who.cyan().bold());
+        for (n, (label, text)) in entries.iter().enumerate() {
+            if n == 0 || all {
+                println!("
+  {label}");
+                println!("{}", qr_text(text)?);
+            }
+            println!("  {label:<3}  {text}");
+        }
+        if interactive && idx + 1 < total {
+            let answer = wizard_prompt("Enter for the next client, q to stop", "");
+            if answer.trim().eq_ignore_ascii_case("q") {
+                break;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn format_bytes(n: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut v = n as f64;
+    let mut i = 0;
+    while v >= 1024.0 && i < UNITS.len() - 1 {
+        v /= 1024.0;
+        i += 1;
+    }
+    if i == 0 { format!("{n} B") } else { format!("{v:.1} {}", UNITS[i]) }
 }
 
 fn link_transport(l: &ostp_core::share_link::ShareLink) -> TransportConfigRaw {
@@ -1152,7 +1224,8 @@ async fn run_app() -> Result<()> {
                 return Ok(());
             }
             Commands::GenerateKey { format, count } => { args.generate_key = true; args.format = format; args.count = count; }
-            Commands::Links => { args.links = true; }
+            Commands::Links { view: Some(_), all } => return cmd_links_qr(&args.config, all),
+            Commands::Links { view: None, .. } => { args.links = true; }
             Commands::Check => { args.check = true; }
             Commands::Connect { url } => { args.url = Some(url); }
             Commands::Uninstall => { args.uninstall = true; }
@@ -1267,6 +1340,30 @@ async fn run_app() -> Result<()> {
     }
 
     if let Some(import_url) = args.import {
+        let import_url = if import_url.trim().to_ascii_lowercase().starts_with("https://") {
+            println!("{} Fetching subscription...", "[ostp]".cyan().bold());
+            let doc = ostp_client::subscription::fetch(&import_url)
+                .await
+                .map_err(|e| anyhow!("Subscription Error: {e}"))?;
+            let links = doc.valid_links();
+            println!("  {} — {} link(s), refresh every {} h", doc.name.bold(), links.len(), doc.update_interval_hours);
+            if let Some(u) = &doc.usage {
+                let limit = u.limit_bytes.map(format_bytes).unwrap_or_else(|| "unlimited".into());
+                println!("  Traffic: {} of {limit}", format_bytes(u.used_bytes));
+            }
+            for (i, l) in links.iter().enumerate() {
+                println!("  [{}] {}", i + 1, l.name.clone().unwrap_or_else(|| l.server()));
+            }
+            let pick = if links.len() > 1 && std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+                wizard_prompt("Which one", "1").trim().parse::<usize>().unwrap_or(1).clamp(1, links.len())
+            } else {
+                1
+            };
+            println!("  Run `ostp import <url>` again to pick up server changes.");
+            links[pick - 1].to_uri()
+        } else {
+            import_url
+        };
         println!("{} Importing configuration from share link...", "[ostp]".cyan().bold());
         let mut client_cfg = parse_ostp_link(&import_url)
             .map_err(|e| anyhow!("Share Link Error: {e}"))?;

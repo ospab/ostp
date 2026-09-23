@@ -19,5 +19,6 @@ tracing.workspace = true
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 ostp-core = { path = "../ostp-core" }
 colored = "2.1"
+qrcode = { version = "0.14", default-features = false }
 rlimit = "0.11.0"
 sha2.workspace = true

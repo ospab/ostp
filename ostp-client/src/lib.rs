@@ -6,6 +6,7 @@ pub mod dpi_probes;
 pub mod migrate;
 pub mod prober;
 pub mod signal;
+pub mod subscription;
 pub mod sysproxy;
 pub mod transport;
 pub mod ttl_probe;
