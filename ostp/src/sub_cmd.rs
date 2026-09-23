@@ -1,8 +1,9 @@
 //! `ostp sub`: the subscription server, managed on its own.
 //!
 //! Nothing here happens implicitly: each subcommand changes exactly what it
-//! says, keeps a backup of the config, never restarts the service and only
-//! touches a web server when asked to (`--vhost`).
+//! says, keeps a backup of the config, restarts a running service to apply it
+//! (`--no-restart` to skip) and only rewrites the web-server site when asked
+//! to (`--vhost`).
 
 use anyhow::{anyhow, bail, Context, Result};
 use colored::Colorize;
@@ -20,7 +21,11 @@ pub enum SubAction {
     /// Start serving subscriptions (needs HTTPS on a domain: `ostp cert issue`)
     Enable(SubOpts),
     /// Stop serving subscriptions (settings are kept)
-    Disable,
+    Disable {
+        /// Do not restart the running ostp service
+        #[arg(long)]
+        no_restart: bool,
+    },
     /// Change subscription settings without turning them on or off
     Set(SubOpts),
     /// Print subscription URLs: every user, or one by number, name or key
@@ -47,13 +52,16 @@ pub struct SubOpts {
     /// Also rewrite the OSTP-managed web-server site so it forwards the subscription path
     #[arg(long)]
     pub vhost: bool,
+    /// Do not restart the running ostp service
+    #[arg(long)]
+    pub no_restart: bool,
 }
 
 pub fn run(action: SubAction, config_path: &Path) -> Result<()> {
     match action {
         SubAction::Status => status(config_path),
         SubAction::Enable(o) => change(config_path, Some(true), o),
-        SubAction::Disable => change(config_path, Some(false), SubOpts::default()),
+        SubAction::Disable { no_restart } => change(config_path, Some(false), SubOpts { no_restart, ..Default::default() }),
         SubAction::Set(o) => {
             if o.path.is_none() && o.name.is_none() && o.interval.is_none() && o.include.is_none() && !o.vhost {
                 bail!("nothing to change: pass --path, --name, --interval, --include or --vhost");
@@ -136,7 +144,7 @@ fn change(config_path: &Path, enabled: Option<bool>, o: SubOpts) -> Result<()> {
         }
     }
 
-    println!("\n  The running service reads this on restart: {}", "sudo systemctl restart ostp".bold());
+    crate::cert_cmd::restart_service(o.no_restart);
     Ok(())
 }
 

@@ -49,6 +49,9 @@ pub struct IssueArgs {
     /// Answer yes to every confirmation
     #[arg(short = 'y', long)]
     pub yes: bool,
+    /// Do not restart the running ostp service afterwards
+    #[arg(long)]
+    pub no_restart: bool,
 }
 
 pub async fn run(action: CertAction, config_path: &Path) -> Result<()> {
@@ -236,7 +239,7 @@ pub async fn issue_interactive(config_path: &Path, a: IssueArgs) -> Result<()> {
     }
 
     print_links(config_path)?;
-    offer_restart(a.yes);
+    restart_service(a.no_restart);
     Ok(())
 }
 
@@ -371,16 +374,32 @@ fn print_links(config_path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn offer_restart(yes: bool) {
-    if !Path::new("/etc/systemd/system/ostp.service").exists() {
-        println!("\n  Restart OSTP to apply the HTTPS settings.");
+/// Applies a config change to the running service: restarts it if it is
+/// running (a stopped service stays stopped), then checks it came back.
+pub(crate) fn restart_service(skip: bool) {
+    let has_unit = Path::new("/etc/systemd/system/ostp.service").exists() || Path::new("/lib/systemd/system/ostp.service").exists();
+    if skip || !has_unit {
+        println!("\n  Restart OSTP to apply this: {}", "sudo systemctl restart ostp".bold());
         return;
     }
-    if yes || crate::wizard_yn("Restart the ostp service now to apply the HTTPS settings?", true) {
-        match std::process::Command::new("systemctl").args(["restart", "ostp"]).status() {
-            Ok(s) if s.success() => crate::wizard_ok("ostp restarted"),
-            _ => crate::wizard_warn("could not restart ostp; run: systemctl restart ostp"),
+    let active = |unit: &str| {
+        std::process::Command::new("systemctl").args(["is-active", "--quiet", unit]).status().is_ok_and(|s| s.success())
+    };
+    if !active("ostp") {
+        println!("\n  The ostp service is not running; the change applies when it starts.");
+        return;
+    }
+    match std::process::Command::new("systemctl").args(["restart", "ostp"]).status() {
+        Ok(s) if s.success() => {
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            if active("ostp") {
+                crate::wizard_ok("ostp restarted with the new settings");
+            } else {
+                crate::wizard_warn("ostp did not stay up after the restart; last log lines:");
+                let _ = std::process::Command::new("journalctl").args(["-u", "ostp", "-n", "15", "--no-pager"]).status();
+            }
         }
+        _ => crate::wizard_warn("could not restart ostp; run: sudo systemctl restart ostp"),
     }
 }
 
