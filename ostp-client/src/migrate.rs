@@ -1,29 +1,28 @@
-//! The ONE authoritative place that upgrades an old `config.json` to the
-//! current schema. Reachable only via the explicit `ostp migrate` command —
-//! nothing else in this codebase silently rewrites a user's config on their
-//! behalf (the old 0.3.x line used to auto-migrate on every load with just a
-//! log warning; that's exactly the kind of "invisible until something looks
-//! wrong" behavior this module replaces).
+//! Upgrades a `config.json` of any past shape to the current schema.
 //!
-//! Every field this module cannot map forward is reported explicitly in
-//! `MigrationReport.notes`, never silently dropped without a trace.
+//! Configs carry a schema version (`config_version`). Migration runs the
+//! ordered steps from the file's version up to [`CURRENT_VERSION`], each step
+//! exactly once, then stamps the new version, so running it again is a no-op.
+//! Files from before the stamp existed are dated by their shape.
+//!
+//! What changed is not hand-reported: [`Migration::changes`] is a structural
+//! diff of input against output, and each step adds the reason for what it
+//! did. Keys the schema does not know (typos, leftovers) are found by
+//! round-tripping through the typed config — no key list to maintain — and
+//! reported with a suggestion, never deleted.
+//!
+//! Reachable only through `ostp migrate`: nothing rewrites a user's config
+//! behind their back.
 
-use serde_json::{json, Value};
+use anyhow::{anyhow, bail, Result};
+use serde_json::{json, Map, Value};
 
-#[derive(Debug, Default)]
-pub struct MigrationReport {
-    /// Whether anything was actually different from the current schema.
-    pub changed: bool,
-    /// Human-readable line per field added, converted, or dropped.
-    pub notes: Vec<String>,
-}
-
-impl MigrationReport {
-    fn note(&mut self, msg: impl Into<String>) {
-        self.changed = true;
-        self.notes.push(msg.into());
-    }
-}
+/// Schema versions:
+/// - `0`: 0.3.1–0.3.21 client, modular `inbounds`/`outbounds`/`routing`.
+/// - `1`: flat configs up to 0.4.5, no version stamp; may carry settings of
+///   features that no longer exist.
+/// - `2`: 0.4.6+, stamped `config_version`.
+pub const CURRENT_VERSION: u32 = 2;
 
 /// Which config this file is (mirrors `AppMode`'s `"mode"` tag). Old configs
 /// from before that tag existed are sniffed structurally as a fallback.
@@ -34,6 +33,16 @@ pub enum ConfigKind {
     Relay,
 }
 
+impl ConfigKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ConfigKind::Client => "client",
+            ConfigKind::Server => "server",
+            ConfigKind::Relay => "relay",
+        }
+    }
+}
+
 pub fn detect_kind(json: &Value) -> Option<ConfigKind> {
     match json.get("mode").and_then(|v| v.as_str()) {
         Some("client") => return Some(ConfigKind::Client),
@@ -41,399 +50,362 @@ pub fn detect_kind(json: &Value) -> Option<ConfigKind> {
         Some("relay") => return Some(ConfigKind::Relay),
         _ => {}
     }
-    // No (or unrecognized) "mode" tag — this is an older config from before
-    // it was mandatory. Sniff by the fields that have been present on each
-    // shape since the earliest surviving config format.
+    // No (or unrecognized) "mode" tag — an older config from before it was
+    // mandatory. Sniff by the fields each shape has always had.
     if json.get("upstream_tcp").is_some() || json.get("upstream_api_url").is_some() {
         Some(ConfigKind::Relay)
     } else if json.get("access_keys").is_some() || json.get("listen").is_some() {
         Some(ConfigKind::Server)
-    } else if json.get("access_key").is_some() || json.get("server").is_some() {
+    } else if json.get("access_key").is_some() || json.get("server").is_some() || json.get("outbounds").is_some() {
         Some(ConfigKind::Client)
     } else {
         None
     }
 }
 
-/// Migrates a client config of any known past shape to the current flat
-/// schema. Returns the migrated JSON and a report of every change made.
-///
-/// Known input shapes, oldest first:
-/// - **v0.3.1–v0.3.21 "modular multi-server"**: `inbounds`/`outbounds` arrays
-///   + `routing.rules`. Only the first `ostp`-type outbound is kept (this
-///   line no longer supports multiple simultaneous servers); every other
-///   `ostp` outbound is reported by tag+address so nothing vanishes
-///   invisibly. `urltest`/`selector`/`direct`/`block` outbounds have no
-///   equivalent and are dropped (reported).
-/// - **pre-0.3.1 flat (up to v0.2.98)**: same field names as today
-///   (`server`, `access_key`, `tun`, `exclude`, `mux`, `transport`, ...)
-///   except `tun.wintun_path`/`tun.ipv4_address` (internal driver detail,
-///   never user-meaningful data) and `transport.wss` (the WSS framing
-///   feature removed entirely in the 0.4.0 rebuild) — both dropped with an
-///   explicit note; everything else maps 1:1, nothing to convert.
-/// - **configs carrying a leftover `transport.stealth_sni`**: dropped with a
-///   note, same reasoning as `wss` — it never fed into anything on the wire
-///   (no TLS/HTTP mimicry exists in this project), so there is no successor
-///   field. Not tied to a specific version: it lingered in the schema well
-///   past when the mimicry work it was meant for got removed.
-/// - **current flat schema**: no-op, `changed = false`.
-pub fn migrate_client_json(json: Value) -> (Value, MigrationReport) {
-    let mut report = MigrationReport::default();
-
-    let has_inbounds = json.get("inbounds").and_then(|v| v.as_array()).is_some();
-    let has_outbounds = json.get("outbounds").and_then(|v| v.as_array()).is_some();
-
-    if has_inbounds && has_outbounds {
-        return migrate_client_from_modular(json, report);
+/// The schema version a file is at: its stamp, or dated by shape.
+pub fn detect_version(json: &Value) -> u32 {
+    if let Some(v) = json.get("config_version").and_then(|v| v.as_u64()) {
+        return v as u32;
     }
-
-    // Flat shape already (current or pre-0.3.1) — normalize obsolete fields
-    // in place rather than rebuilding the whole document from scratch, so
-    // any field this module doesn't know about yet still survives untouched.
-    let mut out = json;
-
-    if let Some(tun) = out.get_mut("tun").and_then(|t| t.as_object_mut()) {
-        for dead_field in ["wintun_path", "ipv4_address"] {
-            if tun.remove(dead_field).is_some() {
-                report.note(format!(
-                    "Dropped tun.{dead_field} — internal driver detail from an older WinTun \
-                     integration, not applicable to the current TUN implementation."
-                ));
-            }
-        }
-    }
-    if let Some(transport) = out.get_mut("transport").and_then(|t| t.as_object_mut()) {
-        if transport.remove("wss").is_some() {
-            report.note(
-                "Dropped transport.wss — WSS framing was removed in the 0.4.0 rebuild \
-                 (the project follows a zapret-like approach: no protocol mimicry, \
-                 just packet-level obfuscation/manipulation, so there is no successor field)."
-                    .to_string(),
-            );
-        }
-        if transport.remove("stealth_sni").is_some() {
-            report.note(
-                "Dropped transport.stealth_sni — never actually used to construct any wire \
-                 bytes (no TLS/HTTP mimicry exists in this project — same zapret-like \
-                 reasoning as transport.wss), so it was unused config plumbing with no effect."
-                    .to_string(),
-            );
-        }
-    }
-
-    (out, report)
+    let modular = json.get("inbounds").is_some_and(|v| v.is_array()) && json.get("outbounds").is_some_and(|v| v.is_array());
+    if modular { 0 } else { 1 }
 }
 
-fn migrate_client_from_modular(json: Value, mut report: MigrationReport) -> (Value, MigrationReport) {
-    report.changed = true; // the shape itself is being replaced regardless of field-level detail
+// ── Steps ────────────────────────────────────────────────────────────────────
 
-    let inbounds = json.get("inbounds").and_then(|v| v.as_array()).cloned().unwrap_or_default();
-    let outbounds = json.get("outbounds").and_then(|v| v.as_array()).cloned().unwrap_or_default();
-    let routing = json.get("routing").cloned().unwrap_or(json!({}));
-    let default_outbound = routing.get("default_outbound").and_then(|v| v.as_str()).map(String::from);
+/// One schema change: applies to files of `kind` at version `from`.
+struct Step {
+    kind: ConfigKind,
+    from: u32,
+    title: &'static str,
+    run: fn(&mut Value, &mut Vec<String>),
+}
 
-    // ── Pick the primary "ostp" outbound ────────────────────────────────
-    // Prefer the one routing.default_outbound points at (directly, or via a
-    // urltest/selector group that references it); otherwise take the first
-    // ostp outbound in file order. Every other ostp outbound is reported by
-    // tag+address, not silently discarded.
-    let ostp_outbounds: Vec<&Value> = outbounds
-        .iter()
-        .filter(|o| o.get("type").and_then(|t| t.as_str()) == Some("ostp"))
-        .collect();
+const STEPS: &[Step] = &[
+    Step { kind: ConfigKind::Client, from: 0, title: "0.3.x modular client config to the flat format", run: client_modular_to_flat },
+    Step { kind: ConfigKind::Client, from: 1, title: "remove settings of removed features", run: client_drop_removed },
+    Step { kind: ConfigKind::Relay, from: 1, title: "remove relay-side authentication settings", run: relay_drop_auth },
+];
 
-    // default_outbound might name an ostp outbound directly, OR name a
-    // urltest/selector GROUP whose first member is the one to actually use —
-    // check both, since a plain `.or_else` here would never even attempt the
-    // group lookup while default_outbound is Some(_) (which it almost always
-    // is), silently falling through to "just take the first ostp outbound in
-    // file order" instead — exactly the kind of silent wrong answer this
-    // migrator exists to avoid.
-    let primary_tag: Option<String> = default_outbound.as_deref().and_then(|def_tag| {
-        if ostp_outbounds.iter().any(|o| o.get("tag").and_then(|t| t.as_str()) == Some(def_tag)) {
-            return Some(def_tag.to_string());
+fn remove_with_reason(obj: &mut Map<String, Value>, path: &str, key: &str, reason: &str, notes: &mut Vec<String>) {
+    if obj.remove(key).is_some() {
+        notes.push(format!("{path}{key}: {reason}"));
+    }
+}
+
+fn client_drop_removed(v: &mut Value, notes: &mut Vec<String>) {
+    if let Some(tun) = v.get_mut("tun").and_then(|t| t.as_object_mut()) {
+        for key in ["wintun_path", "ipv4_address"] {
+            remove_with_reason(tun, "tun.", key, "internal detail of an older WinTun integration; the current TUN sets it itself", notes);
+        }
+    }
+    if let Some(t) = v.get_mut("transport").and_then(|t| t.as_object_mut()) {
+        remove_with_reason(t, "transport.", "wss", "WSS framing was removed in 0.4.0; the TLS carrier is `transport.tls`", notes);
+        remove_with_reason(t, "transport.", "stealth_sni", "never reached the wire; the real TLS server name is `transport.tls_sni`", notes);
+    }
+}
+
+fn relay_drop_auth(v: &mut Value, notes: &mut Vec<String>) {
+    if let Some(obj) = v.as_object_mut() {
+        for key in ["upstream_api_url", "upstream_api_token", "sync_interval_secs"] {
+            remove_with_reason(obj, "", key, "the relay no longer authenticates clients (the target server does, end to end)", notes);
+        }
+    }
+}
+
+/// 0.3.x kept one or more servers as `ostp` outbounds, the proxy and TUN as
+/// inbounds, and exclusions as `routing.rules` pointing at `direct`.
+fn client_modular_to_flat(v: &mut Value, notes: &mut Vec<String>) {
+    let old = std::mem::take(v);
+    let outbounds = old.get("outbounds").and_then(|x| x.as_array()).cloned().unwrap_or_default();
+    let inbounds = old.get("inbounds").and_then(|x| x.as_array()).cloned().unwrap_or_default();
+    let routing = old.get("routing").cloned().unwrap_or(json!({}));
+    let tag_of = |o: &Value| o.get("tag").and_then(|t| t.as_str()).map(str::to_string);
+    let is_ostp = |o: &&Value| o.get("type").and_then(|t| t.as_str()) == Some("ostp");
+    let ostp: Vec<&Value> = outbounds.iter().filter(is_ostp).collect();
+
+    // The server to keep: the one routing.default_outbound names, directly
+    // or as the first member of a urltest/selector group; else the first.
+    let wanted = routing.get("default_outbound").and_then(|d| d.as_str()).and_then(|d| {
+        if ostp.iter().any(|o| tag_of(o).as_deref() == Some(d)) {
+            return Some(d.to_string());
         }
         outbounds.iter().find_map(|o| {
-            let is_group = matches!(o.get("type").and_then(|t| t.as_str()), Some("urltest") | Some("selector"));
-            let tag_matches = o.get("tag").and_then(|t| t.as_str()) == Some(def_tag);
-            if is_group && tag_matches {
-                o.get("outbounds")
-                    .and_then(|v| v.as_array())
-                    .and_then(|arr| arr.first())
-                    .and_then(|v| v.as_str())
-                    .map(String::from)
-            } else {
-                None
-            }
+            let group = matches!(o.get("type").and_then(|t| t.as_str()), Some("urltest" | "selector"));
+            (group && tag_of(o).as_deref() == Some(d))
+                .then(|| o.get("outbounds")?.as_array()?.first()?.as_str().map(str::to_string))
+                .flatten()
         })
     });
-
-    let primary = primary_tag
+    let primary = wanted
         .as_deref()
-        .and_then(|tag| ostp_outbounds.iter().find(|o| o.get("tag").and_then(|t| t.as_str()) == Some(tag)))
-        .copied()
-        .or_else(|| ostp_outbounds.first().copied());
+        .and_then(|t| ostp.iter().copied().find(|o| tag_of(o).as_deref() == Some(t)))
+        .or_else(|| ostp.first().copied());
 
     let Some(primary) = primary else {
-        report.note(
-            "No 'ostp'-type outbound found in the old modular config — nothing to migrate \
-             the server connection from. Wrote a placeholder; you MUST fill in server/access_key \
-             by hand or re-import a share link."
-                .to_string(),
-        );
-        return (
-            json!({
-                "server": "127.0.0.1:50000",
-                "access_key": "",
-            }),
-            report,
-        );
+        notes.push("no `ostp` outbound found: server and access_key are empty and must be filled in (or re-import a share link)".into());
+        *v = json!({ "mode": "client", "server": "", "access_key": "" });
+        return;
     };
-
-    for other in &ostp_outbounds {
+    for other in &ostp {
         if !std::ptr::eq(*other, primary) {
-            let tag = other.get("tag").and_then(|t| t.as_str()).unwrap_or("?");
-            let addr = other.get("server").and_then(|t| t.as_str()).unwrap_or("?");
-            let port = other.get("port").and_then(|t| t.as_u64()).unwrap_or(0);
-            report.note(format!(
-                "Dropped additional server '{tag}' ({addr}:{port}) — multi-server / urltest \
-                 failover is no longer supported; only one server per config now. Kept the \
-                 one from routing.default_outbound (or the first one if that wasn't set)."
+            notes.push(format!(
+                "dropped server {:?} ({}:{}): only one server per config is supported now",
+                tag_of(other).unwrap_or_default(),
+                other.get("server").and_then(|s| s.as_str()).unwrap_or("?"),
+                other.get("port").and_then(|p| p.as_u64()).unwrap_or(0)
             ));
         }
     }
 
-    let server = primary.get("server").and_then(|v| v.as_str()).unwrap_or("127.0.0.1").to_string();
-    let port = primary.get("port").and_then(|v| v.as_u64()).unwrap_or(50000);
-    let access_key = primary.get("access_key").and_then(|v| v.as_str()).unwrap_or("").to_string();
-    let transport_type = primary
-        .get("transport")
-        .and_then(|t| t.get("type").or_else(|| t.get("mode")))
-        .and_then(|v| v.as_str())
-        .unwrap_or("udp")
-        .to_string();
-    if let Some(sni) = primary.get("transport").and_then(|t| t.get("stealth_sni")).and_then(|v| v.as_str()) {
-        if !sni.is_empty() {
-            report.note(format!(
-                "Dropped transport.stealth_sni ({sni:?}) — never actually used to construct \
-                 any wire bytes; unused config plumbing with no successor field."
-            ));
+    let host = primary.get("server").and_then(|s| s.as_str()).unwrap_or("");
+    let port = primary.get("port").and_then(|p| p.as_u64()).unwrap_or(50000);
+    let server = if host.contains(':') && !host.starts_with('[') { format!("[{host}]:{port}") } else { format!("{host}:{port}") };
+    let t = primary.get("transport");
+    let mode = t.and_then(|t| t.get("type").or_else(|| t.get("mode"))).and_then(|m| m.as_str()).unwrap_or("udp");
+    if let Some(sni) = t.and_then(|t| t.get("stealth_sni")).and_then(|s| s.as_str()).filter(|s| !s.is_empty()) {
+        notes.push(format!("transport.stealth_sni ({sni:?}) dropped: it never reached the wire"));
+    }
+
+    let tun = inbounds.iter().find(|i| i.get("type").and_then(|t| t.as_str()) == Some("tun"));
+    let proxy = inbounds.iter().find(|i| i.get("type").and_then(|t| t.as_str()) == Some("local_proxy"));
+
+    let (mut domains, mut ips, mut procs) = (Vec::<Value>::new(), Vec::<Value>::new(), Vec::<Value>::new());
+    for rule in routing.get("rules").and_then(|r| r.as_array()).into_iter().flatten() {
+        let target = rule.get("outbound").and_then(|o| o.as_str()).unwrap_or("");
+        if target != "direct" {
+            notes.push(format!("dropped a routing rule to outbound {target:?}: only rules to `direct` map to today's exclusions"));
+            continue;
+        }
+        for (field, into) in [("domain_suffix", &mut domains), ("ip_cidr", &mut ips), ("process_name", &mut procs)] {
+            into.extend(rule.get(field).and_then(|x| x.as_array()).into_iter().flatten().cloned());
         }
     }
-    let tcp_fragmentation = primary
-        .get("transport")
-        .and_then(|t| t.get("tcp_fragmentation"))
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-    let mux_enabled = primary.get("multiplex").and_then(|m| m.get("enabled")).and_then(|v| v.as_bool()).unwrap_or(false);
-    let mux_sessions = primary.get("multiplex").and_then(|m| m.get("sessions")).and_then(|v| v.as_u64()).unwrap_or(1);
 
-    // ── TUN + local proxy inbounds ───────────────────────────────────────
-    let tun_inbound = inbounds.iter().find(|i| i.get("type").and_then(|t| t.as_str()) == Some("tun"));
-    let proxy_inbound = inbounds.iter().find(|i| i.get("type").and_then(|t| t.as_str()) == Some("local_proxy"));
-
-    let tun_enable = tun_inbound.is_some();
-    let mtu = tun_inbound.and_then(|t| t.get("mtu")).and_then(|v| v.as_u64());
-
-    let socks5_bind = proxy_inbound
-        .map(|p| {
-            let listen = p.get("listen").and_then(|v| v.as_str()).unwrap_or("127.0.0.1");
-            let port = p.get("port").and_then(|v| v.as_u64()).unwrap_or(1088);
-            format!("{listen}:{port}")
-        })
-        .unwrap_or_else(|| "127.0.0.1:1088".to_string());
-
-    // ── Exclusions from routing.rules → direct ──────────────────────────
-    let mut ex_domains: Vec<String> = Vec::new();
-    let mut ex_ips: Vec<String> = Vec::new();
-    let mut ex_processes: Vec<String> = Vec::new();
-    if let Some(rules) = routing.get("rules").and_then(|v| v.as_array()) {
-        for rule in rules {
-            if rule.get("outbound").and_then(|v| v.as_str()) != Some("direct") {
-                continue; // only "route to direct" rules were ever exclusions in the old format
-            }
-            if let Some(v) = rule.get("domain_suffix").and_then(|v| v.as_array()) {
-                ex_domains.extend(v.iter().filter_map(|s| s.as_str().map(String::from)));
-            }
-            if let Some(v) = rule.get("ip_cidr").and_then(|v| v.as_array()) {
-                ex_ips.extend(v.iter().filter_map(|s| s.as_str().map(String::from)));
-            }
-            if let Some(v) = rule.get("process_name").and_then(|v| v.as_array()) {
-                ex_processes.extend(v.iter().filter_map(|s| s.as_str().map(String::from)));
-            }
-        }
-    }
-    for other_rule_outbound in routing
-        .get("rules")
-        .and_then(|v| v.as_array())
-        .into_iter()
-        .flatten()
-        .filter_map(|r| r.get("outbound").and_then(|v| v.as_str()))
-        .filter(|o| *o != "direct")
-    {
-        report.note(format!(
-            "Dropped a routing rule targeting outbound '{other_rule_outbound}' — only \
-             \"route to direct\" rules map to today's exclusions; anything else \
-             (custom per-domain outbound selection) has no equivalent anymore."
-        ));
-    }
-
-    let debug = json.get("log").and_then(|l| l.get("level")).and_then(|v| v.as_str()) == Some("debug");
-
-    let mut client = json!({
+    let mut out = json!({
+        "mode": "client",
         "server": server,
-        "port": port,
-        "access_key": access_key,
-        "socks5_bind": socks5_bind,
-        "debug": debug,
-        "tun": {
-            "enable": tun_enable,
-            "dns": null,
-            "kill_switch": false,
-        },
-        "exclude": {
-            "domains": ex_domains,
-            "ips": ex_ips,
-            "processes": ex_processes,
-        },
+        "access_key": primary.get("access_key").and_then(|k| k.as_str()).unwrap_or(""),
+        "socks5_bind": proxy.map(|p| format!(
+            "{}:{}",
+            p.get("listen").and_then(|l| l.as_str()).unwrap_or("127.0.0.1"),
+            p.get("port").and_then(|x| x.as_u64()).unwrap_or(1088)
+        )).unwrap_or_else(|| "127.0.0.1:1088".into()),
+        "debug": old.pointer("/log/level").and_then(|l| l.as_str()) == Some("debug"),
+        "tun": { "enable": tun.is_some(), "kill_switch": false },
+        "exclude": { "domains": domains, "ips": ips, "processes": procs },
         "mux": {
-            "enabled": mux_enabled,
-            "sessions": mux_sessions,
+            "enabled": primary.pointer("/multiplex/enabled").and_then(|x| x.as_bool()).unwrap_or(false),
+            "sessions": primary.pointer("/multiplex/sessions").and_then(|x| x.as_u64()).unwrap_or(1),
         },
         "transport": {
-            "mode": transport_type,
-            "tcp_fragmentation": tcp_fragmentation,
+            "mode": mode,
+            "tcp_fragmentation": t.and_then(|t| t.get("tcp_fragmentation")).and_then(|x| x.as_bool()).unwrap_or(false),
         },
     });
-    if let Some(mtu) = mtu {
-        client["mtu"] = json!(mtu);
+    if let Some(mtu) = tun.and_then(|t| t.get("mtu")).and_then(|m| m.as_u64()) {
+        out["mtu"] = json!(mtu);
     }
-    if let Some(gui) = json.get("gui") {
-        client["gui"] = gui.clone();
+    if let Some(gui) = old.get("gui") {
+        out["gui"] = gui.clone();
     }
-
-    (client, report)
+    notes.push(format!("kept server {server}"));
+    *v = out;
 }
 
-/// Migrates a server config. The server shape has stayed structurally
-/// identical since the earliest surviving version — this only backfills the
-/// `api` section (added after some configs already existed) and drops the
-/// legacy `api.token` field. Ported from the ad-hoc Python snippet that used
-/// to live in `scripts/install.sh` and only ran at install/update time.
-pub fn migrate_server_json(json: Value) -> (Value, MigrationReport) {
-    let mut report = MigrationReport::default();
-    let mut out = json;
+// ── Driver ───────────────────────────────────────────────────────────────────
 
-    let obj = match out.as_object_mut() {
-        Some(o) => o,
-        None => return (out, report),
-    };
-
-    let api = obj.entry("api").or_insert_with(|| json!({}));
-    if let Some(api_obj) = api.as_object_mut() {
-        let defaults: [(&str, Value); 5] = [
-            ("enabled", json!(false)),
-            ("bind", json!("0.0.0.0:9090")),
-            ("webpath", json!("")),
-            ("username", json!("")),
-            ("password_hash", json!("")),
-        ];
-        for (key, default) in defaults {
-            if !api_obj.contains_key(key) {
-                report.note(format!("Added api.{key} = {default} (missing default)"));
-                api_obj.insert(key.to_string(), default);
-            }
-        }
-        if api_obj.remove("token").is_some() {
-            report.note(
-                "Dropped legacy api.token — superseded by api.password_hash; \
-                 set a new admin password with the management API or panel."
-                    .to_string(),
-            );
-        }
-    }
-
-    // Backfill the SOCKS5 credential fields on `outbound`, added after some
-    // server configs already existed. These are plain strings that default to
-    // "" (no-auth), so making them explicit is safe and concise. The optional
-    // `bind_ip` (top level) and per-rule `send_from` are deliberately NOT
-    // backfilled: absent means "use the default source", which is correct — and
-    // a placeholder would either be stripped (null) or, worse, parse as an
-    // invalid source IP ("").
-    if let Some(outbound) = obj.get_mut("outbound").and_then(|o| o.as_object_mut()) {
-        for key in ["username", "password"] {
-            if !outbound.contains_key(key) {
-                report.note(format!("Added outbound.{key} = \"\" (missing default)"));
-                outbound.insert(key.to_string(), json!(""));
-            }
-        }
-    }
-
-    // A hand-written `tls` section may leave out what `ostp cert issue` would
-    // write; make those defaults explicit. An absent `tls` stays absent: that
-    // is "HTTPS disabled", not a gap.
-    if let Some(tls) = obj.get_mut("tls").and_then(|t| t.as_object_mut()) {
-        let caddy = tls.get("frontend").and_then(|f| f.as_str()) == Some("caddy");
-        let defaults: [(&str, Value); 3] = [
-            ("frontend", json!("builtin")),
-            ("cert", json!(if caddy { "none" } else { "acme" })),
-            ("public_port", json!(443)),
-        ];
-        for (key, default) in defaults {
-            if !tls.contains_key(key) {
-                report.note(format!("Added tls.{key} = {default} (missing default)"));
-                tls.insert(key.to_string(), default);
-            }
-        }
-    }
-
-    (out, report)
+#[derive(Debug, Clone, PartialEq)]
+pub enum Change {
+    Added { path: String, value: Value },
+    Removed { path: String, value: Value },
+    Changed { path: String, from: Value, to: Value },
 }
 
-/// Final normalization pass applied to every migrated config: strip null-valued
-/// keys at every nesting level. A JSON null means "unset", so it is pure noise —
-/// removing it is the "concise" part of the migration, and it never loses real
-/// data (a set value is never null). Key ORDER is already canonical for free:
-/// serde_json serializes object keys in sorted order, so any write of a migrated
-/// config comes out stably ordered no matter how disordered the input was.
-///
-/// Returns whether it removed anything, so the caller folds it into the
-/// "was this already up to date?" decision.
-pub fn normalize(value: &mut Value) -> bool {
-    let before = value.clone();
-    strip_nulls(value);
-    *value != before
+impl std::fmt::Display for Change {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Change::Added { path, value } => write!(f, "+ {path} = {value}"),
+            Change::Removed { path, value } => write!(f, "- {path} (was {value})"),
+            Change::Changed { path, from, to } => write!(f, "~ {path}: {from} -> {to}"),
+        }
+    }
 }
 
-/// Recursively drop keys whose value is JSON null, descending into nested
-/// objects and array elements. Empty objects and arrays are kept — an explicit
-/// `rules: []` or `exclude: {}` carries intent; only nulls are noise.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UnknownKey {
+    pub path: String,
+    pub suggestion: Option<String>,
+}
+
+#[derive(Debug)]
+pub struct StepReport {
+    pub title: &'static str,
+    pub from: u32,
+    pub notes: Vec<String>,
+}
+
+#[derive(Debug)]
+pub struct Migration {
+    pub kind: ConfigKind,
+    pub from_version: u32,
+    pub output: Value,
+    pub steps: Vec<StepReport>,
+    pub changes: Vec<Change>,
+    /// Keys the schema does not know. Kept in the output; ostp ignores them.
+    pub unknown_keys: Vec<UnknownKey>,
+}
+
+impl Migration {
+    pub fn is_up_to_date(&self) -> bool {
+        self.changes.is_empty()
+    }
+}
+
+/// Migrates any past config to the current schema. The output is checked
+/// against the typed schema before it is returned.
+pub fn migrate(input: Value) -> Result<Migration> {
+    if !input.is_object() {
+        bail!("the config is not a JSON object");
+    }
+    let kind = detect_kind(&input).ok_or_else(|| anyhow!("cannot tell whether this is a client, server or relay config"))?;
+    let from_version = detect_version(&input);
+    if from_version > CURRENT_VERSION {
+        bail!(
+            "this config is schema version {from_version}, written by a newer ostp (this one knows up to {CURRENT_VERSION}); update ostp instead of migrating"
+        );
+    }
+
+    let mut out = input.clone();
+    let mut steps = Vec::new();
+    for version in from_version..CURRENT_VERSION {
+        for step in STEPS.iter().filter(|s| s.from == version && s.kind == kind) {
+            let mut notes = Vec::new();
+            (step.run)(&mut out, &mut notes);
+            steps.push(StepReport { title: step.title, from: version, notes });
+        }
+    }
+    out["mode"] = json!(kind.as_str());
+    out["config_version"] = json!(CURRENT_VERSION);
+    strip_nulls(&mut out);
+
+    let typed: crate::config::UnifiedConfig = serde_json::from_value(out.clone())
+        .map_err(|e| anyhow!("the migrated config does not match the schema ({e}); nothing was written. This is a bug in the migrator, please report it"))?;
+    let known = serde_json::to_value(&typed)?;
+    let mut unknown_keys = Vec::new();
+    find_unknown(&out, &known, "", &mut unknown_keys);
+
+    let mut changes = Vec::new();
+    diff(&input, &out, "", &mut changes);
+    Ok(Migration { kind, from_version, output: out, steps, changes, unknown_keys })
+}
+
+/// A JSON null means "unset"; dropping it loses nothing. Empty objects and
+/// arrays are kept: an explicit `rules: []` carries intent.
 fn strip_nulls(value: &mut Value) {
     match value {
         Value::Object(map) => {
             map.retain(|_, v| !v.is_null());
-            for v in map.values_mut() {
-                strip_nulls(v);
+            map.values_mut().for_each(strip_nulls);
+        }
+        Value::Array(arr) => arr.iter_mut().for_each(strip_nulls),
+        _ => {}
+    }
+}
+
+fn join(path: &str, key: &str) -> String {
+    if path.is_empty() { key.to_string() } else { format!("{path}.{key}") }
+}
+
+fn diff(a: &Value, b: &Value, path: &str, out: &mut Vec<Change>) {
+    match (a, b) {
+        (Value::Object(x), Value::Object(y)) => {
+            let mut keys: Vec<&String> = x.keys().chain(y.keys()).collect();
+            keys.sort();
+            keys.dedup();
+            for k in keys {
+                let p = join(path, k);
+                match (x.get(k), y.get(k)) {
+                    (Some(av), Some(bv)) => diff(av, bv, &p, out),
+                    (Some(av), None) => out.push(Change::Removed { path: p, value: av.clone() }),
+                    (None, Some(bv)) => out.push(Change::Added { path: p, value: bv.clone() }),
+                    (None, None) => {}
+                }
             }
         }
-        Value::Array(arr) => {
-            for v in arr.iter_mut() {
-                strip_nulls(v);
+        (Value::Array(x), Value::Array(y)) if x.len() == y.len() => {
+            for (i, (av, bv)) in x.iter().zip(y).enumerate() {
+                diff(av, bv, &format!("{path}[{i}]"), out);
+            }
+        }
+        _ if a != b => out.push(Change::Changed { path: path.to_string(), from: a.clone(), to: b.clone() }),
+        _ => {}
+    }
+}
+
+/// Every key of `value` must appear in `known`, the typed round-trip of the
+/// same config (which serializes every field the schema has).
+fn find_unknown(value: &Value, known: &Value, path: &str, out: &mut Vec<UnknownKey>) {
+    match (value, known) {
+        (Value::Object(v), Value::Object(k)) => {
+            for (key, child) in v {
+                match k.get(key) {
+                    Some(kc) => find_unknown(child, kc, &join(path, key), out),
+                    None => out.push(UnknownKey {
+                        path: join(path, key),
+                        suggestion: closest(key, k.keys().map(String::as_str)),
+                    }),
+                }
+            }
+        }
+        (Value::Array(v), Value::Array(k)) if v.len() == k.len() => {
+            for (i, (vc, kc)) in v.iter().zip(k).enumerate() {
+                find_unknown(vc, kc, &format!("{path}[{i}]"), out);
             }
         }
         _ => {}
     }
 }
 
+fn closest<'a>(key: &str, candidates: impl Iterator<Item = &'a str>) -> Option<String> {
+    candidates
+        .map(|c| (levenshtein(&key.to_lowercase(), &c.to_lowercase()), c))
+        .filter(|(d, c)| *d <= 2.max(c.len() / 4))
+        .min_by_key(|(d, _)| *d)
+        .map(|(_, c)| c.to_string())
+}
+
+fn levenshtein(a: &str, b: &str) -> usize {
+    let b: Vec<char> = b.chars().collect();
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    for (i, ca) in a.chars().enumerate() {
+        let mut cur = vec![i + 1];
+        for (j, cb) in b.iter().enumerate() {
+            cur.push((prev[j] + usize::from(ca != *cb)).min(prev[j + 1] + 1).min(cur[j] + 1));
+        }
+        prev = cur;
+    }
+    prev[b.len()]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// A realistic v0.3.21-shaped modular config (TUN + local_proxy inbounds,
-    /// a single ostp outbound, exclusion rules, mux) — mirrors the actual
-    /// shape from that tag, field for field.
+    fn run(v: Value) -> Migration {
+        migrate(v).expect("migration must succeed")
+    }
+
+    /// Every fixture: migrating the output again changes nothing.
+    fn assert_idempotent(m: &Migration) {
+        let again = run(m.output.clone());
+        assert!(again.is_up_to_date(), "second run changed: {:?}", again.changes);
+        assert!(again.steps.is_empty());
+    }
+
     #[test]
-    fn modular_single_server_preserves_every_field() {
+    fn modular_client_becomes_flat_with_a_usable_server_address() {
         let old = json!({
             "version": "0.3.21",
             "log": { "level": "debug" },
@@ -442,245 +414,160 @@ mod tests {
                 { "type": "local_proxy", "tag": "socks-in", "protocol": "socks", "listen": "127.0.0.1", "port": 1088 }
             ],
             "outbounds": [
-                {
-                    "type": "ostp", "tag": "proxy",
-                    "server": "203.0.113.5", "port": 50000, "access_key": "sekrit123",
-                    "transport": { "type": "uot", "stealth_sni": "vk.com", "tcp_fragmentation": true },
-                    "multiplex": { "enabled": true, "sessions": 4 }
-                },
-                { "type": "direct", "tag": "direct" },
-                { "type": "block", "tag": "block" }
+                { "type": "ostp", "tag": "proxy", "server": "203.0.113.5", "port": 50000, "access_key": "sekrit123",
+                  "transport": { "type": "uot", "stealth_sni": "vk.com", "tcp_fragmentation": true },
+                  "multiplex": { "enabled": true, "sessions": 4 } },
+                { "type": "direct", "tag": "direct" }
             ],
             "routing": {
                 "rules": [
-                    { "domain_suffix": ["local.lan", "internal.corp"], "outbound": "direct" },
+                    { "domain_suffix": ["local.lan"], "outbound": "direct" },
                     { "ip_cidr": ["192.168.0.0/16"], "outbound": "direct" },
-                    { "process_name": ["steam.exe"], "outbound": "direct" }
+                    { "process_name": ["steam.exe"], "outbound": "direct" },
+                    { "domain_suffix": ["ads.example"], "outbound": "block" }
                 ],
                 "default_outbound": "proxy"
             }
         });
-
-        let (new, report) = migrate_client_json(old);
-        assert!(report.changed);
-        assert_eq!(new["server"], "203.0.113.5");
-        assert_eq!(new["port"], 50000);
-        assert_eq!(new["access_key"], "sekrit123");
-        assert_eq!(new["socks5_bind"], "127.0.0.1:1088");
-        assert_eq!(new["mtu"], 1350);
-        assert_eq!(new["debug"], true);
-        assert_eq!(new["tun"]["enable"], true);
-        assert_eq!(new["transport"]["mode"], "uot");
-        assert_eq!(new["transport"]["tcp_fragmentation"], true);
-        assert_eq!(new["mux"]["enabled"], true);
-        assert_eq!(new["mux"]["sessions"], 4);
-        assert_eq!(new["exclude"]["domains"], json!(["local.lan", "internal.corp"]));
-        assert_eq!(new["exclude"]["ips"], json!(["192.168.0.0/16"]));
-        assert_eq!(new["exclude"]["processes"], json!(["steam.exe"]));
-        // stealth_sni never fed into any wire bytes — dropped, not carried forward.
-        assert!(new["transport"].get("stealth_sni").is_none());
-        assert!(report.notes.iter().any(|n| n.contains("stealth_sni") && n.contains("vk.com")));
+        let m = run(old);
+        assert_eq!(m.from_version, 0);
+        let o = &m.output;
+        // Host and port together: the client resolves "host:port".
+        assert_eq!(o["server"], "203.0.113.5:50000");
+        assert!(o.get("port").is_none());
+        assert_eq!(o["access_key"], "sekrit123");
+        assert_eq!(o["socks5_bind"], "127.0.0.1:1088");
+        assert_eq!(o["mtu"], 1350);
+        assert_eq!(o["debug"], true);
+        assert_eq!(o["transport"]["mode"], "uot");
+        assert_eq!(o["mux"]["sessions"], 4);
+        assert_eq!(o["exclude"]["processes"], json!(["steam.exe"]));
+        assert_eq!(o["config_version"], CURRENT_VERSION);
+        let notes: Vec<&String> = m.steps.iter().flat_map(|s| &s.notes).collect();
+        assert!(notes.iter().any(|n| n.contains("block")));
+        assert!(notes.iter().any(|n| n.contains("stealth_sni")));
+        assert!(m.unknown_keys.is_empty(), "{:?}", m.unknown_keys);
+        assert_idempotent(&m);
     }
 
-    /// Old modular configs that had MULTIPLE ostp outbounds (multi-server) —
-    /// must keep the one routing.default_outbound points at and report every
-    /// other one by name/address rather than picking silently.
     #[test]
-    fn modular_multi_server_keeps_default_and_reports_the_rest() {
-        let old = json!({
+    fn modular_multi_server_keeps_the_group_default_and_names_the_rest() {
+        let m = run(json!({
             "inbounds": [],
             "outbounds": [
                 { "type": "ostp", "tag": "proxy-0", "server": "1.1.1.1", "port": 50000, "access_key": "k1" },
-                { "type": "ostp", "tag": "proxy-1", "server": "2.2.2.2", "port": 50000, "access_key": "k2" },
-                {
-                    "type": "urltest", "tag": "proxy",
-                    "outbounds": ["proxy-1", "proxy-0"], "url": "http://cp.cloudflare.com"
-                }
+                { "type": "ostp", "tag": "proxy-1", "server": "2001:db8::1", "port": 443, "access_key": "k2" },
+                { "type": "urltest", "tag": "proxy", "outbounds": ["proxy-1", "proxy-0"] }
             ],
             "routing": { "rules": [], "default_outbound": "proxy" }
-        });
-
-        let (new, report) = migrate_client_json(old);
-        // urltest's first member (proxy-1 / 2.2.2.2) is the one actually picked.
-        assert_eq!(new["server"], "2.2.2.2");
-        assert_eq!(new["access_key"], "k2");
-        assert!(report.notes.iter().any(|n| n.contains("proxy-0") && n.contains("1.1.1.1")));
+        }));
+        assert_eq!(m.output["server"], "[2001:db8::1]:443");
+        assert_eq!(m.output["access_key"], "k2");
+        assert!(m.steps[0].notes.iter().any(|n| n.contains("proxy-0") && n.contains("1.1.1.1")));
     }
 
-    /// Pre-0.3.1 flat config carrying fields that no longer exist
-    /// (tun.wintun_path, tun.ipv4_address, transport.wss, transport.stealth_sni)
-    /// — those get dropped with a note; every field that's still meaningful
-    /// passes through untouched, byte for byte.
     #[test]
-    fn flat_legacy_drops_only_dead_fields() {
-        let old = json!({
+    fn flat_legacy_client_loses_only_removed_features() {
+        let m = run(json!({
             "server": "198.51.100.9:50000",
             "access_key": "oldkey",
             "mtu": 1200,
-            "socks5_bind": "127.0.0.1:1090",
-            "tun": {
-                "enable": true,
-                "wintun_path": "C:\\Program Files\\wintun\\wintun.dll",
-                "ipv4_address": "10.0.0.2",
-                "dns": "1.1.1.1",
-                "kill_switch": true
-            },
-            "exclude": { "domains": ["a.com"], "ips": null, "processes": null },
-            "mux": { "enabled": false, "sessions": 1 },
+            "tun": { "enable": true, "wintun_path": "C:\\wintun.dll", "ipv4_address": "10.0.0.2", "dns": "1.1.1.1" },
+            "exclude": { "domains": ["a.com"], "ips": null },
             "transport": { "mode": "udp", "stealth_sni": "bing.com", "wss": true }
-        });
-
-        let (new, report) = migrate_client_json(old);
-        assert!(report.changed);
-        // Untouched fields survive exactly as they were.
-        assert_eq!(new["server"], "198.51.100.9:50000");
-        assert_eq!(new["access_key"], "oldkey");
-        assert_eq!(new["mtu"], 1200);
-        assert_eq!(new["tun"]["enable"], true);
-        assert_eq!(new["tun"]["dns"], "1.1.1.1");
-        assert_eq!(new["tun"]["kill_switch"], true);
-        assert_eq!(new["exclude"]["domains"], json!(["a.com"]));
-        // Dead fields are gone...
-        assert!(new["tun"].get("wintun_path").is_none());
-        assert!(new["tun"].get("ipv4_address").is_none());
-        assert!(new["transport"].get("wss").is_none());
-        assert!(new["transport"].get("stealth_sni").is_none());
-        // ...and their removal was reported, not silent.
-        assert!(report.notes.iter().any(|n| n.contains("wintun_path")));
-        assert!(report.notes.iter().any(|n| n.contains("ipv4_address")));
-        assert!(report.notes.iter().any(|n| n.contains("wss")));
-        assert!(report.notes.iter().any(|n| n.contains("stealth_sni")));
+        }));
+        assert_eq!(m.from_version, 1);
+        let o = &m.output;
+        assert_eq!(o["server"], "198.51.100.9:50000");
+        assert_eq!(o["tun"]["dns"], "1.1.1.1");
+        assert_eq!(o["exclude"]["domains"], json!(["a.com"]));
+        for gone in ["/tun/wintun_path", "/tun/ipv4_address", "/transport/wss", "/transport/stealth_sni", "/exclude/ips"] {
+            assert!(o.pointer(gone).is_none(), "{gone} should be gone");
+        }
+        let removed: Vec<String> = m
+            .changes
+            .iter()
+            .filter_map(|c| match c { Change::Removed { path, .. } => Some(path.clone()), _ => None })
+            .collect();
+        assert!(removed.contains(&"transport.wss".to_string()), "{removed:?}");
+        assert!(m.changes.contains(&Change::Added { path: "mode".into(), value: json!("client") }));
+        assert!(m.changes.contains(&Change::Added { path: "config_version".into(), value: json!(CURRENT_VERSION) }));
+        assert_idempotent(&m);
     }
 
-    /// A config already in the current shape must be a true no-op: report
-    /// says nothing changed, and every field is untouched.
+    /// Server shape never changed: only the stamp is added. In particular the
+    /// API token is still used by the server and must survive, and no section
+    /// the user did not write is invented.
     #[test]
-    fn current_flat_config_is_a_no_op() {
+    fn server_gets_only_the_version_stamp() {
+        let m = run(json!({
+            "mode": "server",
+            "listen": "0.0.0.0:50000",
+            "access_keys": ["k1", { "access_key": "k2", "name": "bob" }],
+            "api": { "enabled": true, "token": "relay-token" },
+            "domain": "vpn.example.com",
+            "tls": { "enabled": true, "ws_path": "/Xk3pQ9aZr2" }
+        }));
+        assert_eq!(m.output["api"], json!({ "enabled": true, "token": "relay-token" }));
+        assert!(m.output.get("outbound").is_none());
+        assert_eq!(m.output["tls"], json!({ "enabled": true, "ws_path": "/Xk3pQ9aZr2" }));
+        assert_eq!(m.changes, vec![Change::Added { path: "config_version".into(), value: json!(CURRENT_VERSION) }]);
+        assert!(m.unknown_keys.is_empty(), "{:?}", m.unknown_keys);
+        assert_idempotent(&m);
+    }
+
+    #[test]
+    fn relay_drops_the_old_authentication_settings() {
+        let m = run(json!({
+            "mode": "relay",
+            "listen": "0.0.0.0:50000",
+            "upstream_tcp": "203.0.113.10:50000",
+            "upstream_udp": "203.0.113.10:50000",
+            "upstream_api_url": "http://203.0.113.10:9090",
+            "upstream_api_token": "t",
+            "sync_interval_secs": 60
+        }));
+        for gone in ["upstream_api_url", "upstream_api_token", "sync_interval_secs"] {
+            assert!(m.output.get(gone).is_none());
+        }
+        assert_eq!(m.steps.len(), 1);
+        assert_eq!(m.steps[0].notes.len(), 3);
+        assert_idempotent(&m);
+    }
+
+    #[test]
+    fn current_config_is_a_true_no_op() {
         let current = json!({
-            "server": "example.com:50000",
-            "access_key": "k",
-            "tun": { "enable": false, "dns": null, "kill_switch": false },
-            "exclude": { "domains": [], "ips": [], "processes": [] },
-            "mux": { "enabled": false, "sessions": 1 },
-            "transport": { "mode": "udp", "tcp_fragmentation": false }
-        });
-        let (new, report) = migrate_client_json(current.clone());
-        assert!(!report.changed);
-        assert_eq!(new, current);
-    }
-
-    /// Every migrated output must actually deserialize into the ONE
-    /// canonical schema (`crate::config`) — this is the same check
-    /// `cmd_migrate` runs at runtime before ever touching a user's file,
-    /// exercised here directly so a schema/migrator drift fails a fast unit
-    /// test instead of surfacing as "your migrated config won't load".
-    #[test]
-    fn every_migrated_output_matches_the_canonical_schema() {
-        let modular = json!({
-            "inbounds": [{ "type": "tun", "tag": "tun-in", "mtu": 1350 }],
-            "outbounds": [
-                { "type": "ostp", "tag": "proxy", "server": "1.2.3.4", "port": 50000, "access_key": "k" },
-                { "type": "direct", "tag": "direct" }
-            ],
-            "routing": { "rules": [], "default_outbound": "proxy" }
-        });
-        let (new, _) = migrate_client_json(modular);
-        serde_json::from_value::<crate::config::ClientFileConfig>(new)
-            .expect("modular->flat migration output must match ClientFileConfig");
-
-        let legacy_flat = json!({
-            "server": "1.2.3.4:50000",
-            "access_key": "k",
-            "tun": { "enable": true, "wintun_path": "x", "ipv4_address": "y" }
-        });
-        let (new, _) = migrate_client_json(legacy_flat);
-        serde_json::from_value::<crate::config::ClientFileConfig>(new)
-            .expect("legacy-flat migration output must match ClientFileConfig");
-
-        let server = json!({ "listen": "0.0.0.0:50000", "access_keys": ["k"] });
-        let (new, _) = migrate_server_json(server);
-        serde_json::from_value::<crate::config::ServerConfig>(new)
-            .expect("server migration output must match ServerConfig");
-    }
-
-    #[test]
-    fn server_config_backfills_api_defaults_and_drops_legacy_token() {
-        let old = json!({
-            "listen": "0.0.0.0:50000",
-            "access_keys": ["k1"],
-            "api": { "token": "old-plain-token" }
-        });
-        let (new, report) = migrate_server_json(old);
-        assert!(report.changed);
-        assert_eq!(new["api"]["enabled"], false);
-        assert_eq!(new["api"]["bind"], "0.0.0.0:9090");
-        assert!(new["api"].get("token").is_none());
-        assert!(report.notes.iter().any(|n| n.contains("api.token")));
-    }
-
-    #[test]
-    fn server_migrate_backfills_tls_defaults_but_never_adds_tls() {
-        let base = json!({
-            "listen": "0.0.0.0:50000",
-            "access_keys": ["k1"],
-            "api": { "enabled": false, "bind": "0.0.0.0:9090", "webpath": "", "username": "", "password_hash": "" }
-        });
-        let (new, _) = migrate_server_json(base.clone());
-        assert!(new.get("tls").is_none(), "absent tls means disabled and must stay absent");
-
-        let mut with_tls = base.clone();
-        with_tls["domain"] = json!("vpn.example.com");
-        with_tls["tls"] = json!({ "enabled": true, "ws_path": "/Xk3pQ9aZr2" });
-        let (new, report) = migrate_server_json(with_tls);
-        assert_eq!(new["tls"]["frontend"], "builtin");
-        assert_eq!(new["tls"]["cert"], "acme");
-        assert_eq!(new["tls"]["public_port"], 443);
-        assert!(report.notes.iter().any(|n| n.contains("tls.cert")));
-
-        let mut caddy = base;
-        caddy["tls"] = json!({ "enabled": true, "frontend": "caddy", "ws_path": "/Xk3pQ9aZr2" });
-        let (new, _) = migrate_server_json(caddy);
-        assert_eq!(new["tls"]["cert"], "none");
-    }
-
-    /// Client configs keep the new transport fields; only the old mimicry
-    /// ones (`stealth_sni`, `wss`) are dropped.
-    #[test]
-    fn client_migrate_keeps_tls_transport_fields() {
-        let old = json!({
+            "mode": "client", "config_version": CURRENT_VERSION,
             "server": "vpn.example.com:443", "access_key": "k",
-            "transport": { "mode": "uot", "tls": true, "tls_sni": "vpn.example.com", "ws_path": "/Xk3pQ9aZr2", "stealth_sni": "x" }
+            "transport": { "mode": "uot", "tcp_fragmentation": false, "tls": true, "ws_path": "/Xk3pQ9aZr2" }
         });
-        let (new, _) = migrate_client_json(old);
-        assert_eq!(new["transport"]["tls"], true);
-        assert_eq!(new["transport"]["tls_sni"], "vpn.example.com");
-        assert_eq!(new["transport"]["ws_path"], "/Xk3pQ9aZr2");
-        assert!(new["transport"].get("stealth_sni").is_none());
+        let m = run(current.clone());
+        assert!(m.is_up_to_date(), "{:?}", m.changes);
+        assert_eq!(m.output, current);
     }
 
-    /// A server config whose `outbound` predates the SOCKS5 credential fields
-    /// must get them backfilled — this is exactly the "migrate said nothing to
-    /// migrate but the new fields were missing" gap. The optional bind_ip /
-    /// send_from must NOT be injected (absent = correct).
     #[test]
-    fn server_migrate_backfills_outbound_credentials() {
-        let old = json!({
-            "listen": "0.0.0.0:50000",
-            "access_keys": ["k1"],
-            "api": { "enabled": true, "bind": "0.0.0.0:9090", "webpath": "", "username": "", "password_hash": "" },
-            "outbound": {
-                "enabled": false, "protocol": "socks5", "address": "127.0.0.1", "port": 40000,
-                "default_action": "proxy",
-                "rules": [{ "action": "proxy", "domain_suffix": [".onion"] }]
-            }
-        });
-        let (new, report) = migrate_server_json(old);
-        assert!(report.changed, "adding the missing credential fields is a change");
-        assert_eq!(new["outbound"]["username"], "");
-        assert_eq!(new["outbound"]["password"], "");
-        // Optional fields are left absent, not injected.
-        assert!(new.get("bind_ip").is_none());
-        assert!(new["outbound"]["rules"][0].get("send_from").is_none());
+    fn unknown_keys_are_reported_with_a_suggestion_and_kept() {
+        let m = run(json!({
+            "mode": "client", "config_version": CURRENT_VERSION,
+            "server": "h:1", "access_key": "k",
+            "tranport": { "mode": "uot" },
+            "tun": { "enable": true, "kil_switch": true },
+            "my_note": "hello"
+        }));
+        let find = |p: &str| m.unknown_keys.iter().find(|u| u.path == p).cloned();
+        assert_eq!(find("tranport").unwrap().suggestion.as_deref(), Some("transport"));
+        assert_eq!(find("tun.kil_switch").unwrap().suggestion.as_deref(), Some("kill_switch"));
+        assert_eq!(find("my_note").unwrap().suggestion, None);
+        assert_eq!(m.output["tranport"], json!({ "mode": "uot" }), "unknown data is never deleted");
+    }
+
+    #[test]
+    fn a_newer_schema_is_refused() {
+        let e = migrate(json!({ "mode": "client", "config_version": CURRENT_VERSION + 1, "server": "h:1", "access_key": "k" }))
+            .unwrap_err();
+        assert!(e.to_string().contains("newer ostp"), "{e}");
     }
 
     #[test]
@@ -688,80 +575,37 @@ mod tests {
         assert_eq!(detect_kind(&json!({"access_key": "x", "server": "y"})), Some(ConfigKind::Client));
         assert_eq!(detect_kind(&json!({"access_keys": ["x"], "listen": "y"})), Some(ConfigKind::Server));
         assert_eq!(detect_kind(&json!({"upstream_tcp": "x", "upstream_api_url": "y"})), Some(ConfigKind::Relay));
+        assert_eq!(detect_kind(&json!({"inbounds": [], "outbounds": []})), Some(ConfigKind::Client));
         assert_eq!(detect_kind(&json!({"mode": "client", "server": "x"})), Some(ConfigKind::Client));
     }
 
-    // ── normalization (concise + no data loss + canonical) ──────────────────
-
+    /// The configs ostp itself writes (`ostp init`, the wizard) must already
+    /// be current: a fresh install never needs `ostp migrate`.
     #[test]
-    fn normalize_strips_nulls_but_keeps_real_data_and_empty_collections() {
-        let mut v = json!({
-            "mode": "client",
-            "server": "1.2.3.4:50000",
-            "access_key": "k",
-            "socks5_bind": null,                 // unset → removed
-            "tun": { "enable": true, "dns": null }, // nested null → removed
-            "exclude": { "domains": [], "ips": null }, // empty [] kept, null removed
-            "mux": { "enabled": false, "sessions": 1 },
-        });
-        let changed = normalize(&mut v);
-        assert!(changed, "stripping nulls is a change");
-        assert!(v.get("socks5_bind").is_none(), "top-level null must be gone");
-        assert!(v["tun"].get("dns").is_none(), "nested null must be gone");
-        assert!(v["exclude"].get("ips").is_none(), "nested null must be gone");
-        assert_eq!(v["exclude"]["domains"], json!([]), "an explicit empty array is intent, kept");
-        assert_eq!(v["server"], json!("1.2.3.4:50000"), "real data untouched");
-        assert_eq!(v["tun"]["enable"], json!(true));
-    }
-
-    #[test]
-    fn normalize_is_idempotent() {
-        let mut v = json!({ "mode": "server", "listen": "0.0.0.0:50000", "access_keys": ["k"], "debug": null });
-        assert!(normalize(&mut v), "first pass removes the null");
-        let once = v.clone();
-        assert!(!normalize(&mut v), "second pass changes nothing");
-        assert_eq!(v, once);
-    }
-
-    #[test]
-    fn normalize_never_drops_unknown_fields() {
-        // A field the schema has never heard of must survive — no data loss ever.
-        let mut v = json!({ "mode": "client", "server": "s", "access_key": "k", "some_future_field": {"a": 1} });
-        normalize(&mut v);
-        assert_eq!(v["some_future_field"], json!({"a": 1}), "unknown data must be preserved verbatim");
-    }
-
-    /// Forcing function: the configs the tool itself generates (init/setup
-    /// templates, current shape) must already be canonical — running the full
-    /// migrate pipeline over them must report NO change. If someone adds a field
-    /// to a template or the schema without teaching the migrator, this fails
-    /// instead of a user silently ending up with a config that `ostp migrate`
-    /// keeps trying to "fix". Covers all three kinds.
-    #[test]
-    fn generated_configs_are_already_canonical() {
-        // These mirror the exact shapes emitted by `ostp init` / the wizard.
+    fn generated_configs_are_already_current() {
         let client = json!({
-            "mode": "client", "server": "127.0.0.1:50000", "access_key": "k",
+            "mode": "client", "config_version": CURRENT_VERSION, "server": "127.0.0.1:50000", "access_key": "k",
             "socks5_bind": "127.0.0.1:1088",
             "transport": { "mode": "udp", "tcp_fragmentation": false },
             "debug": false,
         });
         let server = json!({
-            "mode": "server", "listen": "0.0.0.0:50000", "access_keys": ["k"],
+            "mode": "server", "config_version": CURRENT_VERSION, "listen": "0.0.0.0:50000", "access_keys": ["k"],
             "outbound": { "enabled": false, "protocol": "socks5", "address": "127.0.0.1",
                           "port": 9050, "username": "", "password": "", "default_action": "proxy", "rules": [] },
+            "domain": "",
+            "tls": { "enabled": false, "frontend": "builtin", "ws_path": "/Xk3pQ9aZr2", "cert": "acme", "public_port": 443,
+                     "acme": { "email": "", "staging": false } },
             "debug": false,
         });
         let relay = json!({
-            "mode": "relay", "listen": "0.0.0.0:50000",
+            "mode": "relay", "config_version": CURRENT_VERSION, "listen": "0.0.0.0:50000",
             "upstream_tcp": "1.2.3.4:50000", "upstream_udp": "1.2.3.4:50000", "debug": false,
         });
-
         for (name, cfg) in [("client", client), ("server", server), ("relay", relay)] {
-            let mut v = cfg.clone();
-            let changed = normalize(&mut v);
-            assert!(!changed, "the generated {name} template must be canonical (no nulls to strip)");
-            assert_eq!(v, cfg, "normalizing the {name} template must not alter it");
+            let m = run(cfg);
+            assert!(m.is_up_to_date(), "the generated {name} config needs migrating: {:?}", m.changes);
+            assert!(m.unknown_keys.is_empty(), "the generated {name} config has unknown keys: {:?}", m.unknown_keys);
         }
     }
 }

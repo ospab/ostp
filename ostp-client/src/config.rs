@@ -386,6 +386,10 @@ pub struct UnifiedConfig {
     #[serde(flatten)]
     pub mode: AppMode,
     pub log_level: Option<String>,
+    /// Schema version the file was written for (see `migrate::CURRENT_VERSION`).
+    /// Absent in files from before 0.4.6.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_version: Option<u32>,
 }
 
 impl UnifiedConfig {

@@ -88,7 +88,11 @@ enum Commands {
     /// ONLY place config migration ever runs - never automatically at
     /// startup or during install/update, so a config never changes shape
     /// without you asking it to.
-    Migrate,
+    Migrate {
+        /// Show what would change without writing anything
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 /// Bridges the new subcommand-based CLI onto the original flat-flag dispatch
@@ -112,6 +116,7 @@ struct LegacyArgs {
     proxy_env: bool,
     proxy_env_clear: bool,
     migrate: bool,
+    migrate_dry_run: bool,
 }
 
 /// Asks the same TUN/mux/debug questions regardless of how a share link
@@ -717,6 +722,7 @@ fn run_setup_wizard(config_path: &std::path::Path) -> Result<Option<PathBuf>> {
 
             let client_json = serde_json::json!({
                 "mode": "client",
+                "config_version": ostp_client::migrate::CURRENT_VERSION,
                 "log_level": "info",
                 "server": server,
                 "access_key": access_key,
@@ -792,6 +798,7 @@ fn run_setup_wizard(config_path: &std::path::Path) -> Result<Option<PathBuf>> {
             // intentional: step text then daemon call below
             let mut server_json = serde_json::json!({
                 "mode": "server",
+                "config_version": ostp_client::migrate::CURRENT_VERSION,
                 "log_level": "info",
                 "listen": listen,
                 "access_keys": access_keys,
@@ -907,6 +914,7 @@ fn run_setup_wizard(config_path: &std::path::Path) -> Result<Option<PathBuf>> {
             let panel_bind = format!("0.0.0.0:{}", panel_port);
             let mut server_json = serde_json::json!({
                 "mode": "server",
+                "config_version": ostp_client::migrate::CURRENT_VERSION,
                 "log_level": "info",
                 "listen": listen,
                 "access_keys": access_keys,
@@ -979,6 +987,7 @@ fn run_setup_wizard(config_path: &std::path::Path) -> Result<Option<PathBuf>> {
             // copy of the access keys.
             let relay_json = serde_json::json!({
                 "mode": "relay",
+                "config_version": ostp_client::migrate::CURRENT_VERSION,
                 "listen": listen,
                 "upstream_tcp": upstream,
                 "upstream_udp": upstream,
@@ -1091,6 +1100,7 @@ async fn run_app() -> Result<()> {
         proxy_env: false,
         proxy_env_clear: false,
         migrate: false,
+        migrate_dry_run: false,
     };
 
     if let Some(cmd) = raw_args.command {
@@ -1138,7 +1148,7 @@ async fn run_app() -> Result<()> {
             Commands::Import { url } => { args.import = Some(url); }
             Commands::ProxyEnv => { args.proxy_env = true; }
             Commands::ProxyEnvClear => { args.proxy_env_clear = true; }
-            Commands::Migrate => { args.migrate = true; }
+            Commands::Migrate { dry_run } => { args.migrate = true; args.migrate_dry_run = dry_run; }
             Commands::Cert { action } => return cert_cmd::run(action, &args.config).await,
         }
     }
@@ -1152,7 +1162,7 @@ async fn run_app() -> Result<()> {
     }
 
     if args.migrate {
-        return cmd_migrate(&args.config);
+        return cmd_migrate(&args.config, args.migrate_dry_run);
     }
 
     // -- Setup wizard: explicit flag or first-time (no config) --------
@@ -1252,6 +1262,7 @@ async fn run_app() -> Result<()> {
         let unified = UnifiedConfig {
             mode: AppMode::Client(client_cfg),
             log_level: Some("info".to_string()),
+            config_version: Some(ostp_client::migrate::CURRENT_VERSION),
         };
         let content = serde_json::to_string_pretty(&unified)?;
         if let Some(parent) = args.config.parent() {
@@ -1344,6 +1355,7 @@ async fn run_app() -> Result<()> {
             format!(r#"{{
   // OSTP Server Configuration
   "mode": "server",
+  "config_version": 2,
   "log_level": "info",
   
   // The address and port the server listens on for incoming OSTP connections.
@@ -1411,6 +1423,7 @@ async fn run_app() -> Result<()> {
             r#"{
   // OSTP Relay Node Configuration
   "mode": "relay",
+  "config_version": 2,
   "listen": "0.0.0.0:50000",
   "upstream_tcp": "TARGET_SERVER_IP:50000",
   "upstream_udp": "TARGET_SERVER_IP:50000",
@@ -1423,6 +1436,7 @@ async fn run_app() -> Result<()> {
             format!(r#"{{
   // OSTP Client Configuration
   "mode": "client",
+  "config_version": 2,
   "log_level": "info",
   
   // Address of the remote OSTP server
@@ -1511,6 +1525,18 @@ async fn run_app() -> Result<()> {
         .map_err(|e| anyhow!("Failed to parse config: {}", e))?;
 
     config.validate()?;
+    let current = ostp_client::migrate::CURRENT_VERSION;
+    match config.config_version {
+        Some(v) if v > current => println!(
+            "{} {:?} was written by a newer ostp (schema v{v}, this one knows v{current}); settings it doesn't know are ignored.",
+            "[warn]".yellow().bold(), args.config
+        ),
+        Some(v) if v == current => {}
+        _ => println!(
+            "{} {:?} predates config schema v{current}; `ostp migrate --dry-run` shows what would change.",
+            "[note]".cyan().bold(), args.config
+        ),
+    }
 
     if args.links {
         match config.mode {
@@ -1743,81 +1769,71 @@ fn cmd_update(_branch: String, _version: Option<String>) -> Result<()> {
 /// why (and for the actual field-by-field mapping). Never called
 /// automatically; only this explicit command touches an existing config's
 /// shape.
-fn cmd_migrate(config_path: &std::path::Path) -> Result<()> {
+fn cmd_migrate(config_path: &std::path::Path, dry_run: bool) -> Result<()> {
+    use ostp_client::migrate::{self, Change};
     if !config_path.exists() {
         anyhow::bail!("Configuration file not found at {:?}", config_path);
     }
 
-    let raw_content = fs::read_to_string(config_path)?;
-    let mut stripped = json_comments::StripComments::new(raw_content.as_bytes());
-    let mut content_str = String::new();
+    let raw = fs::read_to_string(config_path)?;
+    let mut stripped = json_comments::StripComments::new(raw.as_bytes());
+    let mut content = String::new();
     {
         use std::io::Read;
-        stripped.read_to_string(&mut content_str)?;
+        stripped.read_to_string(&mut content)?;
     }
-    let parsed: serde_json::Value = serde_json::from_str(&content_str)
+    let had_comments = content != raw;
+    let parsed: serde_json::Value = serde_json::from_str(&content)
         .map_err(|e| anyhow!("Failed to parse {:?} as JSON: {}", config_path, e))?;
 
-    let kind = ostp_client::migrate::detect_kind(&parsed)
-        .ok_or_else(|| anyhow!("Could not determine whether {:?} is a client, server, or relay config.", config_path))?;
+    let m = migrate::migrate(parsed)?;
+    let tag = "[ostp]".cyan().bold();
 
-    let (mut migrated, mut report) = match kind {
-        ostp_client::migrate::ConfigKind::Client => {
-            let (mut v, r) = ostp_client::migrate::migrate_client_json(parsed);
-            if v.get("mode").is_none() { v["mode"] = serde_json::json!("client"); }
-            (v, r)
-        }
-        ostp_client::migrate::ConfigKind::Server => {
-            let (mut v, r) = ostp_client::migrate::migrate_server_json(parsed);
-            if v.get("mode").is_none() { v["mode"] = serde_json::json!("server"); }
-            (v, r)
-        }
-        ostp_client::migrate::ConfigKind::Relay => {
-            // The relay shape hasn't changed since it was introduced - nothing to migrate yet.
-            (parsed, ostp_client::migrate::MigrationReport::default())
-        }
-    };
-
-    // Uniform final pass for every kind: strip null "unset" keys so the written
-    // config is concise. Key order is already canonical (serde_json sorts keys
-    // on write), so together with the kind-specific rules above this turns any
-    // disordered, noisy config.json into a clean canonical one — without losing
-    // any real data.
-    if ostp_client::migrate::normalize(&mut migrated) {
-        report.changed = true;
-        report.notes.push("Removed unset (null) keys and wrote the config in canonical order.".to_string());
+    for u in &m.unknown_keys {
+        let hint = u.suggestion.as_ref().map(|s| format!(" - did you mean \"{s}\"?")).unwrap_or_default();
+        println!("{} unknown setting \"{}\" is ignored by ostp{hint}", "[warn]".yellow().bold(), u.path);
     }
 
-    if !report.changed {
-        println!("{} Config is already up to date, nothing to migrate.", "[ostp]".green().bold());
+    if m.is_up_to_date() {
+        println!("{tag} {:?} is a current {} config (schema version {}), nothing to migrate.",
+            config_path, m.kind.as_str(), migrate::CURRENT_VERSION);
         return Ok(());
     }
 
-    // Prove the migrator's output actually matches the ONE canonical schema
-    // (ostp_client::config) before ever touching the user's file - this is
-    // what makes "single source of truth" a guarantee instead of just an
-    // intention: if migrate.rs's hand-built JSON ever drifts from what
-    // UnifiedConfig actually expects, this catches it here, not as a
-    // corrupted config.json on someone's server.
-    serde_json::from_value::<ostp_client::config::UnifiedConfig>(migrated.clone())
-        .map_err(|e| anyhow!(
-            "Internal error: the migrated config does not match the current schema ({e}). \
-             Nothing was written - this is a bug in the migrator, please report it."
-        ))?;
+    println!("{tag} {} config, schema version {} -> {}",
+        m.kind.as_str(), m.from_version, migrate::CURRENT_VERSION);
+    for step in &m.steps {
+        println!("  {} (from v{})", step.title.bold(), step.from);
+        for note in &step.notes {
+            println!("    - {note}");
+        }
+    }
+    println!("  Changes:");
+    for c in &m.changes {
+        let line = c.to_string();
+        let line = match c {
+            Change::Added { .. } => line.green(),
+            Change::Removed { .. } => line.red(),
+            Change::Changed { .. } => line.yellow(),
+        };
+        println!("    {line}");
+    }
+    if had_comments {
+        println!("{} comments are not kept in the rewritten file; the original stays in the backup.", "[note]".cyan().bold());
+    }
+
+    if dry_run {
+        println!("\n{tag} Dry run: nothing written. Run without --dry-run to apply.");
+        return Ok(());
+    }
 
     let backup_path = config_path.with_extension("json.bak");
     fs::copy(config_path, &backup_path)?;
-    println!("{} Original config backed up to {:?}", "[ostp]".cyan().bold(), backup_path);
-
-    let new_content = serde_json::to_string_pretty(&migrated)?;
-    fs::write(config_path, new_content)?;
-
-    println!("{} Migrated {:?} - changes made:", "[ostp]".green().bold(), config_path);
-    for note in &report.notes {
-        println!("  - {note}");
-    }
-    println!("\n{} Run 'ostp check' to validate the migrated config.", "[ostp]".cyan().bold());
-
+    let mut out = serde_json::to_string_pretty(&m.output)?;
+    out.push('\n');
+    fs::write(config_path, out)?;
+    println!("\n{tag} Migrated {:?}; the original is in {:?}.", config_path, backup_path);
+    println!("{tag} Run 'ostp check' to validate it.");
     Ok(())
 }
 
