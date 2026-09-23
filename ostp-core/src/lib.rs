@@ -5,6 +5,7 @@ pub mod http_upgrade;
 pub mod protocol;
 pub mod relay;
 pub mod share_link;
+pub mod subscription;
 
 pub use crypto::NoiseRole;
 pub use framing::{TrafficProfile, PaddingStrategy};
