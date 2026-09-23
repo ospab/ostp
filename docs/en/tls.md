@@ -162,7 +162,19 @@ With a domain and TLS set up, the server can give every user a subscription URL,
 }
 ```
 
-`ostp cert issue` turns subscriptions on unless the config already decides either way. `ostp links` and `ostp links qr` print the URL of every key, and the web panel shows it in the Share dialog.
+Nothing turns subscriptions on by itself: they have their own command.
+
+```
+ostp sub status                       # on or off, settings, what is missing
+ostp sub enable [--path /sub] [--name "My VPN"] [--interval 12] [--include tls,udp]
+ostp sub set --interval 6             # change settings without turning them on or off
+ostp sub disable
+ostp sub urls [number|name|key]       # users' subscription URLs
+```
+
+Each command changes exactly what it names, keeps a copy of the config in `config.json.bak` and does not restart the service: changes apply after `systemctl restart ostp`. When nginx, apache or caddy holds 443, the subscription path must be forwarded to OSTP. `ostp sub` does not touch the web server on its own: it prints the block to add, and with `--vhost` it rewrites the site OSTP created (config test first, rollback on failure).
+
+`ostp links` and `ostp links qr` print the URL of every key too, and the web panel shows it in the Share dialog.
 
 - The token is a hash of the access key. The key itself never appears in the URL, so it stays out of web-server logs, but the token still unlocks the links: treat a subscription URL as carefully as a key.
 - Subscriptions are served only inside TLS, or to a local web server (nginx, apache, caddy) that terminated TLS itself. They are never answered in plain HTTP on the OSTP port.

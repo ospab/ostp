@@ -44,7 +44,7 @@ Run by CI or by the developer before the manual run.
 | S-05 | A config newer than supported (`config_version: 99`) | migrate refuses and leaves the file alone | P2 |
 | S-06 | `ostp check` on a valid and a broken config | "Config OK" / a clear error naming the field | P1 |
 | S-07 | Add a key to `config.json` of a running server | within ~5 s the new key connects, no restart | P1 |
-| S-08 | `ostp links` and `ostp links qr` | TLS/UDP links and SUB (when subscriptions are on) per client; in qr mode one client's QR codes at a time, Enter for the next, `q` to stop; `--all` shows a QR for every link | P1 |
+| S-08 | `ostp links` and `ostp links qr` | TLS/UDP links and SUB (when subscriptions are on) per client; in qr mode one QR on screen: ← → switch SUB / TLS / UDP, ↑ ↓ or Enter switch clients, `q` quits; redirected to a file (`> qr.txt`) every client is printed | P1 |
 | S-09 | Scan a QR from `ostp links qr` with a phone | the app imports the profile or the subscription | P1 |
 
 ### 2.2 Carriers
@@ -79,7 +79,7 @@ Repeat for nginx, apache (Debian and RHEL) and caddy.
 
 | # | Steps | Expected | Prio |
 |---|---|---|---|
-| S-30 | `ostp cert issue` on a machine with a web server | the web server is found; after confirmation a vhost is added, the config test passes (`nginx -t` / `configtest` / `caddy validate`), reload done | P1 (nginx), P2 (others) |
+| S-30 | `ostp cert issue` on a machine with a web server | the web server is found; after confirmation a site is added (Debian/Ubuntu: `sites-available/ostp-<domain>` with a symlink in `sites-enabled`, otherwise `conf.d/`), the config test passes (`nginx -t` / `configtest` / `caddy validate`), reload done; `ostp cert status` shows every check green | P1 (nginx), P2 (others) |
 | S-31 | Client over a TLS link with `path=` | connects through 443 | P1 (nginx) |
 | S-32 | Existing sites on that web server | work as before | P1 |
 | S-33 | Break the web server config beforehand, run the install | the install rolls back, the web server keeps running on the old config | P2 |
@@ -90,7 +90,7 @@ Repeat for nginx, apache (Debian and RHEL) and caddy.
 
 | # | Steps | Expected | Prio |
 |---|---|---|---|
-| S-40 | After `ostp cert issue` look at the config and `ostp links` | the `subscription` block is on; every key has `https://domain/sub/<token>` | P1 |
+| S-40 | After `ostp cert issue`: `ostp sub status`; then `ostp sub enable` (behind nginx with `--vhost`), restart, `ostp sub urls` | subscriptions are off after issuing the certificate; after enable they are on, every key has `https://domain/sub/<token>`, `ostp sub status` has nothing red | P1 |
 | S-41 | `curl https://domain/sub/<token>` | 200, one link per line (TLS first, then UDP), headers `Profile-Update-Interval`, `Profile-Title`, `Subscription-Userinfo`, `Cache-Control: no-store` | P1 |
 | S-42 | `curl -H 'Accept: application/json' …` or `?format=json` | JSON with `name`, `update_interval_hours`, `links`, `usage` | P1 |
 | S-43 | A made-up token; the token of a removed key | the same 404 as any other path | P1 |
