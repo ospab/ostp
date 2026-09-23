@@ -244,6 +244,8 @@ cargo test -p ostp-core -p ostp-server
 - [Protocol Design](https://github.com/ospab/ostp/wiki/Protocol-Design)
 - [Building from Source](https://github.com/ospab/ostp/wiki/Building-from-Source)
 - [FAQ](https://github.com/ospab/ostp/wiki/FAQ)
+- [Domains and TLS](docs/en/tls.md)
+- [Test protocol](docs/en/testing.md)
 
 ---
 

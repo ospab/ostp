@@ -237,6 +237,8 @@ cross build --release --target x86_64-unknown-linux-gnu
 - [Администрирование сервера](docs/ru/server.md)
 - [Настройка клиента](docs/ru/client.md)
 - [Интеграции](docs/ru/integrations.md)
+- [Домены и TLS](docs/ru/tls.md)
+- [Протокол тестирования](docs/ru/testing.md)
 
 ---
 
