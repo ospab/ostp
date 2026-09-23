@@ -4,6 +4,9 @@ use std::fs;
 use std::path::PathBuf;
 use colored::Colorize;
 
+mod cert_cmd;
+mod webserver;
+
 #[derive(Parser, Debug)]
 #[command(author, version, about = "OSTP Core - Ospab Stealth Transport Protocol", long_about = None)]
 struct Args {
@@ -76,6 +79,11 @@ enum Commands {
     ProxyEnv,
     /// Output shell export commands to clear proxy (eval $(ostp proxy-env-clear))
     ProxyEnvClear,
+    /// Domain, HTTPS and Let's Encrypt certificate (server only)
+    Cert {
+        #[command(subcommand)]
+        action: cert_cmd::CertAction,
+    },
     /// Upgrade the configuration file to the current schema. This is the
     /// ONLY place config migration ever runs - never automatically at
     /// startup or during install/update, so a config never changes shape
@@ -586,7 +594,10 @@ fn wizard_save_config(config_path: &std::path::Path, json_value: &serde_json::Va
     }
 }
 
-fn run_setup_wizard(config_path: &std::path::Path) -> Result<()> {
+/// Returns the saved config's path when the user asked to set up HTTPS,
+/// which needs async work the caller runs afterwards.
+fn run_setup_wizard(config_path: &std::path::Path) -> Result<Option<PathBuf>> {
+    let mut https_for: Option<PathBuf> = None;
     use std::io::Write;
 
     println!();
@@ -836,6 +847,10 @@ fn run_setup_wizard(config_path: &std::path::Path) -> Result<()> {
                 "To check:  ostp check",
                 "Share links: ostp links",
             ]);
+            println!();
+            if wizard_yn("Bind a domain name and serve OSTP over HTTPS on 443 (Let's Encrypt)?", false) {
+                https_for = Some(actual_path.clone());
+            }
         }
 
         // -- SERVER + PANEL (Linux only) -------------------------------
@@ -942,6 +957,10 @@ fn run_setup_wizard(config_path: &std::path::Path) -> Result<()> {
                 &format!("Username: {}", username),
                 &format!("Password: {}", password),
             ]);
+            println!();
+            if wizard_yn("Bind a domain name: HTTPS on 443 for clients and the panel (Let's Encrypt)?", false) {
+                https_for = Some(actual_path.clone());
+            }
         }
 
         // -- RELAY (Linux only) ----------------------------------------
@@ -986,7 +1005,7 @@ fn run_setup_wizard(config_path: &std::path::Path) -> Result<()> {
         _ => unreachable!()
     }
 
-    Ok(())
+    Ok(https_for)
 }
 
 #[cfg(unix)]
@@ -1120,6 +1139,7 @@ async fn run_app() -> Result<()> {
             Commands::ProxyEnv => { args.proxy_env = true; }
             Commands::ProxyEnvClear => { args.proxy_env_clear = true; }
             Commands::Migrate => { args.migrate = true; }
+            Commands::Cert { action } => return cert_cmd::run(action, &args.config).await,
         }
     }
 
@@ -1137,7 +1157,10 @@ async fn run_app() -> Result<()> {
 
     // -- Setup wizard: explicit flag or first-time (no config) --------
     if args.setup {
-        return run_setup_wizard(&args.config);
+        if let Some(path) = run_setup_wizard(&args.config)? {
+            cert_cmd::issue_interactive(&path, cert_cmd::IssueArgs::default()).await?;
+        }
+        return Ok(());
     }
     // Auto-trigger wizard on first run (no config, no other flags)
     if !args.config.exists()
@@ -1150,7 +1173,10 @@ async fn run_app() -> Result<()> {
         && !args.proxy_env
         && !args.proxy_env_clear
     {
-        return run_setup_wizard(&args.config);
+        if let Some(path) = run_setup_wizard(&args.config)? {
+            cert_cmd::issue_interactive(&path, cert_cmd::IssueArgs::default()).await?;
+        }
+        return Ok(());
     }
 
     if args.proxy_env {
@@ -1635,7 +1661,10 @@ fn cmd_uninstall() -> Result<()> {
         println!("[ostp] Removed {}", install_dir.display());
     }
 
-    // 5. Remove configuration directory
+    // 5. Take the OSTP site back out of nginx/apache/caddy, if one was added
+    webserver::uninstall(std::path::Path::new("/etc/ostp"));
+
+    // 6. Remove configuration directory (certificates included)
     let config_dir = std::path::Path::new("/etc/ostp");
     if config_dir.exists() {
         fs::remove_dir_all(config_dir)?;
