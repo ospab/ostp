@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use colored::Colorize;
 
 mod cert_cmd;
+mod sub_cmd;
 mod webserver;
 
 #[derive(Parser, Debug)]
@@ -90,6 +91,11 @@ enum Commands {
     Cert {
         #[command(subcommand)]
         action: cert_cmd::CertAction,
+    },
+    /// Subscription server: per-user https://<domain>/sub/<token> URLs (server only)
+    Sub {
+        #[command(subcommand)]
+        action: sub_cmd::SubAction,
     },
     /// Upgrade the configuration file to the current schema. This is the
     /// ONLY place config migration ever runs - never automatically at
@@ -264,6 +270,34 @@ fn qr_text(data: &str) -> Result<String> {
         .build())
 }
 
+struct QrClient {
+    who: String,
+    /// (label, text): SUB when subscriptions are on, then TLS, then UDP.
+    links: Vec<(String, String)>,
+}
+
+fn qr_clients(server_cfg: &ostp_client::config::ServerConfig, config_path: &Path) -> Vec<QrClient> {
+    server_cfg
+        .access_keys
+        .iter()
+        .enumerate()
+        .map(|(idx, user)| {
+            let key = user.key();
+            let mut links: Vec<(String, String)> = Vec::new();
+            if let Some(url) = subscription_url_for(server_cfg, &key) {
+                links.push(("SUB".into(), url));
+            }
+            for (label, link) in share_links_for(server_cfg, &key, config_path) {
+                links.push((label.to_string(), link.to_uri()));
+            }
+            QrClient { who: user.name().filter(|n| !n.is_empty()).unwrap_or_else(|| format!("key {}", idx + 1)), links }
+        })
+        .collect()
+}
+
+/// `ostp links qr`: on a terminal, one QR code at a time — left/right switch
+/// between the client's links (SUB, TLS, UDP), up/down or Enter between
+/// clients, q quits. Piped, every client is printed in turn.
 fn cmd_links_qr(config_path: &Path, all: bool) -> Result<()> {
     let content = fs::read_to_string(config_path).with_context(|| format!("cannot read {}", config_path.display()))?;
     let stripped = json_comments::StripComments::new(content.as_bytes());
@@ -271,36 +305,151 @@ fn cmd_links_qr(config_path: &Path, all: bool) -> Result<()> {
     let AppMode::Server(server_cfg) = config.mode else {
         anyhow::bail!("`ostp links qr` needs a server configuration");
     };
-    let interactive = std::io::IsTerminal::is_terminal(&std::io::stdin());
-    let total = server_cfg.access_keys.len();
-    for (idx, user) in server_cfg.access_keys.iter().enumerate() {
-        let key = user.key();
-        // Best first: the subscription carries every link and follows changes.
-        let mut entries: Vec<(String, String)> = Vec::new();
-        if let Some(url) = subscription_url_for(&server_cfg, &key) {
-            entries.push(("SUB".into(), url));
-        }
-        for (label, link) in share_links_for(&server_cfg, &key, config_path) {
-            entries.push((label.to_string(), link.to_uri()));
-        }
-        let who = user.name().filter(|n| !n.is_empty()).unwrap_or_else(|| format!("key {}", idx + 1));
-        println!("
-  {} {}/{total}: {}", "Client".bold(), idx + 1, who.cyan().bold());
-        for (n, (label, text)) in entries.iter().enumerate() {
-            if n == 0 || all {
-                println!("
-  {label}");
-                println!("{}", qr_text(text)?);
+    let clients = qr_clients(&server_cfg, config_path);
+    if clients.is_empty() {
+        anyhow::bail!("the config has no access keys");
+    }
+
+    let tty = std::io::IsTerminal::is_terminal(&std::io::stdin()) && std::io::IsTerminal::is_terminal(&std::io::stdout());
+    if !tty {
+        for (idx, c) in clients.iter().enumerate() {
+            println!("\n  Client {}/{}: {}", idx + 1, clients.len(), c.who);
+            for (n, (label, text)) in c.links.iter().enumerate() {
+                if n == 0 || all {
+                    println!("\n  {label}\n{}", qr_text(text)?);
+                }
+                println!("  {label:<3}  {text}");
             }
-            println!("  {label:<3}  {text}");
         }
-        if interactive && idx + 1 < total {
-            let answer = wizard_prompt("Enter for the next client, q to stop", "");
-            if answer.trim().eq_ignore_ascii_case("q") {
-                break;
-            }
+        return Ok(());
+    }
+    qr_browser(&clients)
+}
+
+#[derive(PartialEq)]
+enum QrKey {
+    Left,
+    Right,
+    Up,
+    Down,
+    Quit,
+    Other,
+}
+
+/// Terminal in raw-ish mode for single keypresses, restored on drop (also on
+/// panic). Uses stty, which every Linux (busybox included) has.
+struct RawTerminal {
+    saved: String,
+}
+
+impl RawTerminal {
+    fn enter() -> Option<Self> {
+        if !cfg!(unix) {
+            return None;
+        }
+        let out = std::process::Command::new("stty").arg("-g").stdin(std::process::Stdio::inherit()).output().ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let saved = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        let ok = std::process::Command::new("stty")
+            .args(["-icanon", "-echo", "-isig", "min", "1", "time", "0"])
+            .stdin(std::process::Stdio::inherit())
+            .status()
+            .ok()?
+            .success();
+        ok.then_some(RawTerminal { saved })
+    }
+
+    fn key(&self) -> QrKey {
+        use std::io::Read;
+        let mut buf = [0u8; 8];
+        let n = match std::io::stdin().read(&mut buf) {
+            Ok(0) | Err(_) => return QrKey::Quit,
+            Ok(n) => n,
+        };
+        match &buf[..n] {
+            [0x1b, b'[', b'D', ..] | [0x1b, b'O', b'D', ..] | [b'h'] | [b'a'] => QrKey::Left,
+            [0x1b, b'[', b'C', ..] | [0x1b, b'O', b'C', ..] | [b'l'] | [b'd'] => QrKey::Right,
+            [0x1b, b'[', b'A', ..] | [0x1b, b'O', b'A', ..] | [b'k'] | [b'w'] => QrKey::Up,
+            [0x1b, b'[', b'B', ..] | [0x1b, b'O', b'B', ..] | [b'j'] | [b's'] | [b'\r'] | [b'\n'] | [b' '] => QrKey::Down,
+            [b'q'] | [b'Q'] | [0x1b] | [0x03] | [0x04] => QrKey::Quit,
+            _ => QrKey::Other,
         }
     }
+}
+
+impl Drop for RawTerminal {
+    fn drop(&mut self) {
+        let _ = std::process::Command::new("stty").arg(&self.saved).stdin(std::process::Stdio::inherit()).status();
+        print!("\x1b[?25h");
+        let _ = std::io::Write::flush(&mut std::io::stdout());
+    }
+}
+
+/// Without stty (Windows): the same keys as letters, each followed by Enter.
+fn line_key() -> QrKey {
+    let mut line = String::new();
+    if std::io::stdin().read_line(&mut line).unwrap_or(0) == 0 {
+        return QrKey::Quit;
+    }
+    match line.trim() {
+        "a" | "h" => QrKey::Left,
+        "d" | "l" => QrKey::Right,
+        "w" | "k" => QrKey::Up,
+        "" | "s" | "j" => QrKey::Down,
+        "q" | "Q" => QrKey::Quit,
+        _ => QrKey::Other,
+    }
+}
+
+fn qr_browser(clients: &[QrClient]) -> Result<()> {
+    use std::io::Write;
+    let raw = RawTerminal::enter();
+    let (mut ci, mut li) = (0usize, 0usize);
+    loop {
+        let c = &clients[ci];
+        li = li.min(c.links.len().saturating_sub(1));
+        let (label, text) = &c.links[li];
+        let tabs: Vec<String> = c
+            .links
+            .iter()
+            .enumerate()
+            .map(|(i, (l, _))| if i == li { format!("[{}]", l).bold().to_string() } else { format!(" {l} ").dimmed().to_string() })
+            .collect();
+        let mut out = String::new();
+        out.push_str("\x1b[?25l\x1b[2J\x1b[H");
+        out.push_str(&format!("  {} {}/{}: {}    {}\n", "Client".bold(), ci + 1, clients.len(), c.who.cyan().bold(), tabs.join(" ")));
+        out.push_str(&qr_text(text)?);
+        out.push_str(&format!("\n  {label}  {text}\n\n"));
+        let hint = if raw.is_some() {
+            "  ← → link   ↑ ↓ / Enter client   q quit"
+        } else {
+            "  a/d + Enter: link   Enter: next client   w: previous   q: quit"
+        };
+        out.push_str(&hint.dimmed().to_string());
+        // Raw mode leaves the terminal without output post-processing on some
+        // systems: send explicit carriage returns.
+        let out = if raw.is_some() { out.replace('\n', "\r\n") } else { out };
+        print!("{out}");
+        std::io::stdout().flush()?;
+
+        let key = match &raw {
+            Some(t) => t.key(),
+            None => line_key(),
+        };
+        match key {
+            QrKey::Left => li = (li + c.links.len() - 1) % c.links.len(),
+            QrKey::Right => li = (li + 1) % c.links.len(),
+            QrKey::Down => ci = (ci + 1) % clients.len(),
+            QrKey::Up => ci = (ci + clients.len() - 1) % clients.len(),
+            QrKey::Quit => break,
+            QrKey::Other => {}
+        }
+    }
+    drop(raw);
+    print!("\x1b[2J\x1b[H");
+    std::io::stdout().flush()?;
     Ok(())
 }
 
@@ -1235,6 +1384,7 @@ async fn run_app() -> Result<()> {
             Commands::ProxyEnvClear => { args.proxy_env_clear = true; }
             Commands::Migrate { dry_run } => { args.migrate = true; args.migrate_dry_run = dry_run; }
             Commands::Cert { action } => return cert_cmd::run(action, &args.config).await,
+            Commands::Sub { action } => return sub_cmd::run(action, &args.config),
         }
     }
 

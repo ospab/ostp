@@ -61,7 +61,7 @@ pub async fn run(action: CertAction, config_path: &Path) -> Result<()> {
 
 // ── Config access ────────────────────────────────────────────────────────────
 
-fn read_json(config_path: &Path) -> Result<serde_json::Value> {
+pub(crate) fn read_json(config_path: &Path) -> Result<serde_json::Value> {
     let raw = std::fs::read_to_string(config_path).with_context(|| format!("cannot read {}", config_path.display()))?;
     let mut stripped = json_comments::StripComments::new(raw.as_bytes());
     let v: serde_json::Value = serde_json::from_reader(&mut stripped)
@@ -82,7 +82,7 @@ fn server_cfg(config_path: &Path) -> Result<ostp_client::config::ServerConfig> {
     }
 }
 
-fn tls_settings(config_path: &Path) -> Result<TlsSettings> {
+pub(crate) fn tls_settings(config_path: &Path) -> Result<TlsSettings> {
     let cfg = server_cfg(config_path)?;
     let tls = cfg
         .tls
@@ -98,7 +98,7 @@ pub(crate) fn random_path() -> String {
     format!("/{s}")
 }
 
-fn listen_port(v: &serde_json::Value) -> u16 {
+pub(crate) fn listen_port(v: &serde_json::Value) -> u16 {
     let first = match &v["listen"] {
         serde_json::Value::String(s) => s.clone(),
         serde_json::Value::Array(a) => a.first().and_then(|x| x.as_str()).unwrap_or_default().to_string(),
@@ -108,7 +108,7 @@ fn listen_port(v: &serde_json::Value) -> u16 {
 }
 
 /// (webpath, loopback API address) when the panel is enabled.
-fn panel_route(v: &serde_json::Value) -> Option<(String, String)> {
+pub(crate) fn panel_route(v: &serde_json::Value) -> Option<(String, String)> {
     let api = v.get("api")?;
     if !api.get("enabled").and_then(|e| e.as_bool()).unwrap_or(false) {
         return None;
@@ -120,7 +120,7 @@ fn panel_route(v: &serde_json::Value) -> Option<(String, String)> {
     Some((webpath, format!("127.0.0.1:{port}")))
 }
 
-fn subscription_prefix(v: &serde_json::Value) -> Option<String> {
+pub(crate) fn subscription_prefix(v: &serde_json::Value) -> Option<String> {
     let cfg: ostp_client::config::SubscriptionCfg = serde_json::from_value(v.get("subscription")?.clone()).ok()?;
     cfg.is_enabled().then(|| cfg.path())
 }
@@ -192,11 +192,6 @@ pub async fn issue_interactive(config_path: &Path, a: IssueArgs) -> Result<()> {
     }
     v["domain"] = domain.clone().into();
     v["tls"] = tls;
-    // A real domain is what subscriptions need; turn them on unless the
-    // operator already decided either way.
-    if v.get("subscription").and_then(|s| s.get("enabled")).is_none() {
-        v["subscription"] = serde_json::json!({ "enabled": true, "path": "/sub" });
-    }
 
     // Validate before touching anything on disk.
     let parsed: ostp_client::config::UnifiedConfig = serde_json::from_value(v.clone())?;

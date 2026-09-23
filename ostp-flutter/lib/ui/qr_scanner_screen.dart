@@ -6,6 +6,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:mobile_scanner/mobile_scanner.dart';
+import '../models/subscription.dart';
 
 class QRScannerScreen extends StatefulWidget {
   const QRScannerScreen({super.key});
@@ -45,9 +46,11 @@ class _QRScannerScreenState extends State<QRScannerScreen> {
               final List<Barcode> barcodes = capture.barcodes;
               for (final barcode in barcodes) {
                 if (barcode.rawValue != null) {
-                  if (barcode.rawValue!.startsWith('ostp://')) {
+                  final value = barcode.rawValue!.trim();
+                  // A share link, or a subscription URL (https://<domain>/sub/<token>).
+                  if (value.startsWith('ostp://') || isSubscriptionUrl(value)) {
                     controller.stop();
-                    Navigator.pop(context, barcode.rawValue);
+                    Navigator.pop(context, value);
                     return;
                   } else {
                     final now = DateTime.now();
@@ -55,7 +58,7 @@ class _QRScannerScreenState extends State<QRScannerScreen> {
                       lastErrorTime = now;
                       ScaffoldMessenger.of(context).showSnackBar(
                         const SnackBar(
-                          content: Text('Invalid QR Code. Must be an OSTP connection link.'),
+                          content: Text('Not an OSTP QR code: expected an ostp:// link or a subscription URL.'),
                           backgroundColor: Colors.redAccent,
                           duration: Duration(seconds: 2),
                         ),

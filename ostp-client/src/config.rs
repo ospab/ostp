@@ -549,7 +549,8 @@ impl SubscriptionCfg {
             anyhow::bail!("subscription needs \"domain\" to be set");
         }
         let p = self.path();
-        if !p.starts_with('/') || p.len() < 2 || p.contains(['?', '#', ' ']) {
+        let url_safe = p.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '-' | '_' | '.' | '~'));
+        if !p.starts_with('/') || p.len() < 2 || !url_safe || p.contains("//") {
             anyhow::bail!("subscription.path must look like \"/sub\" (got '{p}')");
         }
         if p.starts_with("/.well-known") {
