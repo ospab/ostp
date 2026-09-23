@@ -1,6 +1,6 @@
 {
-  "target_version": "0.4.5",
-  "branch": "master",
-  "alpha_iteration": 0,
-  "beta_iteration": 17
+  "target_version": "0.4.6",
+  "branch": "alpha",
+  "alpha_iteration": 1,
+  "beta_iteration": 0
 }
