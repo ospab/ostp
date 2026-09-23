@@ -149,6 +149,9 @@ pub async fn attempt_handshake(
                 access_key: Bytes::copy_from_slice(access_key),
                 ttl,
                 connect_timeout: attempt_timeout,
+                tls: None,
+                ws_path: None,
+                http_host: String::new(),
             };
             match connect_uot(target_ip, port, opts).await {
                 Ok((t, rx)) => (t, Some(rx)),

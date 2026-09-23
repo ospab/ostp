@@ -185,6 +185,10 @@ pub struct Bridge {
     pub ttl_desync_ttl: u8,
     pub ttl_desync_count: u8,
     pub ttl_desync_auto: bool,
+    pub tls: bool,
+    pub tls_sni: Option<String>,
+    pub tls_insecure: bool,
+    pub ws_path: Option<String>,
     /// Cached result of the hop-distance measurement, so the TTL sweep runs once
     /// rather than on every (re)connect. Cleared on a network change.
     ttl_desync_measured: Option<u8>,
@@ -243,6 +247,10 @@ impl Bridge {
             ttl_desync_ttl: config.transport.ttl_desync_ttl,
             ttl_desync_count: config.transport.ttl_desync_count,
             ttl_desync_auto: config.transport.ttl_desync_auto,
+            tls: config.transport.tls,
+            tls_sni: config.transport.tls_sni.clone(),
+            tls_insecure: config.transport.tls_insecure,
+            ws_path: config.transport.ws_path.clone(),
             ttl_desync_measured: None,
             mtu: config.ostp.mtu,
             kill_switch: config.kill_switch,
@@ -716,12 +724,14 @@ impl Bridge {
                         let old_server = self.server_addr.clone();
                         let old_mode = self.mode.clone();
                         let old_transport = self.transport_mode.clone();
+                        let old_carrier = (self.tls, self.tls_sni.clone(), self.tls_insecure, self.ws_path.clone());
                         
                         self.apply_runtime_config(&cfg);
                         
                         let requires_restart = self.server_addr != old_server || 
                                                self.mode != old_mode || 
-                                               self.transport_mode != old_transport;
+                                               self.transport_mode != old_transport ||
+                                               (self.tls, self.tls_sni.clone(), self.tls_insecure, self.ws_path.clone()) != old_carrier;
                                                
                         if !requires_restart {
                             if let Some(tx_watch) = &self.reload_tx {
@@ -1349,6 +1359,10 @@ impl Bridge {
         self.ttl_desync_ttl = cfg.transport.ttl_desync_ttl;
         self.ttl_desync_count = cfg.transport.ttl_desync_count;
         self.ttl_desync_auto = cfg.transport.ttl_desync_auto;
+        self.tls = cfg.transport.tls;
+        self.tls_sni = cfg.transport.tls_sni.clone();
+        self.tls_insecure = cfg.transport.tls_insecure;
+        self.ws_path = cfg.transport.ws_path.clone();
         self.ttl_desync_measured = None; // re-measure after a config change
         self.mtu = cfg.ostp.mtu;
         self.keepalive_interval_sec = cfg.ostp.keepalive_interval_sec;
@@ -1362,7 +1376,8 @@ impl Bridge {
         tx: &mpsc::Sender<UiEvent>,
     ) -> Result<crate::transport::Transport> {
         let mode = self.transport_mode.to_lowercase();
-        if mode == "uot" || mode == "tcp" {
+        // TLS and the upgrade path only exist on the TCP carrier.
+        if mode == "uot" || mode == "tcp" || self.tls || self.ws_path.is_some() {
             // Bound the TCP connect. Without this it inherits the kernel's SYN
             // retry budget, which is tens of seconds (and can reach ~2 minutes).
             // That is exactly what made UoT appear to hang on mobile: callers
@@ -1385,6 +1400,15 @@ impl Bridge {
                     access_key: self.access_key.clone(),
                     ttl: None,
                     connect_timeout: UOT_CONNECT_TIMEOUT,
+                    // Name, not the resolved IP: the certificate and the web
+                    // server's vhost are for the domain, on every resolved
+                    // address and on the NAT64 fallback alike.
+                    tls: self.tls.then(|| crate::transport::TlsClientOptions {
+                        sni: self.tls_sni.clone().unwrap_or_else(|| server_host(&self.server_addr)),
+                        insecure: self.tls_insecure,
+                    }),
+                    ws_path: self.ws_path.clone(),
+                    http_host: self.tls_sni.clone().unwrap_or_else(|| server_host(&self.server_addr)),
                 },
             ).await?;
 
@@ -1477,4 +1501,26 @@ pub(crate) async fn synthesize_nat64(ip: std::net::Ipv4Addr) -> std::net::Ipv6Ad
     )
 }
 
+/// Host part of "host:port" / "[v6]:port", without resolving it.
+pub(crate) fn server_host(server_addr: &str) -> String {
+    if let Some(rest) = server_addr.strip_prefix('[') {
+        return rest.split(']').next().unwrap_or(rest).to_string();
+    }
+    match server_addr.rsplit_once(':') {
+        Some((host, port)) if !host.contains(':') && port.parse::<u16>().is_ok() => host.to_string(),
+        _ => server_addr.to_string(),
+    }
+}
 
+#[cfg(test)]
+mod server_host_tests {
+    use super::server_host;
+
+    #[test]
+    fn strips_port_and_brackets() {
+        assert_eq!(server_host("vpn.example.com:443"), "vpn.example.com");
+        assert_eq!(server_host("1.2.3.4:50000"), "1.2.3.4");
+        assert_eq!(server_host("[2001:db8::1]:443"), "2001:db8::1");
+        assert_eq!(server_host("vpn.example.com"), "vpn.example.com");
+    }
+}

@@ -24,7 +24,11 @@ futures-util = "0.3.32"
 hmac = "0.12.1"
 sha2 = "0.10.8"
 base64 = "0.22.1"
-webpki-roots = "0.26"
+webpki-roots = "1"
+# ring only: aws-lc-rs (rustls' default) does not build for Android and every release target.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
+httparse = "1"
 tun = { version = "0.8.9", features = ["async"] }
 netstack-smoltcp = "0.2.2"
 futures = "0.3.32"

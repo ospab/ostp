@@ -65,6 +65,10 @@ struct TransportConfigRaw {
     ttl_desync_ttl: Option<u8>,
     ttl_desync_count: Option<u8>,
     ttl_desync_auto: Option<bool>,
+    tls: Option<bool>,
+    tls_sni: Option<String>,
+    tls_insecure: Option<bool>,
+    ws_path: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -247,6 +251,10 @@ fn map_to_client_config(raw: &ClientConfigRaw, mode: &str) -> ostp_client::confi
             ttl_desync_ttl: raw.transport.as_ref().and_then(|t| t.ttl_desync_ttl).unwrap_or(8),
             ttl_desync_count: raw.transport.as_ref().and_then(|t| t.ttl_desync_count).unwrap_or(2),
             ttl_desync_auto: raw.transport.as_ref().and_then(|t| t.ttl_desync_auto).unwrap_or(true),
+            tls: raw.transport.as_ref().and_then(|t| t.tls).unwrap_or(false),
+            tls_sni: raw.transport.as_ref().and_then(|t| t.tls_sni.clone()).filter(|s| !s.is_empty()),
+            tls_insecure: raw.transport.as_ref().and_then(|t| t.tls_insecure).unwrap_or(false),
+            ws_path: raw.transport.as_ref().and_then(|t| t.ws_path.clone()).filter(|s| !s.is_empty()),
         },
         exclusions: ostp_client::config::ExclusionConfig {
             domains: raw.exclude.as_ref().and_then(|e| e.domains.clone()).unwrap_or_default(),

@@ -160,48 +160,18 @@ fn prompt_client_options(client_cfg: &mut ClientConfig) {
 }
 
 fn parse_ostp_link(link: &str) -> Result<ClientConfig> {
-    let parsed = url::Url::parse(link)
-        .map_err(|e| anyhow!("Failed to parse share link URL: {e}"))?;
-
-    if parsed.scheme() != "ostp" {
-        anyhow::bail!("Unsupported URL scheme '{}', expected 'ostp://'", parsed.scheme());
-    }
-
-    let access_key = parsed.username().to_string();
-    if access_key.is_empty() {
-        anyhow::bail!("Missing access key (userinfo segment) in share link");
-    }
-
-    let host = parsed.host_str().ok_or_else(|| anyhow!("Missing host in share link"))?;
-    let port = parsed.port().ok_or_else(|| anyhow!("Missing port in share link"))?;
-    let server = format!("{host}:{port}");
-    let mut transport_mode = String::from("udp");
-    let mut tun_enabled = false;
-    let mut tun_dns = None;
-
-    for (k, v) in parsed.query_pairs() {
-        match &*k {
-            "type" => transport_mode = v.into_owned(),
-            "tun" => tun_enabled = v == "true",
-            "dns" => tun_dns = Some(v.into_owned()),
-            _ => {}
-        }
-    }
-
+    let l = ostp_core::share_link::ShareLink::parse(link)?;
     Ok(ClientConfig {
-        server,
-        access_key,
+        server: l.server(),
+        access_key: l.key.clone(),
         mtu: None,
-        transport: Some(TransportConfigRaw {
-            mode: Some(transport_mode),
-            tcp_fragmentation: None,
-        }),
+        transport: Some(link_transport(&l)),
         socks5_bind: Some("127.0.0.1:1088".to_string()),
         tun: Some(TunConfig {
-            enable: tun_enabled,
+            enable: l.tun,
             wintun_path: Some("./wintun.dll".to_string()),
             ipv4_address: Some("10.1.0.2/24".to_string()),
-            dns: tun_dns,
+            dns: l.dns.clone(),
             kill_switch: Some(false),
         }),
 
@@ -210,6 +180,18 @@ fn parse_ostp_link(link: &str) -> Result<ClientConfig> {
         mux: None,
         gui: None,
     })
+}
+
+/// The `transport` section a share link describes.
+fn link_transport(l: &ostp_core::share_link::ShareLink) -> TransportConfigRaw {
+    TransportConfigRaw {
+        mode: Some(l.transport.as_str().to_string()),
+        tls: l.tls.then_some(true),
+        tls_sni: l.sni.clone(),
+        tls_insecure: l.insecure.then_some(true),
+        ws_path: l.path.clone(),
+        ..Default::default()
+    }
 }
 
 fn generate_secure_key(format_type: &str) -> String {
@@ -624,14 +606,16 @@ fn run_setup_wizard(config_path: &std::path::Path) -> Result<()> {
 
             // Try import from link first
             let use_link = wizard_yn("Do you have a share link (ostp://...)?", false);
-            let (server, access_key, transport_mode) = if use_link {
-                let link_str = wizard_prompt("Paste link", "");
-                let parsed = url::Url::parse(&link_str).unwrap();
-                let mut p = parsed.query_pairs();
-                let tm = p.find(|(k, _)| k == "type").map(|(_, v)| v.to_string()).unwrap_or("udp".to_string());
-                (parsed.host_str().unwrap().to_string() + ":" + &parsed.port().unwrap_or(50000).to_string(), parsed.username().to_string(), tm)
+            let (server, access_key, transport) = if use_link {
+                loop {
+                    let link_str = wizard_prompt("Paste link", "");
+                    match ostp_core::share_link::ShareLink::parse(&link_str) {
+                        Ok(l) => break (l.server(), l.key.clone(), link_transport(&l)),
+                        Err(e) => wizard_warn(&format!("Not a valid ostp:// link: {e}")),
+                    }
+                }
             } else {
-                ("127.0.0.1:50000".to_string(), "".to_string(), "udp".to_string())
+                ("127.0.0.1:50000".to_string(), "".to_string(), TransportConfigRaw { mode: Some("udp".into()), ..Default::default() })
             };
 
             wizard_step(2, TOTAL, "Local proxy");
@@ -703,9 +687,7 @@ fn run_setup_wizard(config_path: &std::path::Path) -> Result<()> {
                     "ips": [],
                     "processes": []
                 },
-                "transport": {
-                    "mode": transport_mode
-                },
+                "transport": transport,
                 "mux": {
                     "enabled": mux_enable,
                     "sessions": mux_sessions
@@ -1875,18 +1857,7 @@ async fn run_client_directly(client_cfg: ClientConfig) -> Result<()> {
             enabled: client_cfg.mux.as_ref().and_then(|m| m.enabled).unwrap_or(false),
             sessions: client_cfg.mux.as_ref().and_then(|m| m.sessions).unwrap_or(1),
         },
-        transport: ostp_client::config::TransportConfig {
-            mode: client_cfg.transport.as_ref().and_then(|t| t.mode.clone()).unwrap_or_else(|| "udp".to_string()),
-            tcp_fragmentation: client_cfg.transport.as_ref().and_then(|t| t.tcp_fragmentation).unwrap_or(false),
-            frag_chunk: 2,
-            frag_sleep: 2,
-            junk_pc: [2, 5],
-            junk_ps: [100, 1000],
-            ttl_desync: false,
-            ttl_desync_ttl: 8,
-            ttl_desync_count: 2,
-            ttl_desync_auto: true,
-        },
+        transport: client_cfg.transport.clone().unwrap_or_default().to_runtime(),
         dns_server: client_cfg.tun.as_ref().and_then(|t| t.dns.clone()),
         kill_switch: client_cfg.tun.as_ref().and_then(|t| t.kill_switch).unwrap_or(false),
         gui: None,

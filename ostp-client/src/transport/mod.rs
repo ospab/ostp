@@ -1,13 +1,23 @@
-
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use rand::Rng;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, Mutex};
 use bytes::Bytes;
 
 use crate::debug_preview::describe_foreign_bytes;
+
+pub mod tls;
+pub use tls::TlsClientOptions;
+
+/// Budget for the TLS handshake and the HTTP upgrade, each.
+const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(8);
+/// Junk frames must keep the first byte of the stream in 0x00..=0x05 (a
+/// frame length of at most 1535), which is how the server tells raw UoT
+/// apart from TLS and HTTP on the same port.
+const MAX_JUNK_LEN: usize = 1400;
 
 /// UoT/TCP connection parameters shared by the live bridge and the prober.
 #[derive(Clone)]
@@ -24,10 +34,17 @@ pub struct UotOptions {
     /// answering in place of the real server.
     pub ttl: Option<u32>,
     pub connect_timeout: Duration,
+    /// Run UoT inside TLS.
+    pub tls: Option<TlsClientOptions>,
+    /// Secret HTTP-upgrade path (reaching OSTP through a web server).
+    pub ws_path: Option<String>,
+    /// Host header for the upgrade request (the configured server name).
+    pub http_host: String,
 }
 
-/// Opens a UoT/TCP transport: junk packets, then an optional fragmented
-/// first frame, matching the on-wire shape a real ostp server expects.
+/// Opens a UoT/TCP transport: optionally TLS and an HTTP upgrade, then junk
+/// packets and an optional fragmented first frame (plain TCP only: inside TLS
+/// they are encrypted and pointless), matching what a real ostp server expects.
 ///
 /// The returned receiver carries a human-readable note each time the
 /// connection ends or errors with bytes left over that never formed a
@@ -40,7 +57,7 @@ pub async fn connect_uot(
     port: u16,
     opts: UotOptions,
 ) -> anyhow::Result<(Transport, mpsc::UnboundedReceiver<String>)> {
-    let stream = tokio::time::timeout(
+    let mut stream = tokio::time::timeout(
         opts.connect_timeout,
         tokio::net::TcpStream::connect((target_ip, port)),
     )
@@ -55,24 +72,57 @@ pub async fn connect_uot(
     if let Some(ttl) = opts.ttl {
         let _ = stream.set_ttl(ttl);
     }
-    let (mut read_half, mut write_half) = stream.into_split();
 
-    let tcp_fragmentation = opts.tcp_fragmentation;
+    match &opts.tls {
+        Some(tls_opts) => {
+            let mut tls = tls::wrap_tls(stream, tls_opts, TLS_HANDSHAKE_TIMEOUT).await?;
+            let prefix = match &opts.ws_path {
+                Some(path) => tls::http_upgrade(&mut tls, path, &opts.http_host, TLS_HANDSHAKE_TIMEOUT).await?,
+                None => Bytes::new(),
+            };
+            let (r, w) = tokio::io::split(tls);
+            Ok(spawn_uot_io(r, w, prefix, &opts, false).await)
+        }
+        None => {
+            let prefix = match &opts.ws_path {
+                Some(path) => tls::http_upgrade(&mut stream, path, &opts.http_host, TLS_HANDSHAKE_TIMEOUT).await?,
+                None => Bytes::new(),
+            };
+            let (r, w) = stream.into_split();
+            Ok(spawn_uot_io(r, w, prefix, &opts, true).await)
+        }
+    }
+}
+
+/// Runs the UoT framing over an established byte stream. `prefix` is data
+/// already read off it (after an upgrade response); `obfuscate` enables junk
+/// frames and first-frame fragmentation, which only mean something on plain TCP.
+async fn spawn_uot_io<R, W>(
+    mut read_half: R,
+    mut write_half: W,
+    prefix: Bytes,
+    opts: &UotOptions,
+    obfuscate: bool,
+) -> (Transport, mpsc::UnboundedReceiver<String>)
+where
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    let tcp_fragmentation = obfuscate && opts.tcp_fragmentation;
     let frag_chunk = opts.frag_chunk.max(1);
     let frag_sleep = opts.frag_sleep;
-    let [junk_pc_min, junk_pc_max] = opts.junk_pc;
-    let [junk_ps_min, junk_ps_max] = opts.junk_ps;
-    // Time-rotating per-key junk marker — NOT a global constant and NOT
-    // even a static per-user value: it changes every window, so junk
-    // carries no fixed DPI signature on the wire. All frames in this
-    // burst are sent within milliseconds, so one window applies to all.
-    let junk_marker = ostp_core::crypto::derive_junk_marker(
-        &opts.access_key,
-        ostp_core::crypto::current_junk_window(),
-    );
 
-    {
-        use tokio::io::AsyncWriteExt;
+    if obfuscate {
+        let [junk_pc_min, junk_pc_max] = opts.junk_pc;
+        let [junk_ps_min, junk_ps_max] = opts.junk_ps;
+        // Time-rotating per-key junk marker — NOT a global constant and NOT
+        // even a static per-user value: it changes every window, so junk
+        // carries no fixed DPI signature on the wire. All frames in this
+        // burst are sent within milliseconds, so one window applies to all.
+        let junk_marker = ostp_core::crypto::derive_junk_marker(
+            &opts.access_key,
+            ostp_core::crypto::current_junk_window(),
+        );
         // Build all junk frames up front so ThreadRng isn't held across an
         // await point (keeps this future Send).
         let junk_frames: Vec<Vec<u8>> = {
@@ -82,8 +132,8 @@ pub async fn connect_uot(
             let num_junk = rng.gen_range(min_c..=max_c);
             (0..num_junk)
                 .map(|_| {
-                    let min_s = junk_ps_min.max(1);
-                    let max_s = junk_ps_max.max(min_s);
+                    let min_s = junk_ps_min.clamp(1, MAX_JUNK_LEN);
+                    let max_s = junk_ps_max.clamp(min_s, MAX_JUNK_LEN);
                     let junk_len = rng.gen_range(min_s..=max_s);
                     let mut frame = Vec::with_capacity(2 + junk_len);
                     frame.extend_from_slice(&(junk_len as u16).to_be_bytes());
@@ -112,8 +162,8 @@ pub async fn connect_uot(
     // the FIRST real frame (the handshake — junk above was written
     // directly, so it doesn't count) into tiny TCP segments with short
     // gaps so DPI can't reassemble/classify the handshake from one read.
+    // Otherwise each frame goes out as one write, i.e. one TLS record.
     tokio::spawn(async move {
-        use tokio::io::AsyncWriteExt;
         let mut first_packet = true;
         while let Some(data) = rx_out.recv().await {
             let len_buf = (data.len() as u16).to_be_bytes();
@@ -130,9 +180,12 @@ pub async fn connect_uot(
                 }
                 if broke { break; }
             } else {
-                if write_half.write_all(&len_buf).await.is_err() { break; }
-                if write_half.write_all(&data).await.is_err() { break; }
+                let mut frame = Vec::with_capacity(2 + data.len());
+                frame.extend_from_slice(&len_buf);
+                frame.extend_from_slice(&data);
+                if write_half.write_all(&frame).await.is_err() { break; }
             }
+            if write_half.flush().await.is_err() { break; }
         }
     });
 
@@ -149,8 +202,7 @@ pub async fn connect_uot(
     // includes a successfully-parsed (and therefore genuine) ostp frame.
     let tx_in_clone = tx_in.clone();
     tokio::spawn(async move {
-        use tokio::io::AsyncReadExt;
-        let mut acc: Vec<u8> = Vec::new();
+        let mut acc: Vec<u8> = prefix.to_vec();
         let mut chunk = [0u8; 4096];
         loop {
             if acc.len() >= 2 {
@@ -193,10 +245,10 @@ pub async fn connect_uot(
         }
     });
 
-    Ok((
+    (
         Transport::Uot { tx: tx_out, rx: Arc::new(Mutex::new(rx_in)) },
         foreign_rx,
-    ))
+    )
 }
 
 #[derive(Clone)]

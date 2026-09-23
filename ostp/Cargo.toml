@@ -15,7 +15,6 @@ clap = { version = "4.4", features = ["derive"] }
 json_comments = "0.2"
 base64 = "0.22"
 rand.workspace = true
-url = "2.5"
 tracing.workspace = true
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 ostp-core = { path = "../ostp-core" }

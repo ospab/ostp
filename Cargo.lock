@@ -1068,7 +1068,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tower-service",
- "webpki-roots 1.0.7",
+ "webpki-roots",
 ]
 
 [[package]]
@@ -1633,7 +1633,6 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
- "url",
 ]
 
 [[package]]
@@ -1647,6 +1646,7 @@ dependencies = [
  "futures",
  "futures-util",
  "hmac",
+ "httparse",
  "json_comments",
  "libc",
  "netstack-smoltcp",
@@ -1654,16 +1654,18 @@ dependencies = [
  "ostp-tun",
  "portable-atomic",
  "rand 0.8.5",
+ "rustls",
  "serde",
  "serde_json",
  "sha2",
  "socket2",
  "tokio",
+ "tokio-rustls",
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
  "tun",
- "webpki-roots 0.26.11",
+ "webpki-roots",
  "winapi",
 ]
 
@@ -1741,7 +1743,7 @@ dependencies = [
  "tower-http",
  "tracing",
  "uuid",
- "webpki-roots 1.0.7",
+ "webpki-roots",
  "x25519-dalek",
  "x509-parser",
 ]
@@ -2106,7 +2108,7 @@ dependencies = [
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",
- "webpki-roots 1.0.7",
+ "webpki-roots",
 ]
 
 [[package]]
@@ -3155,15 +3157,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b96554aa2acc8ccdb7e1c9a58a7a68dd5d13bccc69cd124cb09406db612a1c9b"
 dependencies = [
  "rustls-pki-types",
-]
-
-[[package]]
-name = "webpki-roots"
-version = "0.26.11"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "521bc38abb08001b01866da9f51eb7c5d647a19260e00054a8c7fd5f9e57f7a9"
-dependencies = [
- "webpki-roots 1.0.7",
 ]
 
 [[package]]

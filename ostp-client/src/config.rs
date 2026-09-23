@@ -70,8 +70,9 @@ pub struct LocalProxyConfig {
 }
 
 /// Transport layer configuration.
-/// `mode` = "udp" (default) or "uot" (UDP over TCP, no protocol mimicry —
-/// zapret-like: no recognizable header at all, not a fake TLS/HTTP shell).
+/// `mode` = "udp" (default) or "uot" (UDP over TCP). Plain UoT has no
+/// recognizable header at all; optionally it runs inside real TLS to the
+/// server's own domain (`tls`), which is genuine HTTPS, not a mimicked shell.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TransportConfig {
     /// "udp" or "uot"
@@ -79,6 +80,7 @@ pub struct TransportConfig {
     pub mode: String,
     /// Split the first UoT/TCP packet (handshake) into tiny TCP segments to
     /// break DPI that inspects the first packet. UoT/TCP only; ignored for UDP.
+    #[serde(default)]
     pub tcp_fragmentation: bool,
     /// TCP chunk size (bytes)
     #[serde(default = "default_frag_chunk")]
@@ -110,6 +112,21 @@ pub struct TransportConfig {
     /// measured value overrides ttl_desync_ttl. Turn off to pin ttl_desync_ttl.
     #[serde(default = "default_true")]
     pub ttl_desync_auto: bool,
+    /// Wrap UoT in TLS (UoT only). The certificate is verified against the
+    /// public web PKI unless `tls_insecure` is set.
+    #[serde(default)]
+    pub tls: bool,
+    /// TLS server name; defaults to the host part of `server_addr`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls_sni: Option<String>,
+    /// Accept any server certificate. For testing only: it removes the
+    /// protection against someone impersonating the server.
+    #[serde(default)]
+    pub tls_insecure: bool,
+    /// Secret HTTP-upgrade path, needed when a web server (nginx/apache/caddy)
+    /// on 443 forwards to OSTP.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ws_path: Option<String>,
 }
 
 fn default_true() -> bool { true }
@@ -135,6 +152,10 @@ impl Default for TransportConfig {
             ttl_desync_ttl: default_ttl_desync_ttl(),
             ttl_desync_count: default_ttl_desync_count(),
             ttl_desync_auto: true,
+            tls: false,
+            tls_sni: None,
+            tls_insecure: false,
+            ws_path: None,
         }
     }
 }
@@ -224,6 +245,10 @@ struct RawTransportSection {
     ttl_desync_ttl: Option<u8>,
     ttl_desync_count: Option<u8>,
     ttl_desync_auto: Option<bool>,
+    tls: Option<bool>,
+    tls_sni: Option<String>,
+    tls_insecure: Option<bool>,
+    ws_path: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -305,6 +330,10 @@ impl ClientConfig {
                 ttl_desync_ttl: raw.transport.as_ref().and_then(|t| t.ttl_desync_ttl).unwrap_or_else(default_ttl_desync_ttl),
                 ttl_desync_count: raw.transport.as_ref().and_then(|t| t.ttl_desync_count).unwrap_or_else(default_ttl_desync_count),
                 ttl_desync_auto: raw.transport.as_ref().and_then(|t| t.ttl_desync_auto).unwrap_or(true),
+                tls: raw.transport.as_ref().and_then(|t| t.tls).unwrap_or(false),
+                tls_sni: raw.transport.as_ref().and_then(|t| t.tls_sni.clone()).filter(|s| !s.is_empty()),
+                tls_insecure: raw.transport.as_ref().and_then(|t| t.tls_insecure).unwrap_or(false),
+                ws_path: raw.transport.as_ref().and_then(|t| t.ws_path.clone()).filter(|s| !s.is_empty()),
             },
             exclusions: ExclusionConfig {
                 domains: exclusions.domains.unwrap_or_default(),
@@ -648,10 +677,57 @@ pub struct ClientFileConfig {
     pub gui: Option<serde_json::Value>,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
 pub struct TransportConfigRaw {
     pub mode: Option<String>,
     pub tcp_fragmentation: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frag_chunk: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frag_sleep: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub junk_pc: Option<[usize; 2]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub junk_ps: Option<[usize; 2]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttl_desync: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttl_desync_ttl: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttl_desync_count: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttl_desync_auto: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls_sni: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls_insecure: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ws_path: Option<String>,
+}
+
+impl TransportConfigRaw {
+    /// The runtime transport settings this file section describes.
+    pub fn to_runtime(&self) -> TransportConfig {
+        let d = TransportConfig::default();
+        TransportConfig {
+            mode: self.mode.clone().unwrap_or(d.mode),
+            tcp_fragmentation: self.tcp_fragmentation.unwrap_or(d.tcp_fragmentation),
+            frag_chunk: self.frag_chunk.unwrap_or(d.frag_chunk),
+            frag_sleep: self.frag_sleep.unwrap_or(d.frag_sleep),
+            junk_pc: self.junk_pc.unwrap_or(d.junk_pc),
+            junk_ps: self.junk_ps.unwrap_or(d.junk_ps),
+            ttl_desync: self.ttl_desync.unwrap_or(d.ttl_desync),
+            ttl_desync_ttl: self.ttl_desync_ttl.unwrap_or(d.ttl_desync_ttl),
+            ttl_desync_count: self.ttl_desync_count.unwrap_or(d.ttl_desync_count),
+            ttl_desync_auto: self.ttl_desync_auto.unwrap_or(d.ttl_desync_auto),
+            tls: self.tls.unwrap_or(false),
+            tls_sni: self.tls_sni.clone().filter(|s| !s.is_empty()),
+            tls_insecure: self.tls_insecure.unwrap_or(false),
+            ws_path: self.ws_path.clone().filter(|s| !s.is_empty()),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
