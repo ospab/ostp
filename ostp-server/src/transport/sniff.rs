@@ -42,6 +42,8 @@ pub enum Decoy {
 }
 
 pub struct SniffCtx {
+    /// Terminates TLS on this port when a certificate is configured.
+    pub tls: Option<tokio_rustls::TlsAcceptor>,
     pub ws_path: Option<String>,
     pub decoy: Decoy,
     pub limiter: Arc<ConnLimiter>,
@@ -95,14 +97,47 @@ pub async fn serve_listener(listener: TcpListener, ctx: Arc<SniffCtx>) {
         let ctx = ctx.clone();
         tokio::spawn(async move {
             let deadline = Instant::now() + CLASSIFY_TIMEOUT;
-            if let Err(e) = dispatch(stream, BytesMut::new(), peer, ctx, permit, deadline).await {
+            if let Err(e) = handle_conn(stream, peer, ctx, permit, deadline).await {
                 tracing::debug!("TCP connection from {peer} closed: {e}");
             }
         });
     }
 }
 
+/// First look at a connection: TLS is terminated here (once), everything
+/// else goes straight to `dispatch`.
+async fn handle_conn<S>(
+    mut s: S,
+    peer: SocketAddr,
+    ctx: Arc<SniffCtx>,
+    permit: OwnedSemaphorePermit,
+    deadline: Instant,
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let mut buf = BytesMut::with_capacity(2048);
+    if read_more(&mut s, &mut buf, deadline).await? == 0 {
+        return Ok(());
+    }
+    if classify(buf[0]) == Class::Tls {
+        if let Some(acceptor) = ctx.tls.clone() {
+            let tls = match timeout_at(deadline, acceptor.accept(Rewind::new(s, buf.freeze()))).await {
+                Ok(Ok(tls)) => tls,
+                Ok(Err(e)) => {
+                    tracing::debug!("TLS handshake from {peer} failed: {e}");
+                    return Ok(());
+                }
+                Err(_) => return Ok(()),
+            };
+            return dispatch(tls, BytesMut::new(), peer, ctx, permit, deadline).await;
+        }
+    }
+    dispatch(s, buf, peer, ctx, permit, deadline).await
+}
+
 /// Routes a connection given the bytes already read off it (possibly none).
+/// Never terminates TLS itself: TLS inside TLS is not ours.
 async fn dispatch<S>(
     mut s: S,
     mut buf: BytesMut,
@@ -347,6 +382,7 @@ mod tests {
         let (udp_tx, udp_rx) = mpsc::channel(16);
         (
             Arc::new(SniffCtx {
+                tls: None,
                 ws_path: ws_path.map(str::to_string),
                 decoy: Decoy::NotFound,
                 limiter: Arc::new(ConnLimiter::new()),
@@ -361,7 +397,7 @@ mod tests {
     async fn run(ctx: Arc<SniffCtx>) -> tokio::io::DuplexStream {
         let (client, server) = tokio::io::duplex(64 * 1024);
         let permit = ctx.pending.clone().try_acquire_owned().unwrap();
-        tokio::spawn(dispatch(server, BytesMut::new(), public(), ctx, permit, Instant::now() + CLASSIFY_TIMEOUT));
+        tokio::spawn(handle_conn(server, public(), ctx, permit, Instant::now() + CLASSIFY_TIMEOUT));
         client
     }
 
@@ -425,5 +461,95 @@ mod tests {
         let mut resp = Vec::new();
         let n = tokio::time::timeout(Duration::from_secs(1), c.read_to_end(&mut resp)).await;
         assert!(matches!(n, Ok(Ok(0))), "connection should be closed without a response");
+    }
+}
+
+#[cfg(test)]
+mod tls_tests {
+    use super::*;
+    use crate::tls::{build_acceptor, test_util::ca_and_leaf, write_pem_pair, HotCertResolver};
+    use ostp_core::http_upgrade::build_upgrade_request;
+    use rustls::pki_types::{pem::PemObject, CertificateDer, ServerName};
+
+    fn setup(name: &str) -> (tokio_rustls::TlsAcceptor, tokio_rustls::TlsConnector) {
+        let (ca, leaf, key) = ca_and_leaf(name);
+        let dir = std::env::temp_dir().join(format!("ostp-sniff-tls-{}", rand::random::<u64>()));
+        let (cp, kp) = (dir.join("fullchain.pem"), dir.join("privkey.pem"));
+        write_pem_pair(&cp, &leaf, &kp, &key).unwrap();
+        let resolver = HotCertResolver::new(&cp, &kp);
+        resolver.reload().unwrap();
+
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(CertificateDer::from_pem_slice(ca.as_bytes()).unwrap()).unwrap();
+        let mut client = rustls::ClientConfig::builder_with_provider(crate::tls::provider())
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        client.alpn_protocols = vec![b"http/1.1".to_vec()];
+        (build_acceptor(resolver).unwrap(), tokio_rustls::TlsConnector::from(Arc::new(client)))
+    }
+
+    fn ctx(tls: tokio_rustls::TlsAcceptor, ws_path: Option<&str>) -> (Arc<SniffCtx>, mpsc::Receiver<(Bytes, SocketAddr)>) {
+        let (udp_tx, udp_rx) = mpsc::channel(16);
+        (
+            Arc::new(SniffCtx {
+                tls: Some(tls),
+                ws_path: ws_path.map(str::to_string),
+                decoy: Decoy::NotFound,
+                limiter: Arc::new(ConnLimiter::new()),
+                pending: Arc::new(Semaphore::new(MAX_PENDING)),
+                tcp_map: Arc::new(RwLock::new(HashMap::new())),
+                udp_tx,
+            }),
+            udp_rx,
+        )
+    }
+
+    async fn connect(
+        ctx: Arc<SniffCtx>,
+        connector: tokio_rustls::TlsConnector,
+        sni: &str,
+    ) -> std::io::Result<tokio_rustls::client::TlsStream<tokio::io::DuplexStream>> {
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let permit = ctx.pending.clone().try_acquire_owned().unwrap();
+        let peer: SocketAddr = "203.0.113.7:4000".parse().unwrap();
+        tokio::spawn(handle_conn(server, peer, ctx, permit, Instant::now() + CLASSIFY_TIMEOUT));
+        connector.connect(ServerName::try_from(sni.to_string()).unwrap(), client).await
+    }
+
+    #[tokio::test]
+    async fn uot_frames_inside_tls_reach_the_dispatcher() {
+        let (acceptor, connector) = setup("vpn.example.test");
+        let (ctx, mut udp_rx) = ctx(acceptor, None);
+        let mut tls = connect(ctx, connector, "vpn.example.test").await.unwrap();
+        tls.write_all(&[0x00, 0x03, b'a', b'b', b'c']).await.unwrap();
+        tls.flush().await.unwrap();
+        let (frame, _) = udp_rx.recv().await.unwrap();
+        assert_eq!(frame.as_ref(), b"abc");
+    }
+
+    #[tokio::test]
+    async fn upgrade_inside_tls_then_frames() {
+        let (acceptor, connector) = setup("vpn.example.test");
+        let (ctx, mut udp_rx) = ctx(acceptor, Some("/s3cr3t"));
+        let mut tls = connect(ctx, connector, "vpn.example.test").await.unwrap();
+        tls.write_all(&build_upgrade_request("/s3cr3t", "vpn.example.test", "dGhlIHNhbXBsZSBub25jZQ==")).await.unwrap();
+        tls.flush().await.unwrap();
+        let mut resp = vec![0u8; 256];
+        let n = tls.read(&mut resp).await.unwrap();
+        assert!(resp[..n].starts_with(b"HTTP/1.1 101 "));
+        tls.write_all(&[0x00, 0x02, b'o', b'k']).await.unwrap();
+        tls.flush().await.unwrap();
+        let (frame, _) = udp_rx.recv().await.unwrap();
+        assert_eq!(frame.as_ref(), b"ok");
+    }
+
+    #[tokio::test]
+    async fn wrong_sni_fails_certificate_verification() {
+        let (acceptor, connector) = setup("vpn.example.test");
+        let (ctx, _udp_rx) = ctx(acceptor, None);
+        let err = connect(ctx, connector, "other.example.test").await.unwrap_err();
+        assert!(err.to_string().to_lowercase().contains("certificate"), "{err}");
     }
 }

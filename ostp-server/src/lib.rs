@@ -23,6 +23,7 @@ pub mod outbound;
 pub mod api;
 pub mod fallback;
 pub mod transport;
+pub mod tls;
 pub mod relay_node;
 mod relay;
 mod signal;
@@ -433,6 +434,7 @@ async fn run_server_loop(
 
     // TCP listeners (UoT, plus HTTP upgrade and decoy on the same ports)
     let sniff_ctx = Arc::new(transport::sniff::SniffCtx {
+        tls: None,
         ws_path: sniff.ws_path,
         decoy: sniff.decoy,
         limiter: Arc::new(transport::limiter::ConnLimiter::new()),
