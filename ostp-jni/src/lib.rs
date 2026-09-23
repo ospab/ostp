@@ -419,7 +419,7 @@ fn default_matrix_timeout_ms() -> u64 { 2500 }
 /// connected without disturbing it. Blocks the calling thread until the
 /// sweep finishes (callers must invoke this off the UI thread).
 #[no_mangle]
-pub extern "system" fn Java_net_ostp_client_OstpClientSdk_nativeRunProberMatrix(
+pub extern "system" fn Java_net_ostp_client_OstpClientSdk_runProberMatrix(
     mut env: JNIEnv,
     _class: JClass,
     request_json: JString,
@@ -469,7 +469,7 @@ fn default_ttl_timeout_ms() -> u64 { 900 }
 /// the hop distance at which a middlebox starts answering in place of the
 /// real server. Same threading model as the matrix scan.
 #[no_mangle]
-pub extern "system" fn Java_net_ostp_client_OstpClientSdk_nativeRunProberTtlScan(
+pub extern "system" fn Java_net_ostp_client_OstpClientSdk_runProberTtlScan(
     mut env: JNIEnv,
     _class: JClass,
     request_json: JString,
@@ -518,7 +518,7 @@ pub extern "system" fn Java_net_ostp_client_OstpClientSdk_nativeRunProberTtlScan
 /// runtime, safe to run while a tunnel is connected (every probe socket is
 /// protected against the VPN), blocks the calling thread (~10s).
 #[no_mangle]
-pub extern "system" fn Java_net_ostp_client_OstpClientSdk_nativeRunProberDpiBattery(
+pub extern "system" fn Java_net_ostp_client_OstpClientSdk_runProberDpiBattery(
     mut env: JNIEnv,
     _class: JClass,
 ) -> jstring {
@@ -574,3 +574,25 @@ pub extern "system" fn Java_net_ostp_client_OstpClientSdk_notifyNetworkChanged(
     }
 }
 
+
+#[cfg(test)]
+mod tests {
+    /// Every `external fun` the Android app declares must have a matching
+    /// export here, or the call fails only at runtime ("No implementation
+    /// found for ..."), which no build step catches.
+    #[test]
+    fn every_kotlin_external_has_a_jni_export() {
+        const KOTLIN: &str =
+            include_str!("../../ostp-flutter/android/app/src/main/kotlin/net/ostp/client/OstpClientSdk.kt");
+        const RUST: &str = include_str!("lib.rs");
+        let mut checked = 0;
+        for line in KOTLIN.lines() {
+            let Some(rest) = line.trim().strip_prefix("external fun ") else { continue };
+            let name = rest.split('(').next().unwrap().trim();
+            let export = format!("fn Java_net_ostp_client_OstpClientSdk_{name}(");
+            assert!(RUST.contains(&export), "Kotlin declares `{name}` but ostp-jni has no `{export}`");
+            checked += 1;
+        }
+        assert!(checked >= 5, "found only {checked} external declarations; did the Kotlin file move?");
+    }
+}
