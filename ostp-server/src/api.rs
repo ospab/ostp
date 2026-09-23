@@ -50,10 +50,21 @@ pub struct ApiState {
     /// Server address for subscription links (e.g. "example.com")
     pub server_host: String,
     pub server_port: u16,
+    /// Where clients reach the server over TLS, when that is set up.
+    pub tls_link: Option<TlsLink>,
     pub config_path: Option<std::path::PathBuf>,
     pub dns_server: std::sync::Arc<crate::dns::DnsServer>,
     pub audit_logs: Arc<RwLock<Vec<AuditLogEntry>>>,
     pub router: std::sync::Arc<crate::router::Router>,
+}
+
+/// The TLS endpoint put in subscription links.
+#[derive(Debug, Clone)]
+pub struct TlsLink {
+    pub host: String,
+    pub port: u16,
+    /// Upgrade path, needed when a web server fronts OSTP on 443.
+    pub path: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -278,6 +289,7 @@ pub async fn start_api_server(
     user_stats: Arc<RwLock<HashMap<String, Arc<UserStats>>>>,
     server_host: String,
     server_port: u16,
+    tls_link: Option<TlsLink>,
     config_path: Option<std::path::PathBuf>,
     dns_server: std::sync::Arc<crate::dns::DnsServer>,
     router: std::sync::Arc<crate::router::Router>,
@@ -293,6 +305,7 @@ pub async fn start_api_server(
         password_hash: config.password_hash.clone(),
         server_host,
         server_port,
+        tls_link,
         config_path,
         dns_server,
         audit_logs: Arc::new(RwLock::new(Vec::new())),
@@ -788,9 +801,16 @@ async fn handle_reset_stats(
 /// GET /api/subscribe/{key}
 /// Response: JSON client config or ostp:// share link (via Accept header)
 
+#[derive(Debug, Deserialize)]
+struct SubscribeQuery {
+    /// "udp" or "tls"; defaults to tls when it is configured.
+    transport: Option<String>,
+}
+
 async fn handle_subscribe(
     State(state): State<ApiState>,
     Path(key): Path<String>,
+    axum::extract::Query(query): axum::extract::Query<SubscribeQuery>,
     headers: axum::http::HeaderMap,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
@@ -812,26 +832,48 @@ async fn handle_subscribe(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("application/json");
 
+    use ostp_core::share_link::{LinkTransport, ShareLink};
+    let dns_enabled = state.dns_server.config.read().await.enabled;
+    let mut udp = ShareLink::new(&key, &state.server_host, state.server_port);
+    udp.owndns = dns_enabled;
+    let tls = state.tls_link.as_ref().map(|t| {
+        let mut l = ShareLink::new(&key, &t.host, t.port);
+        l.transport = LinkTransport::Uot;
+        l.tls = true;
+        l.path = t.path.clone();
+        l.owndns = dns_enabled;
+        l
+    });
+    let chosen = match (query.transport.as_deref(), &tls) {
+        (Some("udp"), _) | (_, None) => udp.clone(),
+        (_, Some(t)) => t.clone(),
+    };
+    let links = serde_json::json!({
+        "udp": udp.to_uri(),
+        "tls": tls.as_ref().map(|t| t.to_uri()),
+    });
+
     // If client requests plain text, return ostp:// share link
     if accept.contains("text/plain") {
-        let dns_enabled = state.dns_server.config.read().await.enabled;
-        let rq = if dns_enabled {
-            "?type=udp&owndns=true".to_string()
-        } else {
-            "?type=udp".to_string()
-        };
-        let link = format!("ostp://{}@{}:{}{}", key, state.server_host, state.server_port, rq);
         return (StatusCode::OK, Json(serde_json::json!({
             "ok": true,
-            "data": link
+            "data": chosen.to_uri(),
+            "links": links
         }))).into_response();
     }
+
+    let transport = if chosen.tls {
+        serde_json::json!({ "mode": "uot", "tls": true, "ws_path": chosen.path })
+    } else {
+        serde_json::json!({ "mode": "udp" })
+    };
 
     // Default: return full client config JSON
     let config = serde_json::json!({
         "mode": "client",
-        "server": format!("{}:{}", state.server_host, state.server_port),
+        "server": chosen.server(),
         "access_key": key,
+        "transport": transport,
         "socks5_bind": "127.0.0.1:1088",
         "tun": {
             "enable": false,
@@ -854,7 +896,8 @@ async fn handle_subscribe(
 
     (StatusCode::OK, Json(serde_json::json!({
         "ok": true,
-        "data": config
+        "data": config,
+        "links": links
     }))).into_response()
 }
 
@@ -875,6 +918,7 @@ mod tests {
             password_hash: "hash".to_string(),
             server_host: "127.0.0.1".to_string(),
             server_port: 50000,
+            tls_link: None,
             config_path: None,
             dns_server: crate::dns::DnsServer::new(Default::default()),
             audit_logs: Arc::new(RwLock::new(Vec::new())),

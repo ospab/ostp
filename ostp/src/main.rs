@@ -182,6 +182,41 @@ fn parse_ostp_link(link: &str) -> Result<ClientConfig> {
     })
 }
 
+/// Links for one key: over TLS on the domain when that is set up, and UDP.
+fn share_links_for(
+    server_cfg: &ostp_client::config::ServerConfig,
+    key: &str,
+    config_path: &std::path::Path,
+) -> Vec<(&'static str, ostp_core::share_link::ShareLink)> {
+    use ostp_core::share_link::{LinkTransport, ShareLink};
+    let listen = server_cfg.listen.primary();
+    let (listen_host, port) = match listen.rsplit_once(':') {
+        Some((h, p)) => (h.trim_matches(['[', ']']).to_string(), p.parse().unwrap_or(50000)),
+        None => (listen.clone(), 50000),
+    };
+    let domain = server_cfg.domain.clone().filter(|d| !d.is_empty());
+    let host = domain.clone().unwrap_or_else(|| {
+        if listen_host == "0.0.0.0" || listen_host == "::" {
+            get_or_ask_public_ip(config_path)
+        } else {
+            listen_host
+        }
+    });
+
+    let mut links = Vec::new();
+    if let (Some(tls), Some(domain)) = (server_cfg.tls.as_ref().filter(|t| t.is_enabled()), &domain) {
+        let mut l = ShareLink::new(key, domain, tls.public_port.unwrap_or(443));
+        l.transport = LinkTransport::Uot;
+        l.tls = true;
+        if tls.frontend() != "builtin" {
+            l.path = tls.ws_path.clone();
+        }
+        links.push(("TLS", l));
+    }
+    links.push(("UDP", ShareLink::new(key, &host, port)));
+    links
+}
+
 /// The `transport` section a share link describes.
 fn link_transport(l: &ostp_core::share_link::ShareLink) -> TransportConfigRaw {
     TransportConfigRaw {
@@ -1433,26 +1468,11 @@ async fn run_app() -> Result<()> {
     if args.links {
         match config.mode {
             AppMode::Server(server_cfg) => {
-                let listen = server_cfg.listen.primary();
-                let parts: Vec<&str> = listen.split(':').collect();
-                let port = parts.get(1).unwrap_or(&"50000");
-                let host = if parts[0] == "0.0.0.0" { 
-                    get_or_ask_public_ip(&args.config) 
-                } else { 
-                    parts[0].to_string() 
-                };
-                
                 println!("\n  Client share links from {:?}:", args.config);
                 for (idx, key) in server_cfg.access_keys.iter().enumerate() {
-                    let mut query_params = Vec::<String>::new();
-                    query_params.push("type=udp".to_string());
-
-                    let mut link = format!("ostp://{}@{}:{}", key.key(), host, port);
-                    if !query_params.is_empty() {
-                        link.push('?');
-                        link.push_str(&query_params.join("&"));
+                    for (label, link) in share_links_for(&server_cfg, &key.key(), &args.config) {
+                        println!("  [{}] {label:<3}  {}", idx + 1, link.to_uri());
                     }
-                    println!("  [{}] {}", idx + 1, link);
                 }
                 return Ok(());
             }

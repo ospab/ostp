@@ -302,8 +302,16 @@ pub async fn run_server(params: ServerParams) -> Result<()> {
             let config_path_api = config_path.clone();
             let dns_server_api = dns_server.clone();
             let router_api = router.clone();
+            let tls_link = tls.as_ref().and_then(|t| {
+                Some(api::TlsLink {
+                    host: t.domain.clone()?,
+                    port: t.public_port,
+                    // Through a web server the upgrade path is required.
+                    path: (t.frontend != tls::Frontend::Builtin).then(|| t.ws_path.clone()),
+                })
+            });
             tokio::spawn(async move {
-                api::start_api_server(api_cfg, api_keys, api_stats, server_host, server_port, config_path_api, dns_server_api, router_api).await;
+                api::start_api_server(api_cfg, api_keys, api_stats, server_host, server_port, tls_link, config_path_api, dns_server_api, router_api).await;
             });
         }
     }
