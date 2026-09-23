@@ -14,7 +14,8 @@ if (localStorage.getItem('ostp_theme') === 'light') {
 // Only the active profile is compiled into a config and passed to Tauri.
 //
 // Profile shape:
-// { id: string, name: string, server: string, key: string, transport: 'udp'|'uot' }
+// { id: string, name: string, server: string, key: string, transport: 'udp'|'uot',
+//   tls?: bool, tls_sni?: string, tls_insecure?: bool, ws_path?: string }
 
 const PROFILES_KEY  = 'ostp_profiles_v1';
 const ACTIVE_KEY    = 'ostp_active_profile';
@@ -113,6 +114,38 @@ const pmName    = $('pm-name');
 const pmServer  = $('pm-server');
 const pmKey     = $('pm-key');
 const pmTransport = $('pm-transport');
+const pmTlsGroup  = $('pm-tls-group');
+const pmTlsFields = $('pm-tls-fields');
+const pmTls       = $('pm-tls');
+const pmSni       = $('pm-sni');
+const pmWsPath    = $('pm-ws-path');
+const pmTlsInsecure = $('pm-tls-insecure');
+
+// TLS only exists on UoT; its details only while it is on.
+function updateTlsVisibility() {
+  pmTlsGroup.style.display = pmTransport.value === 'uot' ? '' : 'none';
+  pmTlsFields.style.display = pmTls.checked ? '' : 'none';
+}
+pmTransport.addEventListener('change', updateTlsVisibility);
+pmTls.addEventListener('change', updateTlsVisibility);
+
+function setTlsFields(p) {
+  pmTls.checked = !!p.tls;
+  pmSni.value = p.tls_sni || '';
+  pmWsPath.value = p.ws_path || '';
+  pmTlsInsecure.checked = !!p.tls_insecure;
+  updateTlsVisibility();
+}
+
+function tlsFieldsFromEditor() {
+  const uot = pmTransport.value === 'uot';
+  return {
+    tls: uot && pmTls.checked,
+    tls_sni: pmSni.value.trim(),
+    tls_insecure: pmTlsInsecure.checked,
+    ws_path: pmWsPath.value.trim(),
+  };
+}
 const btnProfileCancel = $('btn-profile-cancel');
 const btnProfileSave   = $('btn-profile-save');
 const btnProfileDelete = $('btn-profile-delete');
@@ -321,7 +354,11 @@ function buildConfig() {
       junk_pc: s.junkEnabled ? [s.junkPcMin || 2, s.junkPcMax || 5] : (active.junk_pc || [2, 5]),
       junk_ps: s.junkEnabled ? [s.junkPsMin || 100, s.junkPsMax || 1000] : (active.junk_ps || [100, 1000]),
       ttl_desync: !!s.ttlDesync,
-      ttl_desync_auto: true
+      ttl_desync_auto: true,
+      tls: (active.transport === 'uot') && !!active.tls,
+      tls_sni: active.tls_sni || null,
+      tls_insecure: !!active.tls_insecure,
+      ws_path: active.ws_path || null
     },
     tun: {
       enable: !!s.tun,
@@ -516,11 +553,13 @@ function openProfileEditor(id) {
     pmServer.value = p.server || '';
     pmKey.value = p.key || '';
     pmTransport.value = p.transport || 'udp';
+    setTlsFields(p);
     btnProfileDelete.style.display = '';
   } else {
     profileModalTitle.textContent = 'New Profile';
     pmName.value = pmServer.value = pmKey.value = '';
     pmTransport.value = 'udp';
+    setTlsFields({});
     btnProfileDelete.style.display = 'none';
   }
   pmKey.type = 'password';
@@ -542,6 +581,7 @@ function saveProfileFromEditor() {
         server,
         key,
         transport: pmTransport.value,
+        ...tlsFieldsFromEditor(),
       };
     }
   } else {
@@ -551,6 +591,7 @@ function saveProfileFromEditor() {
       server,
       key,
       transport: pmTransport.value,
+      ...tlsFieldsFromEditor(),
     };
     profiles.push(p);
     if (!activeId) { activeId = p.id; saveActiveId(activeId); }
@@ -580,18 +621,59 @@ function deleteEditingProfile() {
 }
 
 // ── PARSE ostp:// link ─────────────────────────────────────────────────
+// Port of ostp-core/src/share_link.rs (and the Flutter copy): keep in step.
+const truthy = v => ['1', 'true', 'yes'].includes(String(v).toLowerCase());
+const linkDecode = s => decodeURIComponent(s.replace(/\+/g, ' '));
+// RFC 3986 unreserved stay; encodeURIComponent also leaves !'()* alone.
+const linkEncode = s => encodeURIComponent(s).replace(/[!'()*]/g, c => '%' + c.charCodeAt(0).toString(16).toUpperCase());
+
+function splitHostPort(hostPort) {
+  let host, port;
+  if (hostPort.startsWith('[')) {
+    const end = hostPort.indexOf(']');
+    if (end < 0) throw new Error('Unterminated IPv6 address');
+    host = hostPort.slice(1, end);
+    if (hostPort[end + 1] !== ':') throw new Error('Link has no port');
+    port = hostPort.slice(end + 2);
+  } else {
+    const c = hostPort.lastIndexOf(':');
+    if (c < 0) throw new Error('Link has no port');
+    host = hostPort.slice(0, c);
+    port = hostPort.slice(c + 1);
+  }
+  const n = Number(port);
+  if (!host || !/^\d+$/.test(port) || n > 65535) throw new Error('Invalid host or port');
+  return { host, port: n };
+}
+
 function parseOstpLink(raw) {
   raw = raw.trim();
-  if (!raw.startsWith('ostp://')) throw new Error('Must start with ostp://');
-  const url = new URL(raw);
-  const key  = decodeURIComponent(url.username);
-  // host includes port
-  const server = url.host;
-  if (!key || !server) throw new Error('Incomplete link');
-  const type = url.searchParams.get('type') || 'udp';
-  const transport = (type === 'tcp' || type === 'http' || type === 'uot') ? 'uot' : 'udp';
-  const name = url.searchParams.get('name') || server;
-  return { name, server, key, transport };
+  if (!raw.toLowerCase().startsWith('ostp://')) throw new Error('Must start with ostp://');
+  let rest = raw.slice(7).split('#')[0];
+  const q = rest.indexOf('?');
+  const authority = (q >= 0 ? rest.slice(0, q) : rest).replace(/\/+$/, '');
+  const query = q >= 0 ? rest.slice(q + 1) : '';
+  const at = authority.lastIndexOf('@');
+  if (at < 0) throw new Error('Link has no access key');
+  const key = linkDecode(authority.slice(0, at));
+  if (!key) throw new Error('Link has an empty access key');
+  const { host, port } = splitHostPort(authority.slice(at + 1));
+  const server = host.includes(':') ? `[${host}]:${port}` : `${host}:${port}`;
+
+  const out = { name: host, server, key, transport: 'udp', tls: false, tls_sni: '', tls_insecure: false, ws_path: '' };
+  for (const pair of query.split('&').filter(Boolean)) {
+    const eq = pair.indexOf('=');
+    const k = eq >= 0 ? pair.slice(0, eq) : pair;
+    const v = linkDecode(eq >= 0 ? pair.slice(eq + 1) : '');
+    if (k === 'type') out.transport = ['uot', 'tcp', 'http'].includes(v.toLowerCase()) ? 'uot' : 'udp';
+    else if (k === 'tls') out.tls = truthy(v);
+    else if (k === 'sni') out.tls_sni = v;
+    else if (k === 'insecure') out.tls_insecure = truthy(v);
+    else if (k === 'path') out.ws_path = v;
+    else if (k === 'name' && v) out.name = v;
+  }
+  if (out.tls || out.ws_path) out.transport = 'uot';
+  return out;
 }
 
 function importFromLink(raw) {
@@ -604,6 +686,7 @@ function importFromLink(raw) {
     pmServer.value = parsed.server;
     pmKey.value = parsed.key;
     pmTransport.value = parsed.transport;
+    setTlsFields(parsed);
     btnProfileDelete.style.display = 'none';
     profileModal.classList.remove('hidden');
     showToast('Link imported — tap Save', 'ok');
@@ -614,11 +697,15 @@ function importFromLink(raw) {
 
 // ── SHARE ─────────────────────────────────────────────────────────────
 function buildShareLink(p) {
-  const params = [];
-  if (p.transport && p.transport !== 'udp') params.push(`type=${p.transport}`);
-  if (p.name) params.push(`name=${encodeURIComponent(p.name)}`);
-  const qs = params.length ? '?' + params.join('&') : '';
-  return `ostp://${encodeURIComponent(p.key)}@${p.server}${qs}`;
+  const uot = p.transport === 'uot';
+  const tls = uot && !!p.tls;
+  const params = [`type=${uot ? 'uot' : 'udp'}`];
+  if (tls) params.push('tls=1');
+  if (tls && p.tls_sni) params.push(`sni=${linkEncode(p.tls_sni)}`);
+  if (tls && p.tls_insecure) params.push('insecure=1');
+  if (uot && p.ws_path) params.push(`path=${linkEncode(p.ws_path)}`);
+  if (p.name) params.push(`name=${linkEncode(p.name)}`);
+  return `ostp://${linkEncode(p.key)}@${p.server}?${params.join('&')}`;
 }
 
 async function openShare(id) {

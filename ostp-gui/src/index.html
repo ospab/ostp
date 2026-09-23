@@ -412,6 +412,38 @@
             <option value="uot">TCP (UoT)</option>
           </select>
         </div>
+        <div id="pm-tls-group" style="display:none;">
+          <div class="toggle-row">
+            <div class="toggle-text">
+              <span class="toggle-name">TLS (HTTPS)</span>
+              <span class="toggle-hint">Real TLS to the server's domain certificate</span>
+            </div>
+            <label class="toggle">
+              <input type="checkbox" id="pm-tls" />
+              <span class="toggle-track"><span class="toggle-thumb"></span></span>
+            </label>
+          </div>
+          <div id="pm-tls-fields" style="display:none;">
+            <div class="field-group">
+              <label class="field-label" for="pm-sni">Server name (SNI)</label>
+              <input id="pm-sni" class="field-input mono" type="text" placeholder="default: host from Server" spellcheck="false" />
+            </div>
+            <div class="field-group">
+              <label class="field-label" for="pm-ws-path">Upgrade path</label>
+              <input id="pm-ws-path" class="field-input mono" type="text" placeholder="only through nginx / apache / caddy" spellcheck="false" />
+            </div>
+            <div class="toggle-row">
+              <div class="toggle-text">
+                <span class="toggle-name" style="color:#f87171;">Don't verify certificate</span>
+                <span class="toggle-hint" style="color:#f87171;">Insecure: anyone on the path can impersonate the server. Testing only.</span>
+              </div>
+              <label class="toggle">
+                <input type="checkbox" id="pm-tls-insecure" />
+                <span class="toggle-track"><span class="toggle-thumb"></span></span>
+              </label>
+            </div>
+          </div>
+        </div>
 
         <div class="modal-actions">
           <button id="btn-profile-cancel" class="btn secondary">Cancel</button>
