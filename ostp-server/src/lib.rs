@@ -337,8 +337,9 @@ pub async fn run_server(params: ServerParams) -> Result<()> {
             let dns_server_api = dns_server.clone();
             let router_api = router.clone();
             let tls_link = tls_link.clone();
+            let sub_prefix = subscription.as_ref().map(|s| s.settings.prefix.clone());
             tokio::spawn(async move {
-                api::start_api_server(api_cfg, api_keys, api_stats, server_host, server_port, tls_link, config_path_api, dns_server_api, router_api).await;
+                api::start_api_server(api_cfg, api_keys, api_stats, server_host, server_port, tls_link, sub_prefix, config_path_api, dns_server_api, router_api).await;
             });
         }
     }

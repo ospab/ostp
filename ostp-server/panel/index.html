@@ -1,0 +1,898 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<meta name="referrer" content="no-referrer" />
+<title>OSTP Panel</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ccircle cx='16' cy='16' r='13' fill='none' stroke='%232ee66d' stroke-width='4'/%3E%3C/svg%3E" />
+<!-- Self-contained on purpose: no fonts, scripts or styles from anywhere else,
+     so the panel works on an isolated server and leaks nothing to third parties. -->
+<style>
+:root {
+  --bg: #07080a; --surface: #0e1013; --card: #12151a; --border: #1f242c; --hover: #171b21;
+  --fg: #eef1f4; --fg2: #8b95a3; --fg3: #4a5361;
+  --accent: #2ee66d; --accent-dim: rgba(46,230,109,.12);
+  --red: #ff5f5f; --red-dim: rgba(255,95,95,.12); --amber: #f0b840; --amber-dim: rgba(240,184,64,.12);
+  --blue: #5aa9ff;
+  --r: 12px; --r-sm: 8px;
+  --mono: ui-monospace, "SFMono-Regular", "JetBrains Mono", Menlo, Consolas, monospace;
+  color-scheme: dark;
+}
+:root.light {
+  --bg: #f4f6f8; --surface: #ffffff; --card: #ffffff; --border: #e3e7ec; --hover: #f1f3f6;
+  --fg: #14181d; --fg2: #5d6773; --fg3: #b3bbc5;
+  --accent: #14a44d; --accent-dim: rgba(20,164,77,.10);
+  --red: #d93636; --red-dim: rgba(217,54,54,.08); --amber: #c27d0e; --amber-dim: rgba(194,125,14,.10);
+  color-scheme: light;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; height: 100%; }
+body {
+  background: var(--bg); color: var(--fg);
+  font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Roboto, "Helvetica Neue", Arial, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+button, input, select, textarea { font: inherit; color: inherit; }
+a { color: var(--accent); }
+.hidden { display: none !important; }
+.mono { font-family: var(--mono); font-size: .92em; }
+.muted { color: var(--fg2); }
+.small { font-size: 12px; }
+
+/* layout */
+.app { display: grid; grid-template-columns: 220px 1fr; min-height: 100vh; }
+.side { background: var(--surface); border-right: 1px solid var(--border); padding: 18px 12px; display: flex; flex-direction: column; gap: 4px; position: sticky; top: 0; height: 100vh; }
+.brand { display: flex; align-items: center; gap: 10px; padding: 4px 10px 18px; font-weight: 700; letter-spacing: 2px; }
+.brand-dot { width: 10px; height: 10px; border-radius: 50%; background: var(--accent); box-shadow: 0 0 12px var(--accent); }
+.nav { display: flex; align-items: center; gap: 10px; padding: 9px 12px; border-radius: var(--r-sm); color: var(--fg2); cursor: pointer; border: 0; background: none; text-align: left; width: 100%; }
+.nav:hover { background: var(--hover); color: var(--fg); }
+.nav.active { background: var(--accent-dim); color: var(--fg); }
+.nav svg { flex-shrink: 0; }
+.side-foot { margin-top: auto; display: flex; flex-direction: column; gap: 6px; padding: 0 4px; }
+.side-row { display: flex; gap: 6px; }
+.main { padding: 26px 32px 60px; max-width: 1280px; width: 100%; }
+.page-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 20px; flex-wrap: wrap; }
+.page-head h1 { font-size: 20px; margin: 0; font-weight: 650; }
+.page-head .sub { color: var(--fg2); font-size: 13px; margin-top: 2px; }
+
+/* controls */
+.btn { display: inline-flex; align-items: center; justify-content: center; gap: 7px; padding: 8px 14px; border-radius: var(--r-sm); border: 1px solid var(--border); background: var(--card); cursor: pointer; white-space: nowrap; }
+.btn:hover { background: var(--hover); }
+.btn.primary { background: var(--accent); border-color: var(--accent); color: #04130a; font-weight: 600; }
+.btn.primary:hover { filter: brightness(1.07); }
+.btn.danger { color: var(--red); }
+.btn.danger:hover { background: var(--red-dim); }
+.btn.sm { padding: 5px 9px; font-size: 12px; }
+.btn[disabled] { opacity: .5; cursor: default; }
+.icon-btn { width: 30px; height: 30px; display: inline-flex; align-items: center; justify-content: center; border-radius: 7px; border: 1px solid transparent; background: none; color: var(--fg2); cursor: pointer; }
+.icon-btn:hover { background: var(--hover); color: var(--fg); border-color: var(--border); }
+.icon-btn.danger:hover { color: var(--red); background: var(--red-dim); }
+.input { width: 100%; padding: 9px 11px; border-radius: var(--r-sm); border: 1px solid var(--border); background: var(--surface); outline: none; }
+.input:focus { border-color: var(--accent); }
+textarea.input { font-family: var(--mono); font-size: 12.5px; resize: vertical; }
+label.lbl { display: block; font-size: 12px; color: var(--fg2); margin: 0 0 6px; }
+.field { margin-bottom: 14px; }
+.row { display: flex; gap: 10px; align-items: center; }
+.row > .grow { flex: 1; }
+.seg { display: inline-flex; border: 1px solid var(--border); border-radius: var(--r-sm); overflow: hidden; }
+.seg button { border: 0; background: none; padding: 6px 12px; cursor: pointer; color: var(--fg2); }
+.seg button.on { background: var(--accent-dim); color: var(--fg); }
+
+/* cards */
+.grid { display: grid; gap: 14px; }
+.stats { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+.two { grid-template-columns: 1.4fr 1fr; }
+.card { background: var(--card); border: 1px solid var(--border); border-radius: var(--r); padding: 16px 18px; }
+.card h3 { margin: 0 0 12px; font-size: 13px; font-weight: 600; color: var(--fg2); text-transform: uppercase; letter-spacing: .6px; }
+.stat-label { color: var(--fg2); font-size: 12px; display: flex; align-items: center; gap: 7px; }
+.stat-value { font-size: 26px; font-weight: 650; margin-top: 6px; letter-spacing: -.3px; }
+.stat-sub { font-size: 12px; color: var(--fg2); margin-top: 3px; }
+.kv { display: grid; grid-template-columns: 140px 1fr; gap: 8px 12px; font-size: 13px; }
+.kv > :nth-child(odd) { color: var(--fg2); }
+.pill { display: inline-flex; align-items: center; gap: 6px; padding: 2px 9px; border-radius: 999px; font-size: 12px; background: var(--hover); color: var(--fg2); }
+.pill.ok { background: var(--accent-dim); color: var(--accent); }
+.pill.warn { background: var(--amber-dim); color: var(--amber); }
+.pill.bad { background: var(--red-dim); color: var(--red); }
+.dot { width: 8px; height: 8px; border-radius: 50%; background: var(--fg3); display: inline-block; flex-shrink: 0; }
+.dot.on { background: var(--accent); box-shadow: 0 0 8px var(--accent); }
+canvas.chart { width: 100%; height: 170px; display: block; }
+.legend { display: flex; gap: 16px; font-size: 12px; color: var(--fg2); margin-top: 8px; }
+.legend i { display: inline-block; width: 10px; height: 3px; border-radius: 2px; margin-right: 6px; vertical-align: middle; }
+
+/* table */
+.table-wrap { overflow-x: auto; }
+table { width: 100%; border-collapse: collapse; }
+th { text-align: left; font-size: 12px; font-weight: 500; color: var(--fg2); padding: 10px 10px; border-bottom: 1px solid var(--border); white-space: nowrap; cursor: default; }
+th.sortable { cursor: pointer; user-select: none; }
+th.sortable:hover { color: var(--fg); }
+td { padding: 11px 10px; border-bottom: 1px solid var(--border); vertical-align: middle; font-size: 13px; }
+tr:hover td { background: var(--hover); }
+tr:last-child td { border-bottom: 0; }
+.user-name { font-weight: 600; }
+.key { font-family: var(--mono); font-size: 12px; color: var(--fg2); cursor: pointer; }
+.key:hover { color: var(--fg); }
+.usage { min-width: 150px; }
+.bar { height: 5px; border-radius: 999px; background: var(--hover); overflow: hidden; margin-top: 5px; }
+.bar > div { height: 100%; background: var(--accent); border-radius: 999px; }
+.bar.warn > div { background: var(--amber); }
+.bar.full > div { background: var(--red); }
+.actions { display: flex; gap: 2px; justify-content: flex-end; }
+.empty { text-align: center; color: var(--fg2); padding: 40px 10px; }
+.toolbar { display: flex; gap: 10px; align-items: center; margin-bottom: 14px; flex-wrap: wrap; }
+.toolbar .input { max-width: 300px; }
+
+/* modal */
+.overlay { position: fixed; inset: 0; background: rgba(0,0,0,.55); display: flex; align-items: center; justify-content: center; z-index: 50; padding: 16px; backdrop-filter: blur(3px); }
+.modal { background: var(--surface); border: 1px solid var(--border); border-radius: 16px; width: 100%; max-width: 460px; padding: 22px; max-height: 92vh; overflow: auto; }
+.modal.wide { max-width: 560px; }
+.modal h2 { margin: 0 0 4px; font-size: 17px; }
+.modal .desc { color: var(--fg2); font-size: 13px; margin: 0 0 16px; }
+.modal-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 18px; }
+.qr { display: flex; justify-content: center; margin: 14px 0; min-height: 240px; align-items: center; }
+.qr svg { width: 240px; height: 240px; border-radius: 10px; background: #fff; padding: 8px; }
+.copy-box { display: flex; gap: 8px; }
+.copy-box .input { font-family: var(--mono); font-size: 12px; }
+.note { font-size: 12px; color: var(--fg2); margin-top: 10px; }
+.note.warn { color: var(--amber); }
+
+/* login */
+.login-wrap { min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 16px; }
+.login { width: 100%; max-width: 360px; }
+.login .brand { justify-content: center; padding-bottom: 22px; font-size: 18px; }
+
+/* toast */
+.toasts { position: fixed; right: 18px; bottom: 18px; display: flex; flex-direction: column; gap: 8px; z-index: 80; }
+.toast { background: var(--surface); border: 1px solid var(--border); border-left: 3px solid var(--accent); padding: 10px 14px; border-radius: var(--r-sm); min-width: 220px; max-width: 360px; box-shadow: 0 8px 30px rgba(0,0,0,.35); font-size: 13px; animation: in .18s ease; }
+.toast.err { border-left-color: var(--red); }
+@keyframes in { from { transform: translateY(8px); opacity: 0; } }
+
+.log-item { display: flex; gap: 12px; padding: 9px 0; border-bottom: 1px solid var(--border); font-size: 13px; align-items: center; }
+.log-item:last-child { border-bottom: 0; }
+.log-time { font-family: var(--mono); color: var(--fg2); font-size: 12px; width: 70px; flex-shrink: 0; }
+.top-user { display: flex; align-items: center; gap: 10px; padding: 8px 0; border-bottom: 1px solid var(--border); font-size: 13px; }
+.top-user:last-child { border-bottom: 0; }
+.top-user .grow { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+@media (max-width: 1000px) { .stats { grid-template-columns: repeat(2, minmax(0, 1fr)); } .two { grid-template-columns: 1fr; } }
+@media (max-width: 760px) {
+  .app { grid-template-columns: 1fr; }
+  .side { position: sticky; z-index: 10; height: auto; flex-direction: row; overflow-x: auto; padding: 8px; border-right: 0; border-bottom: 1px solid var(--border); }
+  .brand, .side-foot .muted { display: none; }
+  .nav span { display: none; }
+  .side-foot { margin: 0 0 0 auto; flex-direction: row; }
+  .main { padding: 18px 16px 50px; }
+  .hide-sm { display: none; }
+}
+</style>
+</head>
+<body>
+
+<!-- ── Login ─────────────────────────────────────────────────────────── -->
+<div id="login" class="login-wrap hidden">
+  <form class="login card" id="login-form">
+    <div class="brand"><span class="brand-dot"></span>OSTP</div>
+    <div class="field">
+      <label class="lbl" for="lg-user" data-t="username">Username</label>
+      <input class="input" id="lg-user" autocomplete="username" required />
+    </div>
+    <div class="field">
+      <label class="lbl" for="lg-pass" data-t="password">Password</label>
+      <input class="input" id="lg-pass" type="password" autocomplete="current-password" />
+    </div>
+    <button class="btn primary" style="width:100%" data-t="sign_in">Sign in</button>
+    <p id="lg-err" class="note warn hidden"></p>
+  </form>
+</div>
+
+<!-- ── App ───────────────────────────────────────────────────────────── -->
+<div id="app" class="app hidden">
+  <aside class="side">
+    <div class="brand"><span class="brand-dot"></span>OSTP</div>
+    <button class="nav active" data-page="overview">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="9"/><rect x="14" y="3" width="7" height="5"/><rect x="14" y="12" width="7" height="9"/><rect x="3" y="16" width="7" height="5"/></svg>
+      <span data-t="overview">Overview</span></button>
+    <button class="nav" data-page="users">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75"/></svg>
+      <span data-t="users">Users</span></button>
+    <button class="nav" data-page="routing">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="6" cy="19" r="3"/><path d="M9 19h8.5a3.5 3.5 0 0 0 0-7h-11a3.5 3.5 0 0 1 0-7H15"/><circle cx="18" cy="5" r="3"/></svg>
+      <span data-t="routing">Routing</span></button>
+    <button class="nav" data-page="config">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></svg>
+      <span data-t="config">Configuration</span></button>
+    <button class="nav" data-page="activity">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
+      <span data-t="activity">Activity</span></button>
+    <div class="side-foot">
+      <div class="side-row">
+        <button class="icon-btn" id="btn-lang" title="Language"><span id="lang-label" class="small">RU</span></button>
+        <button class="icon-btn" id="btn-theme" title="Theme">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg></button>
+        <button class="icon-btn" id="btn-logout" title="Sign out">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg></button>
+      </div>
+      <div class="muted small" id="side-version"></div>
+    </div>
+  </aside>
+
+  <main class="main">
+    <!-- Overview -->
+    <section id="page-overview">
+      <div class="page-head">
+        <div><h1 data-t="overview">Overview</h1><div class="sub" id="ov-sub"></div></div>
+        <span class="pill" id="ov-live"><span class="dot on"></span><span data-t="live">Live</span></span>
+      </div>
+      <div class="grid stats">
+        <div class="card"><div class="stat-label"><span class="dot on"></span><span data-t="online_now">Online now</span></div>
+          <div class="stat-value" id="st-online">–</div><div class="stat-sub" id="st-online-sub"></div></div>
+        <div class="card"><div class="stat-label">↓ <span data-t="download">Download</span></div>
+          <div class="stat-value" id="st-down">–</div><div class="stat-sub" id="st-down-rate"></div></div>
+        <div class="card"><div class="stat-label">↑ <span data-t="upload">Upload</span></div>
+          <div class="stat-value" id="st-up">–</div><div class="stat-sub" id="st-up-rate"></div></div>
+        <div class="card"><div class="stat-label" data-t="uptime">Uptime</div>
+          <div class="stat-value" id="st-uptime">–</div><div class="stat-sub" id="st-version"></div></div>
+      </div>
+      <div class="grid two" style="margin-top:14px">
+        <div class="card">
+          <h3 data-t="throughput">Throughput</h3>
+          <canvas class="chart" id="chart"></canvas>
+          <div class="legend"><span><i style="background:var(--accent)"></i><span data-t="download">Download</span></span><span><i style="background:var(--blue)"></i><span data-t="upload">Upload</span></span><span class="muted" data-t="last_minutes">last 5 minutes</span></div>
+        </div>
+        <div class="card">
+          <h3 data-t="endpoints">How clients connect</h3>
+          <div class="kv" id="endpoint"></div>
+        </div>
+      </div>
+      <div class="grid two" style="margin-top:14px">
+        <div class="card">
+          <h3 data-t="top_users">Top users by traffic</h3>
+          <div id="top-users"></div>
+        </div>
+        <div class="card">
+          <h3 data-t="recent_activity">Recent activity</h3>
+          <div id="ov-log"></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Users -->
+    <section id="page-users" class="hidden">
+      <div class="page-head">
+        <div><h1 data-t="users">Users</h1><div class="sub" id="users-sub"></div></div>
+        <div class="row">
+          <button class="btn" id="btn-bulk" data-t="bulk_create">Bulk create</button>
+          <button class="btn primary" id="btn-add-user">+ <span data-t="add_user">Add user</span></button>
+        </div>
+      </div>
+      <div class="toolbar">
+        <input class="input" id="user-search" placeholder="Search by name or key" data-tp="search" />
+        <div class="seg" id="user-filter">
+          <button class="on" data-f="all" data-t="all">All</button>
+          <button data-f="online" data-t="online">Online</button>
+          <button data-f="limited" data-t="near_limit">Near limit</button>
+        </div>
+      </div>
+      <div class="card" style="padding:4px 8px">
+        <div class="table-wrap">
+          <table>
+            <thead><tr>
+              <th class="sortable" data-sort="name" data-t="user">User</th>
+              <th class="sortable hide-sm" data-sort="connections" data-t="sessions">Sessions</th>
+              <th class="sortable" data-sort="down" data-t="traffic">Traffic ↓ / ↑</th>
+              <th class="sortable usage" data-sort="usage" data-t="limit">Limit</th>
+              <th></th>
+            </tr></thead>
+            <tbody id="users-body"></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <!-- Routing -->
+    <section id="page-routing" class="hidden">
+      <div class="page-head">
+        <div><h1 data-t="routing">Routing</h1><div class="sub" data-t="routing_sub">Outbound rules: which destinations go direct and which through the upstream proxy.</div></div>
+        <button class="btn primary" id="btn-save-rules" data-t="save">Save</button>
+      </div>
+      <div class="card">
+        <p class="muted small" data-t="routing_help">A list of rules; each has domain_suffix and/or ip_cidr lists and an action ("proxy" or "direct"). Applied immediately.</p>
+        <textarea class="input" id="rules" rows="18" spellcheck="false"></textarea>
+        <p id="rules-note" class="note"></p>
+      </div>
+    </section>
+
+    <!-- Config -->
+    <section id="page-config" class="hidden">
+      <div class="page-head">
+        <div><h1 data-t="config">Configuration</h1><div class="sub" data-t="config_sub">The server's config.json. Access keys reload on their own; other changes need a restart.</div></div>
+        <div class="row">
+          <button class="btn" id="btn-reload-config" data-t="reload">Reload</button>
+          <button class="btn primary" id="btn-save-config" data-t="save">Save</button>
+        </div>
+      </div>
+      <div class="card">
+        <textarea class="input" id="config" rows="28" spellcheck="false"></textarea>
+        <p id="config-note" class="note"></p>
+      </div>
+    </section>
+
+    <!-- Activity -->
+    <section id="page-activity" class="hidden">
+      <div class="page-head">
+        <div><h1 data-t="activity">Activity</h1><div class="sub" data-t="activity_sub">Changes made from this panel since the server started.</div></div>
+        <button class="btn danger" id="btn-clear-log" data-t="clear">Clear</button>
+      </div>
+      <div class="card"><div id="log"></div></div>
+    </section>
+  </main>
+</div>
+
+<!-- ── Modals ────────────────────────────────────────────────────────── -->
+<div id="m-user" class="overlay hidden">
+  <form class="modal" id="f-user">
+    <h2 id="mu-title" data-t="add_user">Add user</h2>
+    <p class="desc" id="mu-desc" data-t="add_user_desc">A random access key is generated unless you paste one.</p>
+    <div class="field"><label class="lbl" for="mu-name" data-t="name">Name</label><input class="input" id="mu-name" placeholder="alice" /></div>
+    <div class="field" id="mu-key-field"><label class="lbl" for="mu-key" data-t="access_key_opt">Access key (optional)</label><input class="input mono" id="mu-key" spellcheck="false" /></div>
+    <div class="field"><label class="lbl" for="mu-limit" data-t="limit_gb">Traffic limit, GB (empty = unlimited)</label><input class="input" id="mu-limit" type="number" min="0" step="0.1" /></div>
+    <div class="modal-actions"><button type="button" class="btn" data-close data-t="cancel">Cancel</button><button class="btn primary" data-t="save">Save</button></div>
+  </form>
+</div>
+
+<div id="m-bulk" class="overlay hidden">
+  <form class="modal" id="f-bulk">
+    <h2 data-t="bulk_create">Bulk create</h2>
+    <p class="desc" data-t="bulk_desc">Creates many unnamed keys at once, e.g. for a batch of devices.</p>
+    <div class="field"><label class="lbl" for="mb-count" data-t="count">Count</label><input class="input" id="mb-count" type="number" min="1" max="1000" value="10" required /></div>
+    <div class="field"><label class="lbl" for="mb-limit" data-t="limit_gb">Traffic limit, GB (empty = unlimited)</label><input class="input" id="mb-limit" type="number" min="0" step="0.1" /></div>
+    <div class="modal-actions"><button type="button" class="btn" data-close data-t="cancel">Cancel</button><button class="btn primary" data-t="create">Create</button></div>
+  </form>
+</div>
+
+<div id="m-share" class="overlay hidden">
+  <div class="modal wide">
+    <h2 id="ms-title">Share</h2>
+    <p class="desc" data-t="share_desc">Scan with the OSTP app, or copy the link. A subscription keeps the app up to date when the server changes.</p>
+    <div class="seg" id="ms-kinds"></div>
+    <div class="qr" id="ms-qr"></div>
+    <div class="copy-box"><input class="input" id="ms-text" readonly /><button class="btn" id="ms-copy" data-t="copy">Copy</button></div>
+    <p class="note" id="ms-note"></p>
+    <div class="modal-actions"><button class="btn" data-close data-t="close">Close</button></div>
+  </div>
+</div>
+
+<div id="m-confirm" class="overlay hidden">
+  <div class="modal">
+    <h2 id="mc-title"></h2>
+    <p class="desc" id="mc-text"></p>
+    <div class="modal-actions"><button class="btn" data-close data-t="cancel">Cancel</button><button class="btn danger" id="mc-ok"></button></div>
+  </div>
+</div>
+
+<div class="toasts" id="toasts"></div>
+
+<script>
+'use strict';
+// ── i18n ──────────────────────────────────────────────────────────────
+const I18N = {
+  en: {
+    username: 'Username', password: 'Password', sign_in: 'Sign in', bad_login: 'Wrong username or password',
+    overview: 'Overview', users: 'Users', routing: 'Routing', config: 'Configuration', activity: 'Activity',
+    live: 'Live', online_now: 'Online now', download: 'Download', upload: 'Upload', uptime: 'Uptime',
+    throughput: 'Throughput', last_minutes: 'last 5 minutes', endpoints: 'How clients connect',
+    top_users: 'Top users by traffic', recent_activity: 'Recent activity', no_activity: 'Nothing yet.',
+    bulk_create: 'Bulk create', add_user: 'Add user', edit_user: 'Edit user', search: 'Search by name or key',
+    all: 'All', online: 'Online', near_limit: 'Near limit', user: 'User', sessions: 'Sessions',
+    traffic: 'Traffic ↓ / ↑', limit: 'Limit', unlimited: 'unlimited', save: 'Save', reload: 'Reload', clear: 'Clear',
+    routing_sub: 'Outbound rules: which destinations go direct and which through the upstream proxy.',
+    routing_help: 'A list of rules; each has domain_suffix and/or ip_cidr lists and an action ("proxy" or "direct"). Applied immediately.',
+    config_sub: "The server's config.json. Access keys reload on their own; other changes need a restart.",
+    activity_sub: 'Changes made from this panel since the server started.',
+    add_user_desc: 'A random access key is generated unless you paste one.', edit_user_desc: 'The access key stays the same.',
+    name: 'Name', access_key_opt: 'Access key (optional)', limit_gb: 'Traffic limit, GB (empty = unlimited)',
+    cancel: 'Cancel', create: 'Create', close: 'Close', copy: 'Copy', copied: 'Copied',
+    bulk_desc: 'Creates many unnamed keys at once, e.g. for a batch of devices.', count: 'Count',
+    share_desc: 'Scan with the OSTP app, or copy the link. A subscription keeps the app up to date when the server changes.',
+    share: 'Share', edit: 'Edit', reset: 'Reset traffic', delete: 'Delete',
+    confirm_delete: 'Delete user?', confirm_delete_text: 'Clients using this key are cut off. This cannot be undone.',
+    confirm_reset: 'Reset traffic?', confirm_reset_text: 'The traffic counters of this user start from zero.',
+    confirm_clear: 'Clear activity?', confirm_clear_text: 'The activity list is emptied.',
+    no_users: 'No users yet. Add one to get a link.', no_match: 'Nobody matches.',
+    users_sub: '{total} users · {online} online', ov_sub: 'OSTP {version} · {host}',
+    host: 'Address', udp: 'UDP', tls: 'TLS', subscription: 'Subscriptions', sub_tab: 'Subscription', own_dns: 'Server DNS',
+    on: 'on', off: 'off', not_set: 'not set up', via_web: 'through a web server', builtin: 'built-in',
+    sub_hint: 'Run `ostp cert issue` to set up a domain with TLS and subscriptions.',
+    online_sub: '{active} used the server · {total} total', rate: '{rate}/s now',
+    saved: 'Saved', created: 'Created', deleted: 'Deleted', reset_done: 'Traffic reset',
+    invalid_json: 'Not valid JSON: {err}', restart_note: 'Saved. Restart the server (systemctl restart ostp) to apply non-key changes.',
+    rules_saved: 'Rules applied', err: 'Error: {err}', copied_key: 'Key copied',
+    sub_note: 'The subscription URL is a credential: share it only with this user.',
+    link_note: 'This link holds the access key: share it only with this user.',
+    qr_failed: 'QR code unavailable', created_n: '{n} keys created',
+    ev_add: 'Added user {x}', ev_edit: 'Edited user {x}', ev_del: 'Deleted user {x}', ev_reset: 'Reset traffic of {x}',
+    ev_bulk: 'Created {x} keys', ev_config: 'Saved configuration', ev_rules: 'Saved routing rules',
+    days: 'd', hours: 'h', minutes: 'm',
+  },
+  ru: {
+    username: 'Логин', password: 'Пароль', sign_in: 'Войти', bad_login: 'Неверный логин или пароль',
+    overview: 'Обзор', users: 'Пользователи', routing: 'Маршрутизация', config: 'Конфигурация', activity: 'Журнал',
+    live: 'Онлайн', online_now: 'Сейчас онлайн', download: 'Загрузка', upload: 'Отдача', uptime: 'Аптайм',
+    throughput: 'Скорость', last_minutes: 'последние 5 минут', endpoints: 'Как подключаются клиенты',
+    top_users: 'Больше всего трафика', recent_activity: 'Последние действия', no_activity: 'Пока ничего.',
+    bulk_create: 'Создать пачкой', add_user: 'Добавить', edit_user: 'Изменить пользователя', search: 'Поиск по имени или ключу',
+    all: 'Все', online: 'Онлайн', near_limit: 'У лимита', user: 'Пользователь', sessions: 'Сессии',
+    traffic: 'Трафик ↓ / ↑', limit: 'Лимит', unlimited: 'без лимита', save: 'Сохранить', reload: 'Перечитать', clear: 'Очистить',
+    routing_sub: 'Правила выхода: какие адреса идут напрямую, а какие через вышестоящий прокси.',
+    routing_help: 'Список правил: у каждого списки domain_suffix и/или ip_cidr и action ("proxy" или "direct"). Применяется сразу.',
+    config_sub: 'config.json сервера. Ключи доступа подхватываются сами, остальное — после перезапуска.',
+    activity_sub: 'Изменения из этой панели с момента запуска сервера.',
+    add_user_desc: 'Ключ доступа сгенерируется сам, если не вставить свой.', edit_user_desc: 'Ключ доступа не меняется.',
+    name: 'Имя', access_key_opt: 'Ключ доступа (необязательно)', limit_gb: 'Лимит трафика, ГБ (пусто — без лимита)',
+    cancel: 'Отмена', create: 'Создать', close: 'Закрыть', copy: 'Копировать', copied: 'Скопировано',
+    bulk_desc: 'Создаёт сразу много безымянных ключей, например для партии устройств.', count: 'Количество',
+    share_desc: 'Отсканируйте в приложении OSTP или скопируйте ссылку. Подписка сама обновит приложение при изменениях на сервере.',
+    share: 'Поделиться', edit: 'Изменить', reset: 'Сбросить трафик', delete: 'Удалить',
+    confirm_delete: 'Удалить пользователя?', confirm_delete_text: 'Клиенты с этим ключом отключатся. Отменить нельзя.',
+    confirm_reset: 'Сбросить трафик?', confirm_reset_text: 'Счётчики трафика пользователя начнутся с нуля.',
+    confirm_clear: 'Очистить журнал?', confirm_clear_text: 'Список действий будет очищен.',
+    no_users: 'Пользователей пока нет. Добавьте, чтобы получить ссылку.', no_match: 'Никого не найдено.',
+    users_sub: 'Всего {total} · онлайн {online}', ov_sub: 'OSTP {version} · {host}',
+    host: 'Адрес', udp: 'UDP', tls: 'TLS', subscription: 'Подписки', sub_tab: 'Подписка', own_dns: 'DNS сервера',
+    on: 'вкл', off: 'выкл', not_set: 'не настроено', via_web: 'через веб-сервер', builtin: 'встроенный',
+    sub_hint: 'Выполните `ostp cert issue`, чтобы настроить домен с TLS и подписками.',
+    online_sub: 'пользовались: {active} · всего {total}', rate: 'сейчас {rate}/с',
+    saved: 'Сохранено', created: 'Создано', deleted: 'Удалено', reset_done: 'Трафик сброшен',
+    invalid_json: 'Некорректный JSON: {err}', restart_note: 'Сохранено. Перезапустите сервер (systemctl restart ostp), чтобы применить изменения кроме ключей.',
+    rules_saved: 'Правила применены', err: 'Ошибка: {err}', copied_key: 'Ключ скопирован',
+    sub_note: 'Ссылка подписки — это пароль: передавайте её только этому пользователю.',
+    link_note: 'В ссылке ключ доступа: передавайте её только этому пользователю.',
+    qr_failed: 'QR-код недоступен', created_n: 'Создано ключей: {n}',
+    ev_add: 'Добавлен пользователь {x}', ev_edit: 'Изменён пользователь {x}', ev_del: 'Удалён пользователь {x}', ev_reset: 'Сброшен трафик {x}',
+    ev_bulk: 'Создано ключей: {x}', ev_config: 'Сохранена конфигурация', ev_rules: 'Сохранены правила маршрутизации',
+    days: 'д', hours: 'ч', minutes: 'м',
+  },
+};
+let lang = localStorage.getItem('ostp_panel_lang') || ((navigator.language || '').toLowerCase().startsWith('ru') ? 'ru' : 'en');
+const t = (k, vars) => {
+  let s = (I18N[lang] && I18N[lang][k]) || I18N.en[k] || k;
+  if (vars) for (const [a, b] of Object.entries(vars)) s = s.split('{' + a + '}').join(b);
+  return s;
+};
+function applyLang() {
+  document.documentElement.lang = lang;
+  document.querySelectorAll('[data-t]').forEach(el => { el.textContent = t(el.dataset.t); });
+  document.querySelectorAll('[data-tp]').forEach(el => { el.placeholder = t(el.dataset.tp); });
+  document.getElementById('lang-label').textContent = lang === 'ru' ? 'EN' : 'RU';
+}
+
+// ── helpers ───────────────────────────────────────────────────────────
+const $ = id => document.getElementById(id);
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+function fmtBytes(n) {
+  if (!n) return '0 B';
+  const u = ['B', 'KB', 'MB', 'GB', 'TB', 'PB'];
+  const i = Math.min(u.length - 1, Math.floor(Math.log(n) / Math.log(1024)));
+  return (n / Math.pow(1024, i)).toFixed(i ? (n / Math.pow(1024, i) < 10 ? 2 : 1) : 0) + ' ' + u[i];
+}
+function fmtUptime(s) {
+  const d = Math.floor(s / 86400), h = Math.floor(s % 86400 / 3600), m = Math.floor(s % 3600 / 60);
+  return d ? `${d}${t('days')} ${h}${t('hours')}` : h ? `${h}${t('hours')} ${m}${t('minutes')}` : `${m}${t('minutes')}`;
+}
+const GB = 1024 ** 3;
+function toast(msg, err = false) {
+  const el = document.createElement('div');
+  el.className = 'toast' + (err ? ' err' : '');
+  el.textContent = msg;
+  $('toasts').appendChild(el);
+  setTimeout(() => el.remove(), 3500);
+}
+async function copy(text) {
+  try { await navigator.clipboard.writeText(text); }
+  catch {
+    const ta = document.createElement('textarea'); ta.value = text; document.body.appendChild(ta);
+    ta.select(); document.execCommand('copy'); ta.remove();
+  }
+}
+function openModal(id) { $(id).classList.remove('hidden'); }
+function closeModals() { document.querySelectorAll('.overlay').forEach(o => o.classList.add('hidden')); }
+document.addEventListener('click', e => {
+  if (e.target.matches('[data-close]') || e.target.classList.contains('overlay')) closeModals();
+});
+document.addEventListener('keydown', e => { if (e.key === 'Escape') closeModals(); });
+function confirmBox(title, text, okLabel) {
+  return new Promise(resolve => {
+    $('mc-title').textContent = title; $('mc-text').textContent = text; $('mc-ok').textContent = okLabel;
+    openModal('m-confirm');
+    const ok = $('mc-ok');
+    const done = v => { ok.onclick = null; closeModals(); resolve(v); };
+    ok.onclick = () => done(true);
+    $('m-confirm').querySelector('[data-close]').onclick = () => done(false);
+  });
+}
+
+// ── API ───────────────────────────────────────────────────────────────
+// The panel lives at /<webpath>/ and the API at /<webpath>/api/.
+let token = sessionStorage.getItem('ostp_panel_token') || '';
+class Unauthorized extends Error {}
+async function api(path, opts = {}) {
+  const headers = { 'Content-Type': 'application/json' };
+  if (token) headers.Authorization = 'Bearer ' + token;
+  const res = await fetch('api/' + path, { ...opts, headers, body: opts.body !== undefined ? JSON.stringify(opts.body) : undefined });
+  if (res.status === 401) throw new Unauthorized();
+  let json;
+  try { json = await res.json(); } catch { throw new Error('HTTP ' + res.status); }
+  if (!json.ok) throw new Error(json.error || 'HTTP ' + res.status);
+  return json.data;
+}
+function audit(key, x) {
+  api('audit', { method: 'POST', body: { eventEn: I18N.en[key].replace('{x}', x), eventRu: I18N.ru[key].replace('{x}', x), success: true } }).catch(() => {});
+}
+
+// ── state ─────────────────────────────────────────────────────────────
+let status = null, users = [], page = 'overview';
+const samples = []; // [{t, up, down}] totals over time
+let sortKey = 'down', sortDir = -1, filter = 'all';
+
+// ── login ─────────────────────────────────────────────────────────────
+function showLogin() {
+  $('app').classList.add('hidden'); $('login').classList.remove('hidden');
+  setTimeout(() => $('lg-user').focus(), 50);
+}
+$('login-form').addEventListener('submit', async e => {
+  e.preventDefault();
+  $('lg-err').classList.add('hidden');
+  try {
+    const d = await api('login', { method: 'POST', body: { username: $('lg-user').value, password: $('lg-pass').value } });
+    token = d.token; sessionStorage.setItem('ostp_panel_token', token);
+    $('login').classList.add('hidden'); start();
+  } catch (err) {
+    $('lg-err').textContent = err instanceof Unauthorized ? t('bad_login') : String(err.message || err);
+    $('lg-err').classList.remove('hidden');
+  }
+});
+$('btn-logout').addEventListener('click', () => { token = ''; sessionStorage.removeItem('ostp_panel_token'); location.reload(); });
+
+// ── navigation ────────────────────────────────────────────────────────
+function go(p) {
+  page = p;
+  document.querySelectorAll('.nav').forEach(n => n.classList.toggle('active', n.dataset.page === p));
+  document.querySelectorAll('main > section').forEach(s => s.classList.toggle('hidden', s.id !== 'page-' + p));
+  if (p === 'config') loadConfig();
+  if (p === 'routing') loadRules();
+  if (p === 'activity') loadLog();
+  if (p === 'overview') drawChart();
+  location.hash = p;
+}
+document.querySelectorAll('.nav').forEach(n => n.addEventListener('click', () => go(n.dataset.page)));
+
+// ── polling ───────────────────────────────────────────────────────────
+async function refresh() {
+  try {
+    [status, users] = await Promise.all([api('server/status'), api('users')]);
+  } catch (err) {
+    if (err instanceof Unauthorized) { showLogin(); return false; }
+    $('ov-live').className = 'pill bad';
+    return true;
+  }
+  $('ov-live').className = 'pill ok';
+  samples.push({ t: Date.now(), up: status.bytes_up || 0, down: status.bytes_down || 0 });
+  while (samples.length > 61) samples.shift();
+  renderOverview();
+  renderUsers();
+  return true;
+}
+
+function rate(field) {
+  if (samples.length < 2) return 0;
+  const a = samples[samples.length - 2], b = samples[samples.length - 1];
+  return Math.max(0, (b[field] - a[field]) / ((b.t - a.t) / 1000));
+}
+
+function renderOverview() {
+  const s = status;
+  $('side-version').textContent = 'v' + s.version;
+  $('ov-sub').textContent = t('ov_sub', { version: s.version, host: s.endpoint.host });
+  $('st-online').textContent = s.online_users;
+  $('st-online-sub').textContent = t('online_sub', { active: s.active_users, total: s.total_users });
+  $('st-down').textContent = fmtBytes(s.bytes_down);
+  $('st-up').textContent = fmtBytes(s.bytes_up);
+  $('st-down-rate').textContent = t('rate', { rate: fmtBytes(rate('down')) });
+  $('st-up-rate').textContent = t('rate', { rate: fmtBytes(rate('up')) });
+  $('st-uptime').textContent = fmtUptime(s.uptime_seconds);
+  $('st-version').textContent = 'OSTP ' + s.version;
+
+  const e = s.endpoint;
+  const pill = (on, text) => `<span class="pill ${on ? 'ok' : ''}">${esc(text)}</span>`;
+  $('endpoint').innerHTML = [
+    [t('host'), `<span class="mono">${esc(e.host)}</span>`],
+    [t('udp'), `<span class="mono">${esc(e.host)}:${e.udp_port}</span>`],
+    [t('tls'), e.tls
+      ? `<span class="mono">${esc(e.tls.host)}:${e.tls.port}</span> <span class="muted small">${esc(e.tls.path ? t('via_web') : t('builtin'))}</span>`
+      : pill(false, t('not_set'))],
+    [t('subscription'), e.subscription_prefix
+      ? `${pill(true, t('on'))} <span class="mono muted small">${esc(e.subscription_prefix)}/…</span>`
+      : pill(false, t('off'))],
+    [t('own_dns'), pill(e.dns_enabled, e.dns_enabled ? t('on') : t('off'))],
+  ].map(([k, v]) => `<div>${esc(k)}</div><div>${v}</div>`).join('') +
+    (!e.subscription_prefix ? `<div></div><div class="muted small">${esc(t('sub_hint'))}</div>` : '');
+
+  const top = [...users].sort((a, b) => (b.bytes_down + b.bytes_up) - (a.bytes_down + a.bytes_up)).slice(0, 6);
+  const max = Math.max(1, ...top.map(u => u.bytes_down + u.bytes_up));
+  $('top-users').innerHTML = top.length ? top.map(u => `
+    <div class="top-user"><span class="dot ${u.online ? 'on' : ''}"></span>
+      <div class="grow">${esc(u.name || u.access_key.slice(0, 8) + '…')}
+        <div class="bar"><div style="width:${((u.bytes_down + u.bytes_up) / max * 100).toFixed(1)}%"></div></div></div>
+      <span class="muted small">${fmtBytes(u.bytes_down + u.bytes_up)}</span></div>`).join('')
+    : `<div class="empty">${esc(t('no_users'))}</div>`;
+  drawChart();
+}
+
+function drawChart() {
+  const c = $('chart');
+  if (!c || page !== 'overview') return;
+  const dpr = window.devicePixelRatio || 1;
+  const w = c.clientWidth, h = c.clientHeight;
+  if (!w) return;
+  c.width = w * dpr; c.height = h * dpr;
+  const g = c.getContext('2d');
+  g.scale(dpr, dpr);
+  g.clearRect(0, 0, w, h);
+  const pts = [];
+  for (let i = 1; i < samples.length; i++) {
+    const a = samples[i - 1], b = samples[i], dt = (b.t - a.t) / 1000 || 1;
+    pts.push({ down: Math.max(0, (b.down - a.down) / dt), up: Math.max(0, (b.up - a.up) / dt) });
+  }
+  const css = getComputedStyle(document.documentElement);
+  const grid = css.getPropertyValue('--border').trim(), fg2 = css.getPropertyValue('--fg2').trim();
+  const max = Math.max(1024, ...pts.map(p => Math.max(p.down, p.up))) * 1.15;
+  g.strokeStyle = grid; g.lineWidth = 1; g.fillStyle = fg2; g.font = '11px ' + getComputedStyle(document.body).fontFamily;
+  for (let i = 0; i <= 3; i++) {
+    const y = Math.round(h - 18 - (h - 28) * i / 3) + .5;
+    g.beginPath(); g.moveTo(0, y); g.lineTo(w, y); g.stroke();
+    if (i) g.fillText(fmtBytes(max * i / 3) + '/s', 4, y - 4);
+  }
+  const n = 60, step = w / n;
+  const line = (key, color) => {
+    if (pts.length < 2) return;
+    g.beginPath();
+    pts.forEach((p, i) => {
+      const x = w - (pts.length - 1 - i) * step, y = h - 18 - (h - 28) * (p[key] / max);
+      i ? g.lineTo(x, y) : g.moveTo(x, y);
+    });
+    g.strokeStyle = color; g.lineWidth = 2; g.lineJoin = 'round'; g.stroke();
+    g.lineTo(w, h - 18); g.lineTo(w - (pts.length - 1) * step, h - 18); g.closePath();
+    g.globalAlpha = .08; g.fillStyle = color; g.fill(); g.globalAlpha = 1;
+  };
+  line('up', css.getPropertyValue('--blue').trim());
+  line('down', css.getPropertyValue('--accent').trim());
+}
+window.addEventListener('resize', drawChart);
+
+// ── users ─────────────────────────────────────────────────────────────
+const ICON = {
+  share: '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/><path d="M14 14h3v3h-3zM18 18h3v3h-3z"/></svg>',
+  edit: '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/></svg>',
+  reset: '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="1 4 1 10 7 10"/><path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"/></svg>',
+  del: '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6M14 11v6"/></svg>',
+};
+const usage = u => u.limit_bytes ? (u.bytes_down + u.bytes_up) / u.limit_bytes : null;
+
+function renderUsers() {
+  $('users-sub').textContent = t('users_sub', { total: users.length, online: users.filter(u => u.online).length });
+  const q = $('user-search').value.trim().toLowerCase();
+  let list = users.filter(u => !q || (u.name || '').toLowerCase().includes(q) || u.access_key.toLowerCase().includes(q));
+  if (filter === 'online') list = list.filter(u => u.online);
+  if (filter === 'limited') list = list.filter(u => (usage(u) ?? 0) >= 0.8);
+  const val = u => ({ name: (u.name || '').toLowerCase(), connections: u.connections, down: u.bytes_down + u.bytes_up, usage: usage(u) ?? -1 })[sortKey];
+  list.sort((a, b) => (val(a) > val(b) ? 1 : val(a) < val(b) ? -1 : 0) * sortDir);
+
+  const body = $('users-body');
+  if (!list.length) {
+    body.innerHTML = `<tr><td colspan="5" class="empty">${esc(users.length ? t('no_match') : t('no_users'))}</td></tr>`;
+    return;
+  }
+  body.innerHTML = list.map(u => {
+    const r = usage(u);
+    const bar = r == null ? `<span class="muted small">${esc(t('unlimited'))}</span>`
+      : `<span class="small">${fmtBytes(u.bytes_down + u.bytes_up)} / ${fmtBytes(u.limit_bytes)}</span>
+         <div class="bar ${r >= 1 ? 'full' : r >= .8 ? 'warn' : ''}"><div style="width:${Math.min(100, r * 100).toFixed(1)}%"></div></div>`;
+    return `<tr data-key="${esc(u.access_key)}">
+      <td><div class="row"><span class="dot ${u.online ? 'on' : ''}"></span><div>
+        <div class="user-name">${esc(u.name || '—')}</div>
+        <div class="key" data-act="copykey" title="${esc(t('copy'))}">${esc(u.access_key.slice(0, 6))}…${esc(u.access_key.slice(-4))}</div></div></div></td>
+      <td class="hide-sm">${u.connections}</td>
+      <td class="small">↓ ${fmtBytes(u.bytes_down)}<br><span class="muted">↑ ${fmtBytes(u.bytes_up)}</span></td>
+      <td class="usage">${bar}</td>
+      <td><div class="actions">
+        <button class="icon-btn" data-act="share" title="${esc(t('share'))}">${ICON.share}</button>
+        <button class="icon-btn" data-act="edit" title="${esc(t('edit'))}">${ICON.edit}</button>
+        <button class="icon-btn" data-act="reset" title="${esc(t('reset'))}">${ICON.reset}</button>
+        <button class="icon-btn danger" data-act="del" title="${esc(t('delete'))}">${ICON.del}</button>
+      </div></td></tr>`;
+  }).join('');
+}
+$('user-search').addEventListener('input', renderUsers);
+$('user-filter').addEventListener('click', e => {
+  const b = e.target.closest('button'); if (!b) return;
+  filter = b.dataset.f;
+  $('user-filter').querySelectorAll('button').forEach(x => x.classList.toggle('on', x === b));
+  renderUsers();
+});
+document.querySelectorAll('th.sortable').forEach(th => th.addEventListener('click', () => {
+  const k = th.dataset.sort;
+  sortDir = sortKey === k ? -sortDir : (k === 'name' ? 1 : -1);
+  sortKey = k; renderUsers();
+}));
+
+$('users-body').addEventListener('click', async e => {
+  const btn = e.target.closest('[data-act]'); if (!btn) return;
+  const key = btn.closest('tr').dataset.key;
+  const u = users.find(x => x.access_key === key); if (!u) return;
+  const label = u.name || key.slice(0, 8);
+  try {
+    if (btn.dataset.act === 'copykey') { await copy(key); toast(t('copied_key')); }
+    if (btn.dataset.act === 'share') openShare(u);
+    if (btn.dataset.act === 'edit') openUserModal(u);
+    if (btn.dataset.act === 'reset' && await confirmBox(t('confirm_reset'), t('confirm_reset_text'), t('reset'))) {
+      await api(`users/${encodeURIComponent(key)}/reset`, { method: 'POST' });
+      audit('ev_reset', label); toast(t('reset_done')); refresh();
+    }
+    if (btn.dataset.act === 'del' && await confirmBox(t('confirm_delete'), t('confirm_delete_text'), t('delete'))) {
+      await api(`users/${encodeURIComponent(key)}`, { method: 'DELETE' });
+      audit('ev_del', label); toast(t('deleted')); refresh();
+    }
+  } catch (err) { toast(t('err', { err: err.message }), true); }
+});
+
+// add / edit
+let editing = null;
+function openUserModal(u) {
+  editing = u || null;
+  $('mu-title').textContent = t(u ? 'edit_user' : 'add_user');
+  $('mu-desc').textContent = t(u ? 'edit_user_desc' : 'add_user_desc');
+  $('mu-key-field').classList.toggle('hidden', !!u);
+  $('mu-name').value = u?.name || '';
+  $('mu-key').value = '';
+  $('mu-limit').value = u?.limit_bytes ? +(u.limit_bytes / GB).toFixed(2) : '';
+  openModal('m-user');
+  setTimeout(() => $('mu-name').focus(), 50);
+}
+$('btn-add-user').addEventListener('click', () => openUserModal(null));
+$('f-user').addEventListener('submit', async e => {
+  e.preventDefault();
+  const name = $('mu-name').value.trim() || null;
+  const lim = parseFloat($('mu-limit').value);
+  const limit_bytes = lim > 0 ? Math.round(lim * GB) : null;
+  try {
+    if (editing) {
+      await api(`users/${encodeURIComponent(editing.access_key)}`, { method: 'PUT', body: { name, limit_bytes } });
+      audit('ev_edit', name || editing.access_key.slice(0, 8)); toast(t('saved'));
+    } else {
+      const key = $('mu-key').value.trim() || null;
+      const created = await api('users', { method: 'POST', body: { access_key: key, name, limit_bytes } });
+      audit('ev_add', name || String(created).slice(0, 8)); toast(t('created'));
+      closeModals(); await refresh();
+      const u = users.find(x => x.access_key === created);
+      if (u) openShare(u);
+      return;
+    }
+    closeModals(); refresh();
+  } catch (err) { toast(t('err', { err: err.message }), true); }
+});
+
+// bulk
+$('btn-bulk').addEventListener('click', () => openModal('m-bulk'));
+$('f-bulk').addEventListener('submit', async e => {
+  e.preventDefault();
+  const count = parseInt($('mb-count').value, 10);
+  const lim = parseFloat($('mb-limit').value);
+  try {
+    const keys = await api('users/bulk', { method: 'POST', body: { count, limit_bytes: lim > 0 ? Math.round(lim * GB) : null } });
+    audit('ev_bulk', String(keys.length)); toast(t('created_n', { n: keys.length }));
+    closeModals(); refresh();
+  } catch (err) { toast(t('err', { err: err.message }), true); }
+});
+
+// share
+async function openShare(u) {
+  $('ms-title').textContent = `${t('share')}: ${u.name || u.access_key.slice(0, 8) + '…'}`;
+  $('ms-qr').innerHTML = '';
+  openModal('m-share');
+  let share;
+  try { share = await api(`users/${encodeURIComponent(u.access_key)}/share`); }
+  catch (err) { $('ms-note').textContent = t('err', { err: err.message }); return; }
+  const kinds = [];
+  if (share.subscription) kinds.push(['subscription', t('sub_tab'), share.subscription]);
+  if (share.tls) kinds.push(['tls', 'TLS', share.tls]);
+  kinds.push(['udp', 'UDP', share.udp]);
+  const seg = $('ms-kinds');
+  seg.innerHTML = kinds.map(([k, label], i) => `<button data-k="${k}" class="${i ? '' : 'on'}">${esc(label)}</button>`).join('');
+  const show = async k => {
+    const [, , text] = kinds.find(x => x[0] === k);
+    seg.querySelectorAll('button').forEach(b => b.classList.toggle('on', b.dataset.k === k));
+    $('ms-text').value = text;
+    $('ms-note').textContent = t(k === 'subscription' ? 'sub_note' : 'link_note');
+    $('ms-qr').innerHTML = '';
+    try { $('ms-qr').innerHTML = await api('qr', { method: 'POST', body: { text } }); }
+    catch { $('ms-qr').innerHTML = `<span class="muted">${esc(t('qr_failed'))}</span>`; }
+  };
+  seg.onclick = e => { const b = e.target.closest('button'); if (b) show(b.dataset.k); };
+  show(kinds[0][0]);
+}
+$('ms-copy').addEventListener('click', async () => { await copy($('ms-text').value); toast(t('copied')); });
+
+// ── routing ───────────────────────────────────────────────────────────
+async function loadRules() {
+  $('rules-note').textContent = '';
+  try { $('rules').value = JSON.stringify(await api('router/rules'), null, 2); }
+  catch (err) { $('rules-note').textContent = t('err', { err: err.message }); }
+}
+$('btn-save-rules').addEventListener('click', async () => {
+  let rules;
+  try { rules = JSON.parse($('rules').value); } catch (err) { $('rules-note').textContent = t('invalid_json', { err: err.message }); return; }
+  try { await api('router/rules', { method: 'PUT', body: rules }); audit('ev_rules', ''); toast(t('rules_saved')); $('rules-note').textContent = ''; }
+  catch (err) { $('rules-note').textContent = t('err', { err: err.message }); }
+});
+
+// ── config ────────────────────────────────────────────────────────────
+async function loadConfig() {
+  $('config-note').textContent = '';
+  try { $('config').value = JSON.stringify(await api('server/config'), null, 2); }
+  catch (err) { $('config-note').textContent = t('err', { err: err.message }); }
+}
+$('btn-reload-config').addEventListener('click', loadConfig);
+$('btn-save-config').addEventListener('click', async () => {
+  let cfg;
+  try { cfg = JSON.parse($('config').value); } catch (err) { $('config-note').className = 'note warn'; $('config-note').textContent = t('invalid_json', { err: err.message }); return; }
+  try {
+    await api('server/config', { method: 'PUT', body: cfg });
+    audit('ev_config', ''); toast(t('saved'));
+    $('config-note').className = 'note warn'; $('config-note').textContent = t('restart_note');
+  } catch (err) { $('config-note').className = 'note warn'; $('config-note').textContent = t('err', { err: err.message }); }
+});
+
+// ── activity ──────────────────────────────────────────────────────────
+function logHtml(items, limit) {
+  if (!items.length) return `<div class="empty">${esc(t('no_activity'))}</div>`;
+  return items.slice(0, limit).map(l => `<div class="log-item"><span class="log-time">${esc(l.time)}</span>
+    <span class="dot ${l.success ? 'on' : ''}"></span><span>${esc(lang === 'ru' ? l.eventRu : l.eventEn)}</span></div>`).join('');
+}
+async function loadLog() {
+  try { const items = await api('audit'); $('log').innerHTML = logHtml(items, 100); $('ov-log').innerHTML = logHtml(items, 6); } catch { /* shown elsewhere */ }
+}
+$('btn-clear-log').addEventListener('click', async () => {
+  if (!await confirmBox(t('confirm_clear'), t('confirm_clear_text'), t('clear'))) return;
+  try { await api('audit', { method: 'DELETE' }); loadLog(); } catch (err) { toast(t('err', { err: err.message }), true); }
+});
+
+// ── theme / language ──────────────────────────────────────────────────
+if (localStorage.getItem('ostp_panel_theme') === 'light') document.documentElement.classList.add('light');
+$('btn-theme').addEventListener('click', () => {
+  const light = document.documentElement.classList.toggle('light');
+  localStorage.setItem('ostp_panel_theme', light ? 'light' : 'dark');
+  drawChart();
+});
+$('btn-lang').addEventListener('click', () => {
+  lang = lang === 'ru' ? 'en' : 'ru';
+  localStorage.setItem('ostp_panel_lang', lang);
+  applyLang();
+  if (status) { renderOverview(); renderUsers(); loadLog(); }
+});
+
+// ── start ─────────────────────────────────────────────────────────────
+let timer = null;
+async function start() {
+  if (!await refresh()) return;
+  $('app').classList.remove('hidden');
+  const p = location.hash.slice(1);
+  go(['overview', 'users', 'routing', 'config', 'activity'].includes(p) ? p : 'overview');
+  loadLog();
+  clearInterval(timer);
+  timer = setInterval(async () => { if (await refresh() && page === 'overview') loadLog(); }, 5000);
+}
+applyLang();
+start();
+</script>
+</body>
+</html>

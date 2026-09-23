@@ -1730,6 +1730,7 @@ dependencies = [
  "mime_guess",
  "ostp-core",
  "portable-atomic",
+ "qrcode",
  "rand 0.8.5",
  "rcgen",
  "reqwest",

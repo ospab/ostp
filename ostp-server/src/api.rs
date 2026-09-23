@@ -52,6 +52,8 @@ pub struct ApiState {
     pub server_port: u16,
     /// Where clients reach the server over TLS, when that is set up.
     pub tls_link: Option<TlsLink>,
+    /// Subscription URL prefix (e.g. "/sub") when subscriptions are served.
+    pub subscription_prefix: Option<String>,
     pub config_path: Option<std::path::PathBuf>,
     pub dns_server: std::sync::Arc<crate::dns::DnsServer>,
     pub audit_logs: Arc<RwLock<Vec<AuditLogEntry>>>,
@@ -127,8 +129,43 @@ pub struct UserMeta {
 struct ServerStatus {
     version: &'static str,
     uptime_seconds: u64,
+    /// Users that moved any traffic since the start.
     active_users: usize,
     total_users: usize,
+    /// Users with a live session right now.
+    online_users: usize,
+    connections: u64,
+    bytes_up: u64,
+    bytes_down: u64,
+    endpoint: Endpoint,
+}
+
+#[derive(Serialize)]
+struct Endpoint {
+    host: String,
+    udp_port: u16,
+    tls: Option<TlsEndpoint>,
+    subscription_prefix: Option<String>,
+    dns_enabled: bool,
+}
+
+#[derive(Serialize)]
+struct TlsEndpoint {
+    host: String,
+    port: u16,
+    path: Option<String>,
+}
+
+#[derive(Serialize)]
+struct UserShare {
+    tls: Option<String>,
+    udp: String,
+    subscription: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct QrRequest {
+    text: String,
 }
 
 #[derive(Deserialize)]
@@ -183,8 +220,9 @@ fn api_unauthorized<T: Serialize>() -> (StatusCode, Json<ApiResponse<T>>) {
     (StatusCode::UNAUTHORIZED, Json(ApiResponse { ok: false, data: None, error: Some("unauthorized".to_string()) }))
 }
 
+/// The panel: plain HTML/CSS/JS, no build step, embedded into the binary.
 #[derive(RustEmbed)]
-#[folder = "../ostp-control/dist/"]
+#[folder = "panel/"]
 struct Assets;
 
 async fn static_handler(State(state): State<ApiState>, uri: Uri) -> impl IntoResponse {
@@ -244,6 +282,8 @@ pub fn create_api_router(state: ApiState) -> Router {
         )
         .route("/users/{key}/limit", put(handle_set_limit))
         .route("/users/{key}/reset", post(handle_reset_stats))
+        .route("/users/{key}/share", get(handle_user_share))
+        .route("/qr", post(handle_qr))
         .route("/subscribe/{key}", get(handle_subscribe))
         .route("/login", post(handle_login))
         .route(
@@ -290,6 +330,7 @@ pub async fn start_api_server(
     server_host: String,
     server_port: u16,
     tls_link: Option<TlsLink>,
+    subscription_prefix: Option<String>,
     config_path: Option<std::path::PathBuf>,
     dns_server: std::sync::Arc<crate::dns::DnsServer>,
     router: std::sync::Arc<crate::router::Router>,
@@ -306,6 +347,7 @@ pub async fn start_api_server(
         server_host,
         server_port,
         tls_link,
+        subscription_prefix,
         config_path,
         dns_server,
         audit_logs: Arc::new(RwLock::new(Vec::new())),
@@ -524,20 +566,39 @@ async fn handle_status(
         return api_unauthorized::<ServerStatus>();
     }
 
+    let dns_enabled = state.dns_server.config.read().await.enabled;
     let keys = state.access_keys.read().unwrap_or_else(|e| e.into_inner());
     let stats = state.user_stats.read().unwrap_or_else(|e| e.into_inner());
-    let online = stats.values()
-        .filter(|us| {
-            let total = us.bytes_up.load(Ordering::Relaxed) + us.bytes_down.load(Ordering::Relaxed);
-            total > 0
-        })
-        .count();
+    let (mut active, mut online, mut connections, mut up, mut down) = (0, 0, 0u64, 0u64, 0u64);
+    for us in stats.values() {
+        let (u, d, c) = (
+            us.bytes_up.load(Ordering::Relaxed),
+            us.bytes_down.load(Ordering::Relaxed),
+            us.connections.load(Ordering::Relaxed),
+        );
+        active += usize::from(u + d > 0);
+        online += usize::from(c > 0);
+        connections += c;
+        up += u;
+        down += d;
+    }
 
     let status = ServerStatus {
         version: env!("CARGO_PKG_VERSION"),
         uptime_seconds: state.start_time.elapsed().as_secs(),
-        active_users: online,
+        active_users: active,
         total_users: keys.len(),
+        online_users: online,
+        connections,
+        bytes_up: up,
+        bytes_down: down,
+        endpoint: Endpoint {
+            host: state.server_host.clone(),
+            udp_port: state.server_port,
+            tls: state.tls_link.as_ref().map(|t| TlsEndpoint { host: t.host.clone(), port: t.port, path: t.path.clone() }),
+            subscription_prefix: state.subscription_prefix.clone(),
+            dns_enabled,
+        },
     };
 
     (StatusCode::OK, ApiResponse::success(status))
@@ -792,6 +853,75 @@ async fn handle_reset_stats(
     }
 }
 
+/// The links and subscription URL to hand a user, as the panel shows them.
+async fn handle_user_share(
+    State(state): State<ApiState>,
+    headers: axum::http::HeaderMap,
+    Path(key): Path<String>,
+) -> impl IntoResponse {
+    if !check_token(&state, &headers) {
+        return api_unauthorized::<UserShare>();
+    }
+    let name = match state.access_keys.read().unwrap_or_else(|e| e.into_inner()).get(&key) {
+        Some(meta) => meta.name.clone().filter(|n| !n.is_empty()),
+        None => return api_error("user not found"),
+    };
+    let owndns = state.dns_server.config.read().await.enabled;
+
+    use ostp_core::share_link::{LinkTransport, ShareLink};
+    let title = |kind: &str| match &name {
+        Some(n) => format!("{n} · {kind}"),
+        None => format!("{} · {kind}", state.server_host),
+    };
+    let mut udp = ShareLink::new(&key, &state.server_host, state.server_port);
+    udp.owndns = owndns;
+    udp.name = Some(title("UDP"));
+    let tls = state.tls_link.as_ref().map(|t| {
+        let mut l = ShareLink::new(&key, &t.host, t.port);
+        l.transport = LinkTransport::Uot;
+        l.tls = true;
+        l.path = t.path.clone();
+        l.owndns = owndns;
+        l.name = Some(title("TLS"));
+        l.to_uri()
+    });
+    let subscription = match (&state.subscription_prefix, &state.tls_link) {
+        (Some(prefix), Some(t)) => {
+            let port = if t.port == 443 { String::new() } else { format!(":{}", t.port) };
+            Some(format!("https://{}{port}{prefix}/{}", t.host, ostp_core::subscription::token_for_key(&key)))
+        }
+        _ => None,
+    };
+    (StatusCode::OK, ApiResponse::success(UserShare { tls, udp: udp.to_uri(), subscription }))
+}
+
+/// Renders a QR code on the server, so the panel needs no script from
+/// anywhere else and keys never go to a third-party QR service.
+async fn handle_qr(
+    State(state): State<ApiState>,
+    headers: axum::http::HeaderMap,
+    Json(req): Json<QrRequest>,
+) -> impl IntoResponse {
+    if !check_token(&state, &headers) {
+        return api_unauthorized::<String>();
+    }
+    if req.text.len() > 2048 {
+        return api_error("text too long for a QR code");
+    }
+    match qrcode::QrCode::new(req.text.as_bytes()) {
+        Ok(code) => {
+            let svg = code
+                .render::<qrcode::render::svg::Color>()
+                .min_dimensions(240, 240)
+                .dark_color(qrcode::render::svg::Color("#000000"))
+                .light_color(qrcode::render::svg::Color("#ffffff"))
+                .build();
+            (StatusCode::OK, ApiResponse::success(svg))
+        }
+        Err(e) => api_error(&format!("cannot encode a QR code: {e}")),
+    }
+}
+
 // ── Subscription endpoint ────────────────────────────────────────────────────
 
 /// Returns a ready-to-use client configuration for the given access key.
@@ -919,6 +1049,7 @@ mod tests {
             server_host: "127.0.0.1".to_string(),
             server_port: 50000,
             tls_link: None,
+            subscription_prefix: None,
             config_path: None,
             dns_server: crate::dns::DnsServer::new(Default::default()),
             audit_logs: Arc::new(RwLock::new(Vec::new())),
