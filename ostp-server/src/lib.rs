@@ -67,18 +67,33 @@ pub(crate) struct RemoteState {
 
 // ── Public API ───────────────────────────────────────────────────────────────
 
-pub async fn run_server(
-    bind_addrs: Vec<String>,
-    server_public_ip: Option<String>,
-    bind_ip: Option<String>,
-    access_keys: Vec<(String, crate::api::UserMeta)>,
-    outbound: Option<OutboundConfig>,
-    api_config: Option<ApiConfig>,
-    fallback_config: Option<FallbackConfig>,
-    debug: bool,
-    dns_config: Option<dns::DnsConfig>,
-    config_path: Option<std::path::PathBuf>,
-) -> Result<()> {
+/// Everything `run_server` needs, resolved from the on-disk config by the CLI.
+pub struct ServerParams {
+    pub bind_addrs: Vec<String>,
+    pub server_public_ip: Option<String>,
+    pub bind_ip: Option<String>,
+    pub access_keys: Vec<(String, crate::api::UserMeta)>,
+    pub outbound: Option<OutboundConfig>,
+    pub api_config: Option<ApiConfig>,
+    pub fallback_config: Option<FallbackConfig>,
+    pub debug: bool,
+    pub dns_config: Option<dns::DnsConfig>,
+    pub config_path: Option<std::path::PathBuf>,
+}
+
+pub async fn run_server(params: ServerParams) -> Result<()> {
+    let ServerParams {
+        bind_addrs,
+        server_public_ip,
+        bind_ip,
+        access_keys,
+        outbound,
+        api_config,
+        fallback_config,
+        debug,
+        dns_config,
+        config_path,
+    } = params;
     let mut keys_map = HashMap::new();
     for (key, meta) in access_keys {
         keys_map.insert(key, meta);
