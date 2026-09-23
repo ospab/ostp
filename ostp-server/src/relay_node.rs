@@ -181,6 +181,11 @@ async fn run_udp_relay(cfg: RelayConfig) -> Result<()> {
                     UdpSession { upstream: upstream.clone(), last_seen: Instant::now() },
                 );
 
+                // Send the first datagram before the reader task exists: if the
+                // upstream is unreachable that task can remove the session the
+                // moment it starts, so it must not be looked up again here.
+                let _ = upstream.send(&buf[..len]).await;
+
                 // Reverse direction for this client.
                 let back_sock = sock.clone();
                 let sessions_rx = sessions.clone();
@@ -201,15 +206,6 @@ async fn run_udp_relay(cfg: RelayConfig) -> Result<()> {
                     }
                     sessions_rx.lock().await.remove(&peer);
                 });
-
-                let _ = sessions
-                    .lock()
-                    .await
-                    .get(&peer)
-                    .map(|s| s.upstream.clone())
-                    .unwrap()
-                    .send(&buf[..len])
-                    .await;
             }
         });
     }
