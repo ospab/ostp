@@ -644,6 +644,103 @@ fn generate_qr(text: String) -> Result<String, String> {
     Ok(svg)
 }
 
+/// Runs a network job on its own thread and runtime (as the Android bridge
+/// does), so the probes never need to be `Send` or share the UI runtime.
+async fn off_thread<F, Fut>(job: F) -> Result<serde_json::Value, String>
+where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = Result<serde_json::Value, String>>,
+{
+    tauri::async_runtime::spawn_blocking(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| format!("failed to create tokio runtime: {e}"))?;
+        rt.block_on(job())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Downloads a subscription (`https://<domain>/sub/<token>`) with the same
+/// code as the CLI and Android: verified TLS, JSON or plain link lists.
+#[tauri::command]
+async fn fetch_subscription(url: String) -> Result<serde_json::Value, String> {
+    off_thread(move || async move {
+        let doc = ostp_client::subscription::fetch(&url).await.map_err(|e| e.to_string())?;
+        serde_json::to_value(doc).map_err(|e| e.to_string())
+    })
+    .await
+}
+
+#[derive(serde::Deserialize)]
+struct ProberRequest {
+    server: String,
+    key: String,
+    #[serde(default)]
+    tls: Option<ostp_client::prober::ProbeTls>,
+    #[serde(default)]
+    timeout_ms: Option<u64>,
+}
+
+/// Real handshakes over every resolved address x carrier (just UoT-in-TLS
+/// for a TLS profile).
+#[tauri::command]
+async fn run_prober_matrix(request: ProberRequest) -> Result<serde_json::Value, String> {
+    off_thread(move || async move {
+        let timeout = std::time::Duration::from_millis(request.timeout_ms.unwrap_or(3000));
+        let entries = ostp_client::prober::run_matrix(&request.server, request.key.as_bytes(), timeout, request.tls)
+            .await
+            .map_err(|e| e.to_string())?;
+        serde_json::to_value(entries).map_err(|e| e.to_string())
+    })
+    .await
+}
+
+#[derive(serde::Deserialize)]
+struct TtlRequest {
+    address: String,
+    port: u16,
+    transport: String,
+    key: String,
+    #[serde(default)]
+    tls: Option<ostp_client::prober::ProbeTls>,
+    #[serde(default)]
+    max_ttl: Option<u32>,
+}
+
+/// Where on the path something answers instead of the server.
+#[tauri::command]
+async fn run_prober_ttl(request: TtlRequest) -> Result<serde_json::Value, String> {
+    let ip: std::net::IpAddr = request.address.parse().map_err(|e| format!("invalid address: {e}"))?;
+    let transport = ostp_client::prober::TransportKind::parse(&request.transport)
+        .ok_or_else(|| format!("unknown transport: {}", request.transport))?;
+    off_thread(move || async move {
+        let report = ostp_client::prober::run_ttl_scan(
+            ip,
+            request.port,
+            transport,
+            request.key.as_bytes(),
+            request.max_ttl.unwrap_or(20).clamp(1, 64),
+            std::time::Duration::from_millis(900),
+            request.tls,
+        )
+        .await;
+        serde_json::to_value(report).map_err(|e| e.to_string())
+    })
+    .await
+}
+
+/// What this network filters in general (well-known public targets, ~10 s).
+#[tauri::command]
+async fn run_dpi_battery() -> Result<serde_json::Value, String> {
+    off_thread(|| async {
+        let report = ostp_client::dpi_probes::run_dpi_battery().await;
+        serde_json::to_value(report).map_err(|e| e.to_string())
+    })
+    .await
+}
+
 #[tauri::command]
 async fn start_tunnel(state: tauri::State<'_, AppState>, app: tauri::AppHandle) -> Result<bool, String> {
     let mut guard = state.0.lock().await;
@@ -1290,7 +1387,7 @@ pub fn run() {
             }
             _ => {}
         })
-        .invoke_handler(tauri::generate_handler![start_tunnel, stop_tunnel, reload_tunnel, get_tunnel_status, get_metrics, get_config, save_config, get_wintun_install_path, set_autostart, get_autostart, list_running_processes, generate_qr])
+        .invoke_handler(tauri::generate_handler![start_tunnel, stop_tunnel, reload_tunnel, get_tunnel_status, get_metrics, get_config, save_config, get_wintun_install_path, set_autostart, get_autostart, list_running_processes, generate_qr, fetch_subscription, run_prober_matrix, run_prober_ttl, run_dpi_battery])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

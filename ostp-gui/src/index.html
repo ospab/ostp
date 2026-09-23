@@ -31,6 +31,11 @@
               <polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/>
             </svg>
           </button>
+          <button id="btn-go-prober" class="icon-btn" aria-label="Network check" title="Network check">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+              <polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/>
+            </svg>
+          </button>
           <button id="btn-theme" class="icon-btn" aria-label="Toggle theme" title="Toggle theme">
             <svg id="icon-sun" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
               <circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/>
@@ -157,6 +162,13 @@
       </header>
 
       <div class="settings-body">
+
+        <!-- Subscriptions -->
+        <div id="sub-section" style="display:none;">
+          <div class="section-divider"><span>Subscriptions</span></div>
+          <div id="sub-list" class="sub-list"></div>
+          <div class="section-divider"><span>Profiles</span></div>
+        </div>
 
         <!-- Profile list -->
         <div id="profile-list" class="profile-list">
@@ -353,11 +365,39 @@
       </div> <!-- settings-body -->
     </div> <!-- settings-screen -->
 
+    <!-- ── PROBER SCREEN ────────────────────────────────────── -->
+    <div id="prober-screen" class="screen">
+      <header class="topbar">
+        <button id="btn-prober-back" class="icon-btn" aria-label="Back">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M19 12H5M12 19l-7-7 7-7"/>
+          </svg>
+        </button>
+        <span class="topbar-title">Network check</span>
+        <span style="width:32px;"></span>
+      </header>
+      <div class="settings-body">
+        <p class="prober-intro">Real OSTP handshakes against your server, a hop-by-hop scan for in-path
+          interference, and a general test of what this network filters. Nothing leaves this device except the probes themselves.</p>
+        <div class="field-group">
+          <label class="field-label" for="pr-profile">Profile</label>
+          <select id="pr-profile" class="field-input"></select>
+        </div>
+        <div class="prober-actions">
+          <button id="btn-pr-matrix" class="btn primary">Check server</button>
+          <button id="btn-pr-ttl" class="btn secondary" disabled title="Run “Check server” first">Path scan (TTL)</button>
+          <button id="btn-pr-dpi" class="btn secondary">Network DPI test</button>
+        </div>
+        <div id="pr-status" class="prober-status"></div>
+        <div id="pr-results" class="prober-results"></div>
+      </div>
+    </div>
+
     <!-- ── ADD PROFILE DROPDOWN ─────────────────────────────── -->
     <div id="add-menu" class="add-menu hidden">
       <button id="add-from-link" class="add-menu-item">
         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg>
-        From link
+        Link or subscription
       </button>
       <button id="add-from-clipboard" class="add-menu-item">
         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
@@ -374,7 +414,8 @@
       <div class="modal-content compact">
         <h3 class="modal-title">Paste link</h3>
         <div class="field-group">
-          <input id="link-input" class="field-input mono" type="text" placeholder="ostp://key@host:port" spellcheck="false" />
+          <input id="link-input" class="field-input mono" type="text" placeholder="ostp://key@host:port  or  https://domain/sub/…" spellcheck="false" />
+          <p class="field-hint">A subscription (https://) keeps its profiles in sync with the server.</p>
         </div>
         <div class="modal-actions">
           <button id="btn-link-cancel" class="btn secondary">Cancel</button>
@@ -456,9 +497,10 @@
     <!-- ── SHARE MODAL ──────────────────────────────────────── -->
     <div id="share-modal" class="modal-overlay hidden">
       <div class="modal-content">
-        <h3 class="modal-title">Share Profile</h3>
-        <p class="modal-text">QR generated locally — the key never leaves this device.</p>
+        <h3 class="modal-title" id="share-title">Share Profile</h3>
+        <p class="modal-text">Scan with the OSTP app. The QR is generated locally — the key never leaves this device.</p>
         <div id="share-qr" class="share-qr"></div>
+        <p id="share-qr-error" class="field-hint is-error" style="display:none;"></p>
         <input id="share-link" class="field-input mono" type="text" readonly />
         <div class="modal-actions">
           <button id="btn-share-close" class="btn secondary">Close</button>

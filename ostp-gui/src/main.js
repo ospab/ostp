@@ -15,7 +15,8 @@ if (localStorage.getItem('ostp_theme') === 'light') {
 //
 // Profile shape:
 // { id: string, name: string, server: string, key: string, transport: 'udp'|'uot',
-//   tls?: bool, tls_sni?: string, tls_insecure?: bool, ws_path?: string }
+//   tls?: bool, tls_sni?: string, tls_insecure?: bool, ws_path?: string,
+//   sub_id?: string }   // set on profiles owned by a subscription
 
 const PROFILES_KEY  = 'ostp_profiles_v1';
 const ACTIVE_KEY    = 'ostp_active_profile';
@@ -471,12 +472,16 @@ async function handleAutoConnect() {
 
 // ── SCREEN NAVIGATION ─────────────────────────────────────────────────
 function showScreen(name) {
+  const prober = $('prober-screen');
+  [homeScreen, settingsScreen, prober].forEach(s => s.classList.remove('active'));
   if (name === 'settings') {
     loadSettingsIntoForm();
-    homeScreen.classList.remove('active');
+    renderSubs();
     settingsScreen.classList.add('active');
+  } else if (name === 'prober') {
+    fillProberProfiles();
+    prober.classList.add('active');
   } else {
-    settingsScreen.classList.remove('active');
     homeScreen.classList.add('active');
   }
 }
@@ -501,10 +506,10 @@ function renderProfiles() {
         <div class="profile-radio-dot"></div>
       </div>
       <div class="profile-info">
-        <div class="profile-name">${escHtml(p.name || p.server)}</div>
+        <div class="profile-name">${escHtml(p.name || p.server)}${p.sub_id ? '<span class="profile-sub-tag">sub</span>' : ''}</div>
         <div class="profile-server">${escHtml(p.server)}</div>
       </div>
-      <span class="profile-transport-badge">${escHtml(p.transport || 'udp')}</span>
+      <span class="profile-transport-badge">${escHtml(p.transport === 'uot' && p.tls ? 'tls' : (p.transport || 'udp'))}</span>
       <div class="profile-actions">
         <button class="profile-action-btn btn-share-profile" title="Share" data-id="${p.id}">
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/><line x1="8.59" y1="13.51" x2="15.42" y2="17.49"/><line x1="15.41" y1="6.51" x2="8.59" y2="10.49"/></svg>
@@ -678,6 +683,7 @@ function parseOstpLink(raw) {
 }
 
 function importFromLink(raw) {
+  if (isSubscriptionUrl(raw)) { addSubscription(raw.trim()); return; }
   try {
     const parsed = parseOstpLink(raw);
     // Pre-fill editor
@@ -712,14 +718,313 @@ function buildShareLink(p) {
 async function openShare(id) {
   const p = profiles.find(p => p.id === id);
   if (!p) return;
-  const link = buildShareLink(p);
-  shareLink.value = link;
+  showShare('Share Profile', buildShareLink(p));
+}
+
+async function showShare(title, text) {
+  $('share-title').textContent = title;
+  shareLink.value = text;
   shareQr.innerHTML = '';
-  try {
-    const svg = await invoke('generate_qr', { text: link });
-    if (svg) shareQr.innerHTML = svg;
-  } catch { /* QR optional */ }
+  const err = $('share-qr-error');
+  err.style.display = 'none';
   shareModal.classList.remove('hidden');
+  try {
+    const svg = await invoke('generate_qr', { text });
+    if (svg) shareQr.innerHTML = svg;
+    else throw new Error('QR codes need the desktop app');
+  } catch (e) {
+    err.textContent = 'QR code unavailable: ' + (e?.message || e);
+    err.style.display = '';
+  }
+}
+
+// ── SUBSCRIPTIONS ─────────────────────────────────────────────────────
+// A subscription URL (https://<domain>/sub/<token>) returns the user's
+// current links. Its profiles carry sub_id and are rewritten on every
+// refresh, so server-side changes reach the app without a new link.
+const SUBS_KEY = 'ostp_subscriptions_v1';
+
+function loadSubs() {
+  try { return JSON.parse(localStorage.getItem(SUBS_KEY) || '[]'); }
+  catch { return []; }
+}
+function saveSubs(subs) { localStorage.setItem(SUBS_KEY, JSON.stringify(subs)); }
+
+const isSubscriptionUrl = s => /^https:\/\//i.test(String(s).trim());
+const subIsDue = s => Date.now() - (s.updatedAt || 0) >= (s.intervalHours || 12) * 3600 * 1000;
+const refreshing = new Set();
+
+function timeAgo(ms) {
+  if (!ms) return 'never';
+  const m = Math.floor((Date.now() - ms) / 60000);
+  if (m < 1) return 'just now';
+  if (m < 60) return `${m} min ago`;
+  if (m < 1440) return `${Math.floor(m / 60)} h ago`;
+  return `${Math.floor(m / 1440)} d ago`;
+}
+
+function carrierOf(p) { return p.transport === 'uot' && p.tls ? 'tls' : (p.transport || 'udp'); }
+
+// Rewrites the subscription's profiles from a fetched document, keeping the
+// active carrier and per-profile tweaks.
+function applySubscription(sub, doc) {
+  const links = [];
+  for (const l of doc.links || []) {
+    try { links.push(parseOstpLink(l)); } catch { /* skip malformed */ }
+  }
+  if (!links.length) throw new Error('the subscription has no usable links');
+
+  sub.name = (doc.name || '').trim() || (() => { try { return new URL(sub.url).host; } catch { return sub.url; } })();
+  sub.intervalHours = Math.min(720, Math.max(1, doc.update_interval_hours || 12));
+  sub.usedBytes = doc.usage ? doc.usage.used_bytes : null;
+  sub.limitBytes = doc.usage ? doc.usage.limit_bytes : null;
+  sub.updatedAt = Date.now();
+  sub.lastError = null;
+
+  const old = profiles.filter(p => p.sub_id === sub.id);
+  const activeOld = old.find(p => p.id === activeId);
+  const fresh = links.map((l, i) => {
+    const prev = old.find(p => carrierOf(p) === carrierOf(l));
+    return { ...(prev || {}), ...l, id: prev ? prev.id : genId(), sub_id: sub.id,
+             name: l.name || `${sub.name} · ${carrierOf(l).toUpperCase()}` };
+  });
+  const at = profiles.findIndex(p => p.sub_id === sub.id);
+  profiles = profiles.filter(p => p.sub_id !== sub.id);
+  profiles.splice(at >= 0 ? at : profiles.length, 0, ...fresh);
+
+  if (activeOld) {
+    const same = fresh.find(p => carrierOf(p) === carrierOf(activeOld)) || fresh[0];
+    activeId = same.id;
+  } else if (!activeId || !profiles.some(p => p.id === activeId)) {
+    activeId = fresh[0].id;
+  }
+  saveActiveId(activeId);
+  saveProfiles(profiles);
+  return fresh.length;
+}
+
+async function refreshSubscription(id, { quiet = false } = {}) {
+  const subs = loadSubs();
+  const sub = subs.find(s => s.id === id);
+  if (!sub || refreshing.has(id)) return;
+  refreshing.add(id);
+  renderSubs();
+  try {
+    const doc = await invoke('fetch_subscription', { url: sub.url });
+    if (!doc) throw new Error('subscriptions need the desktop app');
+    const n = applySubscription(sub, doc);
+    if (!quiet) showToast(`Updated: ${n} profile(s)`, 'ok');
+  } catch (e) {
+    sub.lastError = String(e?.message || e);
+    if (!quiet) showToast('Update failed: ' + sub.lastError, 'error');
+  } finally {
+    refreshing.delete(id);
+    saveSubs(subs);
+    renderSubs();
+    renderProfiles();
+    const cfg = buildConfig();
+    if (cfg) invoke('save_config', { jsonContent: JSON.stringify(cfg, null, 2) }).catch(() => {});
+  }
+}
+
+async function addSubscription(url) {
+  const subs = loadSubs();
+  let sub = subs.find(s => s.url === url);
+  if (!sub) {
+    sub = { id: 'sub' + genId(), url, name: '', updatedAt: 0, intervalHours: 12 };
+    subs.push(sub);
+    saveSubs(subs);
+  }
+  showToast('Fetching subscription…');
+  await refreshSubscription(sub.id);
+  const saved = loadSubs().find(s => s.id === sub.id);
+  // A URL that never worked is not worth keeping.
+  if (saved && !saved.updatedAt) {
+    saveSubs(loadSubs().filter(s => s.id !== sub.id));
+    renderSubs();
+  }
+}
+
+function removeSubscription(id) {
+  const sub = loadSubs().find(s => s.id === id);
+  if (!sub || !confirm(`Remove "${sub.name || sub.url}" and its profiles?`)) return;
+  saveSubs(loadSubs().filter(s => s.id !== id));
+  profiles = profiles.filter(p => p.sub_id !== id);
+  if (!profiles.some(p => p.id === activeId)) { activeId = profiles[0]?.id || null; saveActiveId(activeId); }
+  saveProfiles(profiles);
+  renderSubs();
+  renderProfiles();
+}
+
+async function refreshDueSubscriptions() {
+  for (const s of loadSubs().filter(subIsDue)) await refreshSubscription(s.id, { quiet: true });
+}
+
+function renderSubs() {
+  const subs = loadSubs();
+  $('sub-section').style.display = subs.length ? '' : 'none';
+  const list = $('sub-list');
+  list.innerHTML = '';
+  for (const s of subs) {
+    const used = s.usedBytes, limit = s.limitBytes;
+    const ratio = used != null && limit ? Math.min(1, used / limit) : null;
+    const usage = used == null ? '' : (limit ? `${fmtBytes(used)} of ${fmtBytes(limit)}` : `${fmtBytes(used)} used`);
+    const meta = [usage, `updated ${timeAgo(s.updatedAt)}`, `every ${s.intervalHours || 12} h`].filter(Boolean).join(' · ');
+    const card = document.createElement('div');
+    card.className = 'sub-card';
+    card.innerHTML = `
+      <div class="sub-head">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 11a9 9 0 0 1 9 9"/><path d="M4 4a16 16 0 0 1 16 16"/><circle cx="5" cy="19" r="1"/></svg>
+        <div class="sub-name">${escHtml(s.name || s.url)}</div>
+        <button class="profile-action-btn sub-refresh${refreshing.has(s.id) ? ' spinning' : ''}" title="Update now">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
+        </button>
+        <button class="profile-action-btn sub-share" title="Share subscription (QR)">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/><path d="M14 14h3v3h-3zM18 18h3v3h-3z"/></svg>
+        </button>
+        <button class="profile-action-btn sub-remove" title="Remove">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/></svg>
+        </button>
+      </div>
+      ${ratio != null ? `<div class="sub-bar${ratio >= 1 ? ' full' : ratio >= 0.8 ? ' warn' : ''}"><div style="width:${(ratio * 100).toFixed(1)}%"></div></div>` : ''}
+      <div class="sub-meta">${escHtml(meta)}</div>
+      ${s.lastError ? `<div class="sub-error">${escHtml(s.lastError)}</div>` : ''}
+    `;
+    card.querySelector('.sub-refresh').addEventListener('click', () => refreshSubscription(s.id));
+    card.querySelector('.sub-share').addEventListener('click', () => showShare('Share Subscription', s.url));
+    card.querySelector('.sub-remove').addEventListener('click', () => removeSubscription(s.id));
+    list.appendChild(card);
+  }
+}
+
+// ── PROBER ────────────────────────────────────────────────────────────
+let lastMatrix = null;
+const CARRIER_NAMES = { udp: 'UDP', uot: 'TCP', uot_frag: 'TCP + frag', uot_tls: 'TLS' };
+const carrierName = t => CARRIER_NAMES[t] || String(t).toUpperCase();
+
+function proberTls(p) {
+  if (p.transport !== 'uot' || !p.tls) return null;
+  return { sni: p.tls_sni || '', insecure: !!p.tls_insecure, ws_path: p.ws_path || null };
+}
+
+function fillProberProfiles() {
+  const sel = $('pr-profile');
+  sel.innerHTML = profiles.map(p =>
+    `<option value="${escHtml(p.id)}"${p.id === activeId ? ' selected' : ''}>${escHtml(p.name || p.server)}${
+      (p.name || '').toUpperCase().includes(carrierOf(p).toUpperCase()) ? '' : ' — ' + escHtml(carrierOf(p).toUpperCase())}</option>`).join('');
+}
+
+function prStatus(msg, busy = false) {
+  const el = $('pr-status');
+  el.textContent = msg;
+  el.className = 'prober-status' + (busy ? ' busy' : '');
+}
+
+function prCard(title, html) {
+  const card = document.createElement('div');
+  card.className = 'pr-card';
+  card.innerHTML = `<h4>${escHtml(title)}</h4>${html}`;
+  $('pr-results').prepend(card);
+}
+
+function setProberBusy(busy) {
+  ['btn-pr-matrix', 'btn-pr-dpi'].forEach(id => { $(id).disabled = busy; });
+  $('btn-pr-ttl').disabled = busy || !lastMatrix;
+}
+
+async function runMatrix() {
+  const p = profiles.find(x => x.id === $('pr-profile').value);
+  if (!p) { showToast('Add a profile first', 'error'); return; }
+  setProberBusy(true);
+  prStatus(`Handshaking with ${p.server} over every address and carrier…`, true);
+  try {
+    const rows = await invoke('run_prober_matrix', { request: { server: p.server, key: p.key, tls: proberTls(p) } });
+    if (!rows) throw new Error('the prober needs the desktop app');
+    lastMatrix = { profile: p, rows };
+    const ok = rows.filter(r => r.outcome.success);
+    const foreign = rows.filter(r => r.outcome.foreign_bytes);
+    const verdict = ok.length === rows.length
+      ? `<div class="pr-verdict ok">All ${rows.length} combinations work.</div>`
+      : ok.length
+        ? `<div class="pr-verdict warn">${ok.length} of ${rows.length} work. Use: ${escHtml(ok.map(r => carrierName(r.transport) + ' over ' + r.address_kind).join(', '))}.</div>`
+        : `<div class="pr-verdict bad">Nothing got through.${foreign.length ? ' Something other than the server answered — likely DPI; try the path scan.' : ''}</div>`;
+    const table = `<table class="pr-table"><tr><th>Address</th><th>Carrier</th><th>Result</th></tr>${rows.map(r => `
+      <tr><td class="mono">${escHtml(r.address)}<span class="pr-dim"> ${escHtml(r.address_kind)}</span></td>
+      <td>${escHtml(carrierName(r.transport))}</td>
+      <td>${r.outcome.success
+        ? `<span class="pr-ok">✓ ${r.outcome.rtt_ms != null ? Math.round(r.outcome.rtt_ms) + ' ms' : 'ok'}</span>`
+        : `<span class="${r.outcome.foreign_bytes ? 'pr-warn' : 'pr-bad'}">✕ ${escHtml(r.outcome.error || 'failed')}</span>`}</td></tr>`).join('')}</table>`;
+    prCard(`Server check — ${p.name || p.server}`, verdict + table);
+    prStatus('Done.');
+  } catch (e) {
+    prStatus('Check failed: ' + (e?.message || e));
+  } finally {
+    setProberBusy(false);
+  }
+}
+
+async function runTtl() {
+  if (!lastMatrix) return;
+  const { profile: p, rows } = lastMatrix;
+  // Scan the combination that failed with a foreign answer, else the first that worked.
+  const target = rows.find(r => r.outcome.foreign_bytes) || rows.find(r => r.outcome.success) || rows[0];
+  setProberBusy(true);
+  prStatus(`Scanning ${target.address} hop by hop (${carrierName(target.transport)}); up to 20 steps…`, true);
+  try {
+    const rep = await invoke('run_prober_ttl', { request: {
+      address: target.address, port: target.port, transport: target.transport, key: p.key, tls: proberTls(p), max_ttl: 20 } });
+    const cells = rep.steps.map(s => `<span class="pr-ttl ${s.outcome}" title="${escHtml(s.preview || s.outcome)}">${s.ttl}</span>`).join('');
+    let verdict;
+    if (rep.first_foreign_ttl != null && (rep.first_genuine_ttl == null || rep.first_foreign_ttl < rep.first_genuine_ttl)) {
+      verdict = `<div class="pr-verdict bad">Something answers at hop ${rep.first_foreign_ttl}${rep.first_genuine_ttl != null ? `, before the server at hop ${rep.first_genuine_ttl}` : ''}: an in-path filter (estimate).</div>`;
+    } else if (rep.first_genuine_ttl != null) {
+      verdict = `<div class="pr-verdict ok">The server answers at hop ${rep.first_genuine_ttl}; nothing answered in its place.</div>`;
+    } else {
+      verdict = '<div class="pr-verdict warn">No answer at any hop count.</div>';
+    }
+    prCard(`Path scan — ${target.address}`, verdict + `<div class="pr-ttl-row">${cells}</div>
+      <p class="field-hint">Green: the server. Red: someone else answered. Grey: no answer. Routing noise can blur this; read it as an estimate.</p>`);
+    prStatus('Done.');
+  } catch (e) {
+    prStatus('Path scan failed: ' + (e?.message || e));
+  } finally {
+    setProberBusy(false);
+  }
+}
+
+async function runDpi() {
+  setProberBusy(true);
+  prStatus('Testing what this network filters (about 10 s)…', true);
+  try {
+    const r = await invoke('run_dpi_battery');
+    if (!r) throw new Error('the prober needs the desktop app');
+    const line = (bad, text, okText) => `<tr><td>${bad ? '<span class="pr-bad">✕</span>' : '<span class="pr-ok">✓</span>'}</td><td>${escHtml(bad ? text : okText)}</td></tr>`;
+    const score = Math.round((r.dpi_score || 0) * 100) / 100;
+    const verdict = score >= 0.5
+      ? `<div class="pr-verdict bad">Heavy filtering (score ${score}).</div>`
+      : score > 0
+        ? `<div class="pr-verdict warn">Some filtering (score ${score}).</div>`
+        : '<div class="pr-verdict ok">No filtering detected.</div>';
+    const rows = [
+      line(r.sni_blocked, 'TLS by server name (SNI) is blocked', 'TLS server names are not filtered'),
+      line(r.http_host_blocked, 'HTTP by Host header is blocked', 'HTTP Host headers are not filtered'),
+      line(r.rst_injection_detected, 'Forged TCP resets are injected', 'No forged TCP resets'),
+      line(r.random_payload_blocked, 'Unknown protocols are blocked', 'Unknown protocols pass'),
+      line(r.udp_throttled, 'UDP is throttled', 'UDP is not throttled'),
+      line(r.dns_hijacked, `DNS is hijacked${r.dns_hijacker_ip ? ' by ' + r.dns_hijacker_ip : ''}`, 'DNS answers are not hijacked'),
+      line(r.dns_injected, `DNS answers are injected${r.dns_injection_msg ? ': ' + r.dns_injection_msg : ''}`, 'No injected DNS answers'),
+      line(r.transparent_proxy_detected, 'A transparent proxy sits on the path', 'No transparent proxy'),
+      line(r.connect_hijacked, 'Connections are hijacked', 'Connections reach their targets'),
+    ].join('');
+    const tip = r.vulnerable_to_fragmentation
+      ? '<p class="field-hint">The filter misses fragmented handshakes: TCP fragmentation (UoT) helps here.</p>' : '';
+    prCard('Network DPI test', verdict + `<table class="pr-table">${rows}</table>` + tip);
+    prStatus('Done.');
+  } catch (e) {
+    prStatus('DPI test failed: ' + (e?.message || e));
+  } finally {
+    setProberBusy(false);
+  }
 }
 
 // ── CLIENT SETTINGS ───────────────────────────────────────────────────
@@ -852,6 +1157,10 @@ window.addEventListener('DOMContentLoaded', async () => {
 
   // Render profiles
   renderProfiles();
+  renderSubs();
+  // Subscriptions past their interval refresh in the background, now and hourly.
+  refreshDueSubscriptions();
+  setInterval(refreshDueSubscriptions, 3600 * 1000);
 
   // Restore tunnel state if already running
   try {
@@ -893,6 +1202,12 @@ window.addEventListener('DOMContentLoaded', async () => {
   btnAutoConnect.addEventListener('click', handleAutoConnect);
   btnGoSettings.addEventListener('click', () => showScreen('settings'));
   btnBack.addEventListener('click', () => showScreen('home'));
+  $('btn-go-prober').addEventListener('click', () => showScreen('prober'));
+  $('btn-prober-back').addEventListener('click', () => showScreen('home'));
+  $('btn-pr-matrix').addEventListener('click', runMatrix);
+  $('btn-pr-ttl').addEventListener('click', runTtl);
+  $('btn-pr-dpi').addEventListener('click', runDpi);
+  $('pr-profile').addEventListener('change', () => { lastMatrix = null; setProberBusy(false); });
 
   // Theme toggle (dark ⇄ light), persisted in localStorage
   const btnTheme = $('btn-theme');
@@ -934,10 +1249,10 @@ window.addEventListener('DOMContentLoaded', async () => {
     addMenu.classList.add('hidden');
     try {
       const text = await navigator.clipboard.readText();
-      if (text.startsWith('ostp://')) {
-        importFromLink(text);
+      if (text.trim().startsWith('ostp://') || isSubscriptionUrl(text)) {
+        importFromLink(text.trim());
       } else {
-        showToast('No ostp:// link in clipboard', 'error');
+        showToast('No ostp:// link or subscription URL in clipboard', 'error');
       }
     } catch {
       showToast('Cannot read clipboard', 'error');

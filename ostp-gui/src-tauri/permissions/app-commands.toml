@@ -12,5 +12,12 @@ allow = [
   "save_config",
   "get_wintun_install_path",
   "set_autostart",
-  "get_autostart"
+  "get_autostart",
+  "reload_tunnel",
+  "list_running_processes",
+  "generate_qr",
+  "fetch_subscription",
+  "run_prober_matrix",
+  "run_prober_ttl",
+  "run_dpi_battery"
 ]
