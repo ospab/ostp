@@ -147,3 +147,26 @@ SNI and `Host` always use the configured name, not the resolved address, includi
 Inside TLS, junk packets and first-packet fragmentation are skipped (encrypted, they hide nothing).
 
 Share links carry the same options: `ostp://KEY@vpn.example.com:443?type=uot&tls=1&path=%2FXk3p…`. See the Share Links page for every parameter. The Android app and the desktop GUI have the same switches in the profile editor, with "don't verify certificate" marked as insecure.
+
+## Subscriptions
+
+With a domain and TLS set up, the server can give every user a subscription URL, `https://vpn.example.com/sub/<token>`. It returns that user's current links, TLS first, then UDP. Apps re-fetch it periodically, so a new port, path or certificate setting on the server reaches clients without handing out new links.
+
+```jsonc
+"subscription": {
+  "enabled": true,
+  "path": "/sub",                 // URL prefix
+  "name": "My VPN",               // title shown in apps; the domain by default
+  "update_interval_hours": 12,    // how often apps refresh it
+  "include": ["tls", "udp"]       // which links to hand out
+}
+```
+
+`ostp cert issue` turns subscriptions on unless the config already decides either way. `ostp links` and `ostp links qr` print the URL of every key, and the web panel shows it in the Share dialog.
+
+- The token is a hash of the access key. The key itself never appears in the URL, so it stays out of web-server logs, but the token still unlocks the links: treat a subscription URL as carefully as a key.
+- Subscriptions are served only inside TLS, or to a local web server (nginx, apache, caddy) that terminated TLS itself. They are never answered in plain HTTP on the OSTP port.
+- An unknown token gets the same decoy as any other path.
+- By default the answer is one link per line. With `Accept: application/json` or `?format=json` it is JSON with the name, update interval, links and traffic usage. The `Profile-Update-Interval`, `Profile-Title` and `Subscription-Userinfo` headers are understood by third-party subscription managers too.
+
+Clients: in the Android app and the desktop GUI, import also takes an `https://` subscription URL (typed, from the clipboard or by QR). The subscription gets a card with usage and an update button, and its profiles are rewritten on every update. CLI: `ostp import https://…/sub/…`.
