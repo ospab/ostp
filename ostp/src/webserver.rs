@@ -259,6 +259,8 @@ struct Changes {
     created: Vec<PathBuf>,
     /// (path, original contents) of files that were modified.
     modified: Vec<(PathBuf, Vec<u8>)>,
+    /// (path, original contents) of files that were removed.
+    removed: Vec<(PathBuf, Vec<u8>)>,
     site: Option<String>,
 }
 
@@ -281,6 +283,31 @@ impl Changes {
         std::fs::write(path, contents).with_context(|| format!("cannot write {}", path.display()))
     }
 
+    #[cfg(unix)]
+    fn symlink(&mut self, target: &Path, link: &Path) -> Result<()> {
+        match std::fs::read_link(link) {
+            Ok(existing) if existing == target => return Ok(()),
+            Ok(_) => bail!("{} already exists and points elsewhere; not touching it", link.display()),
+            Err(_) if link.exists() => bail!("{} already exists and is not a symlink; not touching it", link.display()),
+            Err(_) => {}
+        }
+        std::os::unix::fs::symlink(target, link).with_context(|| format!("cannot create {}", link.display()))?;
+        self.created.push(link.to_path_buf());
+        Ok(())
+    }
+
+    #[cfg(not(unix))]
+    fn symlink(&mut self, _target: &Path, _link: &Path) -> Result<()> {
+        bail!("symlinks are only supported on Linux")
+    }
+
+    fn remove(&mut self, path: &Path) -> Result<()> {
+        let old = std::fs::read(path).with_context(|| format!("cannot read {}", path.display()))?;
+        std::fs::remove_file(path).with_context(|| format!("cannot remove {}", path.display()))?;
+        self.removed.push((path.to_path_buf(), old));
+        Ok(())
+    }
+
     fn rollback(&self) {
         if let Some(site) = &self.site {
             let _ = run("a2dissite", &[site]);
@@ -291,7 +318,40 @@ impl Changes {
         for (p, old) in &self.modified {
             let _ = std::fs::write(p, old);
         }
+        for (p, old) in &self.removed {
+            let _ = std::fs::write(p, old);
+        }
     }
+}
+
+/// Where the nginx site goes. Debian and Ubuntu: `sites-available/` plus a
+/// symlink in `sites-enabled/`, when nginx.conf includes that directory.
+/// Otherwise (RHEL, Alpine, nginx.org packages): `conf.d/*.conf`.
+enum NginxLayout {
+    Sites { available: PathBuf, enabled: PathBuf },
+    ConfD(PathBuf),
+}
+
+fn nginx_layout(domain: &str) -> Option<NginxLayout> {
+    let root = Path::new("/etc/nginx");
+    let includes_sites = std::fs::read_to_string(root.join("nginx.conf")).is_ok_and(|c| {
+        c.lines().any(|l| {
+            let l = l.trim();
+            !l.starts_with('#') && l.starts_with("include") && l.contains("sites-enabled")
+        })
+    });
+    let (avail, enabled) = (root.join("sites-available"), root.join("sites-enabled"));
+    if includes_sites && avail.is_dir() && enabled.is_dir() {
+        let name = format!("ostp-{domain}");
+        return Some(NginxLayout::Sites { available: avail.join(&name), enabled: enabled.join(&name) });
+    }
+    let confd = root.join("conf.d");
+    confd.is_dir().then(|| NginxLayout::ConfD(confd.join(format!("ostp-{domain}.conf"))))
+}
+
+/// A file OSTP wrote earlier (it starts with our header), so it is ours to remove.
+fn is_ours(path: &Path) -> bool {
+    std::fs::read_to_string(path).is_ok_and(|c| c.starts_with(HEADER))
 }
 
 /// Installs the vhost and returns the command that reloads the web server.
@@ -305,11 +365,21 @@ pub fn install(kind: Kind, p: &VhostParams, config_dir: &Path) -> Result<String>
     let result = (|| -> Result<()> {
         match kind {
             Kind::Nginx => {
-                let dir = Path::new("/etc/nginx/conf.d");
-                if !dir.is_dir() {
-                    bail!("/etc/nginx/conf.d not found; add this to your nginx config by hand:\n\n{}", nginx_vhost(p, has_ipv6()));
+                let text = nginx_vhost(p, has_ipv6());
+                match nginx_layout(&p.domain) {
+                    Some(NginxLayout::Sites { available, enabled }) => {
+                        ch.write(&available, &text)?;
+                        ch.symlink(&available, &enabled)?;
+                        // Earlier versions wrote conf.d/: two server blocks for
+                        // one name would clash, so our old file goes.
+                        let old = Path::new("/etc/nginx/conf.d").join(format!("ostp-{}.conf", p.domain));
+                        if is_ours(&old) {
+                            ch.remove(&old)?;
+                        }
+                    }
+                    Some(NginxLayout::ConfD(file)) => ch.write(&file, &text)?,
+                    None => bail!("no sites-enabled/ or conf.d/ under /etc/nginx; add this to your nginx config by hand:\n\n{text}"),
                 }
-                ch.write(&dir.join(format!("ostp-{}.conf", p.domain)), &nginx_vhost(p, has_ipv6()))?;
             }
             Kind::Apache => {
                 let ctl = apache_ctl().ok_or_else(|| anyhow!("apachectl not found"))?;
@@ -348,9 +418,20 @@ pub fn install(kind: Kind, p: &VhostParams, config_dir: &Path) -> Result<String>
         return Err(e.context(format!("{} was left as it was", kind.as_str())));
     }
 
-    manifest.files_created = ch.created.clone();
-    manifest.site = ch.site.clone();
+    // A re-install rewrites files it created last time; keep tracking them,
+    // or `ostp uninstall` would forget them.
     let path = manifest_path(config_dir);
+    let previous: Manifest = std::fs::read(&path).ok().and_then(|d| serde_json::from_slice(&d).ok()).unwrap_or_default();
+    let mut files: Vec<PathBuf> = previous.files_created.into_iter().filter(|f| f.exists() || f.is_symlink()).collect();
+    for f in &ch.created {
+        if !files.contains(f) {
+            files.push(f.clone());
+        }
+    }
+    files.retain(|f| !ch.removed.iter().any(|(r, _)| r == f));
+    manifest.files_created = files;
+    manifest.site = ch.site.clone().or(previous.site);
+    manifest.caddy_import |= previous.caddy_import;
     std::fs::write(&path, serde_json::to_vec_pretty(&manifest)?)
         .with_context(|| format!("cannot write {}", path.display()))?;
     Ok(reload_command(kind))
