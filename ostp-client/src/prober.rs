@@ -36,6 +36,8 @@ pub enum TransportKind {
     Udp,
     Uot,
     UotFrag,
+    /// UoT inside TLS (and the upgrade path, when set), as a TLS profile connects.
+    UotTls,
 }
 
 impl TransportKind {
@@ -44,10 +46,33 @@ impl TransportKind {
             TransportKind::Udp => "udp",
             TransportKind::Uot => "uot",
             TransportKind::UotFrag => "uot_frag",
+            TransportKind::UotTls => "uot_tls",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "udp" => Some(TransportKind::Udp),
+            "uot" => Some(TransportKind::Uot),
+            "uot_frag" => Some(TransportKind::UotFrag),
+            "uot_tls" => Some(TransportKind::UotTls),
+            _ => None,
         }
     }
 
     pub const ALL: [TransportKind; 3] = [TransportKind::Udp, TransportKind::Uot, TransportKind::UotFrag];
+}
+
+/// TLS settings of the profile being probed.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+pub struct ProbeTls {
+    /// Server name; the host of the server address when empty.
+    #[serde(default)]
+    pub sni: String,
+    #[serde(default)]
+    pub insecure: bool,
+    #[serde(default)]
+    pub ws_path: Option<String>,
 }
 
 /// Outcome of a single handshake attempt.
@@ -96,6 +121,7 @@ pub async fn attempt_handshake(
     access_key: &[u8],
     ttl: Option<u32>,
     attempt_timeout: Duration,
+    tls: Option<&ProbeTls>,
 ) -> AttemptOutcome {
     let secrets = ostp_core::crypto::derive_all_secrets(access_key);
     let session_id: u32 = rand::thread_rng().gen();
@@ -139,7 +165,15 @@ pub async fn attempt_handshake(
             Ok(t) => (t, None),
             Err(e) => return AttemptOutcome { success: false, rtt_ms: None, error: Some(format!("udp connect failed: {e}")), foreign_bytes: None },
         },
-        TransportKind::Uot | TransportKind::UotFrag => {
+        TransportKind::Uot | TransportKind::UotFrag | TransportKind::UotTls => {
+            let tls = if transport == TransportKind::UotTls {
+                match tls {
+                    Some(t) if !t.sni.is_empty() => Some(t),
+                    _ => return AttemptOutcome { success: false, rtt_ms: None, error: Some("uot_tls needs the TLS server name".into()), foreign_bytes: None },
+                }
+            } else {
+                None
+            };
             let opts = UotOptions {
                 tcp_fragmentation: transport == TransportKind::UotFrag,
                 frag_chunk: 2,
@@ -149,9 +183,9 @@ pub async fn attempt_handshake(
                 access_key: Bytes::copy_from_slice(access_key),
                 ttl,
                 connect_timeout: attempt_timeout,
-                tls: None,
-                ws_path: None,
-                http_host: String::new(),
+                tls: tls.map(|t| crate::transport::TlsClientOptions { sni: t.sni.clone(), insecure: t.insecure }),
+                ws_path: tls.and_then(|t| t.ws_path.clone()).filter(|p| !p.is_empty()),
+                http_host: tls.map(|t| t.sni.clone()).unwrap_or_default(),
             };
             match connect_uot(target_ip, port, opts).await {
                 Ok((t, rx)) => (t, Some(rx)),
@@ -206,7 +240,24 @@ pub struct MatrixEntry {
 /// addresses plus a NAT64-synthesized address (for IPv6-only networks, same
 /// synthesis the live client falls back to), each over UDP / UoT / UoT with
 /// TCP fragmentation.
-pub async fn run_matrix(server_addr: &str, access_key: &[u8], attempt_timeout: Duration) -> anyhow::Result<Vec<MatrixEntry>> {
+///
+/// With `tls` set (a TLS profile) the only carrier probed is UoT inside TLS,
+/// on the profile's port: that is how the profile connects, and UDP/raw UoT
+/// on a 443 served by a web server would only fail for unrelated reasons.
+pub async fn run_matrix(
+    server_addr: &str,
+    access_key: &[u8],
+    attempt_timeout: Duration,
+    tls: Option<ProbeTls>,
+) -> anyhow::Result<Vec<MatrixEntry>> {
+    let tls = tls.map(|mut t| {
+        if t.sni.is_empty() {
+            t.sni = crate::bridge::server_host(server_addr);
+        }
+        t
+    });
+    let transports: Vec<TransportKind> =
+        if tls.is_some() { vec![TransportKind::UotTls] } else { TransportKind::ALL.to_vec() };
     let addrs: Vec<SocketAddr> = tokio::net::lookup_host(server_addr).await?.collect();
     if addrs.is_empty() {
         anyhow::bail!("no addresses resolved for {server_addr}");
@@ -222,10 +273,10 @@ pub async fn run_matrix(server_addr: &str, access_key: &[u8], attempt_timeout: D
         candidates.push(("nat64", IpAddr::V6(nat64), v4.port()));
     }
 
-    let mut results = Vec::with_capacity(candidates.len() * TransportKind::ALL.len());
+    let mut results = Vec::with_capacity(candidates.len() * transports.len());
     for (kind, ip, port) in candidates {
-        for transport in TransportKind::ALL {
-            let outcome = attempt_handshake(ip, port, transport, access_key, None, attempt_timeout).await;
+        for &transport in &transports {
+            let outcome = attempt_handshake(ip, port, transport, access_key, None, attempt_timeout, tls.as_ref()).await;
             results.push(MatrixEntry {
                 address: ip.to_string(),
                 port,
@@ -292,13 +343,14 @@ pub async fn run_ttl_scan(
     access_key: &[u8],
     max_ttl: u32,
     attempt_timeout: Duration,
+    tls: Option<ProbeTls>,
 ) -> TtlScanReport {
     let mut steps = Vec::new();
     let mut first_foreign_ttl = None;
     let mut first_genuine_ttl = None;
 
     for ttl in 1..=max_ttl.max(1) {
-        let outcome = attempt_handshake(target_ip, port, transport, access_key, Some(ttl), attempt_timeout).await;
+        let outcome = attempt_handshake(target_ip, port, transport, access_key, Some(ttl), attempt_timeout, tls.as_ref()).await;
         let (kind, preview) = if outcome.success {
             first_genuine_ttl.get_or_insert(ttl);
             (TtlOutcomeKind::Genuine, None)

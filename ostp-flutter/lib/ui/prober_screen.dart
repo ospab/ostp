@@ -54,6 +54,16 @@ class _ProberScreenState extends State<ProberScreen> {
     super.dispose();
   }
 
+  /// TLS profiles are probed the way they connect: UoT inside TLS.
+  Map<String, dynamic>? _tlsRequest(OstpProfile p) {
+    if (p.transportMode != 'uot' || !p.tls) return null;
+    return {
+      'sni': p.tlsSni,
+      'insecure': p.tlsInsecure,
+      'ws_path': p.wsPath.isEmpty ? null : p.wsPath,
+    };
+  }
+
   Future<void> _runMatrix() async {
     final profile = _profile;
     if (profile == null || profile.serverAddr.isEmpty || profile.accessKey.isEmpty) {
@@ -73,6 +83,7 @@ class _ProberScreenState extends State<ProberScreen> {
       final requestJson = jsonEncode({
         'server_addr': profile.serverAddr,
         'access_key': profile.accessKey,
+        if (_tlsRequest(profile) != null) 'tls': _tlsRequest(profile),
       });
       final String raw = await platform.invokeMethod('runProberMatrix', {'requestJson': requestJson});
       final decoded = jsonDecode(raw);
@@ -108,6 +119,7 @@ class _ProberScreenState extends State<ProberScreen> {
         'transport': entry['transport'],
         'access_key': profile.accessKey,
         'max_ttl': maxTtl.clamp(1, 64),
+        if (_tlsRequest(profile) != null) 'tls': _tlsRequest(profile),
       });
       final String raw = await platform.invokeMethod('runProberTtlScan', {'requestJson': requestJson});
       final decoded = jsonDecode(raw);

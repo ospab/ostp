@@ -407,6 +407,9 @@ pub extern "system" fn Java_net_ostp_client_OstpClientSdk_addLog(
 struct ProberMatrixRequest {
     server_addr: String,
     access_key: String,
+    /// Set for a TLS profile: probe UoT inside TLS instead.
+    #[serde(default)]
+    tls: Option<ostp_client::prober::ProbeTls>,
     #[serde(default = "default_matrix_timeout_ms")]
     timeout_ms: u64,
 }
@@ -439,6 +442,7 @@ pub extern "system" fn Java_net_ostp_client_OstpClientSdk_runProberMatrix(
             &req.server_addr,
             req.access_key.as_bytes(),
             std::time::Duration::from_millis(req.timeout_ms),
+            req.tls,
         )),
         Err(e) => Err(anyhow::anyhow!("failed to create tokio runtime: {e}")),
     };
@@ -455,6 +459,8 @@ struct ProberTtlRequest {
     port: u16,
     transport: String,
     access_key: String,
+    #[serde(default)]
+    tls: Option<ostp_client::prober::ProbeTls>,
     #[serde(default = "default_max_ttl")]
     max_ttl: u32,
     #[serde(default = "default_ttl_timeout_ms")]
@@ -488,11 +494,8 @@ pub extern "system" fn Java_net_ostp_client_OstpClientSdk_runProberTtlScan(
         Ok(ip) => ip,
         Err(e) => return error_jstring(&mut env, &format!("invalid address: {e}")),
     };
-    let transport = match req.transport.as_str() {
-        "udp" => ostp_client::prober::TransportKind::Udp,
-        "uot" => ostp_client::prober::TransportKind::Uot,
-        "uot_frag" => ostp_client::prober::TransportKind::UotFrag,
-        other => return error_jstring(&mut env, &format!("unknown transport: {other}")),
+    let Some(transport) = ostp_client::prober::TransportKind::parse(&req.transport) else {
+        return error_jstring(&mut env, &format!("unknown transport: {}", req.transport));
     };
 
     let report = match Runtime::new() {
@@ -503,6 +506,7 @@ pub extern "system" fn Java_net_ostp_client_OstpClientSdk_runProberTtlScan(
             req.access_key.as_bytes(),
             req.max_ttl,
             std::time::Duration::from_millis(req.timeout_ms),
+            req.tls,
         )),
         Err(e) => return error_jstring(&mut env, &format!("failed to create tokio runtime: {e}")),
     };
