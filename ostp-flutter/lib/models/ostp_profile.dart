@@ -3,8 +3,8 @@ import 'dart:convert';
 /// A saved server profile. Field shape mirrors the desktop GUI's profile
 /// object (ostp-gui/src/main.js) 1:1 — server/key/transport/tcp_fragmentation/
 /// frag_chunk/frag_sleep/junk_pc/junk_ps — so behavior matches across
-/// platforms. `wss` was dropped: the core no longer supports TLS-mimicry
-/// transports (only plain UDP / UoT), so there is nothing left to carry it.
+/// platforms. UoT can optionally run inside real TLS to the server's own
+/// domain (`tls`), optionally through a web server on 443 (`wsPath`).
 class OstpProfile {
   String id;
   String name;
@@ -25,6 +25,12 @@ class OstpProfile {
   int junkPsMax;
   bool ttlDesync; // TTL-desync decoys (UDP), auto-calibrated in the engine
 
+  // TLS carrier (UoT only).
+  bool tls;
+  String tlsSni; // empty = host part of serverAddr
+  bool tlsInsecure; // skip certificate verification (testing only)
+  String wsPath; // secret upgrade path when a web server fronts OSTP
+
   OstpProfile({
     required this.id,
     required this.name,
@@ -40,6 +46,10 @@ class OstpProfile {
     this.junkPsMin = 100,
     this.junkPsMax = 1000,
     this.ttlDesync = false,
+    this.tls = false,
+    this.tlsSni = '',
+    this.tlsInsecure = false,
+    this.wsPath = '',
   });
 
   Map<String, dynamic> toJson() {
@@ -58,6 +68,10 @@ class OstpProfile {
       'junkPsMin': junkPsMin,
       'junkPsMax': junkPsMax,
       'ttlDesync': ttlDesync,
+      'tls': tls,
+      'tlsSni': tlsSni,
+      'tlsInsecure': tlsInsecure,
+      'wsPath': wsPath,
     };
   }
 
@@ -77,6 +91,10 @@ class OstpProfile {
       junkPsMin: json['junkPsMin'] as int? ?? 100,
       junkPsMax: json['junkPsMax'] as int? ?? 1000,
       ttlDesync: json['ttlDesync'] as bool? ?? false,
+      tls: json['tls'] as bool? ?? false,
+      tlsSni: json['tlsSni'] as String? ?? '',
+      tlsInsecure: json['tlsInsecure'] as bool? ?? false,
+      wsPath: json['wsPath'] as String? ?? '',
     );
   }
 }

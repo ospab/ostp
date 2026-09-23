@@ -10,6 +10,7 @@ import 'package:http/http.dart' as http;
 import 'package:url_launcher/url_launcher.dart';
 import 'package:package_info_plus/package_info_plus.dart';
 import '../models/ostp_profile.dart';
+import '../models/share_link.dart';
 
 /// Picks readable black/white text for a given (opaque) background color.
 /// The monochrome theme's `primary` is pure white — hardcoded white text on
@@ -109,28 +110,21 @@ class _SettingsScreenState extends State<SettingsScreen> {
   void _importFromLink(String link) {
     if (link.isEmpty) return;
     try {
-      if (!link.startsWith('ostp://')) {
-        throw Exception('Link must start with ostp://');
-      }
-      final uri = Uri.parse(link);
-      final key = Uri.decodeComponent(uri.userInfo);
-      final host = uri.authority.replaceFirst('${uri.userInfo}@', '');
-      if (key.isEmpty || host.isEmpty) {
-        throw Exception('Incomplete link parameters');
-      }
-      final type = uri.queryParameters['type'];
-      final transportMode = (type == 'tcp' || type == 'http') ? 'uot' : 'udp';
-      final name = uri.queryParameters['name'] ?? host;
+      final l = ShareLink.parse(link);
       final wasEmpty = _profiles.isEmpty;
 
       setState(() {
         _profiles.add(OstpProfile(
           id: DateTime.now().millisecondsSinceEpoch.toString(),
-          name: name,
-          serverAddr: host,
-          accessKey: key,
-          transportMode: transportMode,
+          name: l.name ?? l.host,
+          serverAddr: l.server,
+          accessKey: l.key,
+          transportMode: l.transport,
           active: wasEmpty,
+          tls: l.tls,
+          tlsSni: l.sni ?? '',
+          tlsInsecure: l.insecure,
+          wsPath: l.path ?? '',
         ));
         _saveProfiles();
       });
@@ -225,6 +219,10 @@ class _SettingsScreenState extends State<SettingsScreen> {
     String transportMode = profile?.transportMode ?? 'udp';
     bool tcpFragmentation = profile?.tcpFragmentation ?? false;
     bool ttlDesync = profile?.ttlDesync ?? false;
+    bool tls = profile?.tls ?? false;
+    bool tlsInsecure = profile?.tlsInsecure ?? false;
+    final sniCtrl = TextEditingController(text: profile?.tlsSni ?? '');
+    final wsPathCtrl = TextEditingController(text: profile?.wsPath ?? '');
     bool obscureKey = true;
 
     showDialog(
@@ -272,6 +270,37 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   // "UoT only" caveat. Reactive: switching Transport above calls
                   // setDialogState, which rebuilds this and shows/hides it.
                   if (transportMode == 'uot') ...[
+                    const Divider(height: 32),
+                    const Text('TLS', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 13, color: Colors.white54, letterSpacing: 1.0)),
+                    SwitchListTile(
+                      contentPadding: EdgeInsets.zero,
+                      title: const Text('TLS (HTTPS)', style: TextStyle(fontSize: 14)),
+                      subtitle: const Text('Real TLS to the server\'s domain certificate', style: TextStyle(fontSize: 12, color: Colors.white54)),
+                      value: tls,
+                      onChanged: (v) => setDialogState(() => tls = v),
+                    ),
+                    if (tls) ...[
+                      TextField(
+                        controller: sniCtrl,
+                        decoration: const InputDecoration(labelText: 'Server name (SNI)', hintText: 'default: host from the address'),
+                      ),
+                      const SizedBox(height: 8),
+                      TextField(
+                        controller: wsPathCtrl,
+                        decoration: const InputDecoration(labelText: 'Upgrade path', hintText: 'only through nginx/apache/caddy'),
+                      ),
+                      SwitchListTile(
+                        contentPadding: EdgeInsets.zero,
+                        title: const Text("Don't verify certificate", style: TextStyle(fontSize: 14, color: Colors.redAccent)),
+                        subtitle: const Text('Insecure: anyone on the path can impersonate the server. Testing only.', style: TextStyle(fontSize: 12, color: Colors.redAccent)),
+                        value: tlsInsecure,
+                        onChanged: (v) => setDialogState(() => tlsInsecure = v),
+                      ),
+                    ],
+                  ],
+                  // Inside TLS junk and fragmentation are encrypted and hide
+                  // nothing, so the engine skips them; hide their controls too.
+                  if (transportMode == 'uot' && !tls) ...[
                     const Divider(height: 32),
                     const Text('DPI OBFUSCATION', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 13, color: Colors.white54, letterSpacing: 1.0)),
                     const SizedBox(height: 12),
@@ -357,6 +386,10 @@ class _SettingsScreenState extends State<SettingsScreen> {
                         junkPsMin: int.tryParse(junkPsMinCtrl.text) ?? 100,
                         junkPsMax: int.tryParse(junkPsMaxCtrl.text) ?? 1000,
                         ttlDesync: ttlDesync,
+                        tls: transportMode == 'uot' && tls,
+                        tlsSni: sniCtrl.text.trim(),
+                        tlsInsecure: tlsInsecure,
+                        wsPath: wsPathCtrl.text.trim(),
                       ));
                     } else {
                       profile.name = nameCtrl.text.trim().isNotEmpty ? nameCtrl.text.trim() : server;
@@ -371,6 +404,10 @@ class _SettingsScreenState extends State<SettingsScreen> {
                       profile.junkPsMin = int.tryParse(junkPsMinCtrl.text) ?? 100;
                       profile.junkPsMax = int.tryParse(junkPsMaxCtrl.text) ?? 1000;
                       profile.ttlDesync = ttlDesync;
+                      profile.tls = transportMode == 'uot' && tls;
+                      profile.tlsSni = sniCtrl.text.trim();
+                      profile.tlsInsecure = tlsInsecure;
+                      profile.wsPath = wsPathCtrl.text.trim();
                     }
                     _saveProfiles();
                   });
@@ -490,12 +527,23 @@ class _SettingsScreenState extends State<SettingsScreen> {
   }
 
   void _showShareModal(OstpProfile p) {
-    final key = Uri.encodeComponent(p.accessKey);
     if (p.serverAddr.isEmpty || p.accessKey.isEmpty) return;
-    final queryParams = <String>[];
-    if (p.transportMode != 'udp') queryParams.add('type=${p.transportMode}');
-    final queryString = queryParams.isEmpty ? '' : '?${queryParams.join('&')}';
-    final url = 'ostp://$key@${p.serverAddr}$queryString';
+    final ShareLink link;
+    try {
+      // serverAddr is "host:port"; reuse the codec to split it.
+      link = ShareLink.parse('ostp://x@${p.serverAddr}');
+    } catch (_) {
+      return;
+    }
+    link.key = p.accessKey;
+    link.transport = p.transportMode;
+    link.tls = p.transportMode == 'uot' && p.tls;
+    if (link.tls) {
+      link.sni = p.tlsSni.isEmpty ? null : p.tlsSni;
+      link.insecure = p.tlsInsecure;
+    }
+    link.path = p.wsPath.isEmpty ? null : p.wsPath;
+    final url = link.toUri();
 
     showDialog(
       context: context,

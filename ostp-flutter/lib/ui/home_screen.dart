@@ -158,6 +158,10 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
         "junk_ps": [p?.junkPsMin ?? 100, p?.junkPsMax ?? 1000],
         "ttl_desync": p?.ttlDesync ?? false,
         "ttl_desync_auto": true,
+        "tls": (p?.transportMode == 'uot') && (p?.tls ?? false),
+        "tls_sni": (p?.tlsSni ?? '').isEmpty ? null : p!.tlsSni,
+        "tls_insecure": p?.tlsInsecure ?? false,
+        "ws_path": (p?.wsPath ?? '').isEmpty ? null : p!.wsPath,
       },
       "multiplex": {
         "enabled": muxEnabled,
