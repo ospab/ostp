@@ -63,6 +63,8 @@ pub struct SniffCtx {
     pub tls_required: bool,
     pub panel: Option<PanelRoute>,
     pub ws_path: Option<String>,
+    /// `<prefix>/<token>` subscription documents (TLS or a local proxy only).
+    pub subscription: Option<Arc<crate::subscription::SubscriptionService>>,
     pub decoy: Decoy,
     pub limiter: Arc<ConnLimiter>,
     pub pending: Arc<Semaphore>,
@@ -151,10 +153,10 @@ where
                 }
                 Err(_) => return Ok(()),
             };
-            return dispatch(tls, BytesMut::new(), peer, ctx, permit, deadline).await;
+            return dispatch(tls, BytesMut::new(), peer, ctx, permit, deadline, true).await;
         }
     }
-    dispatch(s, buf, peer, ctx, permit, deadline).await
+    dispatch(s, buf, peer, ctx, permit, deadline, false).await
 }
 
 /// Routes a connection given the bytes already read off it (possibly none).
@@ -166,6 +168,7 @@ async fn dispatch<S>(
     ctx: Arc<SniffCtx>,
     permit: OwnedSemaphorePermit,
     deadline: Instant,
+    via_tls: bool,
 ) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -189,7 +192,7 @@ where
             .await
         }
         Class::Tls => decoy(s, buf, &ctx).await,
-        Class::Http => route_http(s, buf, peer, ctx, permit, deadline).await,
+        Class::Http => route_http(s, buf, peer, ctx, permit, deadline, via_tls).await,
     }
 }
 
@@ -200,6 +203,7 @@ async fn route_http<S>(
     ctx: Arc<SniffCtx>,
     permit: OwnedSemaphorePermit,
     deadline: Instant,
+    via_tls: bool,
 ) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -218,6 +222,18 @@ where
 
     let upgrade = parse_upgrade(&buf[..head_len], ctx.ws_path.as_deref(), peer);
     let Some(upgrade) = upgrade else {
+        // The token is a credential: never answered over plaintext from the
+        // internet, only inside TLS or from a local web server that ended it.
+        if let Some(sub) = ctx.subscription.as_ref().filter(|_| via_tls || is_trusted_proxy(peer)) {
+            if request_path(&buf[..head_len]).is_some_and(|p| sub.wants(&p)) {
+                if let Some(resp) = sub.respond(&buf[..head_len]).await {
+                    drop(permit);
+                    s.write_all(&resp).await?;
+                    let _ = s.shutdown().await;
+                    return Ok(());
+                }
+            }
+        }
         if let Some(panel) = &ctx.panel {
             if request_path(&buf[..head_len]).is_some_and(|p| panel.matches(&p)) {
                 drop(permit);
@@ -422,6 +438,7 @@ mod tests {
                 tls_required: false,
                 panel: None,
                 ws_path: ws_path.map(str::to_string),
+                subscription: None,
                 decoy: Decoy::NotFound,
                 limiter: Arc::new(ConnLimiter::new()),
                 pending: Arc::new(Semaphore::new(MAX_PENDING)),
@@ -536,6 +553,7 @@ mod tls_tests {
                 tls_required: false,
                 panel: None,
                 ws_path: ws_path.map(str::to_string),
+                subscription: None,
                 decoy: Decoy::NotFound,
                 limiter: Arc::new(ConnLimiter::new()),
                 pending: Arc::new(Semaphore::new(MAX_PENDING)),
@@ -612,6 +630,7 @@ mod tls_tests {
             tls_required: true,
             panel: Some(PanelRoute { prefix: "/panel".into(), upstream }),
             ws_path: Some("/s3cr3t".into()),
+            subscription: None,
             decoy: Decoy::NotFound,
             limiter: Arc::new(ConnLimiter::new()),
             pending: Arc::new(Semaphore::new(MAX_PENDING)),

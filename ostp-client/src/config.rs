@@ -416,6 +416,10 @@ impl UnifiedConfig {
                     let webpath = cfg.api.as_ref().and_then(|a| a.webpath.as_deref());
                     tls.validate(cfg.domain.as_deref(), webpath)?;
                 }
+                if let Some(sub) = &cfg.subscription {
+                    let webpath = cfg.api.as_ref().and_then(|a| a.webpath.as_deref());
+                    sub.validate(cfg.domain.as_deref(), cfg.tls.as_ref(), webpath)?;
+                }
             }
             AppMode::Client(cfg) => {
                 if cfg.access_key.is_empty() {
@@ -494,6 +498,80 @@ pub struct ServerConfig {
     pub domain: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tls: Option<TlsServerCfg>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subscription: Option<SubscriptionCfg>,
+}
+
+/// Per-user subscription URLs: `https://<domain>[:port]<path>/<token>`
+/// returns that user's current links, so clients follow server changes
+/// (new port, new path, rotated certificate settings) without a new link.
+/// Served only over the TLS carrier: the token must not travel in clear.
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+pub struct SubscriptionCfg {
+    pub enabled: Option<bool>,
+    /// URL prefix, "/sub" by default.
+    pub path: Option<String>,
+    /// Title shown in apps; the domain by default.
+    pub name: Option<String>,
+    /// How often clients re-fetch, in hours (default 12).
+    pub update_interval_hours: Option<u32>,
+    /// Which links to hand out, best first: "tls", "udp" (default both).
+    pub include: Option<Vec<String>>,
+}
+
+impl SubscriptionCfg {
+    pub fn is_enabled(&self) -> bool {
+        self.enabled.unwrap_or(false)
+    }
+
+    pub fn path(&self) -> String {
+        let p = self.path.as_deref().unwrap_or("/sub").trim_end_matches('/');
+        if p.is_empty() { "/sub".into() } else { p.to_string() }
+    }
+
+    pub fn update_interval_hours(&self) -> u32 {
+        self.update_interval_hours.unwrap_or(12).clamp(1, 24 * 30)
+    }
+
+    pub fn includes(&self, kind: &str) -> bool {
+        self.include.as_ref().map_or(true, |v| v.iter().any(|k| k == kind))
+    }
+
+    pub fn validate(&self, domain: Option<&str>, tls: Option<&TlsServerCfg>, webpath: Option<&str>) -> Result<()> {
+        if !self.is_enabled() {
+            return Ok(());
+        }
+        let tls = tls.filter(|t| t.is_enabled());
+        let Some(tls) = tls else {
+            anyhow::bail!("subscription needs the HTTPS carrier: enable \"tls\" first (ostp cert issue)");
+        };
+        if domain.unwrap_or("").is_empty() {
+            anyhow::bail!("subscription needs \"domain\" to be set");
+        }
+        let p = self.path();
+        if !p.starts_with('/') || p.len() < 2 || p.contains(['?', '#', ' ']) {
+            anyhow::bail!("subscription.path must look like \"/sub\" (got '{p}')");
+        }
+        if p.starts_with("/.well-known") {
+            anyhow::bail!("subscription.path must not be under /.well-known/");
+        }
+        let ws = tls.ws_path.as_deref().unwrap_or("");
+        let panel = format!("/{}", webpath.filter(|w| !w.is_empty()).unwrap_or("panel").trim_matches('/'));
+        for (other, what) in [(ws, "tls.ws_path"), (panel.as_str(), "the panel path")] {
+            if !other.is_empty() && (other == p || other.starts_with(&format!("{p}/")) || p.starts_with(&format!("{other}/"))) {
+                anyhow::bail!("subscription.path {p} overlaps {what}");
+            }
+        }
+        if let Some(v) = &self.include {
+            if let Some(bad) = v.iter().find(|k| !matches!(k.as_str(), "tls" | "udp")) {
+                anyhow::bail!("subscription.include accepts \"tls\" and \"udp\" (got '{bad}')");
+            }
+            if v.is_empty() {
+                anyhow::bail!("subscription.include must name at least one link kind");
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Optional HTTPS carrier: real TLS on a real domain, either terminated by

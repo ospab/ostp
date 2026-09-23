@@ -231,6 +231,18 @@ fn share_links_for(
 }
 
 /// The `transport` section a share link describes.
+/// `https://<domain>[:port]<path>/<token>` when subscriptions are on.
+fn subscription_url_for(server_cfg: &ostp_client::config::ServerConfig, key: &str) -> Option<String> {
+    let sub = server_cfg.subscription.as_ref().filter(|s| s.is_enabled())?;
+    let tls = server_cfg.tls.as_ref().filter(|t| t.is_enabled())?;
+    let domain = server_cfg.domain.as_deref().filter(|d| !d.is_empty())?;
+    let port = match tls.public_port.unwrap_or(443) {
+        443 => String::new(),
+        p => format!(":{p}"),
+    };
+    Some(format!("https://{domain}{port}{}/{}", sub.path(), ostp_core::subscription::token_for_key(key)))
+}
+
 fn link_transport(l: &ostp_core::share_link::ShareLink) -> TransportConfigRaw {
     TransportConfigRaw {
         mode: Some(l.transport.as_str().to_string()),
@@ -1417,6 +1429,16 @@ async fn run_app() -> Result<()> {
     "acme": {{ "email": "", "staging": false }}
   }},
 
+  // Subscriptions (needs tls + domain): every key gets
+  // https://<domain>/sub/<token>, which apps re-fetch to pick up changes.
+  // `ostp links` prints the URLs.
+  "subscription": {{
+    "enabled": false,
+    "path": "/sub",
+    "update_interval_hours": 12,
+    "include": ["tls", "udp"]
+  }},
+
   "debug": false
 }}"#, key, ws = cert_cmd::random_path())
         } else if mode_str == "relay" {
@@ -1546,6 +1568,9 @@ async fn run_app() -> Result<()> {
                     for (label, link) in share_links_for(&server_cfg, &key.key(), &args.config) {
                         println!("  [{}] {label:<3}  {}", idx + 1, link.to_uri());
                     }
+                    if let Some(url) = subscription_url_for(&server_cfg, &key.key()) {
+                        println!("  [{}] SUB  {url}", idx + 1);
+                    }
                 }
                 return Ok(());
             }
@@ -1613,6 +1638,15 @@ async fn run_app() -> Result<()> {
                 .as_ref()
                 .filter(|t| t.is_enabled())
                 .map(|t| resolve_tls_settings(t, domain.clone(), &args.config));
+            let subscription = server_cfg.subscription.as_ref().filter(|s| s.is_enabled()).map(|s| {
+                ostp_server::SubscriptionSettings {
+                    prefix: s.path(),
+                    name: s.name.clone().filter(|n| !n.is_empty()).or_else(|| domain.clone()).unwrap_or_else(|| "OSTP".into()),
+                    update_interval_hours: s.update_interval_hours(),
+                    include_tls: s.includes("tls"),
+                    include_udp: s.includes("udp"),
+                }
+            });
             // Build DNS config and set owndns flag in subscribe links if DNS enabled.
             // Kept untyped (serde_json::Value) in the shared ServerConfig so
             // ostp-client doesn't need a dependency on ostp-server just to
@@ -1635,6 +1669,7 @@ async fn run_app() -> Result<()> {
                 dns_config: dns_cfg,
                 config_path: Some(args.config),
                 tls,
+                subscription,
             })
             .await?;
         }

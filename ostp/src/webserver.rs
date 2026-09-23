@@ -49,6 +49,8 @@ pub struct VhostParams {
     pub ostp_port: u16,
     /// (webpath without slashes, API address) when the panel is enabled.
     pub panel: Option<(String, String)>,
+    /// Subscription prefix (e.g. "/sub"), forwarded to OSTP's own port.
+    pub subscription: Option<String>,
     /// OSTP's local ACME responder (nginx/apache only).
     pub responder: String,
     pub cert_path: PathBuf,
@@ -155,6 +157,17 @@ pub fn nginx_vhost(p: &VhostParams, ipv6: bool) -> String {
             )
         })
         .unwrap_or_default();
+    let sub = p
+        .subscription
+        .as_ref()
+        .map(|prefix| {
+            format!(
+                "    location ^~ {prefix}/ {{\n        proxy_pass http://127.0.0.1:{port};\n        proxy_set_header Host $host;\n        \
+                 proxy_set_header X-Real-IP $remote_addr;\n    }}\n",
+                port = p.ostp_port
+            )
+        })
+        .unwrap_or_default();
     format!(
         "{HEADER}\n\
 server {{\n    listen 80;\n{v6_80}    server_name {domain};\n\n    \
@@ -166,7 +179,7 @@ location = {ws_path} {{\n        proxy_pass http://127.0.0.1:{port};\n        pr
 proxy_set_header Upgrade $http_upgrade;\n        proxy_set_header Connection \"upgrade\";\n        proxy_set_header Host $host;\n        \
 proxy_set_header X-Real-IP $remote_addr;\n        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n        \
 proxy_buffering off;\n        proxy_read_timeout 1d;\n        proxy_send_timeout 1d;\n    }}\n\
-{panel}    location / {{\n        return 404;\n    }}\n}}\n",
+{sub}{panel}    location / {{\n        return 404;\n    }}\n}}\n",
         v6_80 = v6("80", ""),
         v6_443 = v6("443", " ssl"),
         domain = p.domain,
@@ -193,13 +206,18 @@ pub fn apache_vhost(p: &VhostParams, modern: bool) -> String {
             format!("    ProxyPass /{webpath}/ http://{api}/{webpath}/\n    ProxyPassReverse /{webpath}/ http://{api}/{webpath}/\n")
         })
         .unwrap_or_default();
+    let sub = p
+        .subscription
+        .as_ref()
+        .map(|prefix| format!("    ProxyPass {prefix}/ http://127.0.0.1:{0}{prefix}/\n", p.ostp_port))
+        .unwrap_or_default();
     format!(
         "{HEADER}\n\
 <VirtualHost *:80>\n    ServerName {domain}\n    \
 ProxyPass /.well-known/acme-challenge/ http://{responder}/.well-known/acme-challenge/\n    \
 RedirectMatch 301 ^/(?!\\.well-known/acme-challenge/)(.*)$ https://{domain}/$1\n</VirtualHost>\n\n\
 <VirtualHost *:443>\n    ServerName {domain}\n    SSLEngine on\n    SSLCertificateFile {cert}\n    SSLCertificateKeyFile {key}\n    \
-ProxyPreserveHost On\n{ws}{panel}</VirtualHost>\n",
+ProxyPreserveHost On\n{ws}{sub}{panel}</VirtualHost>\n",
         domain = p.domain,
         responder = p.responder,
         cert = p.cert_path.display(),
@@ -214,8 +232,13 @@ pub fn caddy_site(p: &VhostParams) -> String {
         .as_ref()
         .map(|(webpath, api)| format!("    handle /{webpath}/* {{\n        reverse_proxy {api}\n    }}\n"))
         .unwrap_or_default();
+    let sub = p
+        .subscription
+        .as_ref()
+        .map(|prefix| format!("    handle {prefix}/* {{\n        reverse_proxy 127.0.0.1:{0}\n    }}\n", p.ostp_port))
+        .unwrap_or_default();
     format!(
-        "{HEADER}\n{domain} {{\n    handle {ws_path} {{\n        reverse_proxy 127.0.0.1:{port}\n    }}\n{panel}    handle {{\n        respond 404\n    }}\n}}\n",
+        "{HEADER}\n{domain} {{\n    handle {ws_path} {{\n        reverse_proxy 127.0.0.1:{port}\n    }}\n{sub}{panel}    handle {{\n        respond 404\n    }}\n}}\n",
         domain = p.domain,
         ws_path = p.ws_path,
         port = p.ostp_port,
@@ -374,6 +397,7 @@ mod tests {
             ws_path: "/Xk3pQ9aZr2".into(),
             ostp_port: 50000,
             panel: panel.then(|| ("wp".to_string(), "127.0.0.1:9090".to_string())),
+            subscription: panel.then(|| "/sub".to_string()),
             responder: "127.0.0.1:50080".into(),
             cert_path: "/etc/ostp/certs/vpn.example.com/fullchain.pem".into(),
             key_path: "/etc/ostp/certs/vpn.example.com/privkey.pem".into(),
@@ -387,6 +411,7 @@ mod tests {
         assert!(v.contains("proxy_pass http://127.0.0.1:50000;"));
         assert!(v.contains("proxy_set_header Connection \"upgrade\";"));
         assert!(v.contains("location ^~ /wp/ {"));
+        assert!(v.contains("location ^~ /sub/ {\n        proxy_pass http://127.0.0.1:50000;"));
         assert!(v.contains("proxy_pass http://127.0.0.1:50080;"));
         assert!(v.contains("listen [::]:443 ssl;"));
         assert!(v.contains("ssl_certificate /etc/ostp/certs/vpn.example.com/fullchain.pem;"));
@@ -399,6 +424,7 @@ mod tests {
         let modern = apache_vhost(&params(true), true);
         assert!(modern.contains("ProxyPass /Xk3pQ9aZr2 http://127.0.0.1:50000/Xk3pQ9aZr2 upgrade=websocket"));
         assert!(modern.contains("ProxyPass /wp/ http://127.0.0.1:9090/wp/"));
+        assert!(modern.contains("ProxyPass /sub/ http://127.0.0.1:50000/sub/"));
         assert!(modern.contains("ProxyPass /.well-known/acme-challenge/ http://127.0.0.1:50080/.well-known/acme-challenge/"));
         let old = apache_vhost(&params(false), false);
         assert!(old.contains("ProxyPass /Xk3pQ9aZr2 ws://127.0.0.1:50000/Xk3pQ9aZr2"));
@@ -410,6 +436,7 @@ mod tests {
         assert!(c.contains("vpn.example.com {"));
         assert!(c.contains("handle /Xk3pQ9aZr2 {\n        reverse_proxy 127.0.0.1:50000"));
         assert!(c.contains("handle /wp/* {"));
+        assert!(c.contains("handle /sub/* {\n        reverse_proxy 127.0.0.1:50000"));
         assert!(c.contains("handle {\n        respond 404"));
     }
 }

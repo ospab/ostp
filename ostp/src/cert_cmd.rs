@@ -120,6 +120,11 @@ fn panel_route(v: &serde_json::Value) -> Option<(String, String)> {
     Some((webpath, format!("127.0.0.1:{port}")))
 }
 
+fn subscription_prefix(v: &serde_json::Value) -> Option<String> {
+    let cfg: ostp_client::config::SubscriptionCfg = serde_json::from_value(v.get("subscription")?.clone()).ok()?;
+    cfg.is_enabled().then(|| cfg.path())
+}
+
 // ── issue ────────────────────────────────────────────────────────────────────
 
 pub async fn issue_interactive(config_path: &Path, a: IssueArgs) -> Result<()> {
@@ -187,6 +192,11 @@ pub async fn issue_interactive(config_path: &Path, a: IssueArgs) -> Result<()> {
     }
     v["domain"] = domain.clone().into();
     v["tls"] = tls;
+    // A real domain is what subscriptions need; turn them on unless the
+    // operator already decided either way.
+    if v.get("subscription").and_then(|s| s.get("enabled")).is_none() {
+        v["subscription"] = serde_json::json!({ "enabled": true, "path": "/sub" });
+    }
 
     // Validate before touching anything on disk.
     let parsed: ostp_client::config::UnifiedConfig = serde_json::from_value(v.clone())?;
@@ -209,6 +219,7 @@ pub async fn issue_interactive(config_path: &Path, a: IssueArgs) -> Result<()> {
             ws_path: t.ws_path.clone(),
             ostp_port: listen_port(&v),
             panel: panel_route(&v),
+            subscription: subscription_prefix(&v),
             responder: t.acme.responder.clone(),
             cert_path: t.cert_path.clone(),
             key_path: t.key_path.clone(),
@@ -351,6 +362,9 @@ fn print_links(config_path: &Path) -> Result<()> {
         println!("\n  {}", "Share links for the first key:".bold());
         for (label, link) in crate::share_links_for(&cfg, &key.key(), config_path) {
             println!("    {label:<3}  {}", link.to_uri().green());
+        }
+        if let Some(url) = crate::subscription_url_for(&cfg, &key.key()) {
+            println!("    SUB  {}", url.green());
         }
         println!("  All keys: ostp links");
     }

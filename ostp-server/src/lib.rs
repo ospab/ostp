@@ -29,6 +29,9 @@ mod relay;
 mod signal;
 pub mod dns;
 pub mod router;
+mod subscription;
+
+pub use subscription::SubscriptionSettings;
 
 pub use outbound::{OutboundAction, OutboundConfig, OutboundRule};
 pub use api::ApiConfig;
@@ -82,6 +85,8 @@ pub struct ServerParams {
     pub config_path: Option<std::path::PathBuf>,
     /// Enabled `tls` section, resolved.
     pub tls: Option<tls::TlsSettings>,
+    /// Enabled `subscription` section, resolved (needs `tls`).
+    pub subscription: Option<SubscriptionSettings>,
 }
 
 pub async fn run_server(params: ServerParams) -> Result<()> {
@@ -97,6 +102,7 @@ pub async fn run_server(params: ServerParams) -> Result<()> {
         dns_config,
         config_path,
         tls,
+        subscription,
     } = params;
     let mut keys_map = HashMap::new();
     for (key, meta) in access_keys {
@@ -289,27 +295,48 @@ pub async fn run_server(params: ServerParams) -> Result<()> {
         }
     });
 
+    // Where clients reach this server, for subscription links.
+    let primary = bind_addrs.first().cloned().unwrap_or_else(|| "0.0.0.0:50000".to_string());
+    let parts: Vec<&str> = primary.rsplitn(2, ':').collect();
+    let server_port: u16 = parts.first().and_then(|p| p.parse().ok()).unwrap_or(50000);
+    let server_host = server_public_ip.unwrap_or_else(|| parts.get(1).unwrap_or(&"0.0.0.0").trim_matches(['[', ']']).to_string());
+    let tls_link = tls.as_ref().and_then(|t| {
+        Some(api::TlsLink {
+            host: t.domain.clone()?,
+            port: t.public_port,
+            // Through a web server the upgrade path is required.
+            path: (t.frontend != tls::Frontend::Builtin).then(|| t.ws_path.clone()),
+        })
+    });
+    let subscription = match (subscription, &tls_link) {
+        (Some(settings), Some(_)) => {
+            tracing::info!("Subscriptions served at https://<domain>{}/<token>", settings.prefix);
+            Some(Arc::new(subscription::SubscriptionService {
+                settings,
+                tls: tls_link.clone(),
+                udp: (server_host.clone(), server_port),
+                dns: dns_server.clone(),
+                keys: shared_keys.clone(),
+                stats: dispatcher.user_stats_ref(),
+            }))
+        }
+        (Some(_), None) => {
+            tracing::warn!("subscription is enabled but TLS with a domain is not; subscriptions are off");
+            None
+        }
+        _ => None,
+    };
+
     // Spawn Management API if configured
     if let Some(api_cfg) = api_config {
         if api_cfg.enabled {
             let api_keys = shared_keys.clone();
             let api_stats = dispatcher.user_stats_ref();
-            // Extract host:port from primary listen address for subscription links
-            let primary = bind_addrs.first().cloned().unwrap_or_else(|| "0.0.0.0:50000".to_string());
-            let parts: Vec<&str> = primary.rsplitn(2, ':').collect();
-            let server_port: u16 = parts.first().and_then(|p| p.parse().ok()).unwrap_or(50000);
-            let server_host = server_public_ip.unwrap_or_else(|| parts.get(1).unwrap_or(&"0.0.0.0").to_string());
+            let server_host = server_host.clone();
             let config_path_api = config_path.clone();
             let dns_server_api = dns_server.clone();
             let router_api = router.clone();
-            let tls_link = tls.as_ref().and_then(|t| {
-                Some(api::TlsLink {
-                    host: t.domain.clone()?,
-                    port: t.public_port,
-                    // Through a web server the upgrade path is required.
-                    path: (t.frontend != tls::Frontend::Builtin).then(|| t.ws_path.clone()),
-                })
-            });
+            let tls_link = tls_link.clone();
             tokio::spawn(async move {
                 api::start_api_server(api_cfg, api_keys, api_stats, server_host, server_port, tls_link, config_path_api, dns_server_api, router_api).await;
             });
@@ -342,6 +369,7 @@ pub async fn run_server(params: ServerParams) -> Result<()> {
     let sniff = SniffSettings {
         tcp_listen,
         ws_path: tls.as_ref().map(|t| t.ws_path.clone()),
+        subscription,
         decoy: match &fallback {
             Some(fb) => transport::sniff::Decoy::Proxy(fb.target.clone()),
             None => transport::sniff::Decoy::NotFound,
@@ -438,6 +466,7 @@ pub async fn run_server(params: ServerParams) -> Result<()> {
 struct SniffSettings {
     tcp_listen: Vec<String>,
     ws_path: Option<String>,
+    subscription: Option<Arc<subscription::SubscriptionService>>,
     decoy: transport::sniff::Decoy,
     tls: Option<tokio_rustls::TlsAcceptor>,
     /// Built-in frontend: TLS-only listeners that also serve the panel.
@@ -558,6 +587,7 @@ async fn run_server_loop(
         tls_required: false,
         panel: None,
         ws_path: sniff.ws_path.clone(),
+        subscription: sniff.subscription.clone(),
         decoy: sniff.decoy.clone(),
         limiter: limiter.clone(),
         pending: pending.clone(),
@@ -581,6 +611,7 @@ async fn run_server_loop(
             tls_required: true,
             panel: sniff.panel.clone(),
             ws_path: sniff.ws_path.clone(),
+            subscription: sniff.subscription.clone(),
             decoy: sniff.decoy.clone(),
             limiter,
             pending,
