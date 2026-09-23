@@ -541,6 +541,29 @@ fn null_jstring(env: &mut JNIEnv) -> jstring {
     }
 }
 
+/// Downloads a subscription (`https://<domain>/sub/<token>`); returns the
+/// document as JSON (`name`, `update_interval_hours`, `links`, `usage`) or
+/// `{"error": ...}`.
+#[no_mangle]
+pub extern "system" fn Java_net_ostp_client_OstpClientSdk_fetchSubscription(
+    mut env: JNIEnv,
+    _class: JClass,
+    url: JString,
+) -> jstring {
+    let url: String = match env.get_string(&url) {
+        Ok(s) => s.into(),
+        Err(_) => return null_jstring(&mut env),
+    };
+    let result = match Runtime::new() {
+        Ok(rt) => rt.block_on(ostp_client::subscription::fetch(&url)),
+        Err(e) => Err(anyhow::anyhow!("failed to create tokio runtime: {e}")),
+    };
+    match result {
+        Ok(doc) => json_jstring(&mut env, &doc),
+        Err(e) => error_jstring(&mut env, &e.to_string()),
+    }
+}
+
 fn error_jstring(env: &mut JNIEnv, msg: &str) -> jstring {
     let body = serde_json::json!({ "error": msg }).to_string();
     match env.new_string(body.replace('\0', "")) {

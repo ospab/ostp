@@ -62,4 +62,9 @@ object OstpClientSdk {
     @Keep
     @JvmStatic
     external fun runProberDpiBattery(): String
+
+    /** Subscription document as JSON, or {"error": ...}. Blocking: call off the UI thread. */
+    @Keep
+    @JvmStatic
+    external fun fetchSubscription(url: String): String
 }

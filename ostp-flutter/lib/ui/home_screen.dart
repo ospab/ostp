@@ -7,6 +7,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:package_info_plus/package_info_plus.dart';
 import '../models/connection_state_enum.dart';
 import '../models/ostp_profile.dart';
+import '../models/subscription.dart';
 import 'prober_screen.dart';
 import 'settings_screen.dart';
 
@@ -76,6 +77,15 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
     );
     _checkInitialState();
     _startPolling();
+    _refreshSubscriptions();
+  }
+
+  /// Subscriptions whose update interval has passed are fetched in the
+  /// background; failures are shown on the subscription card, not here.
+  Future<void> _refreshSubscriptions() async {
+    try {
+      if (await SubscriptionStore(widget.prefs).refreshDue() && mounted) _loadSettings();
+    } catch (_) {}
   }
 
   Future<void> _loadVersion() async {

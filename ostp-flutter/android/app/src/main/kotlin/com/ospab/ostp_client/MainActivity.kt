@@ -116,6 +116,18 @@ class MainActivity : FlutterActivity() {
                         }
                     }.start()
                 }
+                "fetchSubscription" -> {
+                    // A network round trip with a TLS handshake: never on the UI thread.
+                    val url = call.argument<String>("url") ?: ""
+                    Thread {
+                        try {
+                            val doc = net.ostp.client.OstpClientSdk.fetchSubscription(url)
+                            runOnUiThread { result.success(doc) }
+                        } catch (e: Throwable) {
+                            runOnUiThread { result.error("ERROR", e.message, null) }
+                        }
+                    }.start()
+                }
                 "runProberTtlScan" -> {
                     // A full TTL sweep (up to max_ttl attempts, each with its
                     // own timeout) can take tens of seconds — background thread

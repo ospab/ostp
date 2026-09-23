@@ -31,6 +31,10 @@ class OstpProfile {
   bool tlsInsecure; // skip certificate verification (testing only)
   String wsPath; // secret upgrade path when a web server fronts OSTP
 
+  // Subscription this profile came from ('' = added by hand); such profiles
+  // are rewritten on every refresh of that subscription.
+  String subId;
+
   OstpProfile({
     required this.id,
     required this.name,
@@ -50,6 +54,7 @@ class OstpProfile {
     this.tlsSni = '',
     this.tlsInsecure = false,
     this.wsPath = '',
+    this.subId = '',
   });
 
   Map<String, dynamic> toJson() {
@@ -72,6 +77,7 @@ class OstpProfile {
       'tlsSni': tlsSni,
       'tlsInsecure': tlsInsecure,
       'wsPath': wsPath,
+      'subId': subId,
     };
   }
 
@@ -95,6 +101,7 @@ class OstpProfile {
       tlsSni: json['tlsSni'] as String? ?? '',
       tlsInsecure: json['tlsInsecure'] as bool? ?? false,
       wsPath: json['wsPath'] as String? ?? '',
+      subId: json['subId'] as String? ?? '',
     );
   }
 }

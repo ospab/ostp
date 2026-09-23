@@ -11,6 +11,7 @@ import 'package:url_launcher/url_launcher.dart';
 import 'package:package_info_plus/package_info_plus.dart';
 import '../models/ostp_profile.dart';
 import '../models/share_link.dart';
+import '../models/subscription.dart';
 
 /// Picks readable black/white text for a given (opaque) background color.
 /// The monochrome theme's `primary` is pure white — hardcoded white text on
@@ -42,6 +43,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
   bool _showRtt = true;
 
   List<OstpProfile> _profiles = [];
+  List<OstpSubscription> _subs = [];
+  final Set<String> _refreshing = {};
 
   @override
   void initState() {
@@ -64,6 +67,145 @@ class _SettingsScreenState extends State<SettingsScreen> {
     _showRtt = widget.prefs.getBool('show_rtt') ?? true;
     _muxSessionsCtrl = TextEditingController(text: widget.prefs.getString('mux_sessions') ?? '2');
     _profiles = decodeProfiles(widget.prefs.getString('profiles_json'));
+    _subs = SubscriptionStore(widget.prefs).load();
+  }
+
+  void _reloadProfilesAndSubs() {
+    setState(() {
+      _profiles = decodeProfiles(widget.prefs.getString('profiles_json'));
+      _subs = SubscriptionStore(widget.prefs).load();
+    });
+  }
+
+  // ── Subscriptions ────────────────────────────────────────────────────────
+
+  Future<void> _importSubscription(String url) async {
+    final messenger = ScaffoldMessenger.of(context);
+    messenger.showSnackBar(const SnackBar(content: Text('Fetching subscription...'), duration: Duration(seconds: 2)));
+    try {
+      final n = await SubscriptionStore(widget.prefs).add(url);
+      _reloadProfilesAndSubs();
+      messenger.showSnackBar(SnackBar(content: Text('Subscription added: $n profile(s)')));
+    } catch (e) {
+      messenger.showSnackBar(SnackBar(content: Text('Subscription error: ${e.toString().replaceFirst('Exception: ', '')}')));
+    }
+  }
+
+  Future<void> _refreshSubscription(OstpSubscription s) async {
+    setState(() => _refreshing.add(s.id));
+    final messenger = ScaffoldMessenger.of(context);
+    try {
+      final n = await SubscriptionStore(widget.prefs).refresh(s.id);
+      messenger.showSnackBar(SnackBar(content: Text('Updated: $n profile(s)')));
+    } catch (e) {
+      messenger.showSnackBar(SnackBar(content: Text('Update failed: ${e.toString().replaceFirst('Exception: ', '')}')));
+    } finally {
+      _refreshing.remove(s.id);
+      if (mounted) _reloadProfilesAndSubs();
+    }
+  }
+
+  void _confirmRemoveSubscription(OstpSubscription s) {
+    showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        backgroundColor: Theme.of(context).colorScheme.surface,
+        title: const Text('Remove subscription?'),
+        content: Text('"${s.name}" and its profiles will be removed from this device.'),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(context), child: const Text('Cancel')),
+          TextButton(
+            onPressed: () async {
+              Navigator.pop(context);
+              await SubscriptionStore(widget.prefs).remove(s.id);
+              _reloadProfilesAndSubs();
+            },
+            child: const Text('Remove', style: TextStyle(color: Colors.redAccent)),
+          ),
+        ],
+      ),
+    );
+  }
+
+  String _ago(int ms) {
+    if (ms == 0) return 'never';
+    final d = DateTime.now().difference(DateTime.fromMillisecondsSinceEpoch(ms));
+    if (d.inMinutes < 1) return 'just now';
+    if (d.inHours < 1) return '${d.inMinutes} min ago';
+    if (d.inDays < 1) return '${d.inHours} h ago';
+    return '${d.inDays} d ago';
+  }
+
+  List<Widget> _buildSubscriptionCards() {
+    return _subs.map((s) {
+      final used = s.usedBytes;
+      final limit = s.limitBytes;
+      final usage = used == null
+          ? null
+          : limit != null && limit > 0
+              ? '${formatBytes(used)} of ${formatBytes(limit)}'
+              : '${formatBytes(used)} used';
+      final busy = _refreshing.contains(s.id);
+      return Card(
+        color: Theme.of(context).colorScheme.surface,
+        margin: const EdgeInsets.only(bottom: 12),
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(16, 12, 8, 12),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(
+                children: [
+                  const Icon(Icons.rss_feed_rounded, size: 18, color: Colors.white54),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: Text(s.name.isEmpty ? s.url : s.name,
+                        style: const TextStyle(fontWeight: FontWeight.bold), maxLines: 1, overflow: TextOverflow.ellipsis),
+                  ),
+                  busy
+                      ? const Padding(
+                          padding: EdgeInsets.all(12),
+                          child: SizedBox(width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2)),
+                        )
+                      : IconButton(
+                          icon: const Icon(Icons.refresh_rounded, size: 20, color: Colors.white54),
+                          tooltip: 'Update',
+                          onPressed: () => _refreshSubscription(s),
+                        ),
+                  IconButton(
+                    icon: const Icon(Icons.delete_outline_rounded, size: 20, color: Colors.white54),
+                    tooltip: 'Remove',
+                    onPressed: () => _confirmRemoveSubscription(s),
+                  ),
+                ],
+              ),
+              if (limit != null && limit > 0 && used != null) ...[
+                const SizedBox(height: 4),
+                ClipRRect(
+                  borderRadius: BorderRadius.circular(4),
+                  child: LinearProgressIndicator(value: (used / limit).clamp(0.0, 1.0), minHeight: 4),
+                ),
+              ],
+              const SizedBox(height: 6),
+              Text(
+                [
+                  if (usage != null) usage,
+                  'updated ${_ago(s.updatedAt)}',
+                  'every ${s.intervalHours} h',
+                ].join(' · '),
+                style: const TextStyle(fontSize: 12, color: Colors.white54),
+              ),
+              if (s.lastError != null)
+                Padding(
+                  padding: const EdgeInsets.only(top: 4),
+                  child: Text(s.lastError!, style: const TextStyle(fontSize: 12, color: Colors.redAccent)),
+                ),
+            ],
+          ),
+        ),
+      );
+    }).toList();
   }
 
   @override
@@ -109,6 +251,10 @@ class _SettingsScreenState extends State<SettingsScreen> {
 
   void _importFromLink(String link) {
     if (link.isEmpty) return;
+    if (isSubscriptionUrl(link)) {
+      _importSubscription(link);
+      return;
+    }
     try {
       final l = ShareLink.parse(link);
       final wasEmpty = _profiles.isEmpty;
@@ -152,14 +298,14 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   context,
                   MaterialPageRoute(builder: (context) => const QRScannerScreen()),
                 );
-                if (result != null && result is String && result.startsWith('ostp://')) {
+                if (result != null && result is String && (result.startsWith('ostp://') || isSubscriptionUrl(result))) {
                   _importFromLink(result);
                 }
               },
             ),
             ListTile(
               leading: const Icon(Icons.link, color: Colors.white),
-              title: const Text('Import from link'),
+              title: const Text('Import link or subscription'),
               onTap: () {
                 Navigator.pop(context);
                 _showImportLinkDialog();
@@ -184,11 +330,14 @@ class _SettingsScreenState extends State<SettingsScreen> {
     showDialog(
       context: context,
       builder: (context) => AlertDialog(
-        title: const Text('Import Link'),
+        title: const Text('Import'),
         backgroundColor: Theme.of(context).colorScheme.surface,
         content: TextField(
           controller: linkCtrl,
-          decoration: const InputDecoration(hintText: 'ostp://...'),
+          decoration: const InputDecoration(
+            hintText: 'ostp://... or https://.../sub/...',
+            helperText: 'A subscription keeps its profiles up to date',
+          ),
           autofocus: true,
         ),
         actions: [
@@ -672,9 +821,11 @@ class _SettingsScreenState extends State<SettingsScreen> {
         // second time here would just repeat the title verbatim, so only
         // add it when it's actually different information.
         subtitle: Text(
-          p.name == p.serverAddr
-              ? p.transportMode.toUpperCase()
-              : '${p.serverAddr} · ${p.transportMode.toUpperCase()}',
+          [
+            if (p.name != p.serverAddr) p.serverAddr,
+            p.tls ? 'TLS' : p.transportMode.toUpperCase(),
+            if (p.subId.isNotEmpty) 'subscription',
+          ].join(' · '),
           style: const TextStyle(fontSize: 12),
           maxLines: 1,
           overflow: TextOverflow.ellipsis,
@@ -736,6 +887,12 @@ class _SettingsScreenState extends State<SettingsScreen> {
           ListView(
             padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 16),
             children: [
+              if (_subs.isNotEmpty) ...[
+                const Text('SUBSCRIPTIONS', style: TextStyle(color: Colors.white54, fontSize: 13, fontWeight: FontWeight.bold, letterSpacing: 1.0)),
+                const SizedBox(height: 16),
+                ..._buildSubscriptionCards(),
+                const SizedBox(height: 20),
+              ],
               const Text('PROFILES', style: TextStyle(color: Colors.white54, fontSize: 13, fontWeight: FontWeight.bold, letterSpacing: 1.0)),
               const SizedBox(height: 16),
               if (_profiles.isEmpty)
