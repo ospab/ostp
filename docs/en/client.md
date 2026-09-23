@@ -33,6 +33,7 @@ The client speaks OSTP over one of two carrier transports, selected by `transpor
 
 - **`udp`** (default): each OSTP datagram is sent as one UDP datagram directly to the server. The client binds a single `UdpSocket` and reuses it for the entire session, so NAT/firewall mapping stays stable for the tunnel's lifetime.
 - **`uot`** (UDP-over-TCP): each OSTP datagram is instead carried over a plain TCP connection, framed with a 2-byte length prefix. This is for networks that block or heavily throttle unrecognized UDP; no protocol is mimicked (not a fake TLS/HTTP shell) — the TCP stream is just length-prefixed opaque blobs, consistent with OSTP's "no recognizable header" design.
+- **`uot` + `tls`**: the same UoT stream inside real TLS to the server's domain (optionally through nginx/apache/caddy on 443 via `ws_path`), with certificate verification against the bundled Mozilla roots; `tls_insecure` disables it for testing. See [Domains and TLS](tls.md).
 
 Two further obfuscation knobs apply mainly to `uot`, configured under the same `transport` block: `junk_pc`/`junk_ps` (count/size range of random filler datagrams sent before the handshake, each stamped with a key-derived, time-rotating marker) and `tcp_fragmentation`/`frag_chunk`/`frag_sleep` (splits the first TCP segment — the handshake — into small chunks with short delays, so DPI inspecting only the first segment never sees a complete handshake). See [`obfuscation.md`](obfuscation.md) for the cryptographic detail.
 

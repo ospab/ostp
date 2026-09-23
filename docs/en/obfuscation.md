@@ -56,6 +56,8 @@ The `AdaptivePadder` calculates dynamic dummy byte quantities to append to the p
 
 OSTP does not try to impersonate a known protocol (TLS, HTTP, or otherwise) — a fingerprint-matching filter can always be updated to catch an impersonation attempt. Instead it follows a **zapret-like** approach: no recognizable header at all, plus active manipulation of packet boundaries, so there is nothing distinctive to fingerprint in the first place.
 
+The one opt-in exception is not mimicry either: a server bound to a real domain can carry UoT inside **real TLS** with a real certificate (see [Domains and TLS](tls.md)). That is a genuine HTTPS site, not an imitation of one.
+
 - **Junk packets**: before the handshake, the client sends a configurable number (`junk_pc`) of random-size (`junk_ps`) filler datagrams. Each carries a 4-byte marker **derived from the access key** (the `junk_marker` above) rather than a fixed constant — a fixed marker would itself be a universal signature any observer could filter on across every OSTP deployment. The server derives the same per-key marker while trying candidate keys and drops matching junk silently, before it ever reaches the "unauthorized probe" logging path.
 - **TCP fragmentation** (UoT/TCP transport only): the first packet (the handshake) is split into small chunks (`frag_chunk` bytes) with short delays (`frag_sleep` ms) between writes, so DPI that inspects only the first TCP segment never sees a complete handshake to fingerprint.
 

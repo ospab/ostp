@@ -71,7 +71,7 @@ An optional embedded DNS server (`dns.rs`), independent of the DNS *tunneling* c
 
 ## Fallback (Decoy) Listener
 
-An optional TCP listener (`fallback.rs`) that makes active probing unproductive: any TCP connection that isn't a recognized OSTP/UoT handshake is transparently piped through to a real backend (e.g. a local nginx serving an ordinary site), so a DPI system or a human actively probing the port sees a normal website rather than a closed port or an anomalous protocol. Configured via `fallback.enabled` / `fallback.listen` / `fallback.target`.
+Every OSTP TCP listener sniffs the first byte of a connection: raw UoT is handled as always, TLS is terminated with the server's certificate when one is configured, and an HTTP request for the secret upgrade path continues as UoT (this is how nginx/apache/caddy on 443 hand clients to OSTP). Everything else is a decoy: a bare 404, or — with `fallback.enabled` — a transparent splice to `fallback.target` (e.g. a local nginx serving an ordinary site), so an active prober sees a normal website. `fallback.listen` adds one more such listener. Domains, certificates and the built-in HTTPS frontend are covered in [Domains and TLS](tls.md).
 
 ---
 
