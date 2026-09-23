@@ -80,6 +80,8 @@ pub struct ServerParams {
     pub debug: bool,
     pub dns_config: Option<dns::DnsConfig>,
     pub config_path: Option<std::path::PathBuf>,
+    /// Enabled `tls` section, resolved.
+    pub tls: Option<tls::TlsSettings>,
 }
 
 pub async fn run_server(params: ServerParams) -> Result<()> {
@@ -94,6 +96,7 @@ pub async fn run_server(params: ServerParams) -> Result<()> {
         debug,
         dns_config,
         config_path,
+        tls,
     } = params;
     let mut keys_map = HashMap::new();
     for (key, meta) in access_keys {
@@ -277,6 +280,15 @@ pub async fn run_server(params: ServerParams) -> Result<()> {
         debug,
     ));
 
+    // The panel is also served on the built-in HTTPS frontend at /{webpath}.
+    let panel_route = api_config.as_ref().filter(|a| a.enabled).map(|a| {
+        let webpath = a.webpath.trim_matches('/');
+        transport::sniff::PanelRoute {
+            prefix: format!("/{}", if webpath.is_empty() { "panel" } else { webpath }),
+            upstream: loopback_for(&a.bind),
+        }
+    });
+
     // Spawn Management API if configured
     if let Some(api_cfg) = api_config {
         if api_cfg.enabled {
@@ -305,13 +317,24 @@ pub async fn run_server(params: ServerParams) -> Result<()> {
             tcp_listen.push(fb.listen.clone());
         }
     }
+    let acceptor = tls.as_ref().and_then(prepare_tls);
+    let builtin = tls.as_ref().filter(|t| t.frontend == tls::Frontend::Builtin);
     let sniff = SniffSettings {
         tcp_listen,
-        ws_path: None,
+        ws_path: tls.as_ref().map(|t| t.ws_path.clone()),
         decoy: match &fallback {
             Some(fb) => transport::sniff::Decoy::Proxy(fb.target.clone()),
             None => transport::sniff::Decoy::NotFound,
         },
+        https_listen: match (builtin, &acceptor) {
+            (Some(t), Some(_)) => t.https_listen.clone(),
+            _ => Vec::new(),
+        },
+        tls: acceptor,
+        panel: panel_route,
+        http_listen: builtin.map(|t| t.http_listen.clone()).unwrap_or_default(),
+        redirect: builtin
+            .and_then(|t| t.domain.as_deref().map(|d| tls::http_frontend::RedirectTarget::new(d, t.public_port))),
     };
 
     let (_ui_cmd_tx, ui_cmd_rx) = mpsc::unbounded_channel::<UiCommand>();
@@ -391,6 +414,73 @@ struct SniffSettings {
     tcp_listen: Vec<String>,
     ws_path: Option<String>,
     decoy: transport::sniff::Decoy,
+    tls: Option<tokio_rustls::TlsAcceptor>,
+    /// Built-in frontend: TLS-only listeners that also serve the panel.
+    https_listen: Vec<String>,
+    panel: Option<transport::sniff::PanelRoute>,
+    /// Built-in frontend: plain HTTP, redirected to https.
+    http_listen: Vec<String>,
+    redirect: Option<tls::http_frontend::RedirectTarget>,
+}
+
+/// "0.0.0.0:9090" -> "127.0.0.1:9090", "[::]:9090" -> "[::1]:9090".
+fn loopback_for(bind: &str) -> String {
+    match bind.parse::<std::net::SocketAddr>() {
+        Ok(mut a) if a.ip().is_unspecified() => {
+            a.set_ip(if a.is_ipv6() {
+                std::net::Ipv6Addr::LOCALHOST.into()
+            } else {
+                std::net::Ipv4Addr::LOCALHOST.into()
+            });
+            a.to_string()
+        }
+        _ => bind.to_string(),
+    }
+}
+
+/// Loads (or, before the first issuance, stands in) the certificate and
+/// starts watching it. None when OSTP terminates no TLS itself.
+fn prepare_tls(t: &tls::TlsSettings) -> Option<tokio_rustls::TlsAcceptor> {
+    if t.cert == tls::CertSource::None {
+        return None;
+    }
+    if !t.cert_path.exists() || !t.key_path.exists() {
+        match (t.cert, t.domain.as_deref()) {
+            (tls::CertSource::Acme, Some(domain)) => {
+                if let Err(e) = tls::write_placeholder(domain, &t.cert_path, &t.key_path) {
+                    tracing::error!("TLS disabled: cannot write a placeholder certificate: {e:#}");
+                    return None;
+                }
+                tracing::warn!(
+                    "No certificate yet for {domain}; serving a self-signed placeholder until it is issued (ostp cert issue)"
+                );
+            }
+            _ => {
+                tracing::error!(
+                    "TLS disabled: certificate {} or key {} not found",
+                    t.cert_path.display(),
+                    t.key_path.display()
+                );
+                return None;
+            }
+        }
+    }
+    let resolver = tls::HotCertResolver::new(&t.cert_path, &t.key_path);
+    if let Err(e) = resolver.reload() {
+        tracing::error!("TLS disabled: {e:#}");
+        return None;
+    }
+    resolver.spawn_watch();
+    match tls::build_acceptor(resolver) {
+        Ok(a) => {
+            tracing::info!("TLS enabled ({} frontend), certificate {}", t.frontend.as_str(), t.cert_path.display());
+            Some(a)
+        }
+        Err(e) => {
+            tracing::error!("TLS disabled: {e:#}");
+            None
+        }
+    }
 }
 
 async fn run_server_loop(
@@ -433,12 +523,16 @@ async fn run_server_loop(
     }
 
     // TCP listeners (UoT, plus HTTP upgrade and decoy on the same ports)
+    let limiter = Arc::new(transport::limiter::ConnLimiter::new());
+    let pending = Arc::new(tokio::sync::Semaphore::new(transport::sniff::MAX_PENDING));
     let sniff_ctx = Arc::new(transport::sniff::SniffCtx {
-        tls: None,
-        ws_path: sniff.ws_path,
-        decoy: sniff.decoy,
-        limiter: Arc::new(transport::limiter::ConnLimiter::new()),
-        pending: Arc::new(tokio::sync::Semaphore::new(transport::sniff::MAX_PENDING)),
+        tls: sniff.tls.clone(),
+        tls_required: false,
+        panel: None,
+        ws_path: sniff.ws_path.clone(),
+        decoy: sniff.decoy.clone(),
+        limiter: limiter.clone(),
+        pending: pending.clone(),
         tcp_map: tcp_map.clone(),
         udp_tx: udp_tx.clone(),
     });
@@ -452,6 +546,45 @@ async fn run_server_loop(
         }
     }
     drop(sniff_ctx);
+
+    if !sniff.https_listen.is_empty() {
+        let https_ctx = Arc::new(transport::sniff::SniffCtx {
+            tls: sniff.tls.clone(),
+            tls_required: true,
+            panel: sniff.panel.clone(),
+            ws_path: sniff.ws_path.clone(),
+            decoy: sniff.decoy.clone(),
+            limiter,
+            pending,
+            tcp_map: tcp_map.clone(),
+            udp_tx: udp_tx.clone(),
+        });
+        for addr in &sniff.https_listen {
+            match tokio::net::TcpListener::bind(addr).await {
+                Ok(listener) => {
+                    tracing::info!("HTTPS listener bound to {}", addr);
+                    tokio::spawn(transport::sniff::serve_listener(listener, https_ctx.clone()));
+                }
+                Err(e) => tracing::error!(
+                    "Failed to bind HTTPS on {addr}: {e} (another web server on 443, or not running as root?)"
+                ),
+            }
+        }
+    }
+    if let Some(target) = sniff.redirect {
+        let app = tls::http_frontend::redirect_router(target);
+        for addr in &sniff.http_listen {
+            match tokio::net::TcpListener::bind(addr).await {
+                Ok(listener) => {
+                    tracing::info!("HTTP listener bound to {} (redirect to https)", addr);
+                    tokio::spawn(tls::http_frontend::serve(listener, app.clone()));
+                }
+                Err(e) => tracing::error!(
+                    "Failed to bind HTTP on {addr}: {e} (another web server on 80, or not running as root?)"
+                ),
+            }
+        }
+    }
 
     drop(udp_tx); // Drop the original sender so the channel closes when all tasks end
 

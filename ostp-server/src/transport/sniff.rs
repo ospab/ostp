@@ -41,9 +41,27 @@ pub enum Decoy {
     Proxy(String),
 }
 
+/// `/{webpath}` on the built-in HTTPS listener, proxied to the management API.
+#[derive(Debug, Clone)]
+pub struct PanelRoute {
+    /// e.g. "/panel"
+    pub prefix: String,
+    /// The API's own listen address, reached over loopback.
+    pub upstream: String,
+}
+
+impl PanelRoute {
+    fn matches(&self, path: &str) -> bool {
+        path == self.prefix || path.strip_prefix(self.prefix.as_str()).is_some_and(|rest| rest.starts_with('/'))
+    }
+}
+
 pub struct SniffCtx {
     /// Terminates TLS on this port when a certificate is configured.
     pub tls: Option<tokio_rustls::TlsAcceptor>,
+    /// The built-in 443: plaintext of any kind is closed.
+    pub tls_required: bool,
+    pub panel: Option<PanelRoute>,
     pub ws_path: Option<String>,
     pub decoy: Decoy,
     pub limiter: Arc<ConnLimiter>,
@@ -118,6 +136,9 @@ where
 {
     let mut buf = BytesMut::with_capacity(2048);
     if read_more(&mut s, &mut buf, deadline).await? == 0 {
+        return Ok(());
+    }
+    if ctx.tls_required && classify(buf[0]) != Class::Tls {
         return Ok(());
     }
     if classify(buf[0]) == Class::Tls {
@@ -197,6 +218,12 @@ where
 
     let upgrade = parse_upgrade(&buf[..head_len], ctx.ws_path.as_deref(), peer);
     let Some(upgrade) = upgrade else {
+        if let Some(panel) = &ctx.panel {
+            if request_path(&buf[..head_len]).is_some_and(|p| panel.matches(&p)) {
+                drop(permit);
+                return crate::fallback::proxy_with_prefix(s, buf.freeze(), &panel.upstream).await;
+            }
+        }
         return decoy(s, buf, &ctx).await;
     };
 
@@ -280,6 +307,15 @@ fn parse_upgrade(head: &[u8], ws_path: Option<&str>, peer: SocketAddr) -> Option
     };
 
     Some(Upgrade { ws_key, forwarded_for })
+}
+
+fn request_path(head: &[u8]) -> Option<String> {
+    let mut headers = [httparse::EMPTY_HEADER; 32];
+    let mut req = httparse::Request::new(&mut headers);
+    match req.parse(head) {
+        Ok(httparse::Status::Complete(_)) => req.path.map(|p| p.split('?').next().unwrap_or(p).to_string()),
+        _ => None,
+    }
 }
 
 async fn read_more<S: AsyncRead + Unpin>(s: &mut S, buf: &mut BytesMut, deadline: Instant) -> Result<usize> {
@@ -383,6 +419,8 @@ mod tests {
         (
             Arc::new(SniffCtx {
                 tls: None,
+                tls_required: false,
+                panel: None,
                 ws_path: ws_path.map(str::to_string),
                 decoy: Decoy::NotFound,
                 limiter: Arc::new(ConnLimiter::new()),
@@ -495,6 +533,8 @@ mod tls_tests {
         (
             Arc::new(SniffCtx {
                 tls: Some(tls),
+                tls_required: false,
+                panel: None,
                 ws_path: ws_path.map(str::to_string),
                 decoy: Decoy::NotFound,
                 limiter: Arc::new(ConnLimiter::new()),
@@ -551,5 +591,59 @@ mod tls_tests {
         let (ctx, _udp_rx) = ctx(acceptor, None);
         let err = connect(ctx, connector, "other.example.test").await.unwrap_err();
         assert!(err.to_string().to_lowercase().contains("certificate"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn builtin_https_proxies_panel_and_refuses_plaintext() {
+        let panel = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream = panel.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            let (mut s, _) = panel.accept().await.unwrap();
+            let mut buf = vec![0u8; 1024];
+            let n = s.read(&mut buf).await.unwrap();
+            assert!(buf[..n].starts_with(b"GET /panel/api/server/status "));
+            s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\npanel").await.unwrap();
+        });
+
+        let (acceptor, connector) = setup("vpn.example.test");
+        let (udp_tx, mut udp_rx) = mpsc::channel(16);
+        let ctx = Arc::new(SniffCtx {
+            tls: Some(acceptor),
+            tls_required: true,
+            panel: Some(PanelRoute { prefix: "/panel".into(), upstream }),
+            ws_path: Some("/s3cr3t".into()),
+            decoy: Decoy::NotFound,
+            limiter: Arc::new(ConnLimiter::new()),
+            pending: Arc::new(Semaphore::new(MAX_PENDING)),
+            tcp_map: Arc::new(RwLock::new(HashMap::new())),
+            udp_tx,
+        });
+
+        let mut tls = connect(ctx.clone(), connector, "vpn.example.test").await.unwrap();
+        tls.write_all(b"GET /panel/api/server/status HTTP/1.1\r\nHost: vpn.example.test\r\n\r\n").await.unwrap();
+        tls.flush().await.unwrap();
+        let mut resp = Vec::new();
+        let _ = tls.read_to_end(&mut resp).await;
+        assert!(resp.ends_with(b"panel"), "{}", String::from_utf8_lossy(&resp));
+
+        // Raw UoT on the TLS-only port is dropped without reaching the dispatcher.
+        let (mut client, server) = tokio::io::duplex(1024);
+        let permit = ctx.pending.clone().try_acquire_owned().unwrap();
+        let peer: SocketAddr = "203.0.113.7:4001".parse().unwrap();
+        tokio::spawn(handle_conn(server, peer, ctx, permit, Instant::now() + CLASSIFY_TIMEOUT));
+        client.write_all(&[0x00, 0x02, b'n', b'o']).await.unwrap();
+        let mut rest = Vec::new();
+        client.read_to_end(&mut rest).await.unwrap();
+        assert!(rest.is_empty());
+        assert!(udp_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn panel_prefix_matching() {
+        let p = PanelRoute { prefix: "/wp".into(), upstream: String::new() };
+        assert!(p.matches("/wp"));
+        assert!(p.matches("/wp/x"));
+        assert!(!p.matches("/wpx"));
+        assert!(!p.matches("/"));
     }
 }

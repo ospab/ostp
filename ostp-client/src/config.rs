@@ -376,6 +376,13 @@ impl UnifiedConfig {
                         }
                     }
                 }
+                if let Some(d) = cfg.domain.as_deref().filter(|d| !d.is_empty()) {
+                    validate_domain(d)?;
+                }
+                if let Some(tls) = &cfg.tls {
+                    let webpath = cfg.api.as_ref().and_then(|a| a.webpath.as_deref());
+                    tls.validate(cfg.domain.as_deref(), webpath)?;
+                }
             }
             AppMode::Client(cfg) => {
                 if cfg.access_key.is_empty() {
@@ -449,6 +456,115 @@ pub struct ServerConfig {
     // already depends on both crates — deserializes this into
     // ostp_server::dns::DnsConfig right before handing it to run_server().
     pub dns: Option<serde_json::Value>,
+    /// Public name of the server; used in share links, with or without TLS.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub domain: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls: Option<TlsServerCfg>,
+}
+
+/// Optional HTTPS carrier: real TLS on a real domain, either terminated by
+/// OSTP itself ("builtin", on 443/80) or by a local web server that hands
+/// the secret upgrade path to OSTP.
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+pub struct TlsServerCfg {
+    pub enabled: Option<bool>,
+    /// "builtin" | "nginx" | "apache" | "caddy"
+    pub frontend: Option<String>,
+    /// Secret HTTP-upgrade path, e.g. "/Xk3...".
+    pub ws_path: Option<String>,
+    /// "acme" | "manual" | "none" (caddy manages its own certificate)
+    pub cert: Option<String>,
+    pub cert_path: Option<String>,
+    pub key_path: Option<String>,
+    pub acme: Option<AcmeCfg>,
+    pub https_listen: Option<ListenConfig>,
+    pub http_listen: Option<ListenConfig>,
+    /// Port put in share links (443 unless the frontend listens elsewhere).
+    pub public_port: Option<u16>,
+    /// Run after a renewal so a web-server frontend picks up the new files.
+    pub reload_command: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+pub struct AcmeCfg {
+    pub email: Option<String>,
+    pub staging: Option<bool>,
+    /// Directory URL override (another CA, or a test server).
+    pub directory: Option<String>,
+    /// Local HTTP-01 responder a web-server frontend proxies challenges to.
+    pub responder: Option<String>,
+    pub renew_days_before: Option<u32>,
+}
+
+impl TlsServerCfg {
+    pub fn is_enabled(&self) -> bool {
+        self.enabled.unwrap_or(false)
+    }
+
+    pub fn frontend(&self) -> &str {
+        self.frontend.as_deref().unwrap_or("builtin")
+    }
+
+    /// Caddy always manages its own certificate.
+    pub fn cert_source(&self) -> &str {
+        if self.frontend() == "caddy" {
+            "none"
+        } else {
+            self.cert.as_deref().unwrap_or("acme")
+        }
+    }
+
+    pub fn validate(&self, domain: Option<&str>, webpath: Option<&str>) -> Result<()> {
+        if !self.is_enabled() {
+            return Ok(());
+        }
+        if !matches!(self.frontend(), "builtin" | "nginx" | "apache" | "caddy") {
+            anyhow::bail!("tls.frontend must be one of builtin, nginx, apache, caddy (got '{}')", self.frontend());
+        }
+        let ws = self.ws_path.as_deref().unwrap_or("");
+        if !ws.starts_with('/') || ws.len() < 9 || ws.contains(['?', '#', ' ']) {
+            anyhow::bail!("tls.ws_path must be a secret path like \"/Xk3pQ9aZ...\" (at least 8 characters after '/')");
+        }
+        if ws.starts_with("/.well-known/") {
+            anyhow::bail!("tls.ws_path must not be under /.well-known/");
+        }
+        let panel = format!("/{}", webpath.filter(|w| !w.is_empty()).unwrap_or("panel").trim_matches('/'));
+        if ws == panel || ws.starts_with(&format!("{panel}/")) {
+            anyhow::bail!("tls.ws_path must not be under the panel path {panel}");
+        }
+        match self.cert_source() {
+            "acme" => {
+                let d = domain.unwrap_or("");
+                if d.is_empty() {
+                    anyhow::bail!("tls.cert = \"acme\" needs \"domain\" to be set");
+                }
+            }
+            "manual" => {
+                if self.cert_path.as_deref().unwrap_or("").is_empty() || self.key_path.as_deref().unwrap_or("").is_empty() {
+                    anyhow::bail!("tls.cert = \"manual\" needs both tls.cert_path and tls.key_path");
+                }
+            }
+            "none" => {}
+            other => anyhow::bail!("tls.cert must be acme, manual or none (got '{other}')"),
+        }
+        Ok(())
+    }
+}
+
+/// A bare host name: no scheme, port, path or spaces.
+pub fn validate_domain(domain: &str) -> Result<()> {
+    let ok = !domain.is_empty()
+        && domain.len() <= 253
+        && domain.contains('.')
+        && domain.split('.').all(|l| {
+            !l.is_empty() && l.len() <= 63 && !l.starts_with('-') && !l.ends_with('-')
+                && l.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+        });
+    if !ok {
+        anyhow::bail!("\"{domain}\" is not a valid domain name (expected something like vpn.example.com)");
+    }
+    Ok(())
 }
 
 /// Relay-node config.json shape.
@@ -602,6 +718,38 @@ mod tests {
         let cfg: UnifiedConfig = serde_json::from_str(json)?;
         cfg.validate()?;
         Ok(cfg)
+    }
+
+    fn server_with(extra: &str) -> String {
+        format!(r#"{{"mode":"server","listen":"0.0.0.0:50000","access_keys":["k"]{extra}}}"#)
+    }
+
+    #[test]
+    fn server_tls_configs_validate() {
+        load(&server_with(
+            r#","domain":"vpn.example.com","tls":{"enabled":true,"ws_path":"/Xk3pQ9aZr2","acme":{"email":"a@b.c"}}"#,
+        ))
+        .expect("builtin + acme with a domain loads");
+        load(&server_with(
+            r#","tls":{"enabled":true,"frontend":"caddy","ws_path":"/Xk3pQ9aZr2"}"#,
+        ))
+        .expect("caddy needs no certificate settings");
+        load(&server_with(r#","tls":{"enabled":false}"#)).expect("a disabled section is not validated");
+    }
+
+    #[test]
+    fn server_tls_configs_are_rejected_with_a_reason() {
+        for (extra, why) in [
+            (r#","tls":{"enabled":true,"ws_path":"/Xk3pQ9aZr2"}"#, "acme without domain"),
+            (r#","domain":"vpn.example.com","tls":{"enabled":true}"#, "missing ws_path"),
+            (r#","domain":"vpn.example.com","tls":{"enabled":true,"ws_path":"/short"}"#, "short ws_path"),
+            (r#","domain":"vpn.example.com","tls":{"enabled":true,"ws_path":"/panel/Xk3pQ9aZr2"}"#, "ws_path under panel"),
+            (r#","domain":"vpn.example.com","tls":{"enabled":true,"ws_path":"/Xk3pQ9aZr2","frontend":"iis"}"#, "unknown frontend"),
+            (r#","tls":{"enabled":true,"ws_path":"/Xk3pQ9aZr2","cert":"manual"}"#, "manual without paths"),
+            (r#","domain":"https://vpn.example.com","tls":{"enabled":false}"#, "domain with scheme"),
+        ] {
+            assert!(load(&server_with(extra)).is_err(), "{why} must be rejected");
+        }
     }
 
     /// Regression: the relay used to authenticate clients and so its config

@@ -233,6 +233,49 @@ fn parse_outbound_action(value: Option<String>) -> ostp_server::OutboundAction {
     }
 }
 
+/// Directory holding the config file; certificates and ACME state live under it.
+fn config_dir_of(config_path: &std::path::Path) -> std::path::PathBuf {
+    config_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+}
+
+/// Fills in the defaults of an (already validated) `tls` section.
+fn resolve_tls_settings(
+    t: &ostp_client::config::TlsServerCfg,
+    domain: Option<String>,
+    config_path: &std::path::Path,
+) -> ostp_server::tls::TlsSettings {
+    use ostp_server::tls::{default_cert_paths, AcmeSettings, CertSource, Frontend, TlsSettings};
+    let config_dir = config_dir_of(config_path);
+    let frontend = Frontend::parse(t.frontend()).unwrap_or(Frontend::Builtin);
+    let cert = CertSource::parse(t.cert_source()).unwrap_or(CertSource::Acme);
+    let (default_cert, default_key) = default_cert_paths(&config_dir, domain.as_deref().unwrap_or("default"));
+    let acme = t.acme.clone().unwrap_or_default();
+    TlsSettings {
+        frontend,
+        ws_path: t.ws_path.clone().unwrap_or_default(),
+        cert,
+        cert_path: t.cert_path.clone().map(Into::into).unwrap_or(default_cert),
+        key_path: t.key_path.clone().map(Into::into).unwrap_or(default_key),
+        acme: AcmeSettings {
+            email: acme.email.filter(|e| !e.is_empty()),
+            staging: acme.staging.unwrap_or(false),
+            directory: acme.directory.filter(|d| !d.is_empty()),
+            responder: acme.responder.unwrap_or_else(|| ostp_server::tls::DEFAULT_ACME_RESPONDER.to_string()),
+            renew_days_before: acme.renew_days_before,
+        },
+        https_listen: t.https_listen.as_ref().map(|l| l.addresses()).unwrap_or_else(|| vec!["0.0.0.0:443".into()]),
+        http_listen: t.http_listen.as_ref().map(|l| l.addresses()).unwrap_or_else(|| vec!["0.0.0.0:80".into()]),
+        public_port: t.public_port.unwrap_or(443),
+        reload_command: t.reload_command.clone().filter(|c| !c.is_empty()),
+        domain,
+        config_dir,
+    }
+}
+
 // The on-disk config.json shapes (client/server/relay + all nested types)
 // live in ostp_client::config now - this used to be ~220 lines of struct
 // definitions duplicated here with no other consumer able to see them,
@@ -1487,7 +1530,14 @@ async fn run_app() -> Result<()> {
                     limit_bytes: uc.limit(),
                 })
             }).collect::<Vec<_>>();
-            let host = get_or_ask_public_ip(&args.config);
+            let domain = server_cfg.domain.clone().filter(|d| !d.is_empty());
+            // With a domain there is nothing to ask: never prompt from a service.
+            let host = domain.clone().unwrap_or_else(|| get_or_ask_public_ip(&args.config));
+            let tls = server_cfg
+                .tls
+                .as_ref()
+                .filter(|t| t.is_enabled())
+                .map(|t| resolve_tls_settings(t, domain.clone(), &args.config));
             // Build DNS config and set owndns flag in subscribe links if DNS enabled.
             // Kept untyped (serde_json::Value) in the shared ServerConfig so
             // ostp-client doesn't need a dependency on ostp-server just to
@@ -1509,6 +1559,7 @@ async fn run_app() -> Result<()> {
                 debug,
                 dns_config: dns_cfg,
                 config_path: Some(args.config),
+                tls,
             })
             .await?;
         }

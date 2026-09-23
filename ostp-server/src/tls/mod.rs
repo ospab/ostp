@@ -13,7 +13,95 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, SystemTime};
 use tokio_rustls::TlsAcceptor;
 
+pub mod http_frontend;
+
 const WATCH_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Who terminates TLS on 443.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Frontend {
+    /// OSTP itself listens on 443 (TLS) and 80 (ACME + redirect).
+    Builtin,
+    Nginx,
+    Apache,
+    Caddy,
+}
+
+impl Frontend {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "builtin" => Some(Self::Builtin),
+            "nginx" => Some(Self::Nginx),
+            "apache" => Some(Self::Apache),
+            "caddy" => Some(Self::Caddy),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Builtin => "builtin",
+            Self::Nginx => "nginx",
+            Self::Apache => "apache",
+            Self::Caddy => "caddy",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CertSource {
+    Acme,
+    Manual,
+    /// The web server owns the certificate (caddy).
+    None,
+}
+
+impl CertSource {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "acme" => Some(Self::Acme),
+            "manual" => Some(Self::Manual),
+            "none" => Some(Self::None),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct AcmeSettings {
+    pub email: Option<String>,
+    pub staging: bool,
+    pub directory: Option<String>,
+    /// Local HTTP-01 responder for web-server frontends.
+    pub responder: String,
+    pub renew_days_before: Option<u32>,
+}
+
+pub const DEFAULT_ACME_RESPONDER: &str = "127.0.0.1:50080";
+
+/// Resolved `tls` section of the server config.
+#[derive(Debug, Clone)]
+pub struct TlsSettings {
+    pub domain: Option<String>,
+    pub frontend: Frontend,
+    pub ws_path: String,
+    pub cert: CertSource,
+    pub cert_path: PathBuf,
+    pub key_path: PathBuf,
+    pub acme: AcmeSettings,
+    pub https_listen: Vec<String>,
+    pub http_listen: Vec<String>,
+    pub public_port: u16,
+    pub reload_command: Option<String>,
+    /// Where certificates and ACME state live (the config file's directory).
+    pub config_dir: PathBuf,
+}
+
+/// `<config_dir>/certs/<domain>/{fullchain,privkey}.pem`
+pub fn default_cert_paths(config_dir: &Path, domain: &str) -> (PathBuf, PathBuf) {
+    let dir = config_dir.join("certs").join(domain);
+    (dir.join("fullchain.pem"), dir.join("privkey.pem"))
+}
 
 /// The only crypto backend the project uses; always passed explicitly so a
 /// second backend appearing in the graph can never make rustls ambiguous.
