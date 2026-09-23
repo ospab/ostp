@@ -271,6 +271,13 @@ async fn run_client_once(
         .ok_or_else(|| anyhow::anyhow!("No IP addresses resolved for {}", config.ostp.server_addr))?;
         
     log_to_core_file(&format!("[core] Resolved server address to {}", target_addr));
+    // The bridge derives the TLS SNI and the upgrade's Host header from
+    // server_addr when tls_sni is unset. Pin the name before replacing it with
+    // the IP, or the certificate check and the web server's vhost both see the
+    // bare IP (certificate "not valid for name", or the default site's 200).
+    if config.transport.tls_sni.is_none() {
+        config.transport.tls_sni = server_name_to_pin(&config.ostp.server_addr);
+    }
     config.ostp.server_addr = target_addr.to_string();
 
 
@@ -485,4 +492,24 @@ fn is_essential_log(text: &str) -> bool {
         || text.starts_with("Connection failed:")
         || text.starts_with("Connection lost")
         || text.starts_with("Protocol tick fatal error")
+}
+
+/// The host of `server_addr` when it is a name rather than an IP literal:
+/// the name the certificate and the web server's vhost are issued for.
+fn server_name_to_pin(server_addr: &str) -> Option<String> {
+    let host = crate::bridge::server_host(server_addr);
+    (!host.is_empty() && host.parse::<std::net::IpAddr>().is_err()).then_some(host)
+}
+
+#[cfg(test)]
+mod server_name_tests {
+    use super::server_name_to_pin;
+
+    #[test]
+    fn pins_names_but_not_ip_literals() {
+        assert_eq!(server_name_to_pin("alt.ospab.org:443").as_deref(), Some("alt.ospab.org"));
+        assert_eq!(server_name_to_pin("alt.ospab.org").as_deref(), Some("alt.ospab.org"));
+        assert_eq!(server_name_to_pin("31.76.224.166:443"), None);
+        assert_eq!(server_name_to_pin("[2001:db8::1]:443"), None);
+    }
 }
