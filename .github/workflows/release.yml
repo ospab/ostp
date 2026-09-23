@@ -34,6 +34,16 @@ on:
         options:
           - alpha
           - beta
+  # Called by nightly.yml: builds the given commit and republishes the
+  # rolling "nightly" prerelease.
+  workflow_call:
+    inputs:
+      channel:
+        type: string
+        required: true
+      ref:
+        type: string
+        required: true
 
 permissions:
   contents: write
@@ -64,6 +74,8 @@ jobs:
       prerelease: ${{ steps.resolve.outputs.prerelease }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
 
       - name: Resolve channel, version, and release tag
         id: resolve
@@ -72,7 +84,13 @@ jobs:
           set -euo pipefail
           BASE_VERSION=$(grep -m1 '^version' Cargo.toml | sed -E 's/version *= *"([^"]+)"/\1/')
 
-          if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+          if [ "${{ inputs.channel }}" = "nightly" ]; then
+            # Rolling build of alpha: one "nightly" tag, moved to each new commit.
+            CHANNEL="nightly"
+            TAG="nightly"
+            git tag -f nightly HEAD
+            git push -f origin refs/tags/nightly
+          elif [[ "${{ github.ref }}" == refs/tags/v* ]]; then
             # A pushed tag is authoritative — use it AS-IS (never recompute it
             # from Cargo.toml, or the release would upload to a different tag than
             # the one that triggered this run). The channel, and thus prerelease,
@@ -108,6 +126,8 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
 
       - name: Setup Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -136,6 +156,11 @@ jobs:
 
       - name: cargo test
         run: cargo test --workspace --lib
+
+      # rustls/tokio-rustls/instant-acme default to aws-lc-rs, which does not
+      # build for mipsel/riscv64/Android; everything must stay on ring.
+      - name: No aws-lc-rs in the dependency tree
+        run: "! cargo tree --workspace -e normal -i aws-lc-sys"
 
   publish-release-matrix:
     name: Release for ${{ matrix.target }}
@@ -224,6 +249,8 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
 
       # -- Frontend Build -----------------------------------------------------
       - name: Setup Node.js
@@ -356,6 +383,8 @@ jobs:
             target: aarch64-pc-windows-msvc
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -466,6 +495,8 @@ jobs:
             target: x86_64-unknown-linux-gnu
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -543,6 +574,8 @@ jobs:
             target: aarch64-apple-darwin
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -610,6 +643,8 @@ jobs:
             flutter_target: android-arm
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
 
       - name: Setup Java
         uses: actions/setup-java@v3
