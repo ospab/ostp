@@ -369,6 +369,24 @@ pub fn migrate_server_json(json: Value) -> (Value, MigrationReport) {
         }
     }
 
+    // A hand-written `tls` section may leave out what `ostp cert issue` would
+    // write; make those defaults explicit. An absent `tls` stays absent: that
+    // is "HTTPS disabled", not a gap.
+    if let Some(tls) = obj.get_mut("tls").and_then(|t| t.as_object_mut()) {
+        let caddy = tls.get("frontend").and_then(|f| f.as_str()) == Some("caddy");
+        let defaults: [(&str, Value); 3] = [
+            ("frontend", json!("builtin")),
+            ("cert", json!(if caddy { "none" } else { "acme" })),
+            ("public_port", json!(443)),
+        ];
+        for (key, default) in defaults {
+            if !tls.contains_key(key) {
+                report.note(format!("Added tls.{key} = {default} (missing default)"));
+                tls.insert(key.to_string(), default);
+            }
+        }
+    }
+
     (out, report)
 }
 
@@ -598,6 +616,46 @@ mod tests {
         assert_eq!(new["api"]["bind"], "0.0.0.0:9090");
         assert!(new["api"].get("token").is_none());
         assert!(report.notes.iter().any(|n| n.contains("api.token")));
+    }
+
+    #[test]
+    fn server_migrate_backfills_tls_defaults_but_never_adds_tls() {
+        let base = json!({
+            "listen": "0.0.0.0:50000",
+            "access_keys": ["k1"],
+            "api": { "enabled": false, "bind": "0.0.0.0:9090", "webpath": "", "username": "", "password_hash": "" }
+        });
+        let (new, _) = migrate_server_json(base.clone());
+        assert!(new.get("tls").is_none(), "absent tls means disabled and must stay absent");
+
+        let mut with_tls = base.clone();
+        with_tls["domain"] = json!("vpn.example.com");
+        with_tls["tls"] = json!({ "enabled": true, "ws_path": "/Xk3pQ9aZr2" });
+        let (new, report) = migrate_server_json(with_tls);
+        assert_eq!(new["tls"]["frontend"], "builtin");
+        assert_eq!(new["tls"]["cert"], "acme");
+        assert_eq!(new["tls"]["public_port"], 443);
+        assert!(report.notes.iter().any(|n| n.contains("tls.cert")));
+
+        let mut caddy = base;
+        caddy["tls"] = json!({ "enabled": true, "frontend": "caddy", "ws_path": "/Xk3pQ9aZr2" });
+        let (new, _) = migrate_server_json(caddy);
+        assert_eq!(new["tls"]["cert"], "none");
+    }
+
+    /// Client configs keep the new transport fields; only the old mimicry
+    /// ones (`stealth_sni`, `wss`) are dropped.
+    #[test]
+    fn client_migrate_keeps_tls_transport_fields() {
+        let old = json!({
+            "server": "vpn.example.com:443", "access_key": "k",
+            "transport": { "mode": "uot", "tls": true, "tls_sni": "vpn.example.com", "ws_path": "/Xk3pQ9aZr2", "stealth_sni": "x" }
+        });
+        let (new, _) = migrate_client_json(old);
+        assert_eq!(new["transport"]["tls"], true);
+        assert_eq!(new["transport"]["tls_sni"], "vpn.example.com");
+        assert_eq!(new["transport"]["ws_path"], "/Xk3pQ9aZr2");
+        assert!(new["transport"].get("stealth_sni").is_none());
     }
 
     /// A server config whose `outbound` predates the SOCKS5 credential fields

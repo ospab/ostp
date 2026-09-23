@@ -92,7 +92,7 @@ fn tls_settings(config_path: &Path) -> Result<TlsSettings> {
     Ok(crate::resolve_tls_settings(tls, cfg.domain.clone().filter(|d| !d.is_empty()), config_path))
 }
 
-fn random_path() -> String {
+pub(crate) fn random_path() -> String {
     const A: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
     let s: String = (0..24).map(|_| A[rand::random::<usize>() % A.len()] as char).collect();
     format!("/{s}")

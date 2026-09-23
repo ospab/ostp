@@ -1304,6 +1304,14 @@ async fn run_app() -> Result<()> {
                                 fb.listen.as_deref().unwrap_or("0.0.0.0:443"),
                                 fb.target.as_deref().unwrap_or("127.0.0.1:8080"));
                         }
+                        if let Some(d) = s.domain.as_deref().filter(|d| !d.is_empty()) {
+                            println!("  Domain: {}", d.cyan());
+                        }
+                        match s.tls.as_ref().filter(|t| t.is_enabled()) {
+                            Some(t) => println!("  HTTPS: enabled ({} frontend, certificate: {}) - details: ostp cert status",
+                                t.frontend(), t.cert_source()),
+                            None => println!("  HTTPS: disabled (set up with: ostp cert issue)"),
+                        }
                     }
                     AppMode::Client(c) => {
                         println!("{} Config OK: client mode", "[ostp]".green().bold());
@@ -1383,9 +1391,22 @@ async fn run_app() -> Result<()> {
     "target": "127.0.0.1:8080"
   }},
 
+  // Domain & HTTPS - easiest via `ostp cert issue`. The domain goes into share
+  // links. With tls enabled OSTP accepts TLS on its own port too; the builtin
+  // frontend also serves 443 (and 80 for Let's Encrypt) itself, while nginx /
+  // apache / caddy forward the secret ws_path to it.
+  "domain": "",
+  "tls": {{
+    "enabled": false,
+    "frontend": "builtin",
+    "ws_path": "{ws}",
+    "cert": "acme",
+    "public_port": 443,
+    "acme": {{ "email": "", "staging": false }}
+  }},
 
   "debug": false
-}}"#, key)
+}}"#, key, ws = cert_cmd::random_path())
         } else if mode_str == "relay" {
             r#"{
   // OSTP Relay Node Configuration
