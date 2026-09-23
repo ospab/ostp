@@ -6,7 +6,10 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 const WINDOW: Duration = Duration::from_secs(10);
-const MAX_CONNS: u32 = 10;
+/// Generous on purpose: one client opens several sessions at once (mux, plus
+/// a NAT64 retry each), and mobile carriers put many subscribers behind one
+/// CGNAT address. This only stops floods.
+const MAX_CONNS: u32 = 60;
 /// How often stale windows are swept, so a scan from many addresses cannot
 /// grow the map without bound.
 const PRUNE_EVERY: Duration = Duration::from_secs(60);

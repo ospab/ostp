@@ -117,6 +117,19 @@ where
     }
 }
 
+/// What an upgrade status most likely means, for the error shown to the user.
+fn upgrade_status_hint(code: u16) -> &'static str {
+    match code {
+        404 => "the server does not know this path: the link's path differs from the server's tls.ws_path",
+        429 => "the server is rate-limiting this address; wait a few seconds",
+        502 | 503 | 504 => {
+            "the web server on 443 could not reach OSTP behind it: check that the ostp service is running and              listening on the port its site forwards to (ostp cert status on the server tests this)"
+        }
+        301 | 302 | 307 | 308 => "the web server redirects this path instead of forwarding it to OSTP",
+        _ => "not an OSTP upgrade answer",
+    }
+}
+
 /// Sends the upgrade request and waits for `101`; returns whatever arrived
 /// after the response head (the start of the UoT stream).
 pub async fn http_upgrade<S>(s: &mut S, path: &str, host: &str, timeout: Duration) -> Result<Bytes>
@@ -140,7 +153,7 @@ where
             .await
             .map_err(|_| anyhow!("no answer to the upgrade request within {:?}", timeout))??;
         if n == 0 {
-            bail!("connection closed during the upgrade (wrong ws_path, or the web server does not forward it)");
+            bail!("connection closed during the upgrade, before any answer (wrong port, or not an OSTP server)");
         }
     };
 
@@ -150,8 +163,9 @@ where
     let code = resp.code.unwrap_or(0);
     if code != 101 {
         bail!(
-            "upgrade rejected: HTTP {code} {} (wrong ws_path, or the web server does not forward it to OSTP)",
-            resp.reason.unwrap_or("")
+            "upgrade rejected: HTTP {code} {} ({})",
+            resp.reason.unwrap_or(""),
+            upgrade_status_hint(code)
         );
     }
     let accept = resp

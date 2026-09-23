@@ -18,6 +18,8 @@ const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(8);
 /// frame length of at most 1535), which is how the server tells raw UoT
 /// apart from TLS and HTTP on the same port.
 const MAX_JUNK_LEN: usize = 1400;
+/// How much of the first frame TCP fragmentation splits into small segments.
+const FRAG_HEAD_BYTES: usize = 32;
 
 /// UoT/TCP connection parameters shared by the live bridge and the prober.
 #[derive(Clone)]
@@ -173,12 +175,18 @@ where
                 tokio::time::sleep(Duration::from_millis(5)).await;
                 if write_half.write_all(&len_buf[1..2]).await.is_err() { break; }
                 tokio::time::sleep(Duration::from_millis(5)).await;
+                // Only the head is cut up: that is what a classifier reads.
+                // Cutting the whole handshake into 2-byte pieces took over a
+                // second (timer resolution is 1-16 ms per pause) and made
+                // handshakes time out on real links.
+                let head = data.len().min(FRAG_HEAD_BYTES);
                 let mut broke = false;
-                for chunk in data.chunks(frag_chunk) {
+                for chunk in data[..head].chunks(frag_chunk) {
                     if write_half.write_all(chunk).await.is_err() { broke = true; break; }
                     tokio::time::sleep(Duration::from_millis(frag_sleep)).await;
                 }
                 if broke { break; }
+                if head < data.len() && write_half.write_all(&data[head..]).await.is_err() { break; }
             } else {
                 let mut frame = Vec::with_capacity(2 + data.len());
                 frame.extend_from_slice(&len_buf);

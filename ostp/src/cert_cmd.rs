@@ -54,7 +54,7 @@ pub struct IssueArgs {
 pub async fn run(action: CertAction, config_path: &Path) -> Result<()> {
     match action {
         CertAction::Issue(a) => issue_interactive(config_path, a).await,
-        CertAction::Status => status(config_path),
+        CertAction::Status => status(config_path).await,
         CertAction::Renew { force } => renew(config_path, force).await,
     }
 }
@@ -386,7 +386,7 @@ fn offer_restart(yes: bool) {
 
 // ── status / renew ───────────────────────────────────────────────────────────
 
-fn status(config_path: &Path) -> Result<()> {
+async fn status(config_path: &Path) -> Result<()> {
     let t = tls_settings(config_path)?;
     let now = acme::unix_now();
     println!();
@@ -425,7 +425,103 @@ fn status(config_path: &Path) -> Result<()> {
     if webserver::manifest_path(&t.config_dir).exists() {
         println!("  Web server:  site installed by ostp ({})", webserver::manifest_path(&t.config_dir).display());
     }
+    self_test(config_path, &t).await;
     Ok(())
+}
+
+/// Walks the path a client takes, from the inside out, so a failure names
+/// the link that is broken instead of a bare 502 on the phone.
+async fn self_test(config_path: &Path, t: &TlsSettings) {
+    use ostp_client::transport::tls::{http_upgrade, wrap_tls};
+    use ostp_client::transport::TlsClientOptions;
+    use std::time::Duration;
+    const WAIT: Duration = Duration::from_secs(4);
+
+    let Ok(v) = read_json(config_path) else { return };
+    let domain = t.domain.clone().unwrap_or_else(|| "localhost".into());
+    let port = listen_port(&v);
+    let listen: Vec<String> = match &v["listen"] {
+        serde_json::Value::String(s) => vec![s.clone()],
+        serde_json::Value::Array(a) => a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect(),
+        _ => Vec::new(),
+    };
+    let on_loopback = listen.iter().any(|a| {
+        let host = a.rsplit_once(':').map(|(h, _)| h.trim_matches(['[', ']'])).unwrap_or("");
+        matches!(host, "0.0.0.0" | "::" | "127.0.0.1" | "::1" | "localhost")
+    });
+
+    println!("\n  Checks:");
+    let report = |ok: bool, what: &str, detail: String| {
+        if ok {
+            println!("    {} {what}", "✓".green());
+        } else {
+            println!("    {} {what}\n        {detail}", "✗".red());
+        }
+    };
+
+    // 1. OSTP itself, where the web server forwards to.
+    let direct = async {
+        let mut s = tokio::time::timeout(WAIT, tokio::net::TcpStream::connect(("127.0.0.1", port)))
+            .await
+            .map_err(|_| anyhow!("connect timed out"))??;
+        http_upgrade(&mut s, &t.ws_path, &domain, WAIT).await
+    }
+    .await;
+    let mut detail = match &direct {
+        Ok(_) => String::new(),
+        Err(e) => format!("{e:#}. Is the service running (systemctl status ostp)?"),
+    };
+    if !on_loopback {
+        detail.push_str(&format!(
+            " OSTP listens on {} only, not on 127.0.0.1, which is where the web server forwards: add \"127.0.0.1:{port}\" (or use 0.0.0.0:{port}) in \"listen\".",
+            listen.join(", ")
+        ));
+    }
+    report(direct.is_ok(), &format!("OSTP answers the upgrade on 127.0.0.1:{port}"), detail);
+
+    // 2. The public side: TLS on 443 and the secret path, as a client does it.
+    let tls_opts = TlsClientOptions { sni: domain.clone(), insecure: true };
+    let front = async {
+        let s = tokio::time::timeout(WAIT, tokio::net::TcpStream::connect(("127.0.0.1", t.public_port)))
+            .await
+            .map_err(|_| anyhow!("connect timed out"))??;
+        let mut s = wrap_tls(s, &tls_opts, WAIT).await?;
+        http_upgrade(&mut s, &t.ws_path, &domain, WAIT).await
+    }
+    .await;
+    let via = if t.frontend == ostp_server::tls::Frontend::Builtin { "OSTP" } else { t.frontend.as_str() };
+    report(
+        front.is_ok(),
+        &format!("TLS on :{} ({via}) forwards {} to OSTP", t.public_port, t.ws_path),
+        front.as_ref().err().map(|e| format!("{e:#}")).unwrap_or_default(),
+    );
+
+    // 3. Subscriptions, when they are on.
+    let sub = subscription_prefix(&v);
+    let first_key = v["access_keys"].as_array().and_then(|a| a.first()).and_then(|k| {
+        k.as_str().map(str::to_string).or_else(|| k.get("access_key").and_then(|x| x.as_str()).map(str::to_string))
+    });
+    if let (Some(prefix), Some(key)) = (sub, first_key) {
+        let token = ostp_core::subscription::token_for_key(&key);
+        let got = async {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let s = tokio::time::timeout(WAIT, tokio::net::TcpStream::connect(("127.0.0.1", t.public_port)))
+                .await
+                .map_err(|_| anyhow!("connect timed out"))??;
+            let mut s = wrap_tls(s, &tls_opts, WAIT).await?;
+            s.write_all(format!("GET {prefix}/{token} HTTP/1.1\r\nHost: {domain}\r\nConnection: close\r\n\r\n").as_bytes()).await?;
+            let mut buf = vec![0u8; 256];
+            let n = tokio::time::timeout(WAIT, s.read(&mut buf)).await.map_err(|_| anyhow!("no answer"))??;
+            let line = String::from_utf8_lossy(&buf[..n]).lines().next().unwrap_or("").to_string();
+            if line.contains(" 200 ") { Ok(()) } else { Err(anyhow!("answered \"{line}\" (ostp sub status shows what is missing)")) }
+        }
+        .await;
+        report(
+            got.is_ok(),
+            &format!("subscription {prefix}/<token> is served over TLS"),
+            got.err().map(|e| format!("{e:#}")).unwrap_or_default(),
+        );
+    }
 }
 
 async fn renew(config_path: &Path, force: bool) -> Result<()> {

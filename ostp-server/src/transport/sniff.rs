@@ -222,6 +222,13 @@ where
 
     let upgrade = parse_upgrade(&buf[..head_len], ctx.ws_path.as_deref(), peer);
     let Some(upgrade) = upgrade else {
+        // From a local web server this is our own frontend misrouting, not a
+        // probe: say why, so a 404/502 in front can be traced.
+        if is_trusted_proxy(peer) {
+            if let Some(why) = upgrade_problem(&buf[..head_len], ctx.ws_path.as_deref()) {
+                tracing::info!("request from the local web server is not an OSTP upgrade: {why}");
+            }
+        }
         // The token is a credential: never answered over plaintext from the
         // internet, only inside TLS or from a local web server that ended it.
         if let Some(sub) = ctx.subscription.as_ref().filter(|_| via_tls || is_trusted_proxy(peer)) {
@@ -245,7 +252,11 @@ where
 
     if let Some(real_ip) = upgrade.forwarded_for {
         if !ctx.limiter.check(real_ip) {
-            tracing::debug!("TCP rate limit exceeded for {real_ip} (via {peer}), dropping connection");
+            // A bare close would reach the client as a 502 from the web
+            // server; an explicit 429 says what happened.
+            tracing::info!("rate limit: too many connections from {real_ip} (via the local web server)");
+            s.write_all(TOO_MANY).await?;
+            let _ = s.shutdown().await;
             return Ok(());
         }
     }
@@ -325,6 +336,37 @@ fn parse_upgrade(head: &[u8], ws_path: Option<&str>, peer: SocketAddr) -> Option
     Some(Upgrade { ws_key, forwarded_for })
 }
 
+/// Why a request is not an upgrade to `ws_path`, for the log. `None` when
+/// it is not aimed at the upgrade path at all (panel, subscription, other).
+fn upgrade_problem(head: &[u8], ws_path: Option<&str>) -> Option<String> {
+    let Some(ws_path) = ws_path else { return Some("no ws_path is configured (tls.ws_path)".into()) };
+    let mut headers = [httparse::EMPTY_HEADER; 32];
+    let mut req = httparse::Request::new(&mut headers);
+    if !matches!(req.parse(head), Ok(httparse::Status::Complete(_))) {
+        return Some("malformed HTTP request".into());
+    }
+    let path = req.path.unwrap_or("");
+    let header = |name: &str| req.headers.iter().find(|h| h.name.eq_ignore_ascii_case(name)).and_then(|h| std::str::from_utf8(h.value).ok());
+    if path != ws_path {
+        // Anything that looks like an upgrade attempt on another path is a
+        // path mismatch between the web server and OSTP.
+        return header("upgrade").map(|_| format!("upgrade for {path}, but tls.ws_path is a different path"));
+    }
+    if req.method != Some("GET") {
+        return Some(format!("{} instead of GET", req.method.unwrap_or("?")));
+    }
+    if !header("upgrade").is_some_and(|v| v.trim().eq_ignore_ascii_case("websocket")) {
+        return Some("no \"Upgrade: websocket\" header (the web server must pass it: proxy_set_header Upgrade $http_upgrade)".into());
+    }
+    if !header("connection").is_some_and(|v| v.split(',').any(|t| t.trim().eq_ignore_ascii_case("upgrade"))) {
+        return Some("no \"Connection: upgrade\" header (proxy_set_header Connection \"upgrade\")".into());
+    }
+    if header("sec-websocket-key").map_or(true, |k| k.trim().is_empty()) {
+        return Some("no Sec-WebSocket-Key header".into());
+    }
+    None
+}
+
 fn request_path(head: &[u8]) -> Option<String> {
     let mut headers = [httparse::EMPTY_HEADER; 32];
     let mut req = httparse::Request::new(&mut headers);
@@ -344,6 +386,7 @@ async fn read_more<S: AsyncRead + Unpin>(s: &mut S, buf: &mut BytesMut, deadline
     }
 }
 
+const TOO_MANY: &[u8] = b"HTTP/1.1 429 Too Many Requests\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
 const NOT_FOUND: &[u8] = b"HTTP/1.1 404 Not Found\r\nContent-Type: text/html\r\nContent-Length: 48\r\nConnection: close\r\n\r\n<html><body><h1>404 Not Found</h1></body></html>";
 
 async fn decoy<S>(mut s: S, buf: BytesMut, ctx: &SniffCtx) -> Result<()>
@@ -408,6 +451,17 @@ mod tests {
         assert!(parse_upgrade(plain, Some("/s3cr3t"), public()).is_none());
         let post = b"POST /s3cr3t HTTP/1.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: k\r\n\r\n";
         assert!(parse_upgrade(post, Some("/s3cr3t"), public()).is_none());
+    }
+
+    #[test]
+    fn upgrade_problems_are_named_for_the_log() {
+        let ok = build_upgrade_request("/p", "h", "k");
+        assert_eq!(upgrade_problem(&ok, Some("/p")), None);
+        assert!(upgrade_problem(&ok, Some("/q")).unwrap().contains("different path"));
+        assert!(upgrade_problem(b"GET /x HTTP/1.1\r\nHost: h\r\n\r\n", Some("/p")).is_none());
+        let no_conn = b"GET /p HTTP/1.1\r\nUpgrade: websocket\r\nSec-WebSocket-Key: k\r\n\r\n";
+        assert!(upgrade_problem(no_conn, Some("/p")).unwrap().contains("Connection"));
+        assert!(upgrade_problem(&ok, None).unwrap().contains("ws_path"));
     }
 
     #[test]
