@@ -427,12 +427,7 @@ async fn run_server_loop(
             if let Ok(listener) = tokio::net::TcpListener::bind(&addr).await {
                 tracing::info!("TCP (UoT) listener bound to {}", addr);
 
-                // Rate limiter: track connection attempts per IP
-                // Map<IP, (count, window_start)>
-                let rate_map: std::sync::Arc<tokio::sync::Mutex<std::collections::HashMap<std::net::IpAddr, (u32, std::time::Instant)>>> =
-                    std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
-                const RATE_WINDOW_SECS: u64 = 10;
-                const RATE_MAX_CONNS: u32 = 10;
+                let limiter = crate::transport::limiter::ConnLimiter::new();
 
                 loop {
                     if let Ok((stream, peer_addr)) = listener.accept().await {
@@ -445,24 +440,8 @@ async fn run_server_loop(
                         // must match. (Every TCP-tunnel proxy sets TCP_NODELAY.)
                         let _ = stream.set_nodelay(true);
 
-                        // Rate limit check
-                        let peer_ip = peer_addr.ip();
-                        let allowed = {
-                            let mut map = rate_map.lock().await;
-                            let now = std::time::Instant::now();
-                            let entry = map.entry(peer_ip).or_insert((0, now));
-                            if now.duration_since(entry.1).as_secs() >= RATE_WINDOW_SECS {
-                                // Reset window
-                                *entry = (1, now);
-                                true
-                            } else {
-                                entry.0 += 1;
-                                entry.0 <= RATE_MAX_CONNS
-                            }
-                        };
-
-                        if !allowed {
-                            tracing::debug!("UoT rate limit exceeded for {}, dropping connection", peer_ip);
+                        if !limiter.check(peer_addr.ip()) {
+                            tracing::debug!("UoT rate limit exceeded for {}, dropping connection", peer_addr.ip());
                             continue;
                         }
 
