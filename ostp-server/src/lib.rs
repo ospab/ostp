@@ -317,8 +317,20 @@ pub async fn run_server(params: ServerParams) -> Result<()> {
             tcp_listen.push(fb.listen.clone());
         }
     }
-    let acceptor = tls.as_ref().and_then(prepare_tls);
+    let prepared = tls.as_ref().and_then(prepare_tls);
+    let (acceptor, resolver) = match prepared {
+        Some((a, r)) => (Some(a), Some(r)),
+        None => (None, None),
+    };
     let builtin = tls.as_ref().filter(|t| t.frontend == tls::Frontend::Builtin);
+    // ACME challenges: answered on the built-in port 80, or on a local
+    // responder that the web-server frontend proxies /.well-known/ to.
+    let acme = tls.as_ref().filter(|t| t.cert == tls::CertSource::Acme && t.frontend != tls::Frontend::Caddy);
+    let challenges = acme.map(|t| tls::acme::ChallengeStore::new(&tls::acme::state_dir(&t.config_dir)));
+    let responder = match (acme, &challenges) {
+        (Some(t), Some(store)) if t.frontend != tls::Frontend::Builtin => Some((t.acme.responder.clone(), store.clone())),
+        _ => None,
+    };
     let sniff = SniffSettings {
         tcp_listen,
         ws_path: tls.as_ref().map(|t| t.ws_path.clone()),
@@ -335,7 +347,12 @@ pub async fn run_server(params: ServerParams) -> Result<()> {
         http_listen: builtin.map(|t| t.http_listen.clone()).unwrap_or_default(),
         redirect: builtin
             .and_then(|t| t.domain.as_deref().map(|d| tls::http_frontend::RedirectTarget::new(d, t.public_port))),
+        challenges: challenges.clone(),
+        responder,
     };
+    if let (Some(t), Some(store)) = (acme, challenges) {
+        tokio::spawn(tls::acme::renewal_task(t.clone(), store, resolver));
+    }
 
     let (_ui_cmd_tx, ui_cmd_rx) = mpsc::unbounded_channel::<UiCommand>();
     let (ui_event_tx, mut ui_event_rx) = mpsc::unbounded_channel::<UiEvent>();
@@ -421,6 +438,9 @@ struct SniffSettings {
     /// Built-in frontend: plain HTTP, redirected to https.
     http_listen: Vec<String>,
     redirect: Option<tls::http_frontend::RedirectTarget>,
+    challenges: Option<Arc<tls::acme::ChallengeStore>>,
+    /// Local ACME responder for a web-server frontend: (address, store).
+    responder: Option<(String, Arc<tls::acme::ChallengeStore>)>,
 }
 
 /// "0.0.0.0:9090" -> "127.0.0.1:9090", "[::]:9090" -> "[::1]:9090".
@@ -440,7 +460,7 @@ fn loopback_for(bind: &str) -> String {
 
 /// Loads (or, before the first issuance, stands in) the certificate and
 /// starts watching it. None when OSTP terminates no TLS itself.
-fn prepare_tls(t: &tls::TlsSettings) -> Option<tokio_rustls::TlsAcceptor> {
+fn prepare_tls(t: &tls::TlsSettings) -> Option<(tokio_rustls::TlsAcceptor, Arc<tls::HotCertResolver>)> {
     if t.cert == tls::CertSource::None {
         return None;
     }
@@ -471,10 +491,10 @@ fn prepare_tls(t: &tls::TlsSettings) -> Option<tokio_rustls::TlsAcceptor> {
         return None;
     }
     resolver.spawn_watch();
-    match tls::build_acceptor(resolver) {
+    match tls::build_acceptor(resolver.clone()) {
         Ok(a) => {
             tracing::info!("TLS enabled ({} frontend), certificate {}", t.frontend.as_str(), t.cert_path.display());
-            Some(a)
+            Some((a, resolver))
         }
         Err(e) => {
             tracing::error!("TLS disabled: {e:#}");
@@ -572,7 +592,11 @@ async fn run_server_loop(
         }
     }
     if let Some(target) = sniff.redirect {
-        let app = tls::http_frontend::redirect_router(target);
+        let store = sniff
+            .challenges
+            .clone()
+            .unwrap_or_else(|| tls::acme::ChallengeStore::new(std::path::Path::new(".")));
+        let app = tls::acme::challenge_router(store, Some(target));
         for addr in &sniff.http_listen {
             match tokio::net::TcpListener::bind(addr).await {
                 Ok(listener) => {
@@ -583,6 +607,15 @@ async fn run_server_loop(
                     "Failed to bind HTTP on {addr}: {e} (another web server on 80, or not running as root?)"
                 ),
             }
+        }
+    }
+    if let Some((addr, store)) = sniff.responder {
+        match tokio::net::TcpListener::bind(&addr).await {
+            Ok(listener) => {
+                tracing::info!("ACME responder bound to {}", addr);
+                tokio::spawn(tls::http_frontend::serve(listener, tls::acme::challenge_router(store, None)));
+            }
+            Err(e) => tracing::error!("Failed to bind the ACME responder on {addr}: {e}"),
         }
     }
 

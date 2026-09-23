@@ -13,6 +13,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, SystemTime};
 use tokio_rustls::TlsAcceptor;
 
+pub mod acme;
 pub mod http_frontend;
 
 const WATCH_INTERVAL: Duration = Duration::from_secs(60);
@@ -226,7 +227,7 @@ pub fn write_pem_pair(cert_path: &Path, cert_pem: &str, key_path: &Path, key_pem
     write_atomic(cert_path, cert_pem.as_bytes(), false)
 }
 
-fn write_atomic(path: &Path, data: &[u8], private: bool) -> Result<()> {
+pub(crate) fn write_atomic(path: &Path, data: &[u8], private: bool) -> Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).with_context(|| format!("cannot create {}", dir.display()))?;
     }
