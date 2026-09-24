@@ -40,6 +40,10 @@ pub struct SubscriptionService {
 struct Request {
     token: String,
     json: bool,
+    /// A browser (Accept: text/html): a person opened the link, not an app.
+    html: bool,
+    /// Accept-Language prefers Russian.
+    ru: bool,
     head_only: bool,
 }
 
@@ -66,14 +70,19 @@ impl SubscriptionService {
         if token.len() != 32 || !token.bytes().all(|b| b.is_ascii_hexdigit()) {
             return None;
         }
-        let accept_json = req
-            .headers
-            .iter()
-            .find(|h| h.name.eq_ignore_ascii_case("accept"))
-            .and_then(|h| std::str::from_utf8(h.value).ok())
-            .is_some_and(|v| v.contains("application/json"));
-        let json = accept_json || query.split('&').any(|kv| kv == "format=json");
-        Some(Request { token: token.to_ascii_lowercase(), json, head_only })
+        let header = |name: &str| {
+            req.headers
+                .iter()
+                .find(|h| h.name.eq_ignore_ascii_case(name))
+                .and_then(|h| std::str::from_utf8(h.value).ok())
+                .unwrap_or("")
+                .to_ascii_lowercase()
+        };
+        let accept = header("accept");
+        let json = accept.contains("application/json") || query.split('&').any(|kv| kv == "format=json");
+        let html = !json && accept.contains("text/html");
+        let ru = header("accept-language").trim_start().starts_with("ru");
+        Some(Request { token: token.to_ascii_lowercase(), json, html, ru, head_only })
     }
 
     /// The access key a token belongs to. Every key is checked so the time
@@ -142,6 +151,8 @@ impl SubscriptionService {
 
         let (content_type, body) = if req.json {
             ("application/json", serde_json::to_string(&doc).ok()?)
+        } else if req.html {
+            ("text/html; charset=utf-8", self.page(&doc, &req.token, req.ru))
         } else {
             ("text/plain; charset=utf-8", doc.links.join("\n") + "\n")
         };
@@ -152,6 +163,13 @@ impl SubscriptionService {
             doc.update_interval_hours,
             header_text(&doc.name),
         );
+        if req.html {
+            out.push_str(
+                "X-Robots-Tag: noindex, nofollow\r\nReferrer-Policy: no-referrer\r\nX-Content-Type-Options: nosniff\r\n\
+                 X-Frame-Options: DENY\r\nContent-Security-Policy: default-src 'none'; style-src 'unsafe-inline'; \
+                 script-src 'unsafe-inline'; img-src data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'\r\n",
+            );
+        }
         if let Some(u) = &doc.usage {
             out.push_str(&format!(
                 "Subscription-Userinfo: upload=0; download={}; total={}; expire=0\r\n",
@@ -166,6 +184,108 @@ impl SubscriptionService {
         }
         Some(out)
     }
+}
+
+impl SubscriptionService {
+    /// The subscription's own address, as a person would paste it.
+    fn url(&self, token: &str) -> String {
+        match &self.tls {
+            Some(t) => {
+                let port = if t.port == 443 { String::new() } else { format!(":{}", t.port) };
+                format!("https://{}{port}{}/{token}", t.host, self.settings.prefix)
+            }
+            None => format!("{}/{token}", self.settings.prefix),
+        }
+    }
+
+    /// The page a person sees when they open the subscription in a browser:
+    /// what it is, how to connect, the QR code, both languages.
+    fn page(&self, doc: &SubscriptionDoc, token: &str, ru: bool) -> String {
+        let url = self.url(token);
+        let qr = qrcode::QrCode::new(url.as_bytes())
+            .map(|c| {
+                c.render::<qrcode::render::svg::Color>()
+                    .min_dimensions(176, 176)
+                    .dark_color(qrcode::render::svg::Color("#000000"))
+                    .light_color(qrcode::render::svg::Color("#ffffff"))
+                    .build()
+            })
+            .unwrap_or_default();
+        // Drop the XML prolog: the SVG is inlined into HTML.
+        let qr = match qr.find("<svg") {
+            Some(i) => qr[i..].to_string(),
+            None => qr,
+        };
+
+        let usage = match &doc.usage {
+            Some(u) => {
+                let (limit_en, limit_ru, bar) = match u.limit_bytes.filter(|l| *l > 0) {
+                    Some(l) => {
+                        let pct = (u.used_bytes as f64 / l as f64 * 100.0).min(100.0);
+                        (
+                            format!("of {}", fmt_bytes(l)),
+                            format!("из {}", fmt_bytes(l)),
+                            format!("<div class=\"bar\"><div style=\"width:{pct:.1}%\"></div></div>"),
+                        )
+                    }
+                    None => ("no limit".into(), "без лимита".into(), String::new()),
+                };
+                format!(
+                    "<section class=\"card\"><h2><span lang=\"ru\">Трафик</span><span lang=\"en\">Traffic</span></h2>\
+                     <div class=\"usage-row\"><span><span lang=\"ru\">Использовано</span><span lang=\"en\">Used</span>: <b>{used}</b></span>\
+                     <span class=\"muted\"><span lang=\"ru\">{limit_ru}</span><span lang=\"en\">{limit_en}</span></span></div>{bar}</section>",
+                    used = fmt_bytes(u.used_bytes),
+                )
+            }
+            None => String::new(),
+        };
+
+        let links: String = doc
+            .links
+            .iter()
+            .enumerate()
+            .map(|(i, l)| {
+                let kind = match ShareLink::parse(l) {
+                    Ok(s) if s.tls => "TLS",
+                    Ok(s) if s.transport == LinkTransport::Uot => "TCP",
+                    _ => "UDP",
+                };
+                format!(
+                    "<div class=\"link-row\"><div class=\"muted\">{kind}</div><div class=\"copy\">\
+                     <input id=\"link-{i}\" readonly value=\"{v}\" aria-label=\"{kind}\">\
+                     <button class=\"btn\" type=\"button\" data-copy=\"link-{i}\"><span lang=\"ru\">Копировать</span><span lang=\"en\">Copy</span></button></div></div>",
+                    v = html_escape(l)
+                )
+            })
+            .collect();
+
+        let name = if doc.name.is_empty() { "OSTP".to_string() } else { doc.name.clone() };
+        include_str!("subscription_page.html")
+            .replace("{{LANG}}", if ru { "ru" } else { "en" })
+            .replace("{{RU_PRESSED}}", if ru { "true" } else { "false" })
+            .replace("{{EN_PRESSED}}", if ru { "false" } else { "true" })
+            .replace("{{NAME}}", &html_escape(&name))
+            .replace("{{INTERVAL}}", &doc.update_interval_hours.to_string())
+            .replace("{{USAGE}}", &usage)
+            .replace("{{LINKS}}", &links)
+            .replace("{{QR}}", &qr)
+            .replace("{{SUB_URL}}", &html_escape(&url))
+    }
+}
+
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;").replace('\'', "&#39;")
+}
+
+fn fmt_bytes(n: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    let mut v = n as f64;
+    let mut i = 0;
+    while v >= 1024.0 && i < UNITS.len() - 1 {
+        v /= 1024.0;
+        i += 1;
+    }
+    if i == 0 { format!("{n} B") } else { format!("{v:.1} {}", UNITS[i]) }
 }
 
 /// Header-safe title: plain ASCII as is, anything else as `base64:...`,
@@ -257,6 +377,39 @@ mod tests {
         assert_eq!(doc.links.len(), 1);
         assert!(doc.links[0].contains("tls=1"));
         assert_eq!(doc.usage, None);
+    }
+
+    #[tokio::test]
+    async fn a_browser_gets_the_page_and_apps_do_not() {
+        let svc = service();
+        let path = format!("/sub/{}", token_for_key("key-a"));
+        let browser = format!(
+            "GET {path} HTTP/1.1\r\nHost: vpn.example.com\r\nAccept: text/html,application/xhtml+xml,*/*;q=0.8\r\nAccept-Language: ru-RU,ru;q=0.9\r\n\r\n"
+        );
+        let resp = String::from_utf8(svc.respond(browser.as_bytes()).await.unwrap()).unwrap();
+        assert!(resp.contains("Content-Type: text/html"));
+        assert!(resp.contains("Content-Security-Policy: default-src 'none'"));
+        assert!(resp.contains("X-Robots-Tag: noindex"));
+        let body = resp.split("\r\n\r\n").nth(1).unwrap();
+        assert!(body.contains("<html lang=\"ru\">"));
+        assert!(body.contains(&format!("value=\"https://vpn.example.com/sub/{}\"", token_for_key("key-a"))));
+        assert!(body.contains("<svg"));
+        assert!(body.contains("github.com/ospab/ostp"));
+        assert!(body.contains("из 1000 B") || body.contains("из 1000"));
+        assert!(!body.contains("{{"), "every placeholder is filled");
+
+        // Apps and subscription managers keep getting links.
+        let app = format!("GET {path} HTTP/1.1\r\nAccept: */*\r\n\r\n");
+        let resp = String::from_utf8(svc.respond(app.as_bytes()).await.unwrap()).unwrap();
+        assert!(resp.contains("Content-Type: text/plain"));
+        let json = format!("GET {path} HTTP/1.1\r\nAccept: application/json, text/html\r\n\r\n");
+        let resp = String::from_utf8(svc.respond(json.as_bytes()).await.unwrap()).unwrap();
+        assert!(resp.contains("Content-Type: application/json"));
+    }
+
+    #[test]
+    fn page_escapes_the_title() {
+        assert_eq!(html_escape("<b>\"x\"</b>"), "&lt;b&gt;&quot;x&quot;&lt;/b&gt;");
     }
 
     #[test]
