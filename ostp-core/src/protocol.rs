@@ -103,6 +103,10 @@ pub struct ProtocolMachine {
     /// kind allowed to move the session to a new peer address (RFC 9000 §9.3):
     /// a replay, even of a frame still sitting in the reorder buffer, cannot.
     highest_authenticated_recv_nonce: Option<u64>,
+    /// Data datagrams that passed AEAD. Unlike "on_event returned Ok", this
+    /// cannot be advanced by a peer that does not hold the session keys, so it
+    /// is what callers use as proof the path is alive.
+    authenticated_recv_count: u64,
     /// Congestion controller (BBR-inspired adaptive window)
     cc: CongestionController,
         /// Key-derived handshake padding range
@@ -163,6 +167,7 @@ impl ProtocolMachine {
             last_nack_sent: Instant::now() - Duration::from_secs(1),
             last_recv_advance: Instant::now(),
             highest_authenticated_recv_nonce: None,
+            authenticated_recv_count: 0,
             cc: CongestionController::new(config.mtu as u64),
             handshake_pad_min: config.handshake_pad_min.max(8),
             handshake_pad_max: config.handshake_pad_max.max(config.handshake_pad_min + 16),
@@ -173,6 +178,37 @@ impl ProtocolMachine {
     /// Highest data nonce received that passed authentication, if any.
     pub fn highest_authenticated_recv_nonce(&self) -> Option<u64> {
         self.highest_authenticated_recv_nonce
+    }
+
+    /// Number of data datagrams received that passed authentication.
+    pub fn authenticated_recv_count(&self) -> u64 {
+        self.authenticated_recv_count
+    }
+
+    /// The session now runs over a different socket, address or transport.
+    ///
+    /// Keys, nonces, streams and the reorder buffer stay as they are, so the
+    /// peer sees one continuous session. What was learned about the old path
+    /// is dropped, and every unacknowledged frame becomes due on the next
+    /// tick: whatever was in flight on the old path is most likely lost with
+    /// it, and waiting out a backed-off RTO would stall the move.
+    ///
+    /// Frames are marked as retransmitted (`retries >= 1`) so an ACK for them
+    /// never feeds an RTT sample (Karn), and a pending ACK is forced so the
+    /// first packet on the new path carries a fresh nonce, the thing the
+    /// server moves the session's address on.
+    pub fn on_path_change(&mut self) {
+        self.cc.reset_path();
+        let due = Instant::now()
+            .checked_sub(Duration::from_secs(3600))
+            .unwrap_or_else(Instant::now);
+        for frame in self.sent_history.iter_mut().filter(|f| f.is_retransmittable) {
+            frame.last_sent = due;
+            frame.retries = 1;
+        }
+        self.last_nack_sent = due;
+        self.last_ack_sent = due;
+        self.ack_pending = true;
     }
 
     pub fn in_flight_count(&self) -> usize {
@@ -481,6 +517,7 @@ impl ProtocolMachine {
 
         let session_id_bytes = self.session_id.to_be_bytes();
         let plaintext = cipher.decrypt(nonce, ciphertext, &session_id_bytes)?;
+        self.authenticated_recv_count = self.authenticated_recv_count.wrapping_add(1);
         if self.highest_authenticated_recv_nonce < Some(nonce) {
             self.highest_authenticated_recv_nonce = Some(nonce);
         }
@@ -1293,5 +1330,68 @@ mod tests {
         assert_eq!(delivered.len(), 2, "late frame plus the buffered one");
         assert_eq!(delivered[0][0], 1);
         assert_eq!(delivered[1][0], 2);
+    }
+
+    /// Every datagram `action` would put on the wire, in order.
+    fn datagrams_in(action: &ProtocolAction) -> Vec<Bytes> {
+        match action {
+            ProtocolAction::SendDatagram(d) => vec![d.clone()],
+            ProtocolAction::Multiple(list) => list.iter().flat_map(datagrams_in).collect(),
+            _ => vec![],
+        }
+    }
+
+    #[test]
+    fn path_change_makes_unacked_frames_due_at_once() {
+        let (mut client, _server) = do_handshake();
+        let sent = make_data_frames(&mut client, 3);
+        assert_eq!(sent.len(), 3);
+
+        // Nothing is due right after sending.
+        let before = client.on_event(OstpEvent::Tick).unwrap();
+        assert!(datagrams_in(&before).iter().all(|f| !sent.contains(f)));
+
+        client.on_path_change();
+        let after = client.on_event(OstpEvent::Tick).unwrap();
+        let resent = datagrams_in(&after);
+        for frame in &sent {
+            assert!(resent.contains(frame), "unacked frame was not retransmitted on the new path");
+        }
+    }
+
+    #[test]
+    fn path_change_keeps_the_session_working() {
+        let (mut client, mut server) = do_handshake();
+        client.on_path_change();
+        server.on_path_change();
+
+        let action = client.on_event(OstpEvent::Outbound(1, Bytes::from_static(b"after the move"))).unwrap();
+        let datagram = datagrams_in(&action).remove(0);
+        let delivered = delivered_payloads(&server.on_event(OstpEvent::Inbound(datagram)).unwrap());
+        assert_eq!(delivered, vec![Bytes::from_static(b"after the move")]);
+    }
+
+    #[test]
+    fn only_authenticated_datagrams_count_as_received() {
+        let (mut client, mut server) = do_handshake();
+        let frames = make_data_frames(&mut client, 2);
+        assert_eq!(server.authenticated_recv_count(), 0);
+
+        server.on_event(OstpEvent::Inbound(frames[0].clone())).unwrap();
+        assert_eq!(server.authenticated_recv_count(), 1);
+
+        // A duplicate is answered with an ACK but is not decrypted again.
+        server.on_event(OstpEvent::Inbound(frames[0].clone())).unwrap();
+        assert_eq!(server.authenticated_recv_count(), 1);
+
+        // A forged datagram does not count, whatever on_event returns.
+        let mut forged = frames[1].to_vec();
+        let last = forged.len() - 1;
+        forged[last] ^= 0xff;
+        let _ = server.on_event(OstpEvent::Inbound(Bytes::from(forged)));
+        assert_eq!(server.authenticated_recv_count(), 1);
+
+        server.on_event(OstpEvent::Inbound(frames[1].clone())).unwrap();
+        assert_eq!(server.authenticated_recv_count(), 2);
     }
 }

@@ -225,13 +225,22 @@ A simplified BBR-inspired controller (per-session, independent of TCP-level cong
 * **RTT/RTO estimation:** RFC 6298 `SRTT`/`RTTVAR`, clamped `RTO ∈ [50ms, 16s]`. RTT samples are taken only from frames that were never retransmitted (Karn's algorithm), so a retransmit never spuriously drags the estimate down.
 * **Retransmit budget:** each tick may resend up to `max(2, cwnd_packets / 4)` frames, capped at 64, keeping retransmission bandwidth-aware rather than a flat per-tick constant.
 
-### 9.6 IP Roaming
+### 9.6 Roaming and Session Migration
 
-The server treats `session_id`, not the source `IP:port`, as the durable session identity. Any inbound datagram that passes AEAD authentication for a known session updates that session's tracked return address in place, with no handshake restart — enabling sub-second handoffs across Wi-Fi↔cellular transitions. Because roaming from an unfamiliar address is otherwise a cheap way to force the dispatcher to scan for a match, the roaming path is gated behind its own token bucket (50-token burst, refilled at 50 tokens/sec) to bound the CPU cost of address-spoofing probes; already-authenticated traffic from a session's current known address is not subject to this bucket.
+The server treats `session_id`, not the source `IP:port`, as the durable session identity. A session moves to a new address with no new handshake, but only on a datagram that (1) passed AEAD authentication and (2) carries a nonce higher than any the session has accepted — the same rule as QUIC (RFC 9000 §9.3). A captured datagram replayed from another address, including a frame still waiting in the reorder buffer, is processed but does not move the session, and replies go to its current address. Looking a session up for an unfamiliar address is gated behind its own token bucket (50-token burst, refilled at 50 tokens/sec); traffic from a session's current address is not subject to it.
+
+For UoT the address is that of the TCP connection, so a new TCP connection is a new address just like a new UDP port.
+
+The client moves the session to a new connection of the same transport:
+
+1. **When:** on a network change (`NetworkChanged`), after 10s without an authenticated datagram from the server, when every UoT TCP connection was closed or reset, and after resume from sleep.
+2. **How:** it opens a new connection over the same transport, swaps the socket under the session and resets the path estimates (RTT, congestion window); keys, nonces, streams and the reorder buffer stay. Every unacknowledged frame is retransmitted at once. A packet with a fresh nonce (`Ping`) goes first so the server moves the session's address.
+3. **Confirmation:** the move succeeds when an authenticated datagram arrives over the new path within `max(4s, 4×RTT)`. Otherwise the client logs that the server did not answer and does not try another move for 30s.
+4. **No automation beyond that:** the transport never changes on its own, and a failed move starts neither a reconnect nor a new handshake. The transport is the user's choice. The server deliberately stays silent to packets of an unknown session (an explicit "unknown session" answer would let any scanner confirm it is talking to an OSTP server), so "session expired" and "transport blocked" look the same to the client.
 
 ### 9.7 Session Keepalive and Recovery
 
-* **Client-side:** `Ping`/`Pong` `RelayMessage`s (§8) are exchanged every `keepalive_interval_sec` (default 5s) for RTT measurement. After 25s of received-datagram silence the client begins a background reconnect attempt while continuing to use the existing session; after 180s of total silence it treats the session as permanently lost and stops the tunnel — unless the kill switch is enabled, in which case it retries indefinitely rather than falling open.
+* **Client-side:** `Ping`/`Pong` `RelayMessage`s (§8) are exchanged every `keepalive_interval_sec` (default 5s) for RTT measurement. Only a datagram that passed AEAD counts as a sign of life: a duplicate or garbage with a plausible header does not reset the silence timer. After 10s of silence the client moves the session to a new path (§9.6); after 25s it begins a background reconnect attempt; after 180s of total silence it treats the session as permanently lost and stops the tunnel — unless the kill switch is enabled, in which case it retries indefinitely rather than falling open.
 * **Server-side:** sessions with no valid inbound datagram for 600 seconds are evicted from the dispatcher's session table.
 
 ---

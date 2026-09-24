@@ -21,5 +21,5 @@ on what. Keep it short and current.
 
 | Session / branch | Area (files) | What | Status |
 |---|---|---|---|
-| `claude/ostp-cert-validation-gr1dis` | `ostp-server/src/dispatcher.rs` (session lookup / roaming block in `on_datagram`), `ostp-core/src/protocol.rs` (inbound nonce tracking) | Roaming only on authenticated, fresh packets | done, waiting for merge |
-| `claude/ostp-cert-validation-gr1dis` | `ostp-client/src/bridge.rs` (reconnect / `reset_proxy_streams` paths) | Next: keep the session across socket and transport changes | planned |
+| `claude/ostp-cert-validation-gr1dis` | `ostp-server/src/dispatcher.rs` (roaming block in `on_datagram`), `ostp-core/src/protocol.rs` (inbound nonce tracking, `on_path_change`), `ostp-core/src/congestion.rs` (`reset_path`) | Roaming only on authenticated, fresh packets | done, waiting for merge |
+| `claude/ostp-cert-validation-gr1dis` | `ostp-client/src/bridge.rs` (reconnect paths, session move, carrier choice), `ostp/tests/roaming.rs` | Seamless session move to a new socket of the same transport (no automatic transport switch or reconnect) | done, waiting for merge |

@@ -30,6 +30,26 @@ const UOT_CONNECT_TIMEOUT: Duration = Duration::from_secs(4);
 /// with no working internet at all after waking.
 const RESUME_RECONNECT_GIVE_UP: Duration = Duration::from_secs(45);
 
+/// Silence after which the session is moved to a fresh socket. Pings go out on
+/// every keepalive tick and a healthy path answers within one RTT, so two
+/// ticks of silence already mean the path is gone or blocked. Moving the
+/// session costs no handshake and keeps every stream, so it is tried long
+/// before the 25s full reconnect.
+const STALL_MIGRATE_AFTER: Duration = Duration::from_secs(10);
+
+/// How long a moved session gets to show a sign of life on its new path.
+const MIGRATION_TIMEOUT_MIN: Duration = Duration::from_secs(4);
+
+/// After a move got no answer, no further move is tried for this long: the
+/// server most likely no longer knows the session.
+const MIGRATION_BACKOFF: Duration = Duration::from_secs(30);
+
+/// A session move in progress: sockets are already swapped, the move counts
+/// as done once an authenticated datagram arrives after `started`.
+struct PathMigration {
+    started: Instant,
+}
+
 static SOCKET_PROTECTOR: std::sync::OnceLock<Box<dyn Fn(i32) -> bool + Send + Sync>> = std::sync::OnceLock::new();
 
 pub fn set_socket_protector<F>(f: F)
@@ -55,6 +75,18 @@ pub struct BridgeMetrics {
 
 async fn send_datagram(socket: &crate::transport::Transport, frame: &Bytes, _webrtc_masquerade: bool) -> std::io::Result<usize> {
     socket.send(frame).await
+}
+
+fn collect_datagrams(action: ProtocolAction, out: &mut Vec<Bytes>) {
+    match action {
+        ProtocolAction::SendDatagram(frame) => out.push(frame),
+        ProtocolAction::Multiple(list) => {
+            for item in list {
+                collect_datagrams(item, out);
+            }
+        }
+        _ => {}
+    }
 }
 
 struct SessionState {
@@ -217,6 +249,8 @@ pub struct Bridge {
     /// advance across suspend on Windows, so it cannot measure anything that
     /// begins at wake.
     forced_reconnect_started: Option<SystemTime>,
+    migration: Option<PathMigration>,
+    migration_failed_at: Option<Instant>,
 }
 
 impl Bridge {
@@ -265,6 +299,8 @@ impl Bridge {
             forced_reconnect_pending: false,
             last_forced_reconnect_try: Instant::now(),
             forced_reconnect_started: None,
+            migration: None,
+            migration_failed_at: None,
         })
     }
 
@@ -338,14 +374,15 @@ impl Bridge {
                     // Suspend/resume detection: the wall clock jumps forward on
                     // wake even when the monotonic timer clock does not, so a
                     // large gap here means the machine slept / the app was frozen.
-                    // The session is almost certainly dead (the server evicts
-                    // idle sessions after 10 min), so force one clean reconnect
-                    // rather than waiting on stale-session heuristics.
+                    // The sockets are likely stale, so restore the session now
+                    // rather than waiting on stall heuristics: a move to a fresh
+                    // socket first, and a full reconnect if the server has
+                    // evicted the session meanwhile (it does after 10 min idle).
                     let wall_gap = last_wall_check.elapsed().unwrap_or_default();
                     last_wall_check = SystemTime::now();
                     if self.running && wall_gap > Duration::from_secs(15) {
                         let _ = tx.send(UiEvent::Log(format!(
-                            "Resumed after ~{}s suspend — forcing clean reconnect", wall_gap.as_secs()
+                            "Resumed after ~{}s suspend — restoring the connection", wall_gap.as_secs()
                         ))).await;
                         self.forced_reconnect_pending = true;
                         self.forced_reconnect_started = Some(SystemTime::now());
@@ -407,6 +444,9 @@ impl Bridge {
                         }
                     }
                     if self.running {
+                        self.check_migration(&tx).await;
+                    }
+                    if self.running {
                         self.emit_metrics(&tx).await;
                     }
                 }
@@ -462,6 +502,7 @@ impl Bridge {
                 if let Some(sessions) = sessions_opt.as_mut() {
                     if session_index < sessions.len() {
                         let session = &mut sessions[session_index];
+                        let authenticated_before = session.machine.authenticated_recv_count();
                         let initial_action = match session.machine.on_event(OstpEvent::Inbound(inbound)) {
                             Ok(a) => a,
                             Err(e) => {
@@ -485,7 +526,16 @@ impl Bridge {
                         // `is_healthy` (see emit_metrics) lie in the UI, and handed
                         // any off-path sender a trivial way to pin a client in a
                         // dead session indefinitely.
-                        self.last_valid_recv = Instant::now();
+                        //
+                        // "Authenticated" means the datagram was actually
+                        // decrypted: on_event also returns Ok for a duplicate
+                        // or for a datagram whose (unauthenticated) nonce is
+                        // far outside the window, neither of which proves the
+                        // server is there. This is also what confirms a
+                        // session move (check_migration).
+                        if session.machine.authenticated_recv_count() != authenticated_before {
+                            self.last_valid_recv = Instant::now();
+                        }
 
                         let mut actions_queue = std::collections::VecDeque::new();
                         actions_queue.push_back(initial_action);
@@ -544,6 +594,17 @@ impl Bridge {
                 }
             }
             None => {
+                // Every receiver ended: with UoT that means the TCP connections
+                // were closed or reset (a DPI reset included). Move the session
+                // to a new connection instead of tearing the tunnel down.
+                // A move already in progress settles on its own timer.
+                *udp_rx_opt = None;
+                if self.running
+                    && (self.migration.is_some()
+                        || self.try_migrate("Connection to the server closed", sessions_opt, udp_rx_opt, tx).await)
+                {
+                    return;
+                }
                 let _ = tx.send(UiEvent::Log("UDP channel closed, resetting connection".to_string())).await;
                 self.running = false;
                 crate::sysproxy::disable_system_proxy();
@@ -677,6 +738,18 @@ impl Bridge {
                     }
                 }
 
+                // Move the session to a socket on the new network first: no
+                // handshake, and the apps keep their connections. A move that
+                // is already in progress was opened on the old network, so it
+                // is replaced. If no connection can be opened at all, fall
+                // back to the full reconnect below.
+                if self.running {
+                    self.migration = None;
+                    if self.try_migrate("Network changed", sessions_opt, udp_rx_opt, tx).await {
+                        return true;
+                    }
+                }
+
                 if self.running {
                     let _ = tx.send(UiEvent::Log("Network changed — starting immediate reconnect".to_string())).await;
                     self.metrics.connection_state.store(1, Ordering::Relaxed);
@@ -776,7 +849,22 @@ impl Bridge {
         proxy_tx: &mpsc::UnboundedSender<(u16, ProxyToClientMsg)>,
         proxy_rx: &mut mpsc::Receiver<ProxyEvent>,
     ) {
-        if force || self.last_valid_recv.elapsed().as_secs() > 25 {
+        let silence = self.last_valid_recv.elapsed();
+        // A move in progress is settled by check_migration; starting another
+        // one or a full reconnect on top of it would throw away its sockets.
+        let recovering = self.migration.is_some();
+        // On a stall, move the session to a new socket of the same transport:
+        // no handshake, no dropped streams. The full reconnect below keeps its
+        // own, older trigger; a move neither replaces nor hastens it.
+        let moved = !recovering
+            && (force || silence > STALL_MIGRATE_AFTER)
+            && self.try_migrate(
+                &format!("No answer from the server for {}s", silence.as_secs()),
+                sessions_opt,
+                udp_rx_opt,
+                tx,
+            ).await;
+        if !recovering && !moved && (force || silence.as_secs() > 25) {
             let elapsed = self.last_valid_recv.elapsed().as_secs();
             // On a forced (post-resume) reconnect the monotonic clock may not
             // have advanced, so `elapsed` can be small — never treat a forced
@@ -1339,6 +1427,156 @@ impl Bridge {
         Err(last_err)
     }
 
+    /// Opens a connection to the server over the configured transport,
+    /// trying the resolved addresses IPv4-first and NAT64 once, as the
+    /// handshake path does.
+    async fn connect_server(&self, tx: &mpsc::Sender<UiEvent>) -> Result<crate::transport::Transport> {
+        let mut addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host(&self.server_addr)
+            .await
+            .with_context(|| format!("failed to resolve server address {}", self.server_addr))?
+            .collect();
+        addrs.sort_by_key(|addr| addr.is_ipv6());
+
+        let mut last_err = anyhow::anyhow!("no IP addresses resolved for {}", self.server_addr);
+        let mut nat64_attempted = false;
+        for addr in addrs {
+            match self.try_connect_transport(addr.ip(), addr.port(), tx).await {
+                Ok(sock) => return Ok(sock),
+                Err(e) => last_err = anyhow::anyhow!("{addr}: {e}"),
+            }
+            if let (std::net::IpAddr::V4(ipv4), false) = (addr.ip(), nat64_attempted) {
+                nat64_attempted = true;
+                let nat64 = std::net::IpAddr::V6(synthesize_nat64(ipv4).await);
+                match self.try_connect_transport(nat64, addr.port(), tx).await {
+                    Ok(sock) => return Ok(sock),
+                    Err(e) => last_err = anyhow::anyhow!("{last_err}; NAT64: {e}"),
+                }
+            }
+        }
+        Err(last_err)
+    }
+
+    /// Moves every live session onto a fresh connection of the configured
+    /// transport, with no new handshake: keys, nonces and streams stay, so the
+    /// apps behind the tunnel keep their connections. The server moves the
+    /// session to the new address on the first authenticated packet with a
+    /// fresh nonce.
+    ///
+    /// Only the sockets are swapped here; `check_migration` later reports
+    /// whether the server answered on the new path. The transport is never
+    /// changed and no reconnect is started from here: that stays the user's
+    /// choice.
+    async fn start_migration(
+        &mut self,
+        sessions_opt: &mut Option<Vec<SessionState>>,
+        udp_rx_opt: &mut Option<mpsc::Receiver<(usize, Bytes)>>,
+        tx: &mpsc::Sender<UiEvent>,
+    ) -> Result<()> {
+        let count = match sessions_opt.as_ref() {
+            Some(sessions) if !sessions.is_empty() => sessions.len(),
+            _ => anyhow::bail!("no session to move"),
+        };
+        if sessions_opt.as_ref().is_some_and(|s| s.iter().any(|ses| ses.machine.state() != ostp_core::OstpState::Established)) {
+            anyhow::bail!("a session is not established");
+        }
+
+        // Connect everything before touching the sessions, so a failure leaves
+        // them as they were.
+        let mut sockets = Vec::with_capacity(count);
+        for _ in 0..count {
+            sockets.push(self.connect_server(tx).await?);
+        }
+
+        let (udp_tx, udp_rx) = mpsc::channel(1024);
+        let sessions = sessions_opt.as_mut().expect("checked above");
+        for (index, (session, socket)) in sessions.iter_mut().zip(sockets).enumerate() {
+            session.rx_task.abort();
+            session.rx_task = spawn_session_receiver(socket.clone(), index, udp_tx.clone());
+            session.socket = socket;
+            session.machine.on_path_change();
+
+            // A fresh nonce first: retransmits carry old nonces, and the server
+            // only moves the session on a packet newer than any it has seen.
+            let ts = SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
+            let ping = Bytes::from(RelayMessage::Ping(ts).encode());
+            let mut frames = Vec::new();
+            if let Ok(action) = session.machine.on_event(OstpEvent::Outbound(0, ping)) {
+                collect_datagrams(action, &mut frames);
+            }
+            if let Ok(action) = session.machine.on_event(OstpEvent::Tick) {
+                collect_datagrams(action, &mut frames);
+            }
+            for frame in frames {
+                if send_datagram(&session.socket, &frame, false).await.is_ok() {
+                    self.metrics.bytes_sent.fetch_add(frame.len() as u64, Ordering::Relaxed);
+                }
+            }
+        }
+        *udp_rx_opt = Some(udp_rx);
+
+        self.migration = Some(PathMigration { started: Instant::now() });
+        self.metrics.connection_state.store(1, Ordering::Relaxed);
+        tx.send(UiEvent::Log(
+            "Moving the session to a new connection (no reconnect, streams kept)...".to_string(),
+        )).await.ok();
+        Ok(())
+    }
+
+    /// Starts a move unless a recent one already went unanswered. Returns
+    /// whether a move was started.
+    async fn try_migrate(
+        &mut self,
+        reason: &str,
+        sessions_opt: &mut Option<Vec<SessionState>>,
+        udp_rx_opt: &mut Option<mpsc::Receiver<(usize, Bytes)>>,
+        tx: &mpsc::Sender<UiEvent>,
+    ) -> bool {
+        if self.migration_failed_at.is_some_and(|t| t.elapsed() < MIGRATION_BACKOFF) {
+            return false;
+        }
+        tx.send(UiEvent::Log(format!("{reason}: moving the session to a new path"))).await.ok();
+        match self.start_migration(sessions_opt, udp_rx_opt, tx).await {
+            Ok(()) => true,
+            Err(e) => {
+                tx.send(UiEvent::Log(format!("Could not move the session: {e}"))).await.ok();
+                false
+            }
+        }
+    }
+
+    /// Settles a move in progress: done once the server answered on the new
+    /// path, reported as failed after the timeout. A failed move does not start
+    /// anything else.
+    async fn check_migration(&mut self, tx: &mpsc::Sender<UiEvent>) {
+        let Some(started) = self.migration.as_ref().map(|m| m.started) else { return };
+
+        if self.last_valid_recv >= started {
+            self.migration = None;
+            self.migration_failed_at = None;
+            self.metrics.connection_state.store(2, Ordering::Relaxed);
+            tx.send(UiEvent::Log(format!(
+                "Session moved to the new path in {} ms, no connection was dropped",
+                started.elapsed().as_millis()
+            ))).await.ok();
+            return;
+        }
+
+        let deadline = MIGRATION_TIMEOUT_MIN.max(Duration::from_millis((self.last_rtt_ms * 4.0) as u64));
+        if started.elapsed() < deadline {
+            return;
+        }
+        self.migration = None;
+        self.migration_failed_at = Some(Instant::now());
+        // The server stays silent to unknown sessions on purpose: an explicit
+        // "unknown session" answer would let any scanner confirm it is talking
+        // to an OSTP server. So "expired" and "blocked" look the same here.
+        tx.send(UiEvent::Log(format!(
+            "The server did not answer on the new path within {} s (session expired, or this \
+             transport is blocked on this network)",
+            deadline.as_secs()
+        ))).await.ok();
+    }
+
     fn apply_runtime_config(&mut self, cfg: &ClientConfig) {
         self.server_addr = cfg.ostp.server_addr.clone();
         self.local_bind_addr = cfg.ostp.local_bind_addr.clone();
@@ -1367,6 +1605,7 @@ impl Bridge {
         self.mtu = cfg.ostp.mtu;
         self.keepalive_interval_sec = cfg.ostp.keepalive_interval_sec;
         self.kill_switch = cfg.kill_switch;
+        self.migration = None;
     }
 
     async fn try_connect_transport(

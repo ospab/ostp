@@ -75,10 +75,13 @@ A BBR-inspired controller (`ostp-core::congestion`) tracks `cwnd`/RTT per sessio
 
 ## Dynamic Roaming
 
-Session mappings are bound to the cryptographic `session_id`, not the network address. When a client switches networks (e.g., LTE to Wi-Fi):
-1. Subsequent datagrams arrive from the new IP:port, still carrying the established `session_id`.
-2. The server's AEAD authentication succeeds, the dispatcher looks up the session by ID, and atomically updates its tracked return address — gated behind a 50-token bucket (refilled at 50/sec) so an address-spoofing flood can't force unbounded rebinding work.
-3. The client's proxied TCP/UDP flows stay alive, uninterrupted.
+Session mappings are bound to the cryptographic `session_id`, not the network address. When a client switches networks (e.g., LTE to Wi-Fi) or the current path stops answering:
+1. The client opens a new connection over the same transport and moves the same session onto it, with no new handshake.
+2. The server accepts the datagram from the new address, checks AEAD, and switches the session's return address only if the packet's nonce is newer than any it has accepted. A replayed old packet does not move it.
+3. The client's proxied TCP/UDP flows stay alive; unacknowledged data is retransmitted over the new path.
+4. If the server does not answer (session expired or transport blocked), the client says so in the log and does nothing more on its own: the transport is the user's choice.
+
+Details in the [specification, §9.6](specification.md). Looking a session up for an unfamiliar address is gated behind a token bucket (50-token burst, refilled at 50/sec) so an address-spoofing flood can't force unbounded work.
 
 ---
 

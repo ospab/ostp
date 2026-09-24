@@ -41,7 +41,9 @@ pub enum BridgeCommand {
     NextProfile,
     ReloadConfig,
     /// Triggered by Android NetworkCallback when the active network changes (WiFi→LTE, etc.).
-    /// Causes an immediate background reconnect without waiting for stall detection.
+    /// Moves the session to a socket on the new network at once (no handshake,
+    /// streams kept), without waiting for stall detection. Only if no new
+    /// connection can be opened at all does it run the older full reconnect.
     NetworkChanged,
     Shutdown,
 }

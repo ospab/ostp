@@ -135,6 +135,20 @@ impl CongestionController {
         }
     }
 
+    /// Forget what was learned about the network path, keeping only the
+    /// accounting of bytes still in flight. After the session moves to another
+    /// socket, address or transport, the old RTT and window describe a path
+    /// that no longer carries it: a window grown on Wi-Fi would flood a fresh
+    /// cellular path, and an RTO inflated while the old path was dying would
+    /// hold back the first retransmits on the new one.
+    pub fn reset_path(&mut self) {
+        let bytes_in_flight = self.bytes_in_flight;
+        let total_acked = self.total_acked;
+        *self = Self::new(self.mtu);
+        self.bytes_in_flight = bytes_in_flight;
+        self.total_acked = total_acked;
+    }
+
     /// Bytes of pacing allowance available right now, without consuming any.
     ///
     /// Read-only so the send path can use it as an admission check before it
