@@ -673,6 +673,22 @@ async fn fetch_subscription(url: String) -> Result<serde_json::Value, String> {
     .await
 }
 
+/// The release this build was cut from, e.g. "v0.4.6-beta.2".
+#[tauri::command]
+fn app_build_tag() -> String {
+    ostp_client::updates::build_tag()
+}
+
+/// Newer stable and beta releases on GitHub, if any.
+#[tauri::command]
+async fn check_updates() -> Result<serde_json::Value, String> {
+    off_thread(|| async {
+        let r = ostp_client::updates::check().await.map_err(|e| format!("{e:#}"))?;
+        serde_json::to_value(r).map_err(|e| e.to_string())
+    })
+    .await
+}
+
 #[derive(serde::Deserialize)]
 struct ProberRequest {
     server: String,
@@ -1387,7 +1403,7 @@ pub fn run() {
             }
             _ => {}
         })
-        .invoke_handler(tauri::generate_handler![start_tunnel, stop_tunnel, reload_tunnel, get_tunnel_status, get_metrics, get_config, save_config, get_wintun_install_path, set_autostart, get_autostart, list_running_processes, generate_qr, fetch_subscription, run_prober_matrix, run_prober_ttl, run_dpi_battery])
+        .invoke_handler(tauri::generate_handler![start_tunnel, stop_tunnel, reload_tunnel, get_tunnel_status, get_metrics, get_config, save_config, get_wintun_install_path, set_autostart, get_autostart, list_running_processes, generate_qr, fetch_subscription, run_prober_matrix, run_prober_ttl, run_dpi_battery, app_build_tag, check_updates])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

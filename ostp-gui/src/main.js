@@ -1053,6 +1053,49 @@ async function runDpi() {
   }
 }
 
+// ── UPDATES ───────────────────────────────────────────────────────────
+// Checked once when the app opens (not when the window is shown again from
+// the tray), and on demand. Stable and beta releases; a beta comes with a
+// warning. "Skip this version" silences that one tag.
+const SKIP_UPDATE_KEY = 'ostp_skip_update_tag';
+let pendingUpdate = null;
+
+function openUrl(url) {
+  const opener = window.__TAURI__?.opener || window.__TAURI__?.shell;
+  if (opener?.openUrl) opener.openUrl(url);
+  else if (opener?.open) opener.open(url);
+  else window.open(url, '_blank');
+}
+
+async function checkUpdates({ manual }) {
+  const btn = $('btn-check-updates');
+  if (manual) { btn.disabled = true; btn.textContent = 'Checking…'; }
+  try {
+    const r = await invoke('check_updates');
+    if (!r) throw new Error('update checks need the desktop app');
+    // Offer the beta only when it is newer than the newest stable.
+    const offer = r.beta || r.stable;
+    let skipped = null;
+    try { skipped = localStorage.getItem(SKIP_UPDATE_KEY); } catch {}
+    if (!offer) {
+      if (manual) showToast(`You have the latest version (${r.current})`, 'ok');
+      return;
+    }
+    if (!manual && skipped === offer.tag) return;
+    pendingUpdate = offer;
+    const isBeta = offer.channel === 'beta';
+    $('update-title').textContent = isBeta ? 'Beta version available' : 'Update available';
+    $('update-text').textContent = `${offer.tag} is out. You have ${r.current}.` +
+      (isBeta && r.stable ? ` The newest stable release is ${r.stable.tag}.` : '');
+    $('update-warning').classList.toggle('hidden', !isBeta);
+    $('update-modal').classList.remove('hidden');
+  } catch (e) {
+    if (manual) showToast('Update check failed: ' + (e?.message || e), 'error');
+  } finally {
+    if (manual) { btn.disabled = false; btn.textContent = 'Check for updates'; }
+  }
+}
+
 // ── CLIENT SETTINGS ───────────────────────────────────────────────────
 function loadSettingsIntoForm() {
   const s = loadClientSettings();
@@ -1071,6 +1114,7 @@ function loadSettingsIntoForm() {
   inDebug.checked       = !!s.debug;
   inShowRtt.checked     = s.showRtt !== false;
   inShowSpeed.checked   = s.showSpeed !== false;
+  $('in-update-check').checked = s.updateCheck !== false;
   inJunkEnabled.checked = !!s.junkEnabled;
   inJunkPcMin.value     = s.junkPcMin || 2;
   inJunkPcMax.value     = s.junkPcMax || 5;
@@ -1107,6 +1151,7 @@ function collectAndSaveSettings() {
     debug:        inDebug.checked,
     showRtt:      inShowRtt.checked,
     showSpeed:    inShowSpeed.checked,
+    updateCheck:  $('in-update-check').checked,
     junkEnabled:  inJunkEnabled.checked,
     junkPcMin:    parseInt(inJunkPcMin.value) || 2,
     junkPcMax:    parseInt(inJunkPcMax.value) || 5,
@@ -1245,12 +1290,11 @@ window.addEventListener('DOMContentLoaded', async () => {
   // GUI version shown at the bottom of Settings
   const appVersionEl = $('app-version');
   if (appVersionEl) {
-    const setV = v => { appVersionEl.textContent = 'OSTP GUI v' + v; };
-    if (window.__TAURI__?.app?.getVersion) {
-      window.__TAURI__.app.getVersion().then(setV).catch(() => setV('0.4.1'));
-    } else {
-      setV('0.4.1');
-    }
+    const setV = v => { appVersionEl.textContent = 'OSTP GUI ' + v; };
+    invoke('app_build_tag').then(tag => {
+      if (tag) setV(tag);
+      else if (window.__TAURI__?.app?.getVersion) window.__TAURI__.app.getVersion().then(v => setV('v' + v)).catch(() => {});
+    }).catch(() => {});
   }
 
   // Add-profile button → dropdown
@@ -1322,6 +1366,19 @@ window.addEventListener('DOMContentLoaded', async () => {
   });
   shareModal.addEventListener('click', e => { if (e.target === shareModal) shareModal.classList.add('hidden'); });
 
+  // Updates: once per app start, and the manual button.
+  $('btn-check-updates').addEventListener('click', () => checkUpdates({ manual: true }));
+  $('btn-update-later').addEventListener('click', () => $('update-modal').classList.add('hidden'));
+  $('btn-update-skip').addEventListener('click', () => {
+    try { if (pendingUpdate) localStorage.setItem(SKIP_UPDATE_KEY, pendingUpdate.tag); } catch {}
+    $('update-modal').classList.add('hidden');
+  });
+  $('btn-update-download').addEventListener('click', () => {
+    if (pendingUpdate) openUrl(pendingUpdate.url);
+    $('update-modal').classList.add('hidden');
+  });
+  if (loadClientSettings().updateCheck !== false) setTimeout(() => checkUpdates({ manual: false }), 1500);
+
   // Wintun modal
   btnWintunCancel.addEventListener('click', () => wintunModal.classList.add('hidden'));
   if (btnWintunOpen && window.__TAURI__) {
@@ -1335,7 +1392,7 @@ window.addEventListener('DOMContentLoaded', async () => {
   wintunModal.addEventListener('click', e => { if (e.target === wintunModal) wintunModal.classList.add('hidden'); });
 
   // Client settings — wire all inputs
-  [inTun, inKillSwitch, inMux, inAutoconnect, inLaunchStartup, inDebug, inShowRtt, inShowSpeed, inJunkEnabled, inTcpFrag, inTtlDesync]
+  [inTun, inKillSwitch, inMux, inAutoconnect, inLaunchStartup, inDebug, inShowRtt, inShowSpeed, inJunkEnabled, inTcpFrag, inTtlDesync, $('in-update-check')]
     .filter(Boolean)
     .forEach(el => el.addEventListener('change', collectAndSaveSettings));
   [inMuxSessions, inMtu, inDns, inSocks, inExDomains, inExIps, inExProcs, inJunkPcMin, inJunkPcMax, inJunkPsMin, inJunkPsMax, inFragChunk, inFragSleep]
@@ -1394,6 +1451,7 @@ window.addEventListener('DOMContentLoaded', async () => {
             !wintunModal.classList.contains('hidden') ||
             !junkModal.classList.contains('hidden') ||
             !fragModal.classList.contains('hidden') ||
+            !$('update-modal').classList.contains('hidden') ||
             !addMenu.classList.contains('hidden')) {
           return;
         }

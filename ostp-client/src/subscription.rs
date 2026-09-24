@@ -58,7 +58,7 @@ fn parse_url(url: &str) -> Result<Url> {
 /// Downloads and parses a subscription.
 pub async fn fetch(url: &str) -> Result<SubscriptionDoc> {
     let u = parse_url(url)?;
-    let body = tokio::time::timeout(TIMEOUT, get(&u))
+    let body = tokio::time::timeout(TIMEOUT, get(&u, "application/json"))
         .await
         .map_err(|_| anyhow!("{} did not answer within {}s", u.host, TIMEOUT.as_secs()))??;
     let text = String::from_utf8(body).map_err(|_| anyhow!("the subscription is not text"))?;
@@ -69,7 +69,20 @@ pub async fn fetch(url: &str) -> Result<SubscriptionDoc> {
     Ok(doc)
 }
 
-async fn get(u: &Url) -> Result<Vec<u8>> {
+/// GET over verified TLS; returns the status code and the body.
+pub(crate) async fn https_get(url: &str, accept: &str) -> Result<(u16, Vec<u8>)> {
+    let u = parse_url(url)?;
+    let raw = tokio::time::timeout(TIMEOUT, get_raw(&u, accept))
+        .await
+        .map_err(|_| anyhow!("{} did not answer within {}s", u.host, TIMEOUT.as_secs()))??;
+    split_response(&raw)
+}
+
+async fn get(u: &Url, accept: &str) -> Result<Vec<u8>> {
+    parse_response(&get_raw(u, accept).await?)
+}
+
+async fn get_raw(u: &Url, accept: &str) -> Result<Vec<u8>> {
     let tcp = tokio::net::TcpStream::connect((u.host.as_str(), u.port))
         .await
         .with_context(|| format!("cannot connect to {}:{}", u.host, u.port))?;
@@ -80,7 +93,7 @@ async fn get(u: &Url) -> Result<Vec<u8>> {
     let host_header = if u.host.contains(':') { format!("[{}]", u.host) } else { u.host.clone() };
     let host_header = if u.port == 443 { host_header } else { format!("{host_header}:{}", u.port) };
     let req = format!(
-        "GET {} HTTP/1.1\r\nHost: {host_header}\r\nAccept: application/json\r\nUser-Agent: ostp/{}\r\nConnection: close\r\n\r\n",
+        "GET {} HTTP/1.1\r\nHost: {host_header}\r\nAccept: {accept}\r\nUser-Agent: ostp/{}\r\nConnection: close\r\n\r\n",
         u.target,
         env!("CARGO_PKG_VERSION")
     );
@@ -99,10 +112,40 @@ async fn get(u: &Url) -> Result<Vec<u8>> {
         };
         raw.extend_from_slice(&chunk[..n]);
         if raw.len() > MAX_BODY + 16 * 1024 {
-            bail!("the subscription is larger than {} KiB", MAX_BODY / 1024);
+            bail!("the answer is larger than {} KiB", MAX_BODY / 1024);
         }
     }
-    parse_response(&raw)
+    Ok(raw)
+}
+
+/// Status code and body (de-chunked, cut to Content-Length).
+fn split_response(raw: &[u8]) -> Result<(u16, Vec<u8>)> {
+    let mut headers = [httparse::EMPTY_HEADER; 64];
+    let mut resp = httparse::Response::new(&mut headers);
+    let head_len = match resp.parse(raw) {
+        Ok(httparse::Status::Complete(n)) => n,
+        Ok(httparse::Status::Partial) => bail!("the server closed the connection before answering"),
+        Err(e) => bail!("not an HTTP response: {e}"),
+    };
+    let code = resp.code.unwrap_or(0);
+    let header = |name: &str| {
+        resp.headers
+            .iter()
+            .find(|h| h.name.eq_ignore_ascii_case(name))
+            .and_then(|h| std::str::from_utf8(h.value).ok())
+            .map(str::trim)
+    };
+    let body = &raw[head_len..];
+    let body = if header("transfer-encoding").is_some_and(|v| v.to_ascii_lowercase().contains("chunked")) {
+        dechunk(body)?
+    } else {
+        match header("content-length").and_then(|v| v.parse::<usize>().ok()) {
+            Some(n) if n <= body.len() => body[..n].to_vec(),
+            Some(_) => bail!("the download was cut short"),
+            None => body.to_vec(),
+        }
+    };
+    Ok((code, body))
 }
 
 fn parse_response(raw: &[u8]) -> Result<Vec<u8>> {

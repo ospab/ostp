@@ -19,5 +19,7 @@ allow = [
   "fetch_subscription",
   "run_prober_matrix",
   "run_prober_ttl",
-  "run_dpi_battery"
+  "run_dpi_battery",
+  "app_build_tag",
+  "check_updates"
 ]

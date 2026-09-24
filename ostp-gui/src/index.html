@@ -283,6 +283,17 @@
 
           <div class="toggle-row" style="border-top:none;">
             <div class="toggle-text">
+              <span class="toggle-name">Check for updates</span>
+              <span class="toggle-hint">When the app opens: stable and beta releases</span>
+            </div>
+            <label class="toggle">
+              <input type="checkbox" id="in-update-check" checked />
+              <span class="toggle-track"><span class="toggle-thumb"></span></span>
+            </label>
+          </div>
+
+          <div class="toggle-row" style="border-top:none;">
+            <div class="toggle-text">
               <span class="toggle-name">Debug Logs</span>
               <span class="toggle-hint">Verbose output to .log file</span>
             </div>
@@ -361,7 +372,10 @@
 
         </div> <!-- client-settings-card -->
         
-        <div class="app-version" id="app-version">OSTP GUI</div>
+        <div class="app-version">
+          <span id="app-version">OSTP GUI</span>
+          <button id="btn-check-updates" class="btn secondary compact-btn" type="button">Check for updates</button>
+        </div>
       </div> <!-- settings-body -->
     </div> <!-- settings-screen -->
 
@@ -506,6 +520,20 @@
         <div class="modal-actions">
           <button id="btn-share-close" class="btn secondary">Close</button>
           <button id="btn-share-copy" class="btn primary">Copy link</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- ── UPDATE MODAL ─────────────────────────────────────── -->
+    <div id="update-modal" class="modal-overlay hidden">
+      <div class="modal-content">
+        <h3 class="modal-title" id="update-title">Update available</h3>
+        <p class="modal-text" id="update-text"></p>
+        <p class="modal-text update-warning hidden" id="update-warning">This is a beta: new features that are still being tested. It can be less stable than the release you have; keep the previous installer in case you need to go back.</p>
+        <div class="modal-actions">
+          <button id="btn-update-skip" class="btn secondary">Skip this version</button>
+          <button id="btn-update-later" class="btn secondary">Later</button>
+          <button id="btn-update-download" class="btn primary">Download</button>
         </div>
       </div>
     </div>

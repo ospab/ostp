@@ -8,6 +8,7 @@ pub mod path_probe;
 pub mod prober;
 pub mod signal;
 pub mod subscription;
+pub mod updates;
 pub mod sysproxy;
 pub mod transport;
 pub mod ttl_probe;

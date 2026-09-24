@@ -956,3 +956,7 @@ textarea.field-input {
 .sub-profiles .profile-card { background: transparent; }
 
 .pr-where { color: var(--c-red); font-size: 0.7rem; margin-top: 2px; }
+
+.app-version { display: flex; align-items: center; justify-content: center; gap: 10px; flex-wrap: wrap; }
+.compact-btn { padding: 5px 10px; font-size: 0.72rem; }
+.update-warning { color: var(--c-amber); }
