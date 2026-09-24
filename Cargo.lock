@@ -1693,6 +1693,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "ostp-dns"
+version = "0.4.6"
+dependencies = [
+ "anyhow",
+ "rand 0.8.5",
+ "reqwest",
+ "rustls",
+ "serde",
+ "serde_json",
+ "simple-dns",
+ "tokio",
+ "tokio-rustls",
+ "tracing",
+ "webpki-roots",
+]
+
+[[package]]
 name = "ostp-jni"
 version = "0.1.0"
 dependencies = [
@@ -1729,6 +1746,7 @@ dependencies = [
  "json_comments",
  "mime_guess",
  "ostp-core",
+ "ostp-dns",
  "portable-atomic",
  "qrcode",
  "rand 0.8.5",

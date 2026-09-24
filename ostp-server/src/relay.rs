@@ -63,6 +63,18 @@ pub async fn handle_relay_message(
             if connect_target.starts_with("10.1.0.1:") {
                 connect_target = connect_target.replace("10.1.0.1:", "127.0.0.1:");
             }
+            // DNS over TCP goes to the server's resolver like UDP does; DNS
+            // over TLS is refused while it would skip the filtering (Android's
+            // "Private DNS: automatic" then falls back to port 53).
+            let port = connect_target.rsplit(':').next().unwrap_or("");
+            if port == "53" && router.dns_server.intercepts() {
+                if let Some(addr) = router.dns_tcp.get() {
+                    connect_target = addr.to_string();
+                }
+            } else if port == "853" && router.dns_server.enabled() && router.dns_server.settings().block_doh_bypass {
+                let _ = connect_tx.send((session_id, stream_id, target, Err("DNS over TLS is blocked: this server filters DNS".into())));
+                return Ok(());
+            }
 
             let target_clone = connect_target.clone();
             let connect_tx_clone = connect_tx.clone();
@@ -240,10 +252,7 @@ pub async fn handle_relay_message(
             if let Some(remote) = remotes.get_mut(&(session_id, stream_id)) {
                 // Если целевой порт 53 — пробуем перехватить через встроенный DNS
                 if target.ends_with(":53") {
-                    let should_intercept = {
-                        let cfg = router.dns_server.config.read().await;
-                        cfg.enabled || cfg.intercept_all_port53
-                    };
+                    let should_intercept = router.dns_server.intercepts();
 
                     if should_intercept {
                         match router.route_dns(peer_addr.ip(), &data).await {

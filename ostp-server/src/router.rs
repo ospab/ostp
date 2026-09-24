@@ -9,6 +9,9 @@ pub struct Router {
     pub outbound_cfg: Arc<RwLock<Option<OutboundConfig>>>,
     pub bind_ip: Option<String>,
     pub dns_server: Arc<DnsServer>,
+    /// Loopback listener answering DNS over TCP with `dns_server`: client
+    /// connections to any :53 are sent here instead.
+    pub dns_tcp: Arc<std::sync::OnceLock<std::net::SocketAddr>>,
     pub debug: bool,
 }
 
@@ -18,6 +21,7 @@ impl Router {
             outbound_cfg: Arc::new(RwLock::new(outbound_cfg)),
             bind_ip,
             dns_server,
+            dns_tcp: Arc::new(std::sync::OnceLock::new()),
             debug,
         }
     }
@@ -86,7 +90,7 @@ impl Router {
     
     /// Unified DNS Routing and Resolution (AdBlock / Custom Domains / DoH)
     pub async fn route_dns(&self, client_ip: std::net::IpAddr, payload: &[u8]) -> Option<Vec<u8>> {
-        self.dns_server.resolve(payload, client_ip).await
+        self.dns_server.handle(payload, client_ip).await
     }
 }
 

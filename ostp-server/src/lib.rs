@@ -272,12 +272,11 @@ pub async fn run_server(params: ServerParams) -> Result<()> {
 
     // Инициализируем DNS-сервер
     let dns_cfg = dns_config.unwrap_or_default();
-    let dns_server = dns::DnsServer::new(dns_cfg);
-    let dns_cfg_update = dns_server.clone();
-    let outbound_clone_update = outbound.clone();
-    tokio::spawn(async move {
-        dns_cfg_update.update_proxy(outbound_clone_update.as_ref()).await;
-    });
+    // Lists are cached next to the config (…/dns/lists).
+    let dns_data = config_path.as_ref().and_then(|p| p.parent().map(|d| d.to_path_buf()));
+    let dns_server = dns::DnsServer::new(dns_cfg, dns_data);
+    dns_server.set_proxy(dns::proxy_url(outbound.as_ref()));
+    dns_server.start();
     // Initialize Router
     let router = std::sync::Arc::new(router::Router::new(
         outbound.clone(),
@@ -285,6 +284,12 @@ pub async fn run_server(params: ServerParams) -> Result<()> {
         dns_server.clone(),
         debug,
     ));
+    match dns::spawn_tcp_listener(dns_server.clone()).await {
+        Ok(addr) => {
+            let _ = router.dns_tcp.set(addr);
+        }
+        Err(e) => tracing::warn!("DNS over TCP for clients is off: {e}"),
+    }
 
     // The panel is also served on the built-in HTTPS frontend at /{webpath}.
     let panel_route = api_config.as_ref().filter(|a| a.enabled).map(|a| {

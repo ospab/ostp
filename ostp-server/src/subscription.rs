@@ -99,7 +99,7 @@ impl SubscriptionService {
     }
 
     pub async fn document(&self, key: &str) -> SubscriptionDoc {
-        let owndns = self.dns.config.read().await.enabled;
+        let owndns = self.dns.enabled();
         let user = self
             .keys
             .read()
@@ -345,7 +345,7 @@ mod tests {
             },
             tls: Some(TlsLink { host: "vpn.example.com".into(), port: 443, path: Some("/s3cr3tpath".into()) }),
             udp: ("vpn.example.com".into(), 50000),
-            dns: crate::dns::DnsServer::new(Default::default()),
+            dns: crate::dns::DnsServer::new(Default::default(), None),
             keys: Arc::new(RwLock::new(keys)),
             stats: Arc::new(RwLock::new(stats)),
         }
@@ -363,7 +363,7 @@ mod tests {
         assert!(resp.starts_with("HTTP/1.1 200 OK\r\n"), "{resp}");
         assert!(resp.contains("Profile-Update-Interval: 6\r\n"));
         assert!(resp.contains("Subscription-Userinfo: upload=0; download=42; total=1000; expire=0\r\n"));
-        let body = resp.split("\r\n\r\n").nth(1).unwrap();
+        let body = resp.splitn(2, "\r\n\r\n").nth(1).unwrap();
         let doc = SubscriptionDoc::parse(body).unwrap();
         let links = doc.valid_links();
         assert_eq!(links.len(), 2);
@@ -379,7 +379,7 @@ mod tests {
         let path = format!("/sub/{}?format=json", token_for_key("key-a"));
         let resp = String::from_utf8(svc.respond(&get(&path, "*/*")).await.unwrap()).unwrap();
         assert!(resp.contains("Content-Type: application/json"));
-        let doc = SubscriptionDoc::parse(resp.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        let doc = SubscriptionDoc::parse(resp.splitn(2, "\r\n\r\n").nth(1).unwrap()).unwrap();
         assert_eq!(doc.usage, Some(SubscriptionUsage { used_bytes: 42, limit_bytes: Some(1000) }));
         assert_eq!(doc.update_interval_hours, 6);
     }
@@ -415,9 +415,10 @@ mod tests {
         assert!(resp.contains("Content-Type: text/html"));
         assert!(resp.contains("Content-Security-Policy: default-src 'none'"));
         assert!(resp.contains("X-Robots-Tag: noindex"));
-        let body = resp.split("\r\n\r\n").nth(1).unwrap();
+        let body = resp.splitn(2, "\r\n\r\n").nth(1).unwrap();
         assert!(body.contains("<html lang=\"ru\">"));
-        assert!(body.contains(&format!("value=\"https://vpn.example.com/sub/{}\"", token_for_key("key-a"))));
+        let want = format!("value=\"https://vpn.example.com/sub/{}\"", token_for_key("key-a"));
+        assert!(body.contains(&want), "{want} not in: {}", body.lines().find(|l| l.contains("sub-url")).unwrap_or("<no sub-url line>"));
         assert!(body.contains("<svg"));
         assert!(body.contains("github.com/ospab/ostp"));
         assert!(body.contains("из 1000 B") || body.contains("из 1000"));

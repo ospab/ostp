@@ -566,7 +566,7 @@ async fn handle_status(
         return api_unauthorized::<ServerStatus>();
     }
 
-    let dns_enabled = state.dns_server.config.read().await.enabled;
+    let dns_enabled = state.dns_server.enabled();
     let keys = state.access_keys.read().unwrap_or_else(|e| e.into_inner());
     let stats = state.user_stats.read().unwrap_or_else(|e| e.into_inner());
     let (mut active, mut online, mut connections, mut up, mut down) = (0, 0, 0u64, 0u64, 0u64);
@@ -866,7 +866,7 @@ async fn handle_user_share(
         Some(meta) => meta.name.clone().filter(|n| !n.is_empty()),
         None => return api_error("user not found"),
     };
-    let owndns = state.dns_server.config.read().await.enabled;
+    let owndns = state.dns_server.enabled();
 
     use ostp_core::share_link::{LinkTransport, ShareLink};
     let title = |kind: &str| match &name {
@@ -963,7 +963,7 @@ async fn handle_subscribe(
         .unwrap_or("application/json");
 
     use ostp_core::share_link::{LinkTransport, ShareLink};
-    let dns_enabled = state.dns_server.config.read().await.enabled;
+    let dns_enabled = state.dns_server.enabled();
     let mut udp = ShareLink::new(&key, &state.server_host, state.server_port);
     udp.owndns = dns_enabled;
     let tls = state.tls_link.as_ref().map(|t| {
@@ -1051,9 +1051,9 @@ mod tests {
             tls_link: None,
             subscription_prefix: None,
             config_path: None,
-            dns_server: crate::dns::DnsServer::new(Default::default()),
+            dns_server: crate::dns::DnsServer::new(Default::default(), None),
             audit_logs: Arc::new(RwLock::new(Vec::new())),
-            router: Arc::new(crate::router::Router::new(None, None, crate::dns::DnsServer::new(Default::default()), false)),
+            router: Arc::new(crate::router::Router::new(None, None, crate::dns::DnsServer::new(Default::default(), None), false)),
         }
     }
 
@@ -1246,7 +1246,7 @@ async fn handle_put_rules(
     }
 
     if let Some(cfg) = updated_outbound {
-        state.dns_server.update_proxy(Some(&cfg)).await;
+        state.dns_server.set_proxy(crate::dns::proxy_url(Some(&cfg)));
     }
     
     // Save to config.json
