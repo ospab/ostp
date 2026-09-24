@@ -52,6 +52,20 @@ impl Router {
             }
             _ => target.to_string(),
         };
+        // The server itself (10.1.0.1 as clients see it, i.e. its loopback:
+        // the panel, panel.ostp) is always reached directly. The outbound
+        // proxy cannot reach this machine's loopback, and a socket bound to
+        // bind_ip is not meant for it either.
+        if let Ok(addr) = target.parse::<std::net::SocketAddr>() {
+            let ip = if addr.ip() == std::net::IpAddr::from([10, 1, 0, 1]) { std::net::IpAddr::from([127, 0, 0, 1]) } else { addr.ip() };
+            if ip.is_loopback() {
+                let addr = std::net::SocketAddr::new(ip, addr.port());
+                return match tokio::time::timeout(std::time::Duration::from_secs(10), TcpStream::connect(addr)).await {
+                    Ok(r) => Ok(r?),
+                    Err(_) => Err(anyhow::anyhow!("connect to {addr} timed out")),
+                };
+            }
+        }
         connect_target(&target, cfg.as_ref(), self.bind_ip.as_deref(), self.debug).await
     }
 
@@ -163,3 +177,39 @@ impl UdpSessionRouter {
     }
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::outbound::OutboundAction;
+
+    /// The panel through the tunnel: with every connection sent to an
+    /// outbound proxy (a dead one here) and a bind_ip set, the server's own
+    /// services are still reached.
+    #[tokio::test]
+    async fn the_server_itself_bypasses_outbound_and_bind_ip() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            loop {
+                let _ = listener.accept().await;
+            }
+        });
+        let outbound = OutboundConfig {
+            enabled: true,
+            protocol: "socks5".into(),
+            address: "127.0.0.1".into(),
+            port: 1,
+            username: String::new(),
+            password: String::new(),
+            rules: Vec::new(),
+            default_action: OutboundAction::Proxy,
+        };
+        let router = Router::new(Some(outbound), Some("192.0.2.1".into()), DnsServer::new(Default::default(), None), false);
+        let me: std::net::IpAddr = "203.0.113.5".parse().unwrap();
+        assert!(router.route_tcp(&format!("127.0.0.1:{port}"), me).await.is_ok());
+        assert!(router.route_tcp(&format!("10.1.0.1:{port}"), me).await.is_ok());
+        // Anything else still goes where the rules say: the dead proxy.
+        assert!(router.route_tcp("198.51.100.7:80", me).await.is_err());
+    }
+}
