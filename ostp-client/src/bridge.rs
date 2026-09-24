@@ -603,6 +603,13 @@ impl Bridge {
                                 successful_sessions += 1;
                             }
                             Err(err) => {
+                                // Every session goes to the same server over the same
+                                // path: when not one has got through yet, the rest would
+                                // only fail the same way, each taking as long again.
+                                if successful_sessions == 0 {
+                                    tx.send(UiEvent::Log(format!("Multiplex session {}/{} handshake failed: {}", idx + 1, session_count, err))).await.ok();
+                                    break;
+                                }
                                 tx.send(UiEvent::Log(format!("Multiplex session {}/{} handshake failed: {}. Continuing with remaining sessions...", idx + 1, session_count, err))).await.ok();
                             }
                         }
@@ -610,6 +617,9 @@ impl Bridge {
 
                     if sessions.is_empty() {
                         *proxy_guard = None;
+                        if self.transport_mode == "udp" {
+                            tx.send(UiEvent::Log(udp_failure_diagnosis(&self.server_addr).await)).await.ok();
+                        }
                         tx.send(UiEvent::Log("All multiplexed handshake attempts failed. Connection aborted.".to_string())).await.ok();
                         tx.send(UiEvent::TunnelStopped).await.ok();
                         self.metrics.connection_state.store(0, Ordering::Relaxed);
@@ -1509,6 +1519,24 @@ pub(crate) fn server_host(server_addr: &str) -> String {
     match server_addr.rsplit_once(':') {
         Some((host, port)) if !host.contains(':') && port.parse::<u16>().is_ok() => host.to_string(),
         _ => server_addr.to_string(),
+    }
+}
+
+/// Why a UDP handshake got no answer, told apart by a TCP connect to the
+/// same port (the server takes both on it) made around the tunnel.
+async fn udp_failure_diagnosis(server_addr: &str) -> String {
+    let addr = match tokio::net::lookup_host(server_addr).await.ok().and_then(|mut a| a.next()) {
+        Some(a) => a,
+        None => return format!("{server_addr} does not resolve"),
+    };
+    match crate::path_probe::bypass_tcp_connect(addr, Duration::from_secs(4)).await {
+        Ok(_) => format!(
+            "The server answers on TCP {addr} but not over UDP: UDP to it is dropped on the way \
+             (provider or censor) or by the server's firewall. Connect with this server's TLS or TCP profile, \
+             or check on the server that UDP port {} is open.",
+            addr.port()
+        ),
+        Err(e) => format!("No answer on TCP {addr} either ({e}): the server is down or unreachable from this network."),
     }
 }
 
