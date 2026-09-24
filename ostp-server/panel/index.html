@@ -334,7 +334,8 @@ tr:last-child td { border-bottom: 0; }
     <h2 id="mu-title" data-t="add_user">Add user</h2>
     <p class="desc" id="mu-desc" data-t="add_user_desc">A random access key is generated unless you paste one.</p>
     <div class="field"><label class="lbl" for="mu-name" data-t="name">Name</label><input class="input" id="mu-name" placeholder="alice" /></div>
-    <div class="field" id="mu-key-field"><label class="lbl" for="mu-key" data-t="access_key_opt">Access key (optional)</label><input class="input mono" id="mu-key" spellcheck="false" /></div>
+    <div class="field" id="mu-key-field"><label class="lbl" for="mu-key" data-t="access_key_opt">Access key (optional)</label>
+      <div class="row"><input class="input mono grow" id="mu-key" spellcheck="false" /><button type="button" class="btn" id="mu-gen" data-t="generate">Generate</button></div></div>
     <div class="field"><label class="lbl" for="mu-limit" data-t="limit_gb">Traffic limit, GB (empty = unlimited)</label><input class="input" id="mu-limit" type="number" min="0" step="0.1" /></div>
     <div class="modal-actions"><button type="button" class="btn" data-close data-t="cancel">Cancel</button><button class="btn primary" data-t="save">Save</button></div>
   </form>
@@ -390,7 +391,7 @@ const I18N = {
     config_sub: "The server's config.json. Access keys reload on their own; other changes need a restart.",
     activity_sub: 'Changes made from this panel since the server started.',
     add_user_desc: 'A random access key is generated unless you paste one.', edit_user_desc: 'The access key stays the same.',
-    name: 'Name', access_key_opt: 'Access key (optional)', limit_gb: 'Traffic limit, GB (empty = unlimited)',
+    name: 'Name', access_key_opt: 'Access key (optional)', generate: 'Generate', limit_gb: 'Traffic limit, GB (empty = unlimited)',
     cancel: 'Cancel', create: 'Create', close: 'Close', copy: 'Copy', copied: 'Copied',
     bulk_desc: 'Creates many unnamed keys at once, e.g. for a batch of devices.', count: 'Count',
     share_desc: 'Scan with the OSTP app, or copy the link. A subscription keeps the app up to date when the server changes.',
@@ -428,7 +429,7 @@ const I18N = {
     config_sub: 'config.json сервера. Ключи доступа подхватываются сами, остальное — после перезапуска.',
     activity_sub: 'Изменения из этой панели с момента запуска сервера.',
     add_user_desc: 'Ключ доступа сгенерируется сам, если не вставить свой.', edit_user_desc: 'Ключ доступа не меняется.',
-    name: 'Имя', access_key_opt: 'Ключ доступа (необязательно)', limit_gb: 'Лимит трафика, ГБ (пусто — без лимита)',
+    name: 'Имя', access_key_opt: 'Ключ доступа (необязательно)', generate: 'Сгенерировать', limit_gb: 'Лимит трафика, ГБ (пусто — без лимита)',
     cancel: 'Отмена', create: 'Создать', close: 'Закрыть', copy: 'Копировать', copied: 'Скопировано',
     bulk_desc: 'Создаёт сразу много безымянных ключей, например для партии устройств.', count: 'Количество',
     share_desc: 'Отсканируйте в приложении OSTP или скопируйте ссылку. Подписка сама обновит приложение при изменениях на сервере.',
@@ -759,6 +760,12 @@ function openUserModal(u) {
   setTimeout(() => $('mu-name').focus(), 50);
 }
 $('btn-add-user').addEventListener('click', () => openUserModal(null));
+// 128-bit key in hex, the same shape the server generates.
+$('mu-gen').addEventListener('click', () => {
+  const b = new Uint8Array(16);
+  crypto.getRandomValues(b);
+  $('mu-key').value = Array.from(b, x => x.toString(16).padStart(2, '0')).join('');
+});
 $('f-user').addEventListener('submit', async e => {
   e.preventDefault();
   const name = $('mu-name').value.trim() || null;
