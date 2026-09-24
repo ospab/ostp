@@ -75,14 +75,51 @@ Open the panel on the server at `http://127.0.0.1:9090/<webpath>/`, from elsewhe
 
 ---
 
-## Built-in DNS Resolver
+## Built-in DNS: `ostp dns`
 
-An optional embedded DNS server (`dns.rs`), independent of the DNS *tunneling* concept — this resolves DNS *for* already-tunneled clients, it does not carry OSTP traffic itself:
+A filtering resolver for clients connected to the server (the `ostp-dns` crate): ad and tracker blocking by lists, your own rules and names, much like AdGuard Home. It is not a DNS tunnel and does not carry OSTP traffic.
 
-- Listens on a configurable UDP port (default `50053`) that clients point their resolver at.
-- Serves custom domain overrides, filters against AdBlock-style hosts lists, and forwards everything else via DNS-over-HTTPS (default upstream `https://cloudflare-dns.com/dns-query`).
-- An `intercept_all_port53` mode can additionally catch and resolve any UDP traffic to port 53 through the tunnel even when the full resolver is disabled, to prevent DNS leaks.
-- Replies are rate-limited to bound abuse of the resolver as an amplification vector.
+**It is not reachable from outside.** There is no separate port: the resolver only answers queries that arrive through the tunnel. With filtering on, everything a client resolves goes through it:
+
+| How the client looks a name up | What the server does |
+|---|---|
+| UDP to any address `:53` (TUN mode) | intercepts and answers itself |
+| TCP to any address `:53` | redirects it to the resolver's local DNS-over-TCP |
+| DNS-over-TLS (`:853`) | the connection is refused and the app falls back to plain DNS (with `doh-bypass on`) |
+| A browser's DoH | the `use-application-dns.net` canary gets NXDOMAIN and known DoH hosts are blocked (with `doh-bypass on`) |
+| SOCKS/proxy by name (`CONNECT host:port`) | the name is resolved by the same resolver: a blocked name is refused, a rewritten one goes to its address. With the outbound proxy on, the name is passed to it as is, but blocking still applies |
+
+The pipeline for a name: rewrites → other `*.ostp` names get NXDOMAIN → safe search → DoH bypass blocking → blocked services → lists and your rules → cache → upstream → CNAME check (trackers hidden behind a first-party name are caught by the CNAME target).
+
+```bash
+ostp dns status                          # what is on, lists, rule count, upstreams
+ostp dns enable                          # turn on (the default list is AdGuard DNS filter)
+ostp dns disable [--intercept-only]      # turn off; with --intercept-only clients' DNS still goes through the server, unfiltered
+ostp dns update                          # download the lists now (otherwise every 24 h)
+ostp dns test ads.example.com            # what happens to a name and by which rule (offline, from the downloaded lists)
+
+ostp dns list presets                    # built-in lists: adguard, adaway, stevenblack, oisd-small, hagezi-light
+ostp dns list add oisd-small             # by id or URL; --allow for an allow list
+ostp dns list show | remove | enable | disable
+ostp dns block tracker.example.com       # ||tracker.example.com^
+ostp dns allow cdn.example.com           # @@||cdn.example.com^
+ostp dns rule add '||ads.*^$important'   # your own rules, adblock or hosts syntax
+ostp dns rewrite add panel.ostp 10.1.0.1 # your own names; *.lan for every subdomain
+ostp dns service block tiktok            # whole services; ostp dns service list shows them
+ostp dns safesearch on                   # Google, YouTube, Bing, DuckDuckGo, Yandex
+ostp dns doh-bypass on|off               # keep browsers from bypassing the filter with their own DoH/DoT
+ostp dns mode nxdomain|null_ip|refused   # what a blocked name gets
+ostp dns upstream add tls://dns.quad9.net   # https://…/dns-query, tls://, tcp://, udp:// or an IP
+ostp dns upstream mode fallback|parallel
+```
+
+Every command validates the settings, keeps `config.json.bak`, writes the `"dns"` section and restarts the service if it is running (`--no-restart` to skip). Downloaded lists are kept in `<config dir>/dns/lists/`, so filtering works right after a restart, even offline; a failed download keeps the previous copy. Lists and upstream queries go through the outbound proxy when it is on.
+
+**A name for the panel.** `10.1.0.1` is the server itself as clients see it through the tunnel. After `ostp dns rewrite add panel.ostp 10.1.0.1`, a connected client opens the panel at `http://panel.ostp:9090/<webpath>/` with no SSH tunnel (the port is in `ostp panel status`). Other names in `.ostp` get NXDOMAIN and never leave the server.
+
+**In the panel**, the DNS page shows statistics (queries, blocked, cache, top domains and clients), the query log with Block/Allow buttons, a name test and every setting above. Saving applies at once, without a restart, and writes `config.json` with a backup.
+
+Rule syntax: `||domain^`, `@@||domain^`, `$important`, `*` in names, `/etc/hosts` lines (`0.0.0.0 domain`, `127.0.0.1 domain`; any other address becomes the answer). Regex rules and rules with unknown modifiers are not applied and are counted as unsupported in `ostp dns status`.
 
 ---
 
