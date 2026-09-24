@@ -147,6 +147,14 @@ tr:last-child td { border-bottom: 0; }
 .toast.err { border-left-color: var(--red); }
 @keyframes in { from { transform: translateY(8px); opacity: 0; } }
 
+.dns-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); gap: 8px; }
+.chk { display: flex; align-items: center; gap: 8px; font-size: 13px; cursor: pointer; }
+.chk input { accent-color: var(--accent); width: 16px; height: 16px; }
+.pill.blocked, .pill.blocked_service { background: var(--red-dim); color: var(--red); }
+.pill.rewritten, .pill.safe_search { background: rgba(90,169,255,.14); color: var(--blue); }
+.pill.cached, .pill.allowed, .pill.forwarded { background: var(--accent-dim); color: var(--accent); }
+.pill.failed { background: var(--amber-dim); color: var(--amber); }
+.mini { font-size: 11.5px; color: var(--fg2); }
 .log-item { display: flex; gap: 12px; padding: 9px 0; border-bottom: 1px solid var(--border); font-size: 13px; align-items: center; }
 .log-item:last-child { border-bottom: 0; }
 .log-time { font-family: var(--mono); color: var(--fg2); font-size: 12px; width: 70px; flex-shrink: 0; }
@@ -201,6 +209,9 @@ tr:last-child td { border-bottom: 0; }
     <button class="nav" data-page="config">
       <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></svg>
       <span data-t="config">Configuration</span></button>
+    <button class="nav" data-page="dns">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
+      <span>DNS</span></button>
     <button class="nav" data-page="activity">
       <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
       <span data-t="activity">Activity</span></button>
@@ -317,6 +328,87 @@ tr:last-child td { border-bottom: 0; }
       </div>
     </section>
 
+    <!-- DNS -->
+    <section id="page-dns" class="hidden">
+      <div class="page-head">
+        <div><h1>DNS</h1><div class="sub" data-t="dns_sub">Filtering resolver for connected clients: ads and trackers blocked, your own names answered. Not reachable from the internet.</div></div>
+        <div class="row">
+          <span class="pill" id="dns-state"></span>
+          <button class="btn" id="btn-dns-toggle"></button>
+          <button class="btn" id="btn-dns-update" data-t="dns_update">Update lists</button>
+        </div>
+      </div>
+      <div class="grid stats">
+        <div class="card"><div class="stat-label" data-t="dns_queries">Queries</div><div class="stat-value" id="dns-total">–</div><div class="stat-sub" id="dns-cached"></div></div>
+        <div class="card"><div class="stat-label" data-t="dns_blocked">Blocked</div><div class="stat-value" id="dns-blocked">–</div><div class="stat-sub" id="dns-blocked-pct"></div></div>
+        <div class="card"><div class="stat-label" data-t="dns_rules">Rules</div><div class="stat-value" id="dns-rules">–</div><div class="stat-sub" id="dns-lists-sub"></div></div>
+        <div class="card"><div class="stat-label" data-t="dns_upstream">Upstream</div><div class="stat-value" id="dns-ms">–</div><div class="stat-sub" id="dns-upstreams"></div></div>
+      </div>
+      <div class="grid two" style="margin-top:14px">
+        <div class="card"><h3 data-t="dns_top_blocked">Most blocked</h3><div id="dns-top-blocked"></div></div>
+        <div class="card"><h3 data-t="dns_top_domains">Most queried</h3><div id="dns-top-domains"></div></div>
+      </div>
+      <div class="card" style="margin-top:14px">
+        <h3 data-t="dns_test">Check a domain</h3>
+        <div class="row"><input class="input grow" id="dns-test-name" placeholder="ads.example.com" /><button class="btn" id="btn-dns-test" data-t="dns_check">Check</button></div>
+        <p class="note" id="dns-test-result"></p>
+      </div>
+      <div class="card" style="margin-top:14px">
+        <div class="row" style="justify-content:space-between;margin-bottom:10px">
+          <h3 style="margin:0" data-t="dns_log">Query log</h3>
+          <div class="row"><input class="input" id="dns-log-q" style="max-width:220px" data-tp="dns_filter" placeholder="domain or client" /><button class="btn danger sm" id="btn-dns-clear" data-t="clear">Clear</button></div>
+        </div>
+        <div class="table-wrap"><table><thead><tr><th data-t="dns_time">Time</th><th data-t="dns_client">Client</th><th data-t="dns_domain">Domain</th><th data-t="dns_result">Result</th><th></th></tr></thead><tbody id="dns-log"></tbody></table></div>
+      </div>
+      <div class="grid two" style="margin-top:14px">
+        <div class="card">
+          <h3 data-t="dns_upstreams">Upstream resolvers</h3>
+          <textarea class="input" id="dns-upstreams-edit" rows="4" spellcheck="false"></textarea>
+          <p class="mini" data-t="dns_upstreams_help">One per line: https://…/dns-query, tls://host, tcp://ip, udp://ip or an IP.</p>
+          <div class="row"><label class="lbl" style="margin:0" data-t="dns_mode">Mode</label>
+            <select class="input" id="dns-upstream-mode" style="max-width:220px"><option value="fallback" data-t="dns_fallback">In order</option><option value="parallel" data-t="dns_parallel">Parallel, fastest wins</option></select></div>
+        </div>
+        <div class="card">
+          <h3 data-t="dns_options">Options</h3>
+          <label class="chk"><input type="checkbox" id="dns-safe"> <span data-t="dns_safe">Safe search (Google, YouTube, Bing, DuckDuckGo, Yandex)</span></label>
+          <label class="chk" style="margin-top:8px"><input type="checkbox" id="dns-doh"> <span data-t="dns_doh">Stop browsers' own DNS over HTTPS/TLS</span></label>
+          <div class="row" style="margin-top:10px"><label class="lbl" style="margin:0;min-width:140px" data-t="dns_blocking">Blocked names get</label>
+            <select class="input" id="dns-blocking" style="max-width:220px"><option value="nxdomain">NXDOMAIN</option><option value="null_ip">0.0.0.0 / ::</option><option value="refused">REFUSED</option></select></div>
+          <div class="row" style="margin-top:8px"><label class="lbl" style="margin:0;min-width:140px" data-t="dns_interval">Update lists every, h</label><input class="input" id="dns-interval" type="number" min="1" style="max-width:120px"></div>
+          <div class="row" style="margin-top:8px"><label class="lbl" style="margin:0;min-width:140px" data-t="dns_cache">Cache entries</label><input class="input" id="dns-cache" type="number" min="0" style="max-width:120px"></div>
+        </div>
+      </div>
+      <div class="card" style="margin-top:14px">
+        <h3 data-t="dns_lists">Block lists</h3>
+        <div id="dns-lists"></div>
+        <div class="row" style="margin-top:10px">
+          <select class="input" id="dns-preset" style="max-width:260px"></select>
+          <button class="btn sm" id="btn-dns-preset" data-t="dns_add">Add</button>
+          <input class="input grow" id="dns-list-url" placeholder="https://…/list.txt" />
+          <label class="chk"><input type="checkbox" id="dns-list-allow"> <span data-t="dns_allowlist">allow list</span></label>
+          <button class="btn sm" id="btn-dns-list-add" data-t="dns_add">Add</button>
+        </div>
+      </div>
+      <div class="grid two" style="margin-top:14px">
+        <div class="card">
+          <h3 data-t="dns_rules_own">Your rules</h3>
+          <textarea class="input" id="dns-rules-edit" rows="8" spellcheck="false" placeholder="||ads.example.com^&#10;@@||good.example.com^&#10;0.0.0.0 tracker.example.net"></textarea>
+          <p class="mini" data-t="dns_rules_help">||domain^ blocks it with subdomains, @@ allows, $important wins over exceptions, * is a wildcard, hosts lines work.</p>
+        </div>
+        <div class="card">
+          <h3 data-t="dns_rewrites">Your names</h3>
+          <div id="dns-rewrites"></div>
+          <div class="row" style="margin-top:8px"><input class="input" id="dns-rw-domain" placeholder="panel.ostp"><input class="input" id="dns-rw-answer" placeholder="10.1.0.1"><button class="btn sm" id="btn-dns-rw-add" data-t="dns_add">Add</button></div>
+          <p class="mini" data-t="dns_rewrites_help">10.1.0.1 is this server as clients see it through the tunnel: panel.ostp → 10.1.0.1 opens the panel by name. *.lan covers every subdomain.</p>
+        </div>
+      </div>
+      <div class="card" style="margin-top:14px">
+        <h3 data-t="dns_services">Block services</h3>
+        <div class="dns-grid" id="dns-services"></div>
+      </div>
+      <div class="row" style="justify-content:flex-end;margin-top:14px"><span class="note" id="dns-save-note"></span><button class="btn primary" id="btn-dns-save" data-t="save">Save</button></div>
+    </section>
+
     <!-- Activity -->
     <section id="page-activity" class="hidden">
       <div class="page-head">
@@ -414,6 +506,22 @@ const I18N = {
     ev_add: 'Added user {x}', ev_edit: 'Edited user {x}', ev_del: 'Deleted user {x}', ev_reset: 'Reset traffic of {x}',
     ev_bulk: 'Created {x} keys', ev_config: 'Saved configuration', ev_rules: 'Saved routing rules',
     days: 'd', hours: 'h', minutes: 'm',
+    dns_sub: 'Filtering resolver for connected clients: ads and trackers blocked, your own names answered. Not reachable from the internet.',
+    dns_update: 'Update lists', dns_queries: 'Queries', dns_blocked: 'Blocked', dns_rules: 'Rules', dns_upstream: 'Upstream',
+    dns_top_blocked: 'Most blocked', dns_top_domains: 'Most queried', dns_test: 'Check a domain', dns_check: 'Check',
+    dns_log: 'Query log', dns_filter: 'domain or client', dns_time: 'Time', dns_client: 'Client', dns_domain: 'Domain', dns_result: 'Result',
+    dns_upstreams: 'Upstream resolvers', dns_upstreams_help: 'One per line: https://…/dns-query, tls://host, tcp://ip, udp://ip or an IP.',
+    dns_mode: 'Mode', dns_fallback: 'In order', dns_parallel: 'Parallel, fastest wins', dns_options: 'Options',
+    dns_safe: 'Safe search (Google, YouTube, Bing, DuckDuckGo, Yandex)', dns_doh: "Stop browsers' own DNS over HTTPS/TLS",
+    dns_blocking: 'Blocked names get', dns_interval: 'Update lists every, h', dns_cache: 'Cache entries', dns_lists: 'Block lists',
+    dns_add: 'Add', dns_allowlist: 'allow list', dns_rules_own: 'Your rules',
+    dns_rules_help: '||domain^ blocks it with subdomains, @@ allows, $important wins over exceptions, * is a wildcard, hosts lines work.',
+    dns_rewrites: 'Your names', dns_rewrites_help: '10.1.0.1 is this server as clients see it through the tunnel: panel.ostp → 10.1.0.1 opens the panel by name. *.lan covers every subdomain.',
+    dns_services: 'Block services', dns_on: 'Filtering on', dns_off: 'Filtering off', dns_turn_on: 'Turn on', dns_turn_off: 'Turn off',
+    dns_block: 'Block', dns_allow: 'Allow', dns_cached_n: '{n} from cache', dns_pct: '{p}% of queries', dns_lists_n: '{n} lists',
+    dns_saved: 'Applied without a restart and saved', dns_updated: 'Lists updated: {ok} of {n}', dns_rules_count: '{n} rules', dns_unsupported: '{n} unsupported',
+    dns_never: 'not downloaded yet', dns_empty: 'No queries yet. Connect a client with this server.', dns_remove: 'Remove',
+    o_allowed: 'allowed', o_cached: 'cached', o_blocked: 'blocked', o_blocked_service: 'service', o_safe_search: 'safe search', o_rewritten: 'your name', o_forwarded: 'forwarded', o_failed: 'failed',
   },
   ru: {
     username: 'Логин', password: 'Пароль', sign_in: 'Войти', bad_login: 'Неверный логин или пароль',
@@ -452,6 +560,22 @@ const I18N = {
     ev_add: 'Добавлен пользователь {x}', ev_edit: 'Изменён пользователь {x}', ev_del: 'Удалён пользователь {x}', ev_reset: 'Сброшен трафик {x}',
     ev_bulk: 'Создано ключей: {x}', ev_config: 'Сохранена конфигурация', ev_rules: 'Сохранены правила маршрутизации',
     days: 'д', hours: 'ч', minutes: 'м',
+    dns_sub: 'Фильтрующий резолвер для подключённых клиентов: блокирует рекламу и трекеры, отвечает вашими именами. Из интернета недоступен.',
+    dns_update: 'Обновить списки', dns_queries: 'Запросов', dns_blocked: 'Заблокировано', dns_rules: 'Правил', dns_upstream: 'Вышестоящий',
+    dns_top_blocked: 'Чаще всего блокируется', dns_top_domains: 'Чаще всего запрашивается', dns_test: 'Проверить домен', dns_check: 'Проверить',
+    dns_log: 'Журнал запросов', dns_filter: 'домен или клиент', dns_time: 'Время', dns_client: 'Клиент', dns_domain: 'Домен', dns_result: 'Итог',
+    dns_upstreams: 'Вышестоящие серверы', dns_upstreams_help: 'По одному в строке: https://…/dns-query, tls://хост, tcp://ip, udp://ip или IP.',
+    dns_mode: 'Режим', dns_fallback: 'По очереди', dns_parallel: 'Параллельно, кто быстрее', dns_options: 'Настройки',
+    dns_safe: 'Безопасный поиск (Google, YouTube, Bing, DuckDuckGo, Яндекс)', dns_doh: 'Не давать браузерам свой DNS over HTTPS/TLS',
+    dns_blocking: 'Ответ на блокировку', dns_interval: 'Обновлять списки, ч', dns_cache: 'Размер кэша', dns_lists: 'Списки блокировки',
+    dns_add: 'Добавить', dns_allowlist: 'список разрешений', dns_rules_own: 'Свои правила',
+    dns_rules_help: '||домен^ блокирует его с поддоменами, @@ разрешает, $important сильнее исключений, * — шаблон, строки hosts тоже работают.',
+    dns_rewrites: 'Свои имена', dns_rewrites_help: '10.1.0.1 — это сервер, каким его видят клиенты через туннель: panel.ostp → 10.1.0.1 открывает панель по имени. *.lan — все поддомены.',
+    dns_services: 'Блокировать сервисы', dns_on: 'Фильтрация включена', dns_off: 'Фильтрация выключена', dns_turn_on: 'Включить', dns_turn_off: 'Выключить',
+    dns_block: 'Блок', dns_allow: 'Разрешить', dns_cached_n: 'из кэша: {n}', dns_pct: '{p}% запросов', dns_lists_n: 'списков: {n}',
+    dns_saved: 'Применено без перезапуска и сохранено', dns_updated: 'Списки обновлены: {ok} из {n}', dns_rules_count: 'правил: {n}', dns_unsupported: 'не поддерживается: {n}',
+    dns_never: 'ещё не скачан', dns_empty: 'Запросов пока нет. Подключите клиента к этому серверу.', dns_remove: 'Удалить',
+    o_allowed: 'пропущен', o_cached: 'из кэша', o_blocked: 'заблокирован', o_blocked_service: 'сервис', o_safe_search: 'безопасный поиск', o_rewritten: 'своё имя', o_forwarded: 'переслан', o_failed: 'ошибка',
   },
 };
 let lang = localStorage.getItem('ostp_panel_lang') || ((navigator.language || '').toLowerCase().startsWith('ru') ? 'ru' : 'en');
@@ -562,6 +686,7 @@ function go(p) {
   if (p === 'config') loadConfig();
   if (p === 'routing') loadRules();
   if (p === 'activity') loadLog();
+  if (p === 'dns') loadDns(true);
   if (p === 'overview') drawChart();
   location.hash = p;
 }
@@ -859,6 +984,157 @@ $('btn-save-config').addEventListener('click', async () => {
   } catch (err) { $('config-note').className = 'note warn'; $('config-note').textContent = t('err', { err: err.message }); }
 });
 
+// ── DNS ───────────────────────────────────────────────────────────────
+let dnsSettings = null, dnsMeta = null;
+
+function renderDnsStats(st) {
+  $('dns-state').className = 'pill ' + (st.enabled ? 'ok' : '');
+  $('dns-state').textContent = t(st.enabled ? 'dns_on' : 'dns_off');
+  $('btn-dns-toggle').textContent = t(st.enabled ? 'dns_turn_off' : 'dns_turn_on');
+  $('dns-total').textContent = st.total;
+  $('dns-cached').textContent = t('dns_cached_n', { n: st.cached });
+  $('dns-blocked').textContent = st.blocked;
+  $('dns-blocked-pct').textContent = t('dns_pct', { p: st.total ? Math.round(st.blocked / st.total * 100) : 0 });
+  $('dns-rules').textContent = st.rules.toLocaleString();
+  $('dns-lists-sub').textContent = t('dns_lists_n', { n: st.lists.length - 1 });
+  $('dns-ms').textContent = st.avg_upstream_ms != null ? st.avg_upstream_ms + ' ms' : '–';
+  $('dns-upstreams').textContent = (st.upstreams || []).join(', ');
+  const tops = (list, id) => {
+    const max = Math.max(1, ...list.map(x => x[1]));
+    $(id).innerHTML = list.length ? list.map(([d, n]) => `<div class="top-user"><div class="grow">${esc(d)}<div class="bar"><div style="width:${(n / max * 100).toFixed(1)}%"></div></div></div><span class="muted small">${n}</span></div>`).join('')
+      : `<div class="empty">${esc(t('dns_empty'))}</div>`;
+  };
+  tops(st.top_blocked, 'dns-top-blocked');
+  tops(st.top_domains, 'dns-top-domains');
+  dnsListStats = st.lists;
+}
+let dnsListStats = [];
+
+function renderDnsLog(entries) {
+  const body = $('dns-log');
+  if (!entries.length) { body.innerHTML = `<tr><td colspan="5" class="empty">${esc(t('dns_empty'))}</td></tr>`; return; }
+  body.innerHTML = entries.map(e => {
+    const time = new Date(e.time).toLocaleTimeString();
+    const blocked = e.outcome === 'blocked' || e.outcome === 'blocked_service';
+    const why = e.rule ? `<div class="mini">${esc(e.rule)}${e.source ? ' · ' + esc(e.source) : ''}</div>` : (e.upstream ? `<div class="mini">${esc(e.upstream)}</div>` : '');
+    return `<tr><td class="small">${esc(time)}</td><td class="mono small">${esc(e.client)}</td>
+      <td><span class="mono small">${esc(e.name)}</span> <span class="mini">${esc(e.qtype)} · ${e.elapsed_ms} ms</span>${why}</td>
+      <td><span class="pill ${esc(e.outcome)}">${esc(t('o_' + e.outcome))}</span></td>
+      <td><div class="actions"><button class="btn sm" data-dns-act="${blocked ? 'allow' : 'block'}" data-name="${esc(e.name)}">${esc(t(blocked ? 'dns_allow' : 'dns_block'))}</button></div></td></tr>`;
+  }).join('');
+}
+
+function renderDnsSettings() {
+  const s = dnsSettings;
+  $('dns-upstreams-edit').value = s.upstreams.join('\n');
+  $('dns-upstream-mode').value = s.upstream_mode;
+  $('dns-safe').checked = s.safe_search;
+  $('dns-doh').checked = s.block_doh_bypass;
+  $('dns-blocking').value = s.blocking_mode;
+  $('dns-interval').value = s.update_interval_hours;
+  $('dns-cache').value = s.cache_size;
+  $('dns-rules-edit').value = s.user_rules.join('\n');
+  const row = (l, kind, i) => {
+    const st = dnsListStats.find(x => x.name === l.name);
+    const info = st ? (st.rules ? t('dns_rules_count', { n: st.rules.toLocaleString() }) + (st.unsupported ? ' · ' + t('dns_unsupported', { n: st.unsupported }) : '') : t('dns_never')) : '';
+    return `<div class="top-user"><label class="chk"><input type="checkbox" data-list="${kind}" data-i="${i}" ${l.enabled ? 'checked' : ''}></label>
+      <div class="grow">${esc(l.name)}${kind === 'allow' ? ' <span class="pill ok">allow</span>' : ''}<div class="mini">${esc(l.url)}</div></div>
+      <span class="mini">${esc(info)}</span><button class="icon-btn danger" title="${esc(t('dns_remove'))}" data-list-rm="${kind}" data-i="${i}">✕</button></div>`;
+  };
+  $('dns-lists').innerHTML = s.lists.map((l, i) => row(l, 'block', i)).join('') + s.allowlists.map((l, i) => row(l, 'allow', i)).join('');
+  $('dns-preset').innerHTML = dnsMeta.presets.filter(([, , url]) => !s.lists.some(l => l.url === url)).map(([id, name]) => `<option value="${esc(id)}">${esc(name)}</option>`).join('');
+  $('dns-rewrites').innerHTML = s.rewrites.map((r, i) => `<div class="top-user"><div class="grow mono small">${esc(r.domain)} → ${esc(r.answer)}</div><button class="icon-btn danger" data-rw-rm="${i}">✕</button></div>`).join('');
+  $('dns-services').innerHTML = dnsMeta.services.map(([id, name]) => `<label class="chk"><input type="checkbox" data-svc="${esc(id)}" ${s.blocked_services.includes(id) ? 'checked' : ''}> ${esc(name)}</label>`).join('');
+}
+
+/// The form into dnsSettings (what Save sends).
+function collectDns() {
+  const s = dnsSettings;
+  s.upstreams = $('dns-upstreams-edit').value.split('\n').map(x => x.trim()).filter(Boolean);
+  s.upstream_mode = $('dns-upstream-mode').value;
+  s.safe_search = $('dns-safe').checked;
+  s.block_doh_bypass = $('dns-doh').checked;
+  s.blocking_mode = $('dns-blocking').value;
+  s.update_interval_hours = Math.max(1, parseInt($('dns-interval').value, 10) || 24);
+  s.cache_size = Math.max(0, parseInt($('dns-cache').value, 10) || 0);
+  s.user_rules = $('dns-rules-edit').value.split('\n').map(x => x.trim()).filter(Boolean);
+  document.querySelectorAll('[data-list]').forEach(c => { (c.dataset.list === 'allow' ? s.allowlists : s.lists)[+c.dataset.i].enabled = c.checked; });
+  s.blocked_services = [...document.querySelectorAll('[data-svc]')].filter(c => c.checked).map(c => c.dataset.svc);
+}
+
+async function saveDns(note = true) {
+  try {
+    await api('dns/settings', { method: 'PUT', body: dnsSettings });
+    if (note) toast(t('dns_saved'));
+    $('dns-save-note').textContent = '';
+    loadDns(true);
+  } catch (err) { $('dns-save-note').textContent = t('err', { err: err.message }); toast(t('err', { err: err.message }), true); }
+}
+
+async function loadDns(withSettings) {
+  try {
+    const [st, log] = await Promise.all([api('dns/stats'), api('dns/log?limit=150&q=' + encodeURIComponent($('dns-log-q').value.trim()))]);
+    renderDnsStats(st);
+    renderDnsLog(log);
+    if (withSettings) {
+      [dnsSettings, dnsMeta] = await Promise.all([api('dns/settings'), dnsMeta ? Promise.resolve(dnsMeta) : api('dns/meta')]);
+      renderDnsSettings();
+    }
+  } catch (err) { if (withSettings) toast(t('err', { err: err.message }), true); }
+}
+
+$('btn-dns-save').addEventListener('click', () => { collectDns(); saveDns(); });
+$('btn-dns-toggle').addEventListener('click', () => { collectDns(); dnsSettings.enabled = !dnsSettings.enabled; saveDns(); });
+$('btn-dns-update').addEventListener('click', async () => {
+  const b = $('btn-dns-update'); b.disabled = true;
+  try {
+    const r = await api('dns/update', { method: 'POST' });
+    toast(t('dns_updated', { ok: r.filter(x => x.ok).length, n: r.length }), r.some(x => !x.ok));
+    loadDns(true);
+  } catch (err) { toast(t('err', { err: err.message }), true); }
+  finally { b.disabled = false; }
+});
+$('btn-dns-test').addEventListener('click', async () => {
+  const name = $('dns-test-name').value.trim(); if (!name) return;
+  try {
+    const e = await api('dns/test', { method: 'POST', body: { domain: name } });
+    $('dns-test-result').innerHTML = `<span class="pill ${esc(e.outcome)}">${esc(t('o_' + e.outcome))}</span> ${esc(e.detail)}${e.rule ? ' · <span class="mono">' + esc(e.rule) + '</span>' : ''}${e.source ? ' · ' + esc(e.source) : ''}`;
+  } catch (err) { $('dns-test-result').textContent = t('err', { err: err.message }); }
+});
+$('dns-test-name').addEventListener('keydown', e => { if (e.key === 'Enter') $('btn-dns-test').click(); });
+$('dns-log-q').addEventListener('input', () => loadDns(false));
+$('btn-dns-clear').addEventListener('click', async () => { try { await api('dns/log', { method: 'DELETE' }); loadDns(false); } catch (err) { toast(t('err', { err: err.message }), true); } });
+$('dns-log').addEventListener('click', e => {
+  const b = e.target.closest('[data-dns-act]'); if (!b || !dnsSettings) return;
+  collectDns();
+  const d = b.dataset.name, block = `||${d}^`, allow = `@@||${d}^`;
+  dnsSettings.user_rules = dnsSettings.user_rules.filter(r => r !== block && r !== allow);
+  dnsSettings.user_rules.push(b.dataset.dnsAct === 'block' ? block : allow);
+  saveDns();
+});
+$('btn-dns-preset').addEventListener('click', () => {
+  const id = $('dns-preset').value; const p = dnsMeta.presets.find(x => x[0] === id); if (!p) return;
+  collectDns(); dnsSettings.lists.push({ name: p[1], url: p[2], enabled: true }); saveDns();
+});
+$('btn-dns-list-add').addEventListener('click', () => {
+  const url = $('dns-list-url').value.trim(); if (!/^https?:\/\//.test(url)) return;
+  collectDns();
+  (($('dns-list-allow').checked) ? dnsSettings.allowlists : dnsSettings.lists).push({ name: url.split('/').filter(Boolean).pop() || url, url, enabled: true });
+  $('dns-list-url').value = ''; saveDns();
+});
+$('dns-lists').addEventListener('click', e => {
+  const b = e.target.closest('[data-list-rm]'); if (!b) return;
+  collectDns(); (b.dataset.listRm === 'allow' ? dnsSettings.allowlists : dnsSettings.lists).splice(+b.dataset.i, 1); saveDns();
+});
+$('btn-dns-rw-add').addEventListener('click', () => {
+  const domain = $('dns-rw-domain').value.trim(), answer = $('dns-rw-answer').value.trim(); if (!domain || !answer) return;
+  collectDns(); dnsSettings.rewrites.push({ domain, answer }); $('dns-rw-domain').value = ''; $('dns-rw-answer').value = ''; saveDns();
+});
+$('dns-rewrites').addEventListener('click', e => {
+  const b = e.target.closest('[data-rw-rm]'); if (!b) return;
+  collectDns(); dnsSettings.rewrites.splice(+b.dataset.rwRm, 1); saveDns();
+});
+
 // ── activity ──────────────────────────────────────────────────────────
 function logHtml(items, limit) {
   if (!items.length) return `<div class="empty">${esc(t('no_activity'))}</div>`;
@@ -893,10 +1169,15 @@ async function start() {
   if (!await refresh()) return;
   $('app').classList.remove('hidden');
   const p = location.hash.slice(1);
-  go(['overview', 'users', 'routing', 'config', 'activity'].includes(p) ? p : 'overview');
+  go(['overview', 'users', 'routing', 'config', 'activity', 'dns'].includes(p) ? p : 'overview');
   loadLog();
   clearInterval(timer);
-  timer = setInterval(async () => { if (await refresh() && page === 'overview') loadLog(); }, 5000);
+  timer = setInterval(async () => {
+    if (await refresh()) {
+      if (page === 'overview') loadLog();
+      if (page === 'dns') loadDns(false);
+    }
+  }, 5000);
 }
 applyLang();
 start();

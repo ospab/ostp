@@ -27,12 +27,32 @@ impl Router {
     }
 
     /// TCP Target Routing
-    pub async fn route_tcp(&self, target: &str) -> Result<TcpStream> {
+    pub async fn route_tcp(&self, target: &str, client: std::net::IpAddr) -> Result<TcpStream> {
         let cfg = {
             let lock = self.outbound_cfg.read().unwrap();
             lock.clone()
         };
-        connect_target(target, cfg.as_ref(), self.bind_ip.as_deref(), self.debug).await
+        // A connection by name goes through the server's DNS when filtering is
+        // on: blocked names are refused, local names (rewrites) are used, the
+        // rest is resolved (and logged) here. With the outbound proxy on, the
+        // name is passed to it as is so its domain rules keep working, but a
+        // blocked name is still refused.
+        let target = match target.rsplit_once(':') {
+            Some((host, port)) if host.parse::<std::net::IpAddr>().is_err() && !host.starts_with('[') => {
+                let proxied = cfg.as_ref().is_some_and(|c| c.enabled);
+                match self.dns_server.resolve_host(host, client).await {
+                    Err(reason) => return Err(anyhow::anyhow!("{host}: {reason}")),
+                    Ok(Some(ip)) if !proxied || self.dns_server.explain(host).outcome == ostp_dns::Outcome::Rewritten => {
+                        // 10.1.0.1 is the server itself as clients see it.
+                        let ip = if ip == std::net::IpAddr::from([10, 1, 0, 1]) { std::net::IpAddr::from([127, 0, 0, 1]) } else { ip };
+                        std::net::SocketAddr::new(ip, port.parse().unwrap_or(0)).to_string()
+                    }
+                    Ok(_) => target.to_string(),
+                }
+            }
+            _ => target.to_string(),
+        };
+        connect_target(&target, cfg.as_ref(), self.bind_ip.as_deref(), self.debug).await
     }
 
     /// UDP Target Routing

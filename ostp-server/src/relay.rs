@@ -82,7 +82,7 @@ pub async fn handle_relay_message(
             let router_clone = router.clone();
             let backpressure_clone = session_backpressure.clone();
             tokio::spawn(async move {
-                let stream_res = router_clone.route_tcp(&target_clone).await;
+                let stream_res = router_clone.route_tcp(&target_clone, peer_addr.ip()).await;
                 match stream_res {
                     Ok(stream) => {
                         let (mut reader, writer) = stream.into_split();

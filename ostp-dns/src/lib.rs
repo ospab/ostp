@@ -15,6 +15,7 @@ pub mod settings;
 pub mod upstream;
 
 pub use filter::{Match, Verdict};
+pub use lists::UpdateResult;
 pub use settings::{BlockingMode, DnsSettings, FilterList, Rewrite, UpstreamMode, PRESET_LISTS};
 
 use serde::Serialize;
@@ -526,6 +527,48 @@ impl Dns {
         r.build_bytes_vec_compressed().ok()
     }
 
+    /// For a connection to `host` by name (a SOCKS client sends names, not
+    /// DNS queries): `Err` with the reason when the filter blocks it,
+    /// `Ok(Some(ip))` with the address the resolver gives (rewrites
+    /// included), `Ok(None)` when filtering is off or nothing resolved (the
+    /// caller then connects by name as before).
+    pub async fn resolve_host(&self, host: &str, client: IpAddr) -> Result<Option<IpAddr>, String> {
+        if !self.enabled() || host.parse::<IpAddr>().is_ok() {
+            return Ok(None);
+        }
+        let e = self.explain(host);
+        if matches!(e.outcome, Outcome::Blocked | Outcome::BlockedService) {
+            let mut q = Packet::new_query(rand::random());
+            if let Ok(n) = Name::new(host) {
+                q.questions.push(simple_dns::Question::new(n, QTYPE::TYPE(simple_dns::TYPE::A), simple_dns::QCLASS::CLASS(CLASS::IN), false));
+                if let Ok(bytes) = q.build_bytes_vec() {
+                    // Recorded in the log like any blocked query.
+                    let _ = self.handle(&bytes, client).await;
+                }
+            }
+            return Err(format!("blocked by DNS filtering{}", e.rule.map(|r| format!(" ({r})")).unwrap_or_default()));
+        }
+        for qtype in [simple_dns::TYPE::A, simple_dns::TYPE::AAAA] {
+            let mut q = Packet::new_query(rand::random());
+            q.set_flags(PacketFlag::RECURSION_DESIRED);
+            let Ok(n) = Name::new(host) else { return Ok(None) };
+            q.questions.push(simple_dns::Question::new(n, QTYPE::TYPE(qtype), simple_dns::QCLASS::CLASS(CLASS::IN), false));
+            let Ok(bytes) = q.build_bytes_vec() else { return Ok(None) };
+            let Some(answer) = self.handle(&bytes, client).await else { return Ok(None) };
+            if let Ok(p) = Packet::parse(&answer) {
+                let ip = p.answers.iter().find_map(|r| match &r.rdata {
+                    RData::A(a) => Some(IpAddr::V4(Ipv4Addr::from(a.address))),
+                    RData::AAAA(a) => Some(IpAddr::V6(Ipv6Addr::from(a.address))),
+                    _ => None,
+                });
+                if ip.is_some() {
+                    return Ok(ip);
+                }
+            }
+        }
+        Ok(None)
+    }
+
     /// Answers one DNS query from a client; `None` means "not ours, let it
     /// through" (filtering and interception both off, or not a query).
     pub async fn handle(&self, query: &[u8], client: IpAddr) -> Option<Vec<u8>> {
@@ -738,6 +781,17 @@ mod tests {
     async fn off_means_hands_off() {
         let dns = Dns::new(DnsSettings::default(), None);
         assert!(dns.handle(&query("example.com", TYPE::A), "10.1.0.2".parse().unwrap()).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn connections_by_name() {
+        let dns = Dns::new(settings(fake_upstream().await), None);
+        let me: IpAddr = "10.1.0.2".parse().unwrap();
+        assert_eq!(dns.resolve_host("panel.ostp", me).await, Ok(Some("10.1.0.1".parse().unwrap())));
+        assert_eq!(dns.resolve_host("example.com", me).await, Ok(Some("93.184.216.34".parse().unwrap())));
+        assert!(dns.resolve_host("x.blocked.test", me).await.unwrap_err().contains("||blocked.test^"));
+        assert_eq!(dns.resolve_host("1.2.3.4", me).await, Ok(None));
+        assert_eq!(dns.query_log(10, Some("blocked.test")).len(), 1);
     }
 
     #[test]

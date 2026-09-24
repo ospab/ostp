@@ -293,7 +293,13 @@ pub fn create_api_router(state: ApiState) -> Router {
                 .delete(handle_clear_audit),
         )
         .route("/users/bulk", post(handle_bulk_create_users))
-        .route("/router/rules", get(handle_get_rules).put(handle_put_rules));
+        .route("/router/rules", get(handle_get_rules).put(handle_put_rules))
+        .route("/dns/stats", get(handle_dns_stats))
+        .route("/dns/log", get(handle_dns_log).delete(handle_dns_clear_log))
+        .route("/dns/settings", get(handle_dns_get_settings).put(handle_dns_put_settings))
+        .route("/dns/update", post(handle_dns_update))
+        .route("/dns/test", post(handle_dns_test))
+        .route("/dns/meta", get(handle_dns_meta));
 
     let webpath = state.webpath.clone();
     let webpath = webpath.trim_matches('/');
@@ -1207,6 +1213,119 @@ async fn handle_bulk_create_users(
     let _ = save_config_keys(&state);
 
     (StatusCode::OK, ApiResponse::success(new_keys))
+}
+
+// ── DNS ──────────────────────────────────────────────────────────────────────
+
+async fn handle_dns_stats(State(state): State<ApiState>, headers: axum::http::HeaderMap) -> impl IntoResponse {
+    if !check_token(&state, &headers) {
+        return api_unauthorized::<ostp_dns::Stats>();
+    }
+    (StatusCode::OK, ApiResponse::success(state.dns_server.stats()))
+}
+
+#[derive(Deserialize)]
+struct DnsLogQuery {
+    limit: Option<usize>,
+    q: Option<String>,
+}
+
+async fn handle_dns_log(
+    State(state): State<ApiState>,
+    headers: axum::http::HeaderMap,
+    axum::extract::Query(query): axum::extract::Query<DnsLogQuery>,
+) -> impl IntoResponse {
+    if !check_token(&state, &headers) {
+        return api_unauthorized::<Vec<ostp_dns::LogEntry>>();
+    }
+    let q = query.q.as_deref().map(str::trim).filter(|q| !q.is_empty());
+    (StatusCode::OK, ApiResponse::success(state.dns_server.query_log(query.limit.unwrap_or(200).min(2000), q)))
+}
+
+async fn handle_dns_clear_log(State(state): State<ApiState>, headers: axum::http::HeaderMap) -> impl IntoResponse {
+    if !check_token(&state, &headers) {
+        return api_unauthorized::<bool>();
+    }
+    state.dns_server.clear_log();
+    (StatusCode::OK, ApiResponse::success(true))
+}
+
+async fn handle_dns_get_settings(State(state): State<ApiState>, headers: axum::http::HeaderMap) -> impl IntoResponse {
+    if !check_token(&state, &headers) {
+        return api_unauthorized::<ostp_dns::DnsSettings>();
+    }
+    (StatusCode::OK, ApiResponse::success((*state.dns_server.settings()).clone()))
+}
+
+/// Applies the settings live (no restart) and writes them to config.json.
+async fn handle_dns_put_settings(
+    State(state): State<ApiState>,
+    headers: axum::http::HeaderMap,
+    Json(settings): Json<ostp_dns::DnsSettings>,
+) -> impl IntoResponse {
+    if !check_token(&state, &headers) {
+        return api_unauthorized::<bool>();
+    }
+    if let Err(e) = state.dns_server.apply(settings) {
+        return api_error(&format!("{e:#}"));
+    }
+    if let Some(path) = &state.config_path {
+        let saved = (|| -> Result<(), String> {
+            let content = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+            let mut stripped = json_comments::StripComments::new(content.as_bytes());
+            let mut text = String::new();
+            use std::io::Read;
+            stripped.read_to_string(&mut text).map_err(|e| e.to_string())?;
+            let mut v: serde_json::Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+            v["dns"] = serde_json::to_value(&*state.dns_server.settings()).map_err(|e| e.to_string())?;
+            let _ = std::fs::copy(path, path.with_extension("json.bak"));
+            std::fs::write(path, serde_json::to_string_pretty(&v).map_err(|e| e.to_string())?).map_err(|e| e.to_string())
+        })();
+        if let Err(e) = saved {
+            return api_error(&format!("applied, but config.json was not written: {e}"));
+        }
+    }
+    (StatusCode::OK, ApiResponse::success(true))
+}
+
+async fn handle_dns_update(State(state): State<ApiState>, headers: axum::http::HeaderMap) -> impl IntoResponse {
+    if !check_token(&state, &headers) {
+        return api_unauthorized::<Vec<ostp_dns::lists::UpdateResult>>();
+    }
+    (StatusCode::OK, ApiResponse::success(state.dns_server.update_lists().await))
+}
+
+#[derive(Deserialize)]
+struct DnsTestRequest {
+    domain: String,
+}
+
+async fn handle_dns_test(
+    State(state): State<ApiState>,
+    headers: axum::http::HeaderMap,
+    Json(req): Json<DnsTestRequest>,
+) -> impl IntoResponse {
+    if !check_token(&state, &headers) {
+        return api_unauthorized::<ostp_dns::Explanation>();
+    }
+    (StatusCode::OK, ApiResponse::success(state.dns_server.explain(&req.domain)))
+}
+
+#[derive(Serialize)]
+struct DnsMeta {
+    presets: Vec<(String, String, String)>,
+    services: Vec<(String, String)>,
+}
+
+async fn handle_dns_meta(State(state): State<ApiState>, headers: axum::http::HeaderMap) -> impl IntoResponse {
+    if !check_token(&state, &headers) {
+        return api_unauthorized::<DnsMeta>();
+    }
+    let meta = DnsMeta {
+        presets: ostp_dns::PRESET_LISTS.iter().map(|(i, n, u)| (i.to_string(), n.to_string(), u.to_string())).collect(),
+        services: ostp_dns::services::SERVICES.iter().map(|(i, n, _)| (i.to_string(), n.to_string())).collect(),
+    };
+    (StatusCode::OK, ApiResponse::success(meta))
 }
 
 async fn handle_get_rules(
