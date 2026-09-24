@@ -59,9 +59,8 @@ struct TunnelState {
 #[tokio::main]
 async fn main() -> Result<()> {
     ostp_client::logging::setup_panic_hook();
-    // The helper is a child of the GUI, which already truncated the shared log at
-    // its own startup — pass false so the helper APPENDS instead of wiping the
-    // GUI's session log.
+    // The helper is a child of the GUI, which already marked the connection in
+    // the shared log — pass false so the helper only appends.
     let _log_guard = ostp_client::logging::init_tracing("info", "ostp-helper", env!("CARGO_PKG_VERSION"), false);
 
     if let Ok(exe) = std::env::current_exe() {

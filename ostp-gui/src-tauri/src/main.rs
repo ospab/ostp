@@ -8,10 +8,9 @@ fn main() {
     // Read config BEFORE init_tracing so we can use the correct log level from config.
     // If config is missing or debug=false we default to "info".
     let log_level = detect_log_level_from_config();
-    // The GUI launch IS the daemon's startup, so clear the shared log here
-    // (Windows-only inside init_tracing). The elevated TUN helper spawned later
-    // passes truncate=false so it appends instead of wiping this session's log.
-    let _log_guard = ostp_client::logging::init_tracing(&log_level, "ostp-gui", env!("CARGO_PKG_VERSION"), true);
+    // Opening the GUI is not a connection: the log is trimmed on each connect
+    // (start_tunnel), so it holds the previous connection and the current one.
+    let _log_guard = ostp_client::logging::init_tracing(&log_level, "ostp-gui", env!("CARGO_PKG_VERSION"), false);
 
     tracing::info!("ostp-gui starting (log_level={})", log_level);
 

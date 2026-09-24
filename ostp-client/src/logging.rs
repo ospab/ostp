@@ -20,8 +20,8 @@ pub fn log_file_path() -> PathBuf {
 /// True if this invocation is the long-running daemon (a client/server run),
 /// as opposed to a one-shot subcommand (`gk`, `check`, `init`, `-V`, ...).
 ///
-/// Used to gate log truncation: only the daemon clears the log at startup, so a
-/// one-shot command run while a daemon is live can never wipe the daemon's log.
+/// Used to gate log trimming: only the daemon trims the log at startup, so a
+/// one-shot command run while a daemon is live can never cut the daemon's log.
 /// A daemon invocation is simply one that carries none of the one-shot tokens
 /// (`ostp`, `ostp run`, `ostp connect <url>` → daemon; everything else → one-shot).
 pub fn invocation_is_daemon<I: IntoIterator<Item = String>>(args: I) -> bool {
@@ -48,6 +48,45 @@ pub fn append_line(msg: &str) {
             msg
         );
     }
+}
+
+/// The line that opens each connection's part of `ostp.log`.
+pub const CONNECTION_MARK: &str = "===== connection";
+
+/// Call when a connection starts: drops everything before the previous
+/// connection's mark and writes a new mark, so `ostp.log` holds the previous
+/// connection and the current one instead of all history.
+///
+/// The file is cut in place rather than replaced: the processes still
+/// writing to it (the GUI, a helper finishing its stop) have it open for
+/// appending, and their next lines land at the new end.
+pub fn begin_connection() {
+    let path = log_file_path();
+    if let Ok(text) = std::fs::read(&path) {
+        if let Some(from) = last_mark(&text) {
+            if from > 0 {
+                if let Ok(mut file) = OpenOptions::new().write(true).open(&path) {
+                    let _ = file.set_len(0).and_then(|_| file.write_all(&text[from..]));
+                }
+            }
+        }
+    }
+    append_line(&format!("{CONNECTION_MARK} started ====="));
+}
+
+/// Offset of the line holding the last connection mark.
+fn last_mark(text: &[u8]) -> Option<usize> {
+    let mark = CONNECTION_MARK.as_bytes();
+    let mut found = None;
+    let mut line_start = 0;
+    for line in text.split(|&b| b == b'\n') {
+        // The mark comes after append_line's "[timestamp] ".
+        if line.windows(mark.len()).any(|w| w == mark) {
+            found = Some(line_start);
+        }
+        line_start += line.len() + 1;
+    }
+    found
 }
 
 pub fn setup_panic_hook() {
@@ -77,7 +116,7 @@ pub fn setup_panic_hook() {
         tracing::error!("{}", crash_msg);
 
         // Crashes land in the same shared log file (append — a crash must never
-        // truncate, and the tracing worker may already be dead so we write direct).
+        // trim it, and the tracing worker may already be dead so we write direct).
         if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(log_file_path()) {
             let _ = file.write_all(crash_msg.as_bytes());
             let _ = file.write_all(b"\n===================================================\n");
@@ -96,15 +135,17 @@ pub fn setup_panic_hook() {
 ///
 /// The environment variable `RUST_LOG` overrides this value if set.
 ///
-/// `truncate`: clear the log at startup. Honoured **only on Windows** — Linux
-/// servers keep their history (OS-rotated). Pass `true` only from the daemon's
-/// own entrypoint; one-shot commands and child processes (the TUN helper) pass
-/// `false` so they append instead of wiping a running daemon's log.
+/// `new_connection`: this process starts a connection, so the log keeps only
+/// the previous one before it (see [`begin_connection`]). Honoured **only on
+/// Windows** — Linux servers keep their history (OS-rotated). Pass `true`
+/// only from the daemon's own entrypoint; one-shot commands and child
+/// processes (the TUN helper) pass `false`. The GUI passes `false` and calls
+/// `begin_connection` on each connect instead.
 pub fn init_tracing(
     level: &str,
     app_name: &str,
     version: &str,
-    truncate: bool,
+    new_connection: bool,
 ) -> Option<tracing_appender::non_blocking::WorkerGuard> {
     // RUST_LOG overrides the config-derived level
     let env_filter = EnvFilter::try_from_default_env()
@@ -122,16 +163,13 @@ pub fn init_tracing(
 
     let path = log_file_path();
 
-    let mut open_opts = OpenOptions::new();
-    open_opts.create(true);
-    // Truncate-on-startup is Windows-only and daemon-only. Everywhere else append:
-    // Linux keeps server history, and one-shot commands / the TUN helper must not
-    // wipe a running daemon's log.
-    if truncate && cfg!(windows) {
-        open_opts.write(true).truncate(true);
-    } else {
-        open_opts.append(true);
+    if new_connection && cfg!(windows) {
+        begin_connection();
     }
+    // Always append: several processes write this file, and a handle that
+    // writes at its own offset would overwrite what the others wrote.
+    let mut open_opts = OpenOptions::new();
+    open_opts.create(true).append(true);
 
     if let Ok(mut file) = open_opts.open(&path) {
         // Write the startup banner directly to the log file, bypassing the
@@ -185,5 +223,25 @@ pub fn init_tracing(
             .try_init();
         eprintln!("[WARN] Could not open log file at {}. Logging to stderr only.", path.display());
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::last_mark;
+
+    #[test]
+    fn finds_the_last_connection() {
+        let log = b"old
+[t] ===== connection started =====
+first
+[t] ===== connection started =====
+second
+";
+        let from = last_mark(log).unwrap();
+        assert!(log[from..].starts_with(b"[t] ===== connection started =====
+second"));
+        assert_eq!(last_mark(b"no marks
+"), None);
     }
 }

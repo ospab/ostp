@@ -781,6 +781,10 @@ async fn start_tunnel(state: tauri::State<'_, AppState>, app: tauri::AppHandle) 
         }
     }
 
+    // After the old tunnel's last lines: ostp.log keeps that connection and
+    // this one, nothing older.
+    ostp_client::logging::begin_connection();
+
     let path = get_config_path();
     let content = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
     let mut stripped = json_comments::StripComments::new(content.as_bytes());
