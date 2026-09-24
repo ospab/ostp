@@ -284,6 +284,22 @@ fn status(config_path: &Path) -> Result<()> {
     println!("\n  Open it:");
     println!("    on the server:   http://127.0.0.1:{port}/{webpath}/");
     println!("    over SSH:        ssh -L {port}:127.0.0.1:{port} <user>@<server>, then http://127.0.0.1:{port}/{webpath}/");
+    // A connected client reaches the server's loopback as 10.1.0.1, so a
+    // panel listening there (or on every address) opens through the tunnel.
+    let host = bind.rsplit_once(':').map(|(h, _)| h.trim_matches(|c| c == '[' || c == ']')).unwrap_or("");
+    if host.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback() || ip.is_unspecified()) {
+        let dns_on = v["dns"]["enabled"].as_bool().unwrap_or(false);
+        let name = v["dns"]["rewrites"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|r| r["answer"].as_str() == Some("10.1.0.1") && !r["domain"].as_str().unwrap_or("*").contains('*'))
+            .and_then(|r| r["domain"].as_str());
+        match name {
+            Some(name) if dns_on => println!("    through OSTP:    http://{name}:{port}/{webpath}/  (port and path included)"),
+            _ => println!("    through OSTP:    http://10.1.0.1:{port}/{webpath}/  (a name for it: ostp dns enable, ostp dns rewrite add panel.ostp 10.1.0.1)"),
+        }
+    }
     if let Ok(t) = tls_settings(config_path) {
         if let Some(domain) = &t.domain {
             let reachable = match t.frontend {
