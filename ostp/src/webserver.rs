@@ -261,6 +261,8 @@ struct Changes {
     modified: Vec<(PathBuf, Vec<u8>)>,
     /// (path, original contents) of files that were removed.
     removed: Vec<(PathBuf, Vec<u8>)>,
+    /// (link, target) of symlinks that were removed.
+    removed_links: Vec<(PathBuf, PathBuf)>,
     site: Option<String>,
 }
 
@@ -301,6 +303,13 @@ impl Changes {
         bail!("symlinks are only supported on Linux")
     }
 
+    fn remove_link(&mut self, link: &Path) -> Result<()> {
+        let target = std::fs::read_link(link).with_context(|| format!("{} is not a symlink", link.display()))?;
+        std::fs::remove_file(link).with_context(|| format!("cannot remove {}", link.display()))?;
+        self.removed_links.push((link.to_path_buf(), target));
+        Ok(())
+    }
+
     fn remove(&mut self, path: &Path) -> Result<()> {
         let old = std::fs::read(path).with_context(|| format!("cannot read {}", path.display()))?;
         std::fs::remove_file(path).with_context(|| format!("cannot remove {}", path.display()))?;
@@ -320,6 +329,10 @@ impl Changes {
         }
         for (p, old) in &self.removed {
             let _ = std::fs::write(p, old);
+        }
+        #[cfg(unix)]
+        for (link, target) in &self.removed_links {
+            let _ = std::os::unix::fs::symlink(target, link);
         }
     }
 }
@@ -342,7 +355,7 @@ fn nginx_layout(domain: &str) -> Option<NginxLayout> {
     });
     let (avail, enabled) = (root.join("sites-available"), root.join("sites-enabled"));
     if includes_sites && avail.is_dir() && enabled.is_dir() {
-        let name = format!("ostp-{domain}");
+        let name = format!("ostp-{domain}.conf");
         return Some(NginxLayout::Sites { available: avail.join(&name), enabled: enabled.join(&name) });
     }
     let confd = root.join("conf.d");
@@ -370,11 +383,19 @@ pub fn install(kind: Kind, p: &VhostParams, config_dir: &Path) -> Result<String>
                     Some(NginxLayout::Sites { available, enabled }) => {
                         ch.write(&available, &text)?;
                         ch.symlink(&available, &enabled)?;
-                        // Earlier versions wrote conf.d/: two server blocks for
-                        // one name would clash, so our old file goes.
-                        let old = Path::new("/etc/nginx/conf.d").join(format!("ostp-{}.conf", p.domain));
-                        if is_ours(&old) {
-                            ch.remove(&old)?;
+                        // Earlier versions wrote conf.d/ostp-<domain>.conf, then
+                        // sites-*/ostp-<domain> without the extension: two
+                        // server blocks for one name would clash, so our old
+                        // files go.
+                        let legacy_link = Path::new("/etc/nginx/sites-enabled").join(format!("ostp-{}", p.domain));
+                        let legacy_site = Path::new("/etc/nginx/sites-available").join(format!("ostp-{}", p.domain));
+                        if legacy_link.is_symlink() && std::fs::read_link(&legacy_link).is_ok_and(|t| t == legacy_site) {
+                            ch.remove_link(&legacy_link)?;
+                        }
+                        for old in [legacy_site, Path::new("/etc/nginx/conf.d").join(format!("ostp-{}.conf", p.domain))] {
+                            if is_ours(&old) {
+                                ch.remove(&old)?;
+                            }
                         }
                     }
                     Some(NginxLayout::ConfD(file)) => ch.write(&file, &text)?,
@@ -428,7 +449,7 @@ pub fn install(kind: Kind, p: &VhostParams, config_dir: &Path) -> Result<String>
             files.push(f.clone());
         }
     }
-    files.retain(|f| !ch.removed.iter().any(|(r, _)| r == f));
+    files.retain(|f| !ch.removed.iter().any(|(r, _)| r == f) && !ch.removed_links.iter().any(|(l, _)| l == f));
     manifest.files_created = files;
     manifest.site = ch.site.clone().or(previous.site);
     manifest.caddy_import |= previous.caddy_import;
