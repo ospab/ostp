@@ -15,7 +15,7 @@ pub mod sys {
 
     use winapi::shared::ipmib::{MIB_IPFORWARDROW, MIB_IPFORWARDTABLE};
     use winapi::shared::minwindef::{DWORD, ULONG};
-    use winapi::shared::winerror::{ERROR_INSUFFICIENT_BUFFER, NO_ERROR};
+    use winapi::shared::winerror::{ERROR_BUFFER_OVERFLOW, ERROR_INSUFFICIENT_BUFFER, NO_ERROR};
     use winapi::um::iphlpapi::{
         DeleteIpForwardEntry, GetAdaptersAddresses, GetIpForwardTable,
     };
@@ -163,7 +163,11 @@ pub mod sys {
                 ptr::null_mut(),
                 &mut size,
             );
-            if ret != ERROR_INSUFFICIENT_BUFFER {
+            // GetAdaptersAddresses reports a short buffer as ERROR_BUFFER_OVERFLOW
+            // (unlike GetIpForwardTable's ERROR_INSUFFICIENT_BUFFER). Checking only
+            // the latter made every lookup fail, so the TUN adapter was never
+            // skipped when picking the physical default route.
+            if ret != ERROR_BUFFER_OVERFLOW && ret != ERROR_INSUFFICIENT_BUFFER {
                 return None;
             }
 
