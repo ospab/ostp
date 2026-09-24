@@ -201,6 +201,10 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   padding: const EdgeInsets.only(top: 4),
                   child: Text(s.lastError!, style: const TextStyle(fontSize: 12, color: Colors.redAccent)),
                 ),
+              // The subscription's own profiles live here, not among the
+              // ones added by hand: a refresh rewrites them.
+              const SizedBox(height: 6),
+              ..._profiles.where((p) => p.subId == s.id).map((p) => _profileTile(p, dense: true)),
             ],
           ),
         ),
@@ -298,7 +302,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   context,
                   MaterialPageRoute(builder: (context) => const QRScannerScreen()),
                 );
-                if (result != null && result is String && (result.startsWith('ostp://') || isSubscriptionUrl(result))) {
+                if (result != null && result is String && (result.toLowerCase().startsWith('ostp://') || isSubscriptionUrl(result))) {
                   _importFromLink(result);
                 }
               },
@@ -352,6 +356,17 @@ class _SettingsScreenState extends State<SettingsScreen> {
         ],
       ),
     );
+  }
+
+  /// Host part of "host:port" / "[v6]:port" — the TLS name used when SNI is empty.
+  String _hostOf(String server) {
+    final s = server.trim();
+    if (s.startsWith('[')) {
+      final end = s.indexOf(']');
+      return end > 0 ? s.substring(1, end) : s;
+    }
+    final c = s.lastIndexOf(':');
+    return c > 0 ? s.substring(0, c) : (s.isEmpty ? 'the server host' : s);
   }
 
   void _showEditProfileDialog(OstpProfile? profile) {
@@ -431,7 +446,13 @@ class _SettingsScreenState extends State<SettingsScreen> {
                     if (tls) ...[
                       TextField(
                         controller: sniCtrl,
-                        decoration: const InputDecoration(labelText: 'Server name (SNI)', hintText: 'default: host from the address'),
+                        decoration: InputDecoration(
+                          labelText: 'Server name (SNI)',
+                          hintText: _hostOf(serverCtrl.text),
+                          helperText: 'Name sent in the TLS handshake and checked against the certificate. '
+                              'Empty = ${_hostOf(serverCtrl.text)} from the address; set only for another name on the same certificate.',
+                          helperMaxLines: 3,
+                        ),
                       ),
                       const SizedBox(height: 8),
                       TextField(
@@ -795,12 +816,54 @@ class _SettingsScreenState extends State<SettingsScreen> {
     );
   }
 
-  List<Widget> _buildProfileCards() {
-    String? activeId;
+  String? get _activeId {
     for (final x in _profiles) {
-      if (x.active) { activeId = x.id; break; }
+      if (x.active) return x.id;
     }
-    return _profiles.map((p) => Card(
+    return null;
+  }
+
+  /// One selectable profile row; `dense` inside a subscription card.
+  Widget _profileTile(OstpProfile p, {bool dense = false}) {
+    return ListTile(
+      dense: dense,
+      contentPadding: dense ? EdgeInsets.zero : null,
+      leading: Radio<String>(
+        value: p.id,
+        groupValue: _activeId,
+        onChanged: (_) => _selectActive(p),
+      ),
+      title: Text(p.name, style: TextStyle(fontWeight: FontWeight.bold, fontSize: dense ? 14 : null), maxLines: 1, overflow: TextOverflow.ellipsis),
+      subtitle: Text(
+        [
+          if (p.name != p.serverAddr) p.serverAddr,
+          p.tls ? 'TLS' : p.transportMode.toUpperCase(),
+        ].join(' · '),
+        style: const TextStyle(fontSize: 12),
+        maxLines: 1,
+        overflow: TextOverflow.ellipsis,
+        softWrap: false,
+      ),
+      trailing: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          IconButton(
+            icon: const Icon(Icons.share_rounded, size: 20, color: Colors.white54),
+            onPressed: () => _showShareModal(p),
+          ),
+          IconButton(
+            icon: const Icon(Icons.edit, size: 20, color: Colors.white54),
+            onPressed: () => _showEditProfileDialog(p),
+          ),
+        ],
+      ),
+      onTap: () => _selectActive(p),
+    );
+  }
+
+  List<Widget> _buildProfileCards(List<OstpProfile> list) {
+    final activeId = _activeId;
+    return list.map((p) => Card(
       color: p.active
           ? Theme.of(context).colorScheme.primary.withOpacity(0.12)
           : Theme.of(context).colorScheme.surface,
@@ -893,17 +956,21 @@ class _SettingsScreenState extends State<SettingsScreen> {
                 ..._buildSubscriptionCards(),
                 const SizedBox(height: 20),
               ],
-              const Text('PROFILES', style: TextStyle(color: Colors.white54, fontSize: 13, fontWeight: FontWeight.bold, letterSpacing: 1.0)),
+              Text(_subs.isEmpty ? 'PROFILES' : 'MY PROFILES',
+                  style: const TextStyle(color: Colors.white54, fontSize: 13, fontWeight: FontWeight.bold, letterSpacing: 1.0)),
               const SizedBox(height: 16),
-              if (_profiles.isEmpty)
+              if (_profiles.every((p) => p.subId.isNotEmpty))
                 Center(
                   child: Padding(
-                    padding: const EdgeInsets.all(32.0),
-                    child: Text('Create a new profile', style: TextStyle(color: Colors.white54, fontSize: 18)),
+                    padding: EdgeInsets.all(_subs.isEmpty ? 32.0 : 12.0),
+                    child: Text(
+                      _subs.isEmpty ? 'Create a new profile' : 'Profiles you add by hand appear here',
+                      style: TextStyle(color: Colors.white54, fontSize: _subs.isEmpty ? 18 : 13),
+                    ),
                   ),
                 )
               else
-                ..._buildProfileCards(),
+                ..._buildProfileCards(_profiles.where((p) => p.subId.isEmpty).toList()),
 
           const SizedBox(height: 32),
           const Text('CLIENT SETTINGS', style: TextStyle(color: Colors.white54, fontSize: 13, fontWeight: FontWeight.bold, letterSpacing: 1.0)),

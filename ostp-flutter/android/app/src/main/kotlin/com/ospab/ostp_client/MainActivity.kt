@@ -116,6 +116,13 @@ class MainActivity : FlutterActivity() {
                         }
                     }.start()
                 }
+                "addLog" -> {
+                    val message = call.argument<String>("message") ?: ""
+                    try {
+                        net.ostp.client.OstpClientSdk.addLog(message)
+                    } catch (_: Throwable) {}
+                    result.success(null)
+                }
                 "fetchSubscription" -> {
                     // A network round trip with a TLS handshake: never on the UI thread.
                     val url = call.argument<String>("url") ?: ""

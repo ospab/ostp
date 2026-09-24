@@ -950,3 +950,7 @@ textarea.field-input {
 .pr-ttl.genuine { background: var(--c-green-dim); color: var(--c-green); }
 .pr-ttl.foreign { background: rgba(255,95,95,0.14); color: var(--c-red); }
 .share-qr svg { width: 240px; height: 240px; }
+
+.sub-profiles { display: flex; flex-direction: column; gap: 6px; margin-top: 8px; }
+.sub-profiles:empty { display: none; }
+.sub-profiles .profile-card { background: transparent; }

@@ -122,6 +122,14 @@ const pmSni       = $('pm-sni');
 const pmWsPath    = $('pm-ws-path');
 const pmTlsInsecure = $('pm-tls-insecure');
 
+// With SNI empty the client uses the host from the Server field: show it.
+function updateSniHint() {
+  const s = pmServer.value.trim();
+  const host = s.startsWith('[') ? s.slice(1, s.indexOf(']')) : (s.lastIndexOf(':') > 0 ? s.slice(0, s.lastIndexOf(':')) : s);
+  pmSni.placeholder = host ? `${host} (from Server)` : 'the host from Server';
+}
+pmServer.addEventListener('input', updateSniHint);
+
 // TLS only exists on UoT; its details only while it is on.
 function updateTlsVisibility() {
   pmTlsGroup.style.display = pmTransport.value === 'uot' ? '' : 'none';
@@ -136,6 +144,7 @@ function setTlsFields(p) {
   pmWsPath.value = p.ws_path || '';
   pmTlsInsecure.checked = !!p.tls_insecure;
   updateTlsVisibility();
+  updateSniHint();
 }
 
 function tlsFieldsFromEditor() {
@@ -487,17 +496,19 @@ function showScreen(name) {
 }
 
 // ── PROFILE RENDERING ─────────────────────────────────────────────────
+// Profiles added by hand are listed here; a subscription's profiles are
+// listed inside its card (renderSubs), since every refresh rewrites them.
 function renderProfiles() {
   // Remove all cards but keep empty-state node
   Array.from(profileList.querySelectorAll('.profile-card')).forEach(n => n.remove());
+  const manual = profiles.filter(p => !p.sub_id);
+  const hasSubs = loadSubs().length > 0;
+  profileEmpty.style.display = manual.length || hasSubs ? 'none' : '';
+  manual.forEach(p => profileList.appendChild(profileCard(p)));
+  renderSubs();
+}
 
-  if (profiles.length === 0) {
-    profileEmpty.style.display = '';
-    return;
-  }
-  profileEmpty.style.display = 'none';
-
-  profiles.forEach(p => {
+function profileCard(p) {
     const card = document.createElement('div');
     card.className = 'profile-card' + (p.id === activeId ? ' active' : '');
     card.dataset.id = p.id;
@@ -506,7 +517,7 @@ function renderProfiles() {
         <div class="profile-radio-dot"></div>
       </div>
       <div class="profile-info">
-        <div class="profile-name">${escHtml(p.name || p.server)}${p.sub_id ? '<span class="profile-sub-tag">sub</span>' : ''}</div>
+        <div class="profile-name">${escHtml(p.name || p.server)}</div>
         <div class="profile-server">${escHtml(p.server)}</div>
       </div>
       <span class="profile-transport-badge">${escHtml(p.transport === 'uot' && p.tls ? 'tls' : (p.transport || 'udp'))}</span>
@@ -540,8 +551,7 @@ function renderProfiles() {
       openShare(p.id);
     });
 
-    profileList.appendChild(card);
-  });
+    return card;
 }
 
 function escHtml(str) {
@@ -889,7 +899,10 @@ function renderSubs() {
       ${ratio != null ? `<div class="sub-bar${ratio >= 1 ? ' full' : ratio >= 0.8 ? ' warn' : ''}"><div style="width:${(ratio * 100).toFixed(1)}%"></div></div>` : ''}
       <div class="sub-meta">${escHtml(meta)}</div>
       ${s.lastError ? `<div class="sub-error">${escHtml(s.lastError)}</div>` : ''}
+      <div class="sub-profiles"></div>
     `;
+    const own = card.querySelector('.sub-profiles');
+    profiles.filter(p => p.sub_id === s.id).forEach(p => own.appendChild(profileCard(p)));
     card.querySelector('.sub-refresh').addEventListener('click', () => refreshSubscription(s.id));
     card.querySelector('.sub-share').addEventListener('click', () => showShare('Share Subscription', s.url));
     card.querySelector('.sub-remove').addEventListener('click', () => removeSubscription(s.id));

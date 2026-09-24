@@ -167,7 +167,7 @@
         <div id="sub-section" style="display:none;">
           <div class="section-divider"><span>Subscriptions</span></div>
           <div id="sub-list" class="sub-list"></div>
-          <div class="section-divider"><span>Profiles</span></div>
+          <div class="section-divider"><span>My profiles</span></div>
         </div>
 
         <!-- Profile list -->
@@ -467,7 +467,8 @@
           <div id="pm-tls-fields" style="display:none;">
             <div class="field-group">
               <label class="field-label" for="pm-sni">Server name (SNI)</label>
-              <input id="pm-sni" class="field-input mono" type="text" placeholder="default: host from Server" spellcheck="false" />
+              <input id="pm-sni" class="field-input mono" type="text" placeholder="the host from Server" spellcheck="false" />
+              <p class="field-hint">Sent in the TLS handshake and checked against the certificate. Leave empty to use the host from Server; set it only for another name on the same certificate.</p>
             </div>
             <div class="field-group">
               <label class="field-label" for="pm-ws-path">Upgrade path</label>

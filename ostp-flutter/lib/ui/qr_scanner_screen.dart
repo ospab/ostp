@@ -15,7 +15,21 @@ class QRScannerScreen extends StatefulWidget {
   State<QRScannerScreen> createState() => _QRScannerScreenState();
 }
 
+/// The ostp:// link or https:// subscription URL in a scanned code. Looks
+/// in every field the scanner fills (some decoders put a URL only in `url`)
+/// and anywhere in the text, not just at its start.
+String? extractImportable(Barcode b) {
+  final pattern = RegExp(r'(ostp://\S+|https://\S+)', caseSensitive: false);
+  for (final text in [b.rawValue, b.displayValue, b.url?.url]) {
+    if (text == null) continue;
+    final m = pattern.firstMatch(text.trim());
+    if (m != null) return m.group(1);
+  }
+  return null;
+}
+
 class _QRScannerScreenState extends State<QRScannerScreen> {
+  static const _channel = MethodChannel('com.ospab.ostp/vpn');
   final MobileScannerController controller = MobileScannerController(
     detectionSpeed: DetectionSpeed.normal,
     facing: CameraFacing.back,
@@ -45,26 +59,27 @@ class _QRScannerScreenState extends State<QRScannerScreen> {
             onDetect: (capture) {
               final List<Barcode> barcodes = capture.barcodes;
               for (final barcode in barcodes) {
-                if (barcode.rawValue != null) {
-                  final value = barcode.rawValue!.trim();
-                  // A share link, or a subscription URL (https://<domain>/sub/<token>).
-                  if (value.startsWith('ostp://') || isSubscriptionUrl(value)) {
-                    controller.stop();
-                    Navigator.pop(context, value);
-                    return;
-                  } else {
-                    final now = DateTime.now();
-                    if (lastErrorTime == null || now.difference(lastErrorTime!) > const Duration(seconds: 3)) {
-                      lastErrorTime = now;
-                      ScaffoldMessenger.of(context).showSnackBar(
-                        const SnackBar(
-                          content: Text('Not an OSTP QR code: expected an ostp:// link or a subscription URL.'),
-                          backgroundColor: Colors.redAccent,
-                          duration: Duration(seconds: 2),
-                        ),
-                      );
-                    }
-                  }
+                // A share link, or a subscription URL (https://<domain>/sub/<token>).
+                final value = extractImportable(barcode);
+                if (value != null && (value.toLowerCase().startsWith('ostp://') || isSubscriptionUrl(value))) {
+                  controller.stop();
+                  Navigator.pop(context, value);
+                  return;
+                }
+                final now = DateTime.now();
+                if (lastErrorTime == null || now.difference(lastErrorTime!) > const Duration(seconds: 3)) {
+                  lastErrorTime = now;
+                  final read = barcode.rawValue ?? barcode.displayValue ?? barcode.url?.url ?? '(no text)';
+                  // Into the app log too, so a code that is not recognised can be traced.
+                  _channel.invokeMethod('addLog', {'message': 'QR scanner: not importable (${barcode.format.name}): $read'}).catchError((_) => null);
+                  final shown = read.length > 60 ? '${read.substring(0, 60)}…' : read;
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    SnackBar(
+                      content: Text('Not an OSTP code. Read: $shown'),
+                      backgroundColor: Colors.redAccent,
+                      duration: const Duration(seconds: 3),
+                    ),
+                  );
                 }
               }
             },
