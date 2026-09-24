@@ -1624,6 +1624,7 @@ dependencies = [
  "json_comments",
  "ostp-client",
  "ostp-core",
+ "ostp-dns",
  "ostp-server",
  "qrcode",
  "rand 0.8.5",

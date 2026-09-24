@@ -7,6 +7,7 @@ use colored::Colorize;
 mod cert_cmd;
 mod sub_cmd;
 mod panel_cmd;
+mod dns_cmd;
 mod webserver;
 
 #[derive(Parser, Debug)]
@@ -102,6 +103,11 @@ enum Commands {
     Panel {
         #[command(subcommand)]
         action: panel_cmd::PanelAction,
+    },
+    /// Filtering DNS for connected clients: block lists, rules, local names (server only)
+    Dns {
+        #[command(subcommand)]
+        action: dns_cmd::DnsAction,
     },
     /// Upgrade the configuration file to the current schema. This is the
     /// ONLY place config migration ever runs - never automatically at
@@ -1392,6 +1398,7 @@ async fn run_app() -> Result<()> {
             Commands::Cert { action } => return cert_cmd::run(action, &args.config).await,
             Commands::Sub { action } => return sub_cmd::run(action, &args.config),
             Commands::Panel { action } => return panel_cmd::run(action, &args.config),
+            Commands::Dns { action } => return dns_cmd::run(action, &args.config).await,
         }
     }
 

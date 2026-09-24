@@ -54,7 +54,7 @@ pub struct UpdateResult {
 
 /// Downloads every enabled list; a failed download keeps the cached copy.
 pub async fn update_all(settings: &DnsSettings, data_dir: &Path, proxy: Option<&str>) -> Vec<UpdateResult> {
-    let mut builder = reqwest::Client::builder().timeout(Duration::from_secs(60)).user_agent(concat!("ostp-dns/", env!("CARGO_PKG_VERSION")));
+    let mut builder = reqwest::Client::builder().timeout(Duration::from_secs(180)).user_agent(concat!("ostp-dns/", env!("CARGO_PKG_VERSION")));
     if let Some(p) = proxy {
         if let Ok(px) = reqwest::Proxy::all(p) {
             builder = builder.proxy(px);
