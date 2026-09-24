@@ -263,6 +263,9 @@ struct Changes {
     removed: Vec<(PathBuf, Vec<u8>)>,
     /// (link, target) of symlinks that were removed.
     removed_links: Vec<(PathBuf, PathBuf)>,
+    /// Files and links that are ours whether this run created them or
+    /// rewrote them (the site itself), so the manifest always lists them.
+    owned: Vec<PathBuf>,
     site: Option<String>,
 }
 
@@ -285,16 +288,27 @@ impl Changes {
         std::fs::write(path, contents).with_context(|| format!("cannot write {}", path.display()))
     }
 
+    /// Writes a file that is entirely ours (the site) and records it.
+    fn write_site(&mut self, path: &Path, contents: &str) -> Result<()> {
+        self.write(path, contents)?;
+        self.owned.push(path.to_path_buf());
+        Ok(())
+    }
+
     #[cfg(unix)]
     fn symlink(&mut self, target: &Path, link: &Path) -> Result<()> {
         match std::fs::read_link(link) {
-            Ok(existing) if existing == target => return Ok(()),
+            Ok(existing) if existing == target => {
+                self.owned.push(link.to_path_buf());
+                return Ok(());
+            }
             Ok(_) => bail!("{} already exists and points elsewhere; not touching it", link.display()),
             Err(_) if link.exists() => bail!("{} already exists and is not a symlink; not touching it", link.display()),
             Err(_) => {}
         }
         std::os::unix::fs::symlink(target, link).with_context(|| format!("cannot create {}", link.display()))?;
         self.created.push(link.to_path_buf());
+        self.owned.push(link.to_path_buf());
         Ok(())
     }
 
@@ -381,7 +395,7 @@ pub fn install(kind: Kind, p: &VhostParams, config_dir: &Path) -> Result<String>
                 let text = nginx_vhost(p, has_ipv6());
                 match nginx_layout(&p.domain) {
                     Some(NginxLayout::Sites { available, enabled }) => {
-                        ch.write(&available, &text)?;
+                        ch.write_site(&available, &text)?;
                         ch.symlink(&available, &enabled)?;
                         // Earlier versions wrote conf.d/ostp-<domain>.conf, then
                         // sites-*/ostp-<domain> without the extension: two
@@ -398,7 +412,7 @@ pub fn install(kind: Kind, p: &VhostParams, config_dir: &Path) -> Result<String>
                             }
                         }
                     }
-                    Some(NginxLayout::ConfD(file)) => ch.write(&file, &text)?,
+                    Some(NginxLayout::ConfD(file)) => ch.write_site(&file, &text)?,
                     None => bail!("no sites-enabled/ or conf.d/ under /etc/nginx; add this to your nginx config by hand:\n\n{text}"),
                 }
             }
@@ -408,11 +422,11 @@ pub fn install(kind: Kind, p: &VhostParams, config_dir: &Path) -> Result<String>
                 if Path::new("/etc/apache2/sites-available").is_dir() {
                     let _ = run_ok("a2enmod", &["-q", "ssl", "proxy", "proxy_http", "proxy_wstunnel"]);
                     let site = format!("ostp-{}", p.domain);
-                    ch.write(&PathBuf::from(format!("/etc/apache2/sites-available/{site}.conf")), &text)?;
+                    ch.write_site(&PathBuf::from(format!("/etc/apache2/sites-available/{site}.conf")), &text)?;
                     run_ok("a2ensite", &["-q", &site])?;
                     ch.site = Some(site);
                 } else if Path::new("/etc/httpd/conf.d").is_dir() {
-                    ch.write(&PathBuf::from(format!("/etc/httpd/conf.d/ostp-{}.conf", p.domain)), &text)?;
+                    ch.write_site(&PathBuf::from(format!("/etc/httpd/conf.d/ostp-{}.conf", p.domain)), &text)?;
                 } else {
                     bail!("unknown Apache layout; add this to your Apache config by hand:\n\n{text}");
                 }
@@ -420,7 +434,7 @@ pub fn install(kind: Kind, p: &VhostParams, config_dir: &Path) -> Result<String>
             Kind::Caddy => {
                 let caddyfile = std::fs::read_to_string(CADDYFILE)
                     .with_context(|| format!("{CADDYFILE} not found (caddy run from JSON/API is not supported); add this by hand:\n\n{}", caddy_site(p)))?;
-                ch.write(&Path::new(CADDY_DIR).join(format!("{}.caddy", p.domain)), &caddy_site(p))?;
+                ch.write_site(&Path::new(CADDY_DIR).join(format!("{}.caddy", p.domain)), &caddy_site(p))?;
                 if !caddyfile.contains(CADDY_BEGIN) {
                     let block = format!("\n{CADDY_BEGIN}\nimport {CADDY_DIR}/*.caddy\n{CADDY_END}\n");
                     ch.write(Path::new(CADDYFILE), &format!("{}{block}", caddyfile.trim_end()))?;
@@ -444,7 +458,7 @@ pub fn install(kind: Kind, p: &VhostParams, config_dir: &Path) -> Result<String>
     let path = manifest_path(config_dir);
     let previous: Manifest = std::fs::read(&path).ok().and_then(|d| serde_json::from_slice(&d).ok()).unwrap_or_default();
     let mut files: Vec<PathBuf> = previous.files_created.into_iter().filter(|f| f.exists() || f.is_symlink()).collect();
-    for f in &ch.created {
+    for f in ch.created.iter().chain(ch.owned.iter()) {
         if !files.contains(f) {
             files.push(f.clone());
         }
