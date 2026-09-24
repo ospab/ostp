@@ -8,6 +8,7 @@ import 'package:package_info_plus/package_info_plus.dart';
 import '../models/connection_state_enum.dart';
 import '../models/ostp_profile.dart';
 import '../models/subscription.dart';
+import '../services/updates.dart' as updates;
 import 'prober_screen.dart';
 import 'settings_screen.dart';
 
@@ -78,6 +79,13 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
     _checkInitialState();
     _startPolling();
     _refreshSubscriptions();
+    // Once per app start (initState does not run again when the app comes
+    // back from the background).
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted && (widget.prefs.getBool(updates.autoUpdateCheckKey) ?? true)) {
+        updates.checkForUpdates(context, widget.prefs, manual: false);
+      }
+    });
   }
 
   /// Subscriptions whose update interval has passed are fetched in the
@@ -92,7 +100,9 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
     try {
       final info = await PackageInfo.fromPlatform();
       if (mounted) {
-        setState(() => _version = 'v${info.version} (${info.buildNumber})');
+        final tag = await updates.buildTag();
+        if (!mounted) return;
+        setState(() => _version = '${tag ?? 'v${info.version}'} (${info.buildNumber})');
       }
     } catch (_) {
       // Non-fatal: just leave the version line blank if it can't be read.

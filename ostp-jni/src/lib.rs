@@ -564,6 +564,28 @@ pub extern "system" fn Java_net_ostp_client_OstpClientSdk_fetchSubscription(
     }
 }
 
+/// The release this build was cut from, e.g. "v0.4.6-beta.2".
+#[no_mangle]
+pub extern "system" fn Java_net_ostp_client_OstpClientSdk_buildTag(mut env: JNIEnv, _class: JClass) -> jstring {
+    match env.new_string(ostp_client::updates::build_tag()) {
+        Ok(s) => s.into_raw(),
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+/// Newer stable/beta releases on GitHub as JSON, or {"error": ...}.
+#[no_mangle]
+pub extern "system" fn Java_net_ostp_client_OstpClientSdk_checkForUpdates(mut env: JNIEnv, _class: JClass) -> jstring {
+    let result = match Runtime::new() {
+        Ok(rt) => rt.block_on(ostp_client::updates::check()),
+        Err(e) => Err(anyhow::anyhow!("failed to create tokio runtime: {e}")),
+    };
+    match result {
+        Ok(r) => json_jstring(&mut env, &r),
+        Err(e) => error_jstring(&mut env, &format!("{e:#}")),
+    }
+}
+
 fn error_jstring(env: &mut JNIEnv, msg: &str) -> jstring {
     let body = serde_json::json!({ "error": msg }).to_string();
     match env.new_string(body.replace('\0', "")) {

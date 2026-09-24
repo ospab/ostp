@@ -1,4 +1,3 @@
-import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -6,12 +5,10 @@ import 'app_routing_screen.dart';
 import 'logs_screen.dart';
 import 'qr_scanner_screen.dart';
 import 'package:qr_flutter/qr_flutter.dart';
-import 'package:http/http.dart' as http;
-import 'package:url_launcher/url_launcher.dart';
-import 'package:package_info_plus/package_info_plus.dart';
 import '../models/ostp_profile.dart';
 import '../models/share_link.dart';
 import '../models/subscription.dart';
+import '../services/updates.dart' as updates;
 
 /// Picks readable black/white text for a given (opaque) background color.
 /// The monochrome theme's `primary` is pure white — hardcoded white text on
@@ -41,6 +38,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
   bool _isCheckingUpdates = false;
   bool _showSpeed = true;
   bool _showRtt = true;
+  bool _autoUpdateCheck = true;
 
   List<OstpProfile> _profiles = [];
   List<OstpSubscription> _subs = [];
@@ -65,6 +63,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
     _muxEnabled = widget.prefs.getBool('mux_enabled') ?? false;
     _showSpeed = widget.prefs.getBool('show_speed') ?? true;
     _showRtt = widget.prefs.getBool('show_rtt') ?? true;
+    _autoUpdateCheck = widget.prefs.getBool(updates.autoUpdateCheckKey) ?? true;
     _muxSessionsCtrl = TextEditingController(text: widget.prefs.getString('mux_sessions') ?? '2');
     _profiles = decodeProfiles(widget.prefs.getString('profiles_json'));
     _subs = SubscriptionStore(widget.prefs).load();
@@ -234,6 +233,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
     widget.prefs.setBool('mux_enabled', _muxEnabled);
     widget.prefs.setBool('show_speed', _showSpeed);
     widget.prefs.setBool('show_rtt', _showRtt);
+    widget.prefs.setBool(updates.autoUpdateCheckKey, _autoUpdateCheck);
     widget.prefs.setString('mux_sessions', _muxSessionsCtrl.text.trim());
     widget.prefs.setString('profiles_json', encodeProfiles(_profiles));
   }
@@ -990,6 +990,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                 if (_muxEnabled)
                   _buildTextField('MUX Sessions', _muxSessionsCtrl, hint: 'e.g. 2, 4, 8'),
 
+                _buildToggle('Check for updates', 'When the app opens: stable and beta releases', _autoUpdateCheck, (v) => _autoUpdateCheck = v),
                 _buildToggle('Debug Mode', 'Verbose logging', _debugMode, (v) => _debugMode = v),
                 _buildToggle('Show Speed', 'Live download/upload speed on the home screen', _showSpeed, (v) => _showSpeed = v),
                 _buildToggle('Show RTT', 'Live server ping on the home screen', _showRtt, (v) => _showRtt = v),
@@ -1059,7 +1060,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                         const Text('Check for Updates', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16, color: Colors.white)),
                         const SizedBox(height: 4),
                         Text(
-                          _isCheckingUpdates ? 'Checking...' : 'Check latest release on GitHub',
+                          _isCheckingUpdates ? 'Checking...' : 'Stable and beta releases on GitHub',
                           style: const TextStyle(fontSize: 13, color: Colors.white54),
                         ),
                       ],
@@ -1086,46 +1087,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
     if (_isCheckingUpdates) return;
     setState(() { _isCheckingUpdates = true; });
     try {
-      final packageInfo = await PackageInfo.fromPlatform();
-      final currentVersion = packageInfo.version;
-
-      final response = await http.get(Uri.parse('https://api.github.com/repos/ospab/ostp/releases/latest'));
-      if (response.statusCode == 200) {
-        final data = json.decode(response.body);
-        final latestVersion = (data['tag_name'] as String).replaceAll('v', '');
-        final hasUpdate = latestVersion != currentVersion;
-
-        if (!mounted) return;
-        showDialog(
-          context: context,
-          builder: (context) {
-            return AlertDialog(
-              backgroundColor: Theme.of(context).colorScheme.surface,
-              title: Text(hasUpdate ? 'Update Available!' : 'Up to Date'),
-              content: Text(hasUpdate
-                  ? 'A new version ($latestVersion) is available on GitHub. You are currently running version $currentVersion.'
-                  : 'You are running the latest version ($currentVersion).'),
-              actions: [
-                TextButton(onPressed: () => Navigator.pop(context), child: const Text('Close')),
-                if (hasUpdate)
-                  TextButton(
-                    onPressed: () {
-                      Navigator.pop(context);
-                      final url = Uri.parse(data['html_url'] ?? 'https://github.com/ospab/ostp/releases/latest');
-                      launchUrl(url, mode: LaunchMode.externalApplication);
-                    },
-                    child: const Text('Download'),
-                  )
-              ],
-            );
-          },
-        );
-      } else {
-        throw Exception('HTTP ${response.statusCode}');
-      }
-    } catch (e) {
-      if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Error checking updates: $e')));
+      await updates.checkForUpdates(context, widget.prefs, manual: true);
     } finally {
       if (mounted) setState(() { _isCheckingUpdates = false; });
     }

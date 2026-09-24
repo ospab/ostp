@@ -67,4 +67,14 @@ object OstpClientSdk {
     @Keep
     @JvmStatic
     external fun fetchSubscription(url: String): String
+
+    /** Release tag of this build, e.g. "v0.4.6-beta.2". */
+    @Keep
+    @JvmStatic
+    external fun buildTag(): String
+
+    /** Newer stable/beta releases as JSON, or {"error": ...}. Blocking: call off the UI thread. */
+    @Keep
+    @JvmStatic
+    external fun checkForUpdates(): String
 }

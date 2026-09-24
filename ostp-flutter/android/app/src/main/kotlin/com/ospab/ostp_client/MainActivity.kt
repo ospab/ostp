@@ -116,6 +116,24 @@ class MainActivity : FlutterActivity() {
                         }
                     }.start()
                 }
+                "buildTag" -> {
+                    try {
+                        result.success(net.ostp.client.OstpClientSdk.buildTag())
+                    } catch (e: Throwable) {
+                        result.error("ERROR", e.message, null)
+                    }
+                }
+                "checkForUpdates" -> {
+                    // A network round trip to GitHub: never on the UI thread.
+                    Thread {
+                        try {
+                            val json = net.ostp.client.OstpClientSdk.checkForUpdates()
+                            runOnUiThread { result.success(json) }
+                        } catch (e: Throwable) {
+                            runOnUiThread { result.error("ERROR", e.message, null) }
+                        }
+                    }.start()
+                }
                 "addLog" -> {
                     val message = call.argument<String>("message") ?: ""
                     try {
