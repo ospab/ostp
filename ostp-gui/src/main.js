@@ -1007,7 +1007,7 @@ async function runTtl() {
 
 async function runDpi() {
   setProberBusy(true);
-  prStatus('Testing what this network filters (about 10 s)…', true);
+  prStatus('Testing what this network filters, around the VPN tunnel (10–30 s)…', true);
   try {
     const r = await invoke('run_dpi_battery');
     if (!r) throw new Error('the prober needs the desktop app');
@@ -1022,7 +1022,6 @@ async function runDpi() {
       line(r.sni_blocked, 'TLS by server name (SNI) is blocked', 'TLS server names are not filtered'),
       line(r.http_host_blocked, 'HTTP by Host header is blocked', 'HTTP Host headers are not filtered'),
       line(r.rst_injection_detected, 'Forged TCP resets are injected', 'No forged TCP resets'),
-      line(r.random_payload_blocked, 'Unknown protocols are blocked', 'Unknown protocols pass'),
       line(r.udp_throttled, 'UDP is throttled', 'UDP is not throttled'),
       line(r.dns_hijacked, `DNS is hijacked${r.dns_hijacker_ip ? ' by ' + r.dns_hijacker_ip : ''}`, 'DNS answers are not hijacked'),
       line(r.dns_injected, `DNS answers are injected${r.dns_injection_msg ? ': ' + r.dns_injection_msg : ''}`, 'No injected DNS answers'),
@@ -1031,7 +1030,21 @@ async function runDpi() {
     ].join('');
     const tip = r.vulnerable_to_fragmentation
       ? '<p class="field-hint">The filter misses fragmented handshakes: TCP fragmentation (UoT) helps here.</p>' : '';
-    prCard('Network DPI test', verdict + `<table class="pr-table">${rows}</table>` + tip);
+    // Checks with a verdict and, when the censor answers, its hop.
+    const checks = (r.checks || []).map(c => {
+      const mark = c.ok === true ? '<span class="pr-ok">✓</span>' : c.ok === false ? '<span class="pr-bad">✕</span>' : '<span class="pr-dim">–</span>';
+      const hop = c.locate && c.locate.verdict === 'on_path'
+        ? `<div class="pr-where">Censor at hop ${c.locate.reaction_hop}${c.locate.reaction_hop_address ? ' (' + escHtml(c.locate.reaction_hop_address) + ')' : ''}, server at hop ${c.locate.server_hop ?? '?'}</div>` : '';
+      return `<tr><td>${mark}</td><td><b>${escHtml(c.title)}</b><div class="pr-dim">${escHtml(c.detail)}</div>${hop}</td></tr>`;
+    }).join('');
+    // The path toward a foreign host: where a silent drop can be.
+    const path = (r.path || []).map(h => `<tr><td class="mono">${h.ttl}</td><td class="mono">${escHtml(h.address || '*')}</td><td>${escHtml(h.asn ? 'AS' + h.asn + ' ' + (h.as_name || '') : (h.address ? 'local network' : 'no answer'))}${h.is_target ? ' <span class="pr-ok">destination</span>' : ''}</td></tr>`).join('');
+    const pathBlock = path
+      ? `<h4 style="margin-top:14px">Path to ${escHtml(r.path_target || '')}</h4>
+         ${r.path_summary ? `<p class="field-hint">${escHtml(r.path_summary.charAt(0).toUpperCase() + r.path_summary.slice(1))}.</p>` : ''}
+         <table class="pr-table"><tr><th>Hop</th><th>Router</th><th>Network</th></tr>${path}</table>
+         <p class="field-hint">A censor that resets or answers is placed by TTL; one that drops silently can only be narrowed to the hops before the destination network.</p>` : '';
+    prCard('Network DPI test', verdict + `<table class="pr-table">${checks}${rows}</table>` + tip + pathBlock);
     prStatus('Done.');
   } catch (e) {
     prStatus('DPI test failed: ' + (e?.message || e));

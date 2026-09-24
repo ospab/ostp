@@ -954,3 +954,5 @@ textarea.field-input {
 .sub-profiles { display: flex; flex-direction: column; gap: 6px; margin-top: 8px; }
 .sub-profiles:empty { display: none; }
 .sub-profiles .profile-card { background: transparent; }
+
+.pr-where { color: var(--c-red); font-size: 0.7rem; margin-top: 2px; }

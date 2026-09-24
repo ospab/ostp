@@ -1,4 +1,4 @@
-mod proxy;
+pub(crate) mod proxy;
 mod ip_reasm;
 pub mod native_handler;
 

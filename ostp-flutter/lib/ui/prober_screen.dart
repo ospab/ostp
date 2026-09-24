@@ -380,7 +380,9 @@ class _ProberScreenState extends State<ProberScreen> {
             'checks the standalone ostp-prober desktop tool runs: SNI/HTTP-Host filtering, '
             'DNS hijack/injection, CONNECT hijacking, RST injection, UDP throttling. Tells '
             'you whether the network filters in general, independent of whether your own '
-            'server works. Takes about 10 seconds; safe to run while connected.',
+            'server works. Also: foreign hosting, the TLS freeze, QUIC, and the path hop by hop '
+            'with who owns each hop. A censor that resets is placed by TTL. Takes 10–30 seconds; '
+            'safe to run while connected (the probes go around the tunnel).',
             style: TextStyle(fontSize: 12, color: Colors.white54),
           ),
           const SizedBox(height: 12),
@@ -435,9 +437,32 @@ class _ProberScreenState extends State<ProberScreen> {
             _dpiFindingRow('RST injection', _dpiReport!['rst_injection_detected'] == true,
                 _dpiReport!['rst_injection_detected'] == true ? 'middlebox on path' : 'not seen',
                 'RST on a closed port arrived faster than RTT — timing heuristic'),
-            _dpiFindingRow('Whitelist DPI', _dpiReport!['random_payload_blocked'] == true,
-                _dpiReport!['random_payload_blocked'] == true ? 'cuts unknown protocols on :443' : 'not seen',
-                'random bytes on :443 get an instant RST — heuristic'),
+            ...((_dpiReport!['checks'] as List<dynamic>? ?? []).map((raw) {
+              final c = raw as Map<String, dynamic>;
+              final ok = c['ok'];
+              final loc = c['locate'] as Map<String, dynamic>?;
+              final where = loc != null && loc['verdict'] == 'on_path'
+                  ? 'Censor at hop ${loc['reaction_hop']}${loc['reaction_hop_address'] != null ? ' (${loc['reaction_hop_address']})' : ''}, server at hop ${loc['server_hop'] ?? '?'}'
+                  : null;
+              return Padding(
+                padding: const EdgeInsets.symmetric(vertical: 4),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      '${ok == true ? '✓' : ok == false ? '✕' : '–'}  ${c['title']}',
+                      style: TextStyle(
+                        fontSize: 13,
+                        fontWeight: FontWeight.w600,
+                        color: ok == true ? Colors.greenAccent : ok == false ? Colors.redAccent : Colors.white54,
+                      ),
+                    ),
+                    Text('${c['detail']}', style: const TextStyle(fontSize: 11, color: Colors.white54)),
+                    if (where != null) Text(where, style: const TextStyle(fontSize: 11, color: Colors.redAccent)),
+                  ],
+                ),
+              );
+            })),
             _dpiFindingRow('UDP throttling', _dpiReport!['udp_throttled'] == true,
                 _dpiReport!['udp_throttled'] == true ? 'abnormal latency spread' : 'not seen',
                 'UDP/53 RTT variance — heuristic, can false-positive'),
@@ -445,6 +470,35 @@ class _ProberScreenState extends State<ProberScreen> {
               _dpiFindingRow('Split-TLS bypass', _dpiReport!['vulnerable_to_fragmentation'] != true,
                   _dpiReport!['vulnerable_to_fragmentation'] == true ? 'works — DPI does not reassemble' : 'did not help',
                   'splitting ClientHello at byte 5 to slip past the DPI box'),
+            if ((_dpiReport!['path'] as List<dynamic>? ?? []).isNotEmpty) ...[
+              const SizedBox(height: 12),
+              Text('Path to ${_dpiReport!['path_target'] ?? ''}',
+                  style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13, color: Colors.white)),
+              if (_dpiReport!['path_summary'] != null)
+                Padding(
+                  padding: const EdgeInsets.only(top: 2, bottom: 4),
+                  child: Text('${_dpiReport!['path_summary']}', style: const TextStyle(fontSize: 11, color: Colors.white70)),
+                ),
+              ...((_dpiReport!['path'] as List<dynamic>).map((raw) {
+                final h = raw as Map<String, dynamic>;
+                final owner = h['asn'] != null
+                    ? 'AS${h['asn']} ${h['as_name'] ?? ''}'
+                    : (h['address'] != null ? 'local network' : 'no answer');
+                return Text(
+                  '${h['ttl'].toString().padLeft(2)}  ${(h['address'] ?? '*').toString().padRight(15)}  $owner${h['is_target'] == true ? '  ← destination' : ''}',
+                  style: TextStyle(
+                    fontFamily: 'monospace',
+                    fontSize: 11,
+                    color: h['is_target'] == true ? Colors.greenAccent : Colors.white70,
+                  ),
+                );
+              })),
+              const Text(
+                'A censor that resets or answers is placed by TTL; one that drops silently can only be narrowed '
+                'to the hops before the destination network.',
+                style: TextStyle(fontSize: 11, color: Colors.white38),
+              ),
+            ],
             const SizedBox(height: 8),
             const Text('DNS servers', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 13, color: Colors.white)),
             ...((_dpiReport!['dns_servers'] as List<dynamic>? ?? []).map((raw) {
