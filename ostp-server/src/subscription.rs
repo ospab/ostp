@@ -81,7 +81,7 @@ impl SubscriptionService {
         let accept = header("accept");
         let json = accept.contains("application/json") || query.split('&').any(|kv| kv == "format=json");
         let html = !json && accept.contains("text/html");
-        let ru = header("accept-language").trim_start().starts_with("ru");
+        let ru = prefers_russian(&header("accept-language"));
         Some(Request { token: token.to_ascii_lowercase(), json, html, ru, head_only })
     }
 
@@ -273,6 +273,31 @@ impl SubscriptionService {
     }
 }
 
+/// Whether Accept-Language ranks Russian above English (by q, then order).
+/// Neither listed: English.
+fn prefers_russian(accept_language: &str) -> bool {
+    let mut best: Option<(f32, usize, bool)> = None;
+    for (i, part) in accept_language.split(',').enumerate() {
+        let mut it = part.split(';');
+        let tag = it.next().unwrap_or("").trim().to_ascii_lowercase();
+        let q = it
+            .find_map(|p| p.trim().strip_prefix("q=").and_then(|v| v.trim().parse::<f32>().ok()))
+            .unwrap_or(1.0);
+        let is_ru = tag == "ru" || tag.starts_with("ru-");
+        if !(is_ru || tag == "en" || tag.starts_with("en-")) || q <= 0.0 {
+            continue;
+        }
+        let better = match best {
+            None => true,
+            Some((bq, bi, _)) => q > bq || (q == bq && i < bi),
+        };
+        if better {
+            best = Some((q, i, is_ru));
+        }
+    }
+    best.is_some_and(|(_, _, ru)| ru)
+}
+
 fn html_escape(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;").replace('\'', "&#39;")
 }
@@ -405,6 +430,17 @@ mod tests {
         let json = format!("GET {path} HTTP/1.1\r\nAccept: application/json, text/html\r\n\r\n");
         let resp = String::from_utf8(svc.respond(json.as_bytes()).await.unwrap()).unwrap();
         assert!(resp.contains("Content-Type: application/json"));
+    }
+
+    #[test]
+    fn language_follows_accept_language_priorities() {
+        assert!(prefers_russian("ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7"));
+        assert!(!prefers_russian("en-US,en;q=0.9,ru;q=0.8"));
+        assert!(prefers_russian("uk-UA,uk;q=0.9,ru;q=0.8,en;q=0.7"));
+        assert!(prefers_russian("en;q=0.5, ru;q=0.9"));
+        assert!(!prefers_russian("de-DE,de;q=0.9"));
+        assert!(!prefers_russian(""));
+        assert!(!prefers_russian("ru;q=0, en"));
     }
 
     #[test]

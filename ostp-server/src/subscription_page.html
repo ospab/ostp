@@ -5,6 +5,9 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="robots" content="noindex, nofollow">
 <meta name="referrer" content="no-referrer">
+<meta name="color-scheme" content="light dark">
+<meta name="theme-color" content="#f4f5f2" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#0f1214" media="(prefers-color-scheme: dark)">
 <title>{{NAME}} · OSTP</title>
 <style>
 :root {
@@ -133,7 +136,20 @@ footer a { color: var(--accent); }
     buttons.forEach(function (b) { b.setAttribute('aria-pressed', String(b.dataset.lang === l)); });
     try { localStorage.setItem('ostp-sub-lang', l); } catch (e) {}
   }
-  try { var saved = localStorage.getItem('ostp-sub-lang'); if (saved === 'ru' || saved === 'en') setLang(saved); } catch (e) {}
+  // Theme follows the system on its own (CSS). Language: the viewer's own
+  // choice if they made one, otherwise the browser's languages in order.
+  var saved = null;
+  try { saved = localStorage.getItem('ostp-sub-lang'); } catch (e) {}
+  if (saved === 'ru' || saved === 'en') {
+    root.lang = saved;
+  } else {
+    var langs = navigator.languages && navigator.languages.length ? navigator.languages : [navigator.language || ''];
+    for (var i = 0; i < langs.length; i++) {
+      var l = String(langs[i]).toLowerCase().slice(0, 2);
+      if (l === 'ru' || l === 'en') { root.lang = l; break; }
+    }
+  }
+  buttons.forEach(function (b) { b.setAttribute('aria-pressed', String(b.dataset.lang === root.lang)); });
   buttons.forEach(function (b) { b.addEventListener('click', function () { setLang(b.dataset.lang); }); });
   document.querySelectorAll('[data-copy]').forEach(function (b) {
     b.addEventListener('click', function () {
