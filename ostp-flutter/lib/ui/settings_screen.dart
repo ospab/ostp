@@ -173,6 +173,15 @@ class _SettingsScreenState extends State<SettingsScreen> {
                           onPressed: () => _refreshSubscription(s),
                         ),
                   IconButton(
+                    icon: const Icon(Icons.qr_code_rounded, size: 20, color: Colors.white54),
+                    tooltip: 'Share',
+                    onPressed: () => _showQrDialog(
+                      'Share Subscription',
+                      s.url,
+                      note: 'Anyone with this link connects as you and uses your traffic. Share it only with your own devices.',
+                    ),
+                  ),
+                  IconButton(
                     icon: const Icon(Icons.delete_outline_rounded, size: 20, color: Colors.white54),
                     tooltip: 'Remove',
                     onPressed: () => _confirmRemoveSubscription(s),
@@ -713,18 +722,21 @@ class _SettingsScreenState extends State<SettingsScreen> {
       link.insecure = p.tlsInsecure;
     }
     link.path = p.wsPath.isEmpty ? null : p.wsPath;
-    final url = link.toUri();
+    // Deliberately generic title — not "Share {name}": when a profile has no
+    // custom name, `name` falls back to the raw server address, and this
+    // dialog is exactly the wrong place to be casually displaying that
+    // (screenshots, screen recordings, shoulder-surfing).
+    _showQrDialog('Share Profile', link.toUri());
+  }
 
+  /// QR code, the text itself and a copy button: profiles and subscriptions.
+  void _showQrDialog(String title, String url, {String? note}) {
     showDialog(
       context: context,
       builder: (context) => AlertDialog(
         backgroundColor: Theme.of(context).colorScheme.surface,
         shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
-        // Deliberately generic — not "Share {name}": when a profile has no
-        // custom name, `name` falls back to the raw server address, and this
-        // dialog is exactly the wrong place to be casually displaying that
-        // (screenshots, screen recordings, shoulder-surfing).
-        title: const Text('Share Profile', textAlign: TextAlign.center),
+        title: Text(title, textAlign: TextAlign.center),
         content: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
@@ -733,7 +745,17 @@ class _SettingsScreenState extends State<SettingsScreen> {
               decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(16)),
               child: QrImageView(data: url, version: QrVersions.auto, size: 200.0),
             ),
-            const SizedBox(height: 20),
+            const SizedBox(height: 12),
+            SelectableText(
+              url,
+              textAlign: TextAlign.center,
+              style: const TextStyle(fontFamily: 'monospace', fontSize: 11, color: Colors.white70),
+            ),
+            if (note != null) ...[
+              const SizedBox(height: 8),
+              Text(note, textAlign: TextAlign.center, style: const TextStyle(fontSize: 12, color: Colors.orangeAccent)),
+            ],
+            const SizedBox(height: 16),
             Builder(builder: (context) {
               final bg = Theme.of(context).colorScheme.primary;
               final fg = _onColor(bg);
