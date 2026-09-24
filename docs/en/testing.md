@@ -79,7 +79,7 @@ Repeat for nginx, apache (Debian and RHEL) and caddy.
 
 | # | Steps | Expected | Prio |
 |---|---|---|---|
-| S-30 | `ostp cert issue` on a machine with a web server | the web server is found; after confirmation a site is added (Debian/Ubuntu: `sites-available/ostp-<domain>` with a symlink in `sites-enabled`, otherwise `conf.d/`), the config test passes (`nginx -t` / `configtest` / `caddy validate`), reload done; `ostp cert status` shows every check green | P1 (nginx), P2 (others) |
+| S-30 | `ostp cert issue` on a machine with a web server | the web server is found; after confirmation a site is added (Debian/Ubuntu: `sites-available/ostp-<domain>.conf` with the symlink `sites-enabled/ostp-<domain>.conf`, otherwise `conf.d/`), the config test passes (`nginx -t` / `configtest` / `caddy validate`), reload done; `ostp cert status` shows every check green | P1 (nginx), P2 (others) |
 | S-31 | Client over a TLS link with `path=` | connects through 443 | P1 (nginx) |
 | S-32 | Existing sites on that web server | work as before | P1 |
 | S-33 | Break the web server config beforehand, run the install | the install rolls back, the web server keeps running on the old config | P2 |

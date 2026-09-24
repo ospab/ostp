@@ -56,6 +56,23 @@ An optional REST API (`api.rs`), enabled via the `api` block in `config.json`, e
 - **Endpoints** (mounted under the configured `webpath`): `GET /server/status`, `GET`/`PUT /server/config`, `GET`/`POST /users`, `GET`/`PUT`/`DELETE /users/{key}`, `PUT /users/{key}/limit`, `POST /users/{key}/reset`, `POST /users/bulk`, `GET`/`POST`/`DELETE /audit`, `GET`/`PUT /router/rules`, and `GET /subscribe/{key}` (no Bearer token needed — the access key itself authenticates the request, returning a ready-to-use client config or `ostp://` share link).
 - See the [Management API wiki page](https://github.com/ospab/ostp/wiki/Management-API) for the full request/response reference.
 
+### Web panel: `ostp panel`
+
+The panel is built into the binary and runs on the same API. It has its own command:
+
+```
+ostp panel status                      # on or off, address, path, sign-in, how to open it
+ostp panel enable [--bind 127.0.0.1:9090] [--webpath x7Kq2m] [--user admin]
+ostp panel set --webpath x7Kq2m        # change settings without turning it on or off
+ostp panel passwd [--user NAME]        # password: asked twice without echo, or read from stdin
+ostp panel token [--new | --clear]     # API token for scripts
+ostp panel disable
+```
+
+`enable` does not turn on a panel without sign-in: it asks for a name and a password when they are missing. The password is never an argument (it would stay in shell history) and needs 8 or more characters. Every command keeps a copy of the config and restarts a running service (`--no-restart` to skip).
+
+Open the panel on the server at `http://127.0.0.1:9090/<webpath>/`, from elsewhere through an SSH tunnel (`ssh -L 9090:127.0.0.1:9090 user@server`) or over HTTPS on the domain when the built-in frontend holds 443 or the web server forwards the panel path (`ostp panel set --vhost`). `ostp panel status` lists every address that works.
+
 ---
 
 ## Built-in DNS Resolver

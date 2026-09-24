@@ -56,6 +56,23 @@
 - **Эндпоинты** (монтируются под настроенным `webpath`): `GET /server/status`, `GET`/`PUT /server/config`, `GET`/`POST /users`, `GET`/`PUT`/`DELETE /users/{key}`, `PUT /users/{key}/limit`, `POST /users/{key}/reset`, `POST /users/bulk`, `GET`/`POST`/`DELETE /audit`, `GET`/`PUT /router/rules`, а также `GET /subscribe/{key}` (без Bearer-токена — аутентифицирует запрос сам ключ доступа, возвращая готовую конфигурацию клиента или ссылку `ostp://`).
 - Полный справочник запросов/ответов — на [странице Management API в вики](https://github.com/ospab/ostp/wiki/Management-API).
 
+### Веб-панель: `ostp panel`
+
+Панель встроена в бинарник и работает поверх того же API. Управление — отдельной командой:
+
+```
+ostp panel status                      # включена ли, адрес, путь, вход, как открыть
+ostp panel enable [--bind 127.0.0.1:9090] [--webpath x7Kq2m] [--user admin]
+ostp panel set --webpath x7Kq2m        # поменять настройки, не включая и не выключая
+ostp panel passwd [--user NAME]        # пароль: запрашивается дважды без эха или читается из stdin
+ostp panel token [--new | --clear]     # API-токен для скриптов
+ostp panel disable
+```
+
+`enable` не включит панель без входа: если логин или пароль не заданы, команда их спросит. Пароль никогда не передаётся аргументом (он остался бы в истории shell) и должен быть не короче 8 символов. Каждая команда сохраняет копию конфига и перезапускает запущенную службу (`--no-restart`, чтобы не перезапускать).
+
+Панель открывается на сервере по `http://127.0.0.1:9090/<webpath>/`, с другого компьютера — через SSH-туннель (`ssh -L 9090:127.0.0.1:9090 user@server`) или по HTTPS на домене, если 443 держит встроенный фронтенд либо веб-сервер пробрасывает путь панели (`ostp panel set --vhost`). `ostp panel status` показывает все доступные адреса.
+
 ---
 
 ## Встроенный DNS-резолвер

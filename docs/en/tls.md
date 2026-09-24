@@ -176,6 +176,8 @@ Each command changes exactly what it names, keeps a copy of the config in `confi
 
 `ostp links` and `ostp links qr` print the URL of every key too, and the web panel shows it in the Share dialog.
 
+Opened in a browser, the subscription URL shows a page for a person instead of raw links: what the link is and why not to share it, traffic used, how to connect (get the app, paste the address or scan the QR code), the individual links for manual setup, and a link to the repository. It is in Russian and English, picked from the browser's language. Apps and subscription managers get what they always got.
+
 - The token is a hash of the access key. The key itself never appears in the URL, so it stays out of web-server logs, but the token still unlocks the links: treat a subscription URL as carefully as a key.
 - Subscriptions are served only inside TLS, or to a local web server (nginx, apache, caddy) that terminated TLS itself. They are never answered in plain HTTP on the OSTP port.
 - An unknown token gets the same decoy as any other path.
