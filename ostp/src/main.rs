@@ -6,6 +6,7 @@ use colored::Colorize;
 
 mod cert_cmd;
 mod sub_cmd;
+mod panel_cmd;
 mod webserver;
 
 #[derive(Parser, Debug)]
@@ -96,6 +97,11 @@ enum Commands {
     Sub {
         #[command(subcommand)]
         action: sub_cmd::SubAction,
+    },
+    /// Web panel and management API: on/off, address, path, sign-in, API token (server only)
+    Panel {
+        #[command(subcommand)]
+        action: panel_cmd::PanelAction,
     },
     /// Upgrade the configuration file to the current schema. This is the
     /// ONLY place config migration ever runs - never automatically at
@@ -1385,6 +1391,7 @@ async fn run_app() -> Result<()> {
             Commands::Migrate { dry_run } => { args.migrate = true; args.migrate_dry_run = dry_run; }
             Commands::Cert { action } => return cert_cmd::run(action, &args.config).await,
             Commands::Sub { action } => return sub_cmd::run(action, &args.config),
+            Commands::Panel { action } => return panel_cmd::run(action, &args.config),
         }
     }
 

@@ -148,7 +148,7 @@ fn change(config_path: &Path, enabled: Option<bool>, o: SubOpts) -> Result<()> {
     Ok(())
 }
 
-fn web_kind(f: Frontend) -> Option<Kind> {
+pub(crate) fn web_kind(f: Frontend) -> Option<Kind> {
     match f {
         Frontend::Builtin => None,
         Frontend::Nginx => Some(Kind::Nginx),
@@ -168,7 +168,7 @@ fn snippet(kind: Kind, prefix: &str, port: u16) -> String {
 }
 
 /// Whether the site OSTP wrote for the web server already forwards `prefix`.
-fn vhost_forwards(config_path: &Path, prefix: &str) -> bool {
+pub(crate) fn vhost_forwards(config_path: &Path, prefix: &str) -> bool {
     let manifest = webserver::manifest_path(&crate::config_dir_of(config_path));
     let Ok(raw) = std::fs::read_to_string(manifest) else { return false };
     let Ok(m) = serde_json::from_str::<webserver::Manifest>(&raw) else { return false };
