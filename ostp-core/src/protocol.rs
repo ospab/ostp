@@ -99,6 +99,10 @@ pub struct ProtocolMachine {
     /// evicted from sent_history, this timer detects the deadlock and skips
     /// the gap to restore liveness.
     last_recv_advance: Instant,
+    /// Highest data nonce that passed AEAD. A packet that raises it is the only
+    /// kind allowed to move the session to a new peer address (RFC 9000 §9.3):
+    /// a replay, even of a frame still sitting in the reorder buffer, cannot.
+    highest_authenticated_recv_nonce: Option<u64>,
     /// Congestion controller (BBR-inspired adaptive window)
     cc: CongestionController,
         /// Key-derived handshake padding range
@@ -158,11 +162,17 @@ impl ProtocolMachine {
             last_ack_sent: Instant::now(),
             last_nack_sent: Instant::now() - Duration::from_secs(1),
             last_recv_advance: Instant::now(),
+            highest_authenticated_recv_nonce: None,
             cc: CongestionController::new(config.mtu as u64),
             handshake_pad_min: config.handshake_pad_min.max(8),
             handshake_pad_max: config.handshake_pad_max.max(config.handshake_pad_min + 16),
             _mtu: config.mtu,
         })
+    }
+
+    /// Highest data nonce received that passed authentication, if any.
+    pub fn highest_authenticated_recv_nonce(&self) -> Option<u64> {
+        self.highest_authenticated_recv_nonce
     }
 
     pub fn in_flight_count(&self) -> usize {
@@ -471,7 +481,10 @@ impl ProtocolMachine {
 
         let session_id_bytes = self.session_id.to_be_bytes();
         let plaintext = cipher.decrypt(nonce, ciphertext, &session_id_bytes)?;
-        
+        if self.highest_authenticated_recv_nonce < Some(nonce) {
+            self.highest_authenticated_recv_nonce = Some(nonce);
+        }
+
         let packet = FramedPacket::decode_zero_copy(Bytes::from(plaintext))?;
         
         let mut outbound_actions = Vec::new();

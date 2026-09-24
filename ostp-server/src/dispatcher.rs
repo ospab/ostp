@@ -345,19 +345,11 @@ impl Dispatcher {
             }
 
             if let Some(peer_state) = self.peer_machines.get_mut(&session_id) {
-
-                if peer_state.last_addr != peer {
-                    tracing::info!("Client roamed: session {} from {} to {}", session_id, peer_state.last_addr, peer);
-                    self.addr_to_session.remove(&peer_state.last_addr);
-                }
-                peer_state.last_addr = peer;
-                peer_state.last_seen = std::time::Instant::now();
-                self.addr_to_session.insert(peer, session_id);
-                
                 // Track inbound bytes per user
                 let key = peer_state.access_key.clone();
                 track_user_bytes_up(&self.user_stats, &self.access_keys, &key, packet.len() as u64);
 
+                let highest_before = peer_state.machine.highest_authenticated_recv_nonce();
                 let action = match peer_state.machine.on_event(OstpEvent::Inbound(packet)) {
                     Ok(a) => a,
                     Err(e) => {
@@ -365,6 +357,26 @@ impl Dispatcher {
                         return Ok(DispatchOutcome::Unauthorized);
                     }
                 };
+
+                // Session state moves only after the packet authenticated. The
+                // address moves only on a packet that also raised the highest
+                // authenticated nonce: a copy of an already-seen packet, replayed
+                // from another address, would otherwise redirect the session's
+                // traffic there. Anything else from a non-current address (a
+                // replay, a late packet from the old path) is processed, but its
+                // responses go to the address the session is actually on.
+                let highest_after = peer_state.machine.highest_authenticated_recv_nonce();
+                let raised_highest = highest_after.is_some() && highest_after != highest_before;
+                if peer_state.last_addr != peer && raised_highest {
+                    tracing::info!("Client roamed: session {} from {} to {}", session_id, peer_state.last_addr, peer);
+                    self.addr_to_session.remove(&peer_state.last_addr);
+                    peer_state.last_addr = peer;
+                    self.addr_to_session.insert(peer, session_id);
+                }
+                if peer_state.last_addr == peer {
+                    peer_state.last_seen = std::time::Instant::now();
+                }
+                let reply_addr = peer_state.last_addr;
 
                 let mut responses = Vec::new();
                 let mut app_payloads = Vec::new();
@@ -396,7 +408,7 @@ impl Dispatcher {
                 return Ok(DispatchOutcome::Accepted {
                     responses,
                     app_payloads,
-                    peer_addr: peer,
+                    peer_addr: reply_addr,
                 });
             }
         }
@@ -716,4 +728,156 @@ fn track_user_bytes_down(
 ) {
     let stats = get_or_create_stats(user_stats, access_keys, key);
     stats.bytes_down.fetch_add(bytes, Ordering::Relaxed);
+}
+
+#[cfg(test)]
+mod roaming_tests {
+    use super::*;
+    use ostp_core::{NoiseRole, PaddingStrategy};
+
+    const KEY: &str = "roaming-test-key";
+    const SID: u32 = 0x1234_5678;
+
+    fn base_config(role: NoiseRole) -> ProtocolConfig {
+        ProtocolConfig {
+            role,
+            psk: [0u8; 32],
+            session_id: 0,
+            handshake_payload: vec![],
+            max_padding: 256,
+            padding_strategy: PaddingStrategy::Adaptive,
+            obfuscation_key: [0u8; 8],
+            max_reorder: 16384,
+            max_reorder_buffer: 8192,
+            ack_delay_ms: 5,
+            rto_ms: 100,
+            max_retries: 8,
+            max_sent_history: 32768,
+            handshake_pad_min: 32,
+            handshake_pad_max: 128,
+            mtu: 1350,
+        }
+    }
+
+    fn addr(s: &str) -> SocketAddr {
+        s.parse().unwrap()
+    }
+
+    fn first_datagram(action: ProtocolAction) -> Bytes {
+        match action {
+            ProtocolAction::SendDatagram(d) => d,
+            ProtocolAction::Multiple(list) => list
+                .into_iter()
+                .find_map(|a| match a {
+                    ProtocolAction::SendDatagram(d) => Some(d),
+                    _ => None,
+                })
+                .expect("no datagram in actions"),
+            _ => panic!("expected a datagram"),
+        }
+    }
+
+    /// A dispatcher and a client with an established session on `home`.
+    fn established(home: SocketAddr) -> (Dispatcher, ProtocolMachine) {
+        let keys = Arc::new(RwLock::new(HashMap::from([(KEY.to_string(), crate::api::UserMeta { name: None, limit_bytes: None })])));
+        let mut dispatcher = Dispatcher::new(base_config(NoiseRole::Responder), keys);
+
+        let secrets = ostp_core::crypto::derive_all_secrets(KEY.as_bytes());
+        let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        let mut payload = ts.to_be_bytes().to_vec();
+        payload.extend_from_slice(&SID.to_be_bytes());
+        payload.extend_from_slice(KEY.as_bytes());
+        let mut cfg = base_config(NoiseRole::Initiator);
+        cfg.session_id = SID;
+        cfg.psk = secrets.psk;
+        cfg.obfuscation_key = secrets.obfuscation_key;
+        cfg.handshake_pad_min = secrets.handshake_pad_min;
+        cfg.handshake_pad_max = secrets.handshake_pad_max;
+        cfg.handshake_payload = payload;
+        let mut client = ProtocolMachine::new(cfg).unwrap();
+
+        let msg1 = first_datagram(client.on_event(OstpEvent::Start).unwrap());
+        let msg2 = match dispatcher.on_datagram(home, msg1).unwrap() {
+            DispatchOutcome::Accepted { mut responses, .. } => responses.remove(0),
+            _ => panic!("handshake not accepted"),
+        };
+        client.on_event(OstpEvent::Inbound(msg2)).unwrap();
+        (dispatcher, client)
+    }
+
+    fn send(client: &mut ProtocolMachine, data: &'static [u8]) -> Bytes {
+        first_datagram(client.on_event(OstpEvent::Outbound(1, Bytes::from_static(data))).unwrap())
+    }
+
+    fn reply_addr(outcome: DispatchOutcome) -> SocketAddr {
+        match outcome {
+            DispatchOutcome::Accepted { peer_addr, .. } => peer_addr,
+            _ => panic!("packet not accepted"),
+        }
+    }
+
+    #[test]
+    fn replayed_packet_from_another_address_does_not_move_the_session() {
+        let home = addr("198.51.100.1:40000");
+        let attacker = addr("203.0.113.9:5555");
+        let (mut dispatcher, mut client) = established(home);
+
+        let d1 = send(&mut client, b"one");
+        assert_eq!(reply_addr(dispatcher.on_datagram(home, d1.clone()).unwrap()), home);
+
+        // The same bytes again, from somewhere else: authentic, but not new.
+        let outcome = dispatcher.on_datagram(attacker, d1).unwrap();
+        assert_eq!(reply_addr(outcome), home, "replies must stay on the session's address");
+        assert_eq!(dispatcher.peer_machines[&SID].last_addr, home);
+        assert_eq!(dispatcher.addr_to_session.get(&attacker), None);
+    }
+
+    #[test]
+    fn replay_of_a_buffered_out_of_order_packet_does_not_move_the_session() {
+        let home = addr("198.51.100.1:40000");
+        let attacker = addr("203.0.113.9:5555");
+        let (mut dispatcher, mut client) = established(home);
+
+        let _lost = send(&mut client, b"one");
+        let d2 = send(&mut client, b"two");
+        let d3 = send(&mut client, b"three");
+        // d2 and d3 wait in the reorder buffer behind the lost d1.
+        dispatcher.on_datagram(home, d2.clone()).unwrap();
+        dispatcher.on_datagram(home, d3).unwrap();
+
+        dispatcher.on_datagram(attacker, d2).unwrap();
+        assert_eq!(dispatcher.peer_machines[&SID].last_addr, home);
+    }
+
+    #[test]
+    fn garbage_with_a_valid_header_does_not_move_the_session() {
+        let home = addr("198.51.100.1:40000");
+        let attacker = addr("203.0.113.9:5555");
+        let (mut dispatcher, mut client) = established(home);
+
+        let mut forged = send(&mut client, b"one").to_vec();
+        let last = forged.len() - 1;
+        forged[last] ^= 0xff; // breaks the Poly1305 tag
+        assert!(matches!(
+            dispatcher.on_datagram(attacker, Bytes::from(forged)).unwrap(),
+            DispatchOutcome::Unauthorized
+        ));
+        assert_eq!(dispatcher.peer_machines[&SID].last_addr, home);
+    }
+
+    #[test]
+    fn a_new_packet_from_a_new_address_roams() {
+        let home = addr("198.51.100.1:40000");
+        let roamed = addr("192.0.2.77:61000");
+        let (mut dispatcher, mut client) = established(home);
+
+        let d1 = send(&mut client, b"one");
+        dispatcher.on_datagram(home, d1).unwrap();
+
+        let d2 = send(&mut client, b"two");
+        assert_eq!(reply_addr(dispatcher.on_datagram(roamed, d2).unwrap()), roamed);
+        assert_eq!(dispatcher.peer_machines[&SID].last_addr, roamed);
+        assert_eq!(dispatcher.addr_to_session.get(&roamed), Some(&SID));
+        assert_eq!(dispatcher.addr_to_session.get(&home), None);
+    }
 }
