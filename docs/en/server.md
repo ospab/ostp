@@ -85,7 +85,8 @@ A filtering resolver for clients connected to the server (the `ostp-dns` crate):
 |---|---|
 | UDP to any address `:53` (TUN mode) | intercepts and answers itself |
 | TCP to any address `:53` | redirects it to the resolver's local DNS-over-TCP |
-| DNS-over-TLS (`:853`) | the connection is refused and the app falls back to plain DNS (with `doh-bypass on`) |
+| DNS-over-TLS / DNS-over-QUIC (`:853`, TCP and UDP) | the connection is refused and the app falls back to plain DNS (with `doh-bypass on`) |
+| Encrypted DNS to a public resolver's address (1.1.1.1, 8.8.8.8, Quad9, AdGuard, OpenDNS, Yandex… on `:443`, TCP and QUIC) | refused (with `doh-bypass on`). Android ("Private DNS: automatic") and Chrome switch to encrypted DNS by themselves when the system DNS is 1.1.1.1 or 8.8.8.8, and nearly everything would pass the filter |
 | A browser's DoH | the `use-application-dns.net` canary gets NXDOMAIN and known DoH hosts are blocked (with `doh-bypass on`) |
 | SOCKS/proxy by name (`CONNECT host:port`) | the name is resolved by the same resolver: a blocked name is refused, a rewritten one goes to its address. With the outbound proxy on, the name is passed to it as is, but blocking still applies |
 

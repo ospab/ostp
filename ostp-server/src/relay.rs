@@ -71,8 +71,11 @@ pub async fn handle_relay_message(
                 if let Some(addr) = router.dns_tcp.get() {
                     connect_target = addr.to_string();
                 }
-            } else if port == "853" && router.dns_server.enabled() && router.dns_server.settings().block_doh_bypass {
-                let _ = connect_tx.send((session_id, stream_id, target, Err("DNS over TLS is blocked: this server filters DNS".into())));
+            } else if router.dns_server.is_dns_bypass(&connect_target) {
+                // Encrypted DNS would skip the filtering; refused, the device
+                // falls back to plain port 53 (Android's "Private DNS:
+                // automatic", Chrome's secure DNS upgrade).
+                let _ = connect_tx.send((session_id, stream_id, target, Err("encrypted DNS is blocked: this server filters DNS".into())));
                 return Ok(());
             }
 
@@ -280,6 +283,16 @@ pub async fn handle_relay_message(
                             )));
                         }
                     }
+                }
+
+                // DNS over QUIC (853) and DoH over HTTP/3 to a public resolver
+                // (443) skip the filtering the same way; dropped, so the device
+                // falls back to plain port 53.
+                if router.dns_server.is_dns_bypass(&target) {
+                    if router.debug {
+                        let _ = ui_event_tx.send(UiEvent::Log(format!("DNS [{session_id}:{stream_id}] encrypted DNS over UDP to {target} dropped")));
+                    }
+                    return Ok(());
                 }
 
                 if let Some(ref udp_tx) = remote.udp_tx {

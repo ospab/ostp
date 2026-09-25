@@ -77,6 +77,44 @@ pub const DOH_HOSTS: &[&str] = &[
     "common.dot.dns.yandex.net",
 ];
 
+/// Public resolvers that speak encrypted DNS on their own addresses. Android
+/// ("Private DNS: automatic", DoT on 853 and on Android 13+ DoH over QUIC on
+/// 443) and Chrome's secure DNS switch to it by themselves when the system
+/// DNS is one of these, which is what the VPN hands out (1.1.1.1, 8.8.8.8).
+/// Those queries would pass through the tunnel encrypted and never reach the
+/// filter, so while it is on they are refused and the device falls back to
+/// plain port 53, which the server answers.
+pub const RESOLVER_IPS: &[&str] = &[
+    // Cloudflare
+    "1.1.1.1", "1.0.0.1", "1.1.1.2", "1.0.0.2", "1.1.1.3", "1.0.0.3",
+    "2606:4700:4700::1111", "2606:4700:4700::1001", "2606:4700:4700::1112", "2606:4700:4700::1002",
+    "2606:4700:4700::1113", "2606:4700:4700::1003",
+    // Google
+    "8.8.8.8", "8.8.4.4", "2001:4860:4860::8888", "2001:4860:4860::8844",
+    // Quad9
+    "9.9.9.9", "149.112.112.112", "9.9.9.10", "149.112.112.10", "9.9.9.11", "149.112.112.11",
+    "2620:fe::fe", "2620:fe::9", "2620:fe::10", "2620:fe::fe:10", "2620:fe::11", "2620:fe::fe:11",
+    // AdGuard
+    "94.140.14.14", "94.140.15.15", "94.140.14.15", "94.140.15.16", "94.140.14.140", "94.140.14.141",
+    "2a10:50c0::ad1:ff", "2a10:50c0::ad2:ff",
+    // OpenDNS
+    "208.67.222.222", "208.67.220.220", "208.67.222.123", "208.67.220.123",
+    "2620:119:35::35", "2620:119:53::53",
+    // CleanBrowsing, DNS.SB, Mullvad, NextDNS anycast, Yandex
+    "185.228.168.9", "185.228.169.9", "185.228.168.168", "185.228.169.168",
+    "185.222.222.222", "45.11.45.11", "194.242.2.2", "194.242.2.3", "194.242.2.4",
+    "45.90.28.0", "45.90.30.0", "77.88.8.8", "77.88.8.1", "77.88.8.88", "77.88.8.2",
+];
+
+pub fn is_public_resolver(ip: std::net::IpAddr) -> bool {
+    static PARSED: std::sync::OnceLock<Vec<std::net::IpAddr>> = std::sync::OnceLock::new();
+    let ip = match ip {
+        std::net::IpAddr::V6(v6) => v6.to_ipv4_mapped().map(std::net::IpAddr::V4).unwrap_or(ip),
+        v4 => v4,
+    };
+    PARSED.get_or_init(|| RESOLVER_IPS.iter().filter_map(|s| s.parse().ok()).collect()).contains(&ip)
+}
+
 pub fn service_of(name: &str, blocked: &[String]) -> Option<&'static str> {
     for (id, label, domains) in SERVICES {
         if !blocked.iter().any(|b| b == id) {

@@ -305,6 +305,22 @@ impl Dns {
         self.settings().enabled
     }
 
+    /// Whether a client's connection (TCP or UDP) to `target` is encrypted DNS
+    /// that would skip the filter: anything to port 853 (DoT, DoQ), and port
+    /// 443 on a public resolver's address (DoH, DoH over QUIC). Refused while
+    /// filtering is on and `block_doh_bypass` is set; DoH servers reached by
+    /// name are blocked by the resolver itself.
+    pub fn is_dns_bypass(&self, target: &str) -> bool {
+        let s = self.settings();
+        if !s.enabled || !s.block_doh_bypass {
+            return false;
+        }
+        match target.parse::<std::net::SocketAddr>() {
+            Ok(addr) => addr.port() == 853 || (addr.port() == 443 && services::is_public_resolver(addr.ip())),
+            Err(_) => target.rsplit_once(':').is_some_and(|(_, p)| p == "853"),
+        }
+    }
+
     /// Whether the server should answer its clients' port-53 queries.
     pub fn intercepts(&self) -> bool {
         let s = self.settings();
@@ -792,6 +808,26 @@ mod tests {
         assert!(dns.resolve_host("x.blocked.test", me).await.unwrap_err().contains("||blocked.test^"));
         assert_eq!(dns.resolve_host("1.2.3.4", me).await, Ok(None));
         assert_eq!(dns.query_log(10, Some("blocked.test")).len(), 1);
+    }
+
+    #[test]
+    fn encrypted_dns_to_public_resolvers() {
+        let mut s = DnsSettings::default();
+        let dns = Dns::new(s.clone(), None);
+        assert!(!dns.is_dns_bypass("1.1.1.1:853"), "filter off: nothing refused");
+        s.enabled = true;
+        let dns = Dns::new(s.clone(), None);
+        assert!(dns.is_dns_bypass("1.1.1.1:853"));
+        assert!(dns.is_dns_bypass("8.8.8.8:443"));
+        assert!(dns.is_dns_bypass("[2001:4860:4860::8888]:443"));
+        assert!(dns.is_dns_bypass("[::ffff:1.1.1.1]:443"));
+        assert!(dns.is_dns_bypass("dns.example:853"));
+        assert!(!dns.is_dns_bypass("93.184.216.34:443"));
+        assert!(!dns.is_dns_bypass("1.1.1.1:80"));
+        assert!(!dns.is_dns_bypass("example.com:443"));
+        s.block_doh_bypass = false;
+        let dns = Dns::new(s, None);
+        assert!(!dns.is_dns_bypass("8.8.8.8:443"));
     }
 
     #[test]
