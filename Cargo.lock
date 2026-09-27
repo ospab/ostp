@@ -2242,6 +2242,7 @@ dependencies = [
  "anyhow",
  "base64 0.22.1",
  "bytes",
+ "chacha20 0.9.1",
  "chacha20poly1305",
  "hkdf 0.12.4",
  "hmac 0.12.1",
@@ -2253,6 +2254,7 @@ dependencies = [
  "sha2 0.10.9",
  "snow",
  "thiserror 1.0.69",
+ "tokio",
  "tracing",
  "x25519-dalek",
 ]

@@ -74,7 +74,7 @@ pub struct UserStatsSnapshot {
 pub struct PeerState {
     pub machine: ProtocolMachine,
     pub last_addr: SocketAddr,
-    pub obfuscation_key: [u8; 8],
+    pub obfuscation_key: ostp_core::crypto::HeaderKey,
     pub last_seen: std::time::Instant,
     pub access_key: String,
 }
@@ -746,7 +746,7 @@ mod roaming_tests {
             handshake_payload: vec![],
             max_padding: 256,
             padding_strategy: PaddingStrategy::Adaptive,
-            obfuscation_key: [0u8; 8],
+            obfuscation_key: [0u8; 32],
             max_reorder: 16384,
             max_reorder_buffer: 8192,
             ack_delay_ms: 5,

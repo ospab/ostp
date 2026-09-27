@@ -1,143 +1,79 @@
 // =============================================================================
-// OSTP Key Derivation — Kerckhoffs's Principle
+// OSTP key schedule and header protection
 // =============================================================================
 //
-// All protocol secrets (PSK, obfuscation key, padding parameters) are derived
-// exclusively from the access key using HKDF-SHA256. There are NO hardcoded
-// salt strings, protocol identifiers, or magic constants in this module.
-//
-// An adversary who reverse-engineers the binary sees only generic HMAC/SHA-256
-// operations with no protocol-specific strings to search for. Building a DPI
-// filter requires knowledge of the access key.
+// Kerckhoffs's principle: everything in this file is public, the labels
+// included. The only secret input is the user's access key; every value below
+// is derived from it with HKDF-SHA256 (RFC 5869), and header protection
+// follows QUIC's ChaCha20 construction (RFC 9001 §5.4.4).
 // =============================================================================
 
+use chacha20::cipher::{KeyIvInit, StreamCipher, StreamCipherSeek};
+use chacha20::ChaCha20;
+use hkdf::Hkdf;
 use sha2::Sha256;
-use hmac::{Hmac, Mac};
-type HmacSha256 = Hmac<Sha256>;
 
-// ── HKDF-SHA256 (RFC 5869) ──────────────────────────────────────────────────
-// Implemented inline to avoid adding a dependency. Uses only hmac + sha2.
-
-/// HKDF-Extract: PRK = HMAC-SHA256(salt, IKM)
-fn hkdf_extract(salt: &[u8], ikm: &[u8]) -> [u8; 32] {
-    let mut mac = HmacSha256::new_from_slice(salt).expect("HMAC accepts any key length");
-    mac.update(ikm);
-    let result = mac.finalize().into_bytes();
-    let mut prk = [0u8; 32];
-    prk.copy_from_slice(&result);
-    prk
-}
-
-/// HKDF-Expand: OKM = T(1) || T(2) || ... truncated to `len` bytes.
-/// T(i) = HMAC-SHA256(PRK, T(i-1) || info || i)
-fn hkdf_expand(prk: &[u8; 32], info: &[u8], len: usize) -> Vec<u8> {
-    let mut okm = Vec::with_capacity(len);
-    let mut t = Vec::new();
-    let mut counter = 1u8;
-    while okm.len() < len {
-        let mut mac = HmacSha256::new_from_slice(prk).expect("HMAC accepts any key length");
-        mac.update(&t);
-        mac.update(info);
-        mac.update(&[counter]);
-        let block = mac.finalize().into_bytes();
-        t = block.to_vec();
-        okm.extend_from_slice(&t[..t.len().min(len - okm.len() + t.len()).min(t.len())]);
-        counter = counter.wrapping_add(1);
-    }
-    okm.truncate(len);
-    okm
-}
-
-/// Derive all protocol secrets from a single access key.
-/// Returns (obfuscation_key, psk, handshake_pad_min, handshake_pad_max).
+/// OSTP wire protocol version. It is part of every HKDF label below, so
+/// peers on different versions derive different keys: a handshake from an
+/// older client does not unmask or decrypt on a newer server and is dropped
+/// like any other unauthenticated packet. Nothing on the wire carries it.
 ///
-/// The derivation uses the access key as both IKM and salt material,
-/// split into two halves. No fixed strings are used — the access key
-/// alone determines all derived values.
+/// History: 4 = 0.4.0; 5 = transport keys from Noise's Split(); 6 = RFC 5869
+/// labels, 256-bit RFC 9001 header protection, Noise prologue, RFC 6455
+/// frames after an HTTP upgrade.
+pub const PROTOCOL_VERSION: u8 = 6;
+
+/// Key for header protection (RFC 9001 §5.4): 256 bits for ChaCha20.
+pub type HeaderKey = [u8; 32];
+
+/// Every secret derived from one access key.
 #[derive(Clone)]
 pub struct DerivedSecrets {
-    pub obfuscation_key: [u8; 8],
+    /// Header protection key (the historical field name is kept).
+    pub obfuscation_key: HeaderKey,
+    /// Noise pre-shared key (the `psk0` of `NNpsk0`).
     pub psk: [u8; 32],
     pub handshake_pad_min: usize,
     pub handshake_pad_max: usize,
 }
-// NOTE: the junk marker is NOT part of DerivedSecrets — it is time-rotating and
-// derived separately per window via `derive_junk_marker` (see below), so it
-// carries no static per-user signature.
+// The junk marker is not part of DerivedSecrets: it rotates with time and is
+// derived per window by `derive_junk_marker`.
 
-/// OSTP wire protocol version. Mixed into key derivation (NOT sent on the
-/// wire) so peers running incompatible versions derive entirely different
-/// secrets and therefore cannot deobfuscate / decrypt each other's traffic.
-///
-/// This is a hard, deterministic version gate that needs NO plaintext version
-/// byte on the wire — a constant marker would defeat the project's stealth
-/// north-star ("no recognizable header"). A pre-0.4.0 client (which derived
-/// without a version) produces a different obfuscation key, so a 0.4.0 server
-/// cannot recover its handshake header and rejects it as an unauthorized probe.
-///
-/// Bump this on any wire-breaking protocol change. 0.4.0 = version 4;
-/// version 5 (0.4.x hardening) moved transport keys from the handshake hash to
-/// Noise's Split() output — a wire-breaking crypto change, so old peers must not
-/// interop (they would derive different session keys and fail decryption).
-pub const PROTOCOL_VERSION: u8 = 5;
+/// `ostp v6 <purpose>`: the HKDF-Expand info label (RFC 5869 §3.2) for one
+/// output. Labels separate the outputs from each other and from other versions.
+fn label(version: u8, purpose: &str) -> Vec<u8> {
+    format!("ostp v{version} {purpose}").into_bytes()
+}
+
+/// HKDF-Extract with no salt (RFC 5869 §2.2: a string of HashLen zeros),
+/// the access key as input keying material. The access key is 128 random bits,
+/// so a salt adds nothing.
+fn prk(access_key: &[u8]) -> Hkdf<Sha256> {
+    Hkdf::<Sha256>::new(None, access_key)
+}
+
+fn expand<const N: usize>(hk: &Hkdf<Sha256>, info: &[u8]) -> [u8; N] {
+    let mut out = [0u8; N];
+    hk.expand(info, &mut out).expect("HKDF-SHA256 output of at most 255 blocks");
+    out
+}
 
 pub fn derive_all_secrets(access_key: &[u8]) -> DerivedSecrets {
     derive_all_secrets_versioned(access_key, PROTOCOL_VERSION)
 }
 
-/// Version-parameterised derivation. `derive_all_secrets` always pins the
-/// current `PROTOCOL_VERSION`; this form exists so tests can prove that a
-/// different version yields incompatible secrets (the version gate).
+/// [`derive_all_secrets`] for any version, so tests can show that another
+/// version yields unrelated secrets.
 pub(crate) fn derive_all_secrets_versioned(access_key: &[u8], version: u8) -> DerivedSecrets {
-    // Split the key hash into two halves for salt/info separation; a
-    // trailing byte per output separates the derived values. Public labels
-    // would do the same job: the access key is the only secret here.
-    use sha2::Digest;
-    let key_hash = sha2::Sha256::digest(access_key);
-    let salt = &key_hash[..16];
-    let info_base = &key_hash[16..];
-
-    // Mix the protocol version into the IKM so a different version produces a
-    // completely different PRK → different obf_key / psk / padding. This is the
-    // wire-version gate: it is invisible on the wire (only the derived output,
-    // which is already indistinguishable from random, ever leaves the host).
-    let mut ikm = Vec::with_capacity(access_key.len() + 1);
-    ikm.extend_from_slice(access_key);
-    ikm.push(version);
-
-    // Extract PRK from version-tagged access key using its hash as salt
-    let prk = hkdf_extract(salt, &ikm);
-
-    // Derive obfuscation key (8 bytes) — info = key_hash[16..] || 0x01
-    let mut obf_info = info_base.to_vec();
-    obf_info.push(0x01);
-    let obf_bytes = hkdf_expand(&prk, &obf_info, 8);
-    let mut obfuscation_key = [0u8; 8];
-    obfuscation_key.copy_from_slice(&obf_bytes);
-
-    // Derive PSK (32 bytes) — info = key_hash[16..] || 0x02
-    let mut psk_info = info_base.to_vec();
-    psk_info.push(0x02);
-    let psk_bytes = hkdf_expand(&prk, &psk_info, 32);
-    let mut psk = [0u8; 32];
-    psk.copy_from_slice(&psk_bytes);
-
-    // Derive handshake padding range (2 bytes) — info = key_hash[16..] || 0x03
-    // This makes different access keys produce different handshake sizes,
-    // preventing DPI from building a universal size-based filter.
-    let mut pad_info = info_base.to_vec();
-    pad_info.push(0x03);
-    let pad_bytes = hkdf_expand(&prk, &pad_info, 2);
-    // Map to range: min ∈ [16..80], max ∈ [min+48..min+176]
-    let pad_min = 16 + (pad_bytes[0] as usize % 64);       // 16-79
-    let pad_max = pad_min + 48 + (pad_bytes[1] as usize % 128); // +48..+175
-
-    DerivedSecrets {
-        obfuscation_key,
-        psk,
-        handshake_pad_min: pad_min,
-        handshake_pad_max: pad_max,
-    }
+    let hk = prk(access_key);
+    let obfuscation_key = expand::<32>(&hk, &label(version, "header protection"));
+    let psk = expand::<32>(&hk, &label(version, "noise psk"));
+    // Per-key handshake padding, so one size filter does not fit every user:
+    // min in [16, 80), max in [min + 48, min + 176).
+    let pad = expand::<2>(&hk, &label(version, "handshake padding"));
+    let pad_min = 16 + (pad[0] as usize % 64);
+    let pad_max = pad_min + 48 + (pad[1] as usize % 128);
+    DerivedSecrets { obfuscation_key, psk, handshake_pad_min: pad_min, handshake_pad_max: pad_max }
 }
 
 /// Window length (seconds) for the rotating junk marker. The marker changes
@@ -153,43 +89,21 @@ pub fn current_junk_window() -> u64 {
         .unwrap_or(0)
 }
 
-/// Derive the 4-byte junk marker for a given time `window`.
-///
-/// Uses the same version-gated HKDF scheme as [`derive_all_secrets`], with the
-/// window folded into the `info` (label byte `0x04`). Folding in the window
-/// makes the marker rotate: to an on-path observer the junk prefix changes every
-/// window (no fixed signature), and a captured marker is only valid for ~1
-/// window. Only a holder of the access key can compute it, so an outsider cannot
-/// forge a silently-dropped junk packet.
+/// The 4-byte junk marker for a time `window`: `ostp v6 junk marker` with the
+/// window (big-endian) appended to the label. It rotates every window and only
+/// a holder of the access key can compute it, so an outsider cannot forge a
+/// silently dropped junk packet.
 pub fn derive_junk_marker(access_key: &[u8], window: u64) -> [u8; 4] {
     derive_junk_marker_versioned(access_key, window, PROTOCOL_VERSION)
 }
 
 pub(crate) fn derive_junk_marker_versioned(access_key: &[u8], window: u64, version: u8) -> [u8; 4] {
-    use sha2::Digest;
-    let key_hash = sha2::Sha256::digest(access_key);
-    let salt = &key_hash[..16];
-    let info_base = &key_hash[16..];
-
-    let mut ikm = Vec::with_capacity(access_key.len() + 1);
-    ikm.extend_from_slice(access_key);
-    ikm.push(version);
-    let prk = hkdf_extract(salt, &ikm);
-
-    // info = key_hash[16..] || 0x04 || window(LE) — same label byte as before,
-    // now parameterised by the time window.
-    let mut info = info_base.to_vec();
-    info.push(0x04);
-    info.extend_from_slice(&window.to_le_bytes());
-    let bytes = hkdf_expand(&prk, &info, 4);
-    let mut marker = [0u8; 4];
-    marker.copy_from_slice(&bytes);
-    marker
+    let mut info = label(version, "junk marker");
+    info.extend_from_slice(&window.to_be_bytes());
+    expand::<4>(&prk(access_key), &info)
 }
 
-// ── Legacy API (delegates to derive_all_secrets) ─────────────────────────────
-
-pub fn derive_obfuscation_key(access_key: &[u8]) -> [u8; 8] {
+pub fn derive_obfuscation_key(access_key: &[u8]) -> HeaderKey {
     derive_all_secrets(access_key).obfuscation_key
 }
 
@@ -197,86 +111,71 @@ pub fn derive_psk(access_key: &[u8]) -> [u8; 32] {
     derive_all_secrets(access_key).psk
 }
 
-// ── Wire Obfuscation ─────────────────────────────────────────────────────────
+// ── Header protection (RFC 9001 §5.4) ────────────────────────────────────────
 
-/// Derives a per-packet mask from the payload following the header.
-/// Used by both data and handshake packets so every mask is unique.
-fn derive_payload_mask(key: &[u8; 8], payload: &[u8]) -> [u8; 32] {
-    let mut sample = [0u8; 32];
-    let take_len = payload.len().min(32);
-    sample[..take_len].copy_from_slice(&payload[..take_len]);
+/// Bytes of ciphertext sampled for the mask (RFC 9001 §5.4.2).
+pub const HP_SAMPLE_LEN: usize = 16;
 
-    let mut mac = HmacSha256::new_from_slice(key).expect("HMAC accepts any key length");
-    mac.update(&sample);
-    let result = mac.finalize().into_bytes();
-    let mut mask = [0u8; 32];
-    mask.copy_from_slice(&result);
-    mask
+/// The header mask for a packet, from the 16 bytes of ciphertext right after
+/// the header (RFC 9001 §5.4.4): the first 4 sample bytes are the ChaCha20
+/// block counter (little-endian), the other 12 the nonce, and the mask is the
+/// keystream for 5 zero bytes, here extended to the 12 header bytes OSTP masks.
+/// `None` when there is not enough ciphertext: such a packet is invalid anyway
+/// (an AEAD tag alone is 16 bytes).
+fn header_mask(key: &HeaderKey, ciphertext: &[u8]) -> Option<[u8; 12]> {
+    let sample = ciphertext.get(..HP_SAMPLE_LEN)?;
+    let counter = u32::from_le_bytes(sample[..4].try_into().unwrap());
+    let nonce: [u8; 12] = sample[4..].try_into().unwrap();
+    let mut cipher = ChaCha20::new(key.into(), &nonce.into());
+    cipher.seek(u64::from(counter) * 64);
+    let mut mask = [0u8; 12];
+    cipher.apply_keystream(&mut mask);
+    Some(mask)
 }
 
-/// Wire layout for DATA packets:
-///   [0..4]   = session_id XOR mask[0..4]
-///   [4..12]  = nonce XOR mask[4..12]
-///   [12..]   = AEAD ciphertext
-///   mask = HMAC-SHA256(obf_key, ciphertext_sample[0..32])
-///
-/// Wire layout for HANDSHAKE packets:
-///   [0..6]   = (session_id || noise_len) XOR mask[0..6]
-///   [6..]    = noise_payload || random_padding
-///   mask = HMAC-SHA256(obf_key, noise_payload_sample[0..32])
-///
-/// In both cases, the mask is derived from the payload that follows the header.
-/// Since the payload contains cryptographically random data (AEAD ciphertext
-/// or Noise ephemeral key), the mask is unique per packet, making the entire
-/// wire output indistinguishable from random noise.
-pub fn obfuscate_packet_inplace(raw: &mut [u8], key: &[u8; 8], is_handshake: bool) {
-    if !is_handshake && raw.len() >= 12 {
-        let header_len = 12;
-        if raw.len() > header_len {
-            let ciphertext = &raw[header_len..];
-            let mask = derive_payload_mask(key, ciphertext);
+/// Header length: DATA packets `session_id (4) || nonce (8)`, HANDSHAKE
+/// packets `session_id (4) || noise_len (2)`.
+fn header_len(is_handshake: bool) -> usize {
+    if is_handshake { 6 } else { 12 }
+}
 
-            for i in 0..12 {
-                raw[i] ^= mask[i];
-            }
-        }
-    } else if is_handshake && raw.len() > 6 {
-        let payload = &raw[6..];
-        let mask = derive_payload_mask(key, payload);
-
-        for i in 0..6 {
-            raw[i] ^= mask[i];
+/// Masks (or unmasks: XOR is its own inverse) the header in place.
+///
+/// Wire layout:
+///   DATA:      [session_id ^ m[0..4]] [nonce ^ m[4..12]] [AEAD ciphertext ...]
+///   HANDSHAKE: [session_id ^ m[0..4]] [noise_len ^ m[4..6]] [Noise message || padding]
+/// with m = header_mask(key, the 16 bytes after the header). Those bytes are
+/// AEAD ciphertext or a Noise ephemeral key, so every packet gets a new mask
+/// and the whole datagram is indistinguishable from random bytes.
+fn protect_header(raw: &mut [u8], key: &HeaderKey, is_handshake: bool) {
+    let hl = header_len(is_handshake);
+    if raw.len() < hl + HP_SAMPLE_LEN {
+        return;
+    }
+    let (header, rest) = raw.split_at_mut(hl);
+    if let Some(mask) = header_mask(key, rest) {
+        for (b, m) in header.iter_mut().zip(mask) {
+            *b ^= m;
         }
     }
 }
 
-pub fn deobfuscate_header_inplace(
-    header: &mut [u8; 12],
-    ciphertext: &[u8],
-    key: &[u8; 8],
-    is_handshake: bool,
-) {
-    if !is_handshake {
-        let mask = derive_payload_mask(key, ciphertext);
-        for i in 0..12 {
-            header[i] ^= mask[i];
-        }
-    }
+pub fn obfuscate_packet_inplace(raw: &mut [u8], key: &HeaderKey, is_handshake: bool) {
+    protect_header(raw, key, is_handshake);
 }
 
-pub fn deobfuscate_packet_inplace(raw: &mut [u8], key: &[u8; 8], is_handshake: bool) {
-    if !is_handshake && raw.len() >= 12 {
-        let (header_slice, ciphertext) = raw.split_at_mut(12);
-        let mut header = [0u8; 12];
-        header.copy_from_slice(header_slice);
-        deobfuscate_header_inplace(&mut header, ciphertext, key, is_handshake);
-        header_slice.copy_from_slice(&header);
-    } else if is_handshake && raw.len() > 6 {
-        let payload = &raw[6..];
-        let mask = derive_payload_mask(key, payload);
+pub fn deobfuscate_packet_inplace(raw: &mut [u8], key: &HeaderKey, is_handshake: bool) {
+    protect_header(raw, key, is_handshake);
+}
 
-        for i in 0..6 {
-            raw[i] ^= mask[i];
+/// Unmasks a DATA header that was copied out of the packet.
+pub fn deobfuscate_header_inplace(header: &mut [u8; 12], ciphertext: &[u8], key: &HeaderKey, is_handshake: bool) {
+    if is_handshake {
+        return;
+    }
+    if let Some(mask) = header_mask(key, ciphertext) {
+        for (b, m) in header.iter_mut().zip(mask) {
+            *b ^= m;
         }
     }
 }

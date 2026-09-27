@@ -216,4 +216,47 @@ mod tests {
             derive_junk_marker_versioned(key_a, 1000, PROTOCOL_VERSION.wrapping_add(1)),
         );
     }
+
+    fn unhex(s: &str) -> Vec<u8> {
+        (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect()
+    }
+
+    /// RFC 9001 Appendix A.5: ChaCha20-Poly1305 short header packet. The
+    /// first 5 mask bytes for this key and sample are `aefefe7d03`.
+    #[test]
+    fn header_mask_matches_rfc9001_vector() {
+        let key: HeaderKey = unhex("25a282b9e82f06f21f488917a4fc8f1b73573685608597d0efcb076b0ab7a7a4").try_into().unwrap();
+        let sample = unhex("5e5cd55c41f69080575d7999c25a5bfb");
+        // A DATA packet whose ciphertext starts with the sample: the mask is
+        // XORed onto an all-zero header, so the header becomes the mask.
+        let mut packet = vec![0u8; 12];
+        packet.extend_from_slice(&sample);
+        obfuscate_packet_inplace(&mut packet, &key, false);
+        assert_eq!(&packet[..5], unhex("aefefe7d03").as_slice());
+    }
+
+    /// Too little ciphertext to sample: the packet is left as it is (and
+    /// fails authentication later) instead of being masked with a weak mask.
+    #[test]
+    fn short_packets_are_not_masked() {
+        let key = derive_all_secrets(b"k").obfuscation_key;
+        let mut data = vec![7u8; 12 + HP_SAMPLE_LEN - 1];
+        let before = data.clone();
+        obfuscate_packet_inplace(&mut data, &key, false);
+        assert_eq!(data, before);
+        let mut hs = vec![7u8; 6 + HP_SAMPLE_LEN];
+        obfuscate_packet_inplace(&mut hs, &key, true);
+        assert_ne!(&hs[..6], &[7u8; 6]);
+    }
+
+    /// The labels are public; the secrets differ per purpose and per version.
+    #[test]
+    fn labelled_outputs_are_independent() {
+        let s = derive_all_secrets(b"0123456789abcdef0123456789abcdef");
+        assert_ne!(s.obfuscation_key, s.psk);
+        assert_eq!(PROTOCOL_VERSION, 6);
+        let v5 = derive_all_secrets_versioned(b"0123456789abcdef0123456789abcdef", 5);
+        assert_ne!(s.obfuscation_key, v5.obfuscation_key);
+        assert_ne!(s.psk, v5.psk);
+    }
 }

@@ -135,7 +135,7 @@ pub async fn run_server(params: ServerParams) -> Result<()> {
         handshake_payload: vec![],
         max_padding: 256,
         padding_strategy: PaddingStrategy::Adaptive,
-        obfuscation_key: [0u8; 8],
+        obfuscation_key: [0u8; 32],
         max_reorder: 16384,
         max_reorder_buffer: 8192,
         ack_delay_ms: 5,

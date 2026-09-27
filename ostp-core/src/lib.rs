@@ -6,6 +6,7 @@ pub mod protocol;
 pub mod relay;
 pub mod share_link;
 pub mod subscription;
+pub mod websocket;
 
 pub use crypto::NoiseRole;
 pub use framing::{TrafficProfile, PaddingStrategy};

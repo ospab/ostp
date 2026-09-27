@@ -31,7 +31,7 @@ pub struct ProtocolConfig {
     pub handshake_payload: Vec<u8>,
     pub max_padding: usize,
     pub padding_strategy: PaddingStrategy,
-    pub obfuscation_key: [u8; 8],
+    pub obfuscation_key: crate::crypto::HeaderKey,
     pub max_reorder: u64,
     pub max_reorder_buffer: usize,
     pub ack_delay_ms: u64,
@@ -83,7 +83,7 @@ pub struct ProtocolMachine {
     session_id: u32,
     handshake_payload: Vec<u8>,
     padder: AdaptivePadder,
-    obfuscation_key: [u8; 8],
+    obfuscation_key: crate::crypto::HeaderKey,
     max_reorder: u64,
     max_reorder_buffer: usize,
     ack_delay: Duration,
@@ -695,7 +695,7 @@ impl ProtocolMachine {
         Ok(final_bytes)
     }
 
-    pub fn set_session_keys(&mut self, session_id: u32, obfuscation_key: [u8; 8]) {
+    pub fn set_session_keys(&mut self, session_id: u32, obfuscation_key: crate::crypto::HeaderKey) {
         self.session_id = session_id;
         self.obfuscation_key = obfuscation_key;
     }
@@ -971,7 +971,7 @@ mod tests {
             handshake_payload: vec![],
             max_padding: 64,
             padding_strategy: PaddingStrategy::Adaptive,
-            obfuscation_key: [0u8; 8],
+            obfuscation_key: [0u8; 32],
             max_reorder: 128,
             max_reorder_buffer: 256,
             ack_delay_ms: 5,

@@ -30,7 +30,11 @@ impl NoiseSession {
             .parse()
             .map_err(|_| ProtocolError::Crypto("noise-params".to_string()))?;
 
-        let mut builder = Builder::new(params);
+        // The prologue binds the handshake to this protocol and version
+        // (Noise spec §6): both sides hash it in, so a peer with another
+        // prologue fails the handshake. It is public and never sent.
+        let prologue = format!("ostp v{}", crate::crypto::obfuscation::PROTOCOL_VERSION);
+        let mut builder = Builder::new(params).prologue(prologue.as_bytes());
         builder = builder.psk(0, psk);
 
         let handshake = match role {
