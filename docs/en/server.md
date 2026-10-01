@@ -156,6 +156,27 @@ By default the server proxies decrypted client traffic directly to the internet 
 
 ---
 
+## overnet: `.ov` for clients and the exit
+
+[overnet](https://github.com/ospab/overnet) is an onion network with its own name zone `.ov`. It runs as a separate process next to the server; the server talks to it only through local SOCKS5 ports. The OSTP protocol is unchanged, so this works with any 0.4.x client.
+
+```jsonc
+"overnet": {
+  "enabled": true,
+  "entry": true,                    // clients open .ov sites through this server
+  "gateway": "127.0.0.1:9150",      // SOCKS5 port of the local overnet gateway
+  "exit": false,                    // let overnet users reach the internet through this server
+  "exit_listen": "127.0.0.1:9151"   // where the exit listens; loopback only
+}
+```
+
+- **Entry.** A connection to `name.ov` goes to the gateway, by name in proxy mode. In TUN mode the server's DNS answers `name.ov` with a fake address from `198.18.0.0/15`, and connections to that address go to the gateway as `name.ov`. `.ov` is answered by the server whatever the `dns` settings say. `.ov` never reaches the DNS upstreams or the internet: with `entry` off, such names get NXDOMAIN and connections are refused. Only TCP; UDP to `.ov` is dropped.
+- **Exit.** Off by default: whatever leaves an exit is attributed to its address. The SOCKS5 listener has no authentication and therefore binds to loopback only; the local overnet node sends its users' clearnet connections there. They follow the same route as client traffic (outbound rules, upstream proxy, `bind_ip`, DNS blocklists). Refused: `.ov`, the server itself, its tunnel network and private, link-local and special ranges. Names are resolved and checked before the connection, unless the outbound proxy resolves them.
+
+The overnet gateway with a SOCKS5 port is being written on the overnet side; until it exists, entry answers with a connection error.
+
+---
+
 ## Relay-Node Federation
 
 `relay_node.rs` implements a lightweight relay mode (`"mode": "relay"` in config) for chaining: `Client → Relay₁ → Relay₂ → ... → Target Server`. A relay node:

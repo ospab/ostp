@@ -500,6 +500,10 @@ pub struct ServerConfig {
     pub tls: Option<TlsServerCfg>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subscription: Option<SubscriptionCfg>,
+    /// overnet: `.ov` for clients and the overnet exit. Untyped for the same
+    /// reason as `dns`; the CLI reads it as `ostp_server::OvernetConfig`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overnet: Option<serde_json::Value>,
 }
 
 /// Per-user subscription URLs: `https://<domain>[:port]<path>/<token>`

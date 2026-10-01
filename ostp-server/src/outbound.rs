@@ -273,7 +273,7 @@ where
     Ok(())
 }
 
-async fn connect_via_socks5(
+pub(crate) async fn connect_via_socks5(
     proxy_addr: &str,
     target: &str,
     bind_ip: Option<&str>,

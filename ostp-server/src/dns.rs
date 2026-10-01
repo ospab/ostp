@@ -17,7 +17,10 @@ pub fn proxy_url(outbound: Option<&crate::outbound::OutboundConfig>) -> Option<S
 
 /// Serves DNS over TCP on a loopback port with the resolver; the relay sends
 /// clients' TCP connections to port 53 here, so they are filtered too.
-pub async fn spawn_tcp_listener(dns: std::sync::Arc<DnsServer>) -> std::io::Result<std::net::SocketAddr> {
+pub async fn spawn_tcp_listener(
+    dns: std::sync::Arc<DnsServer>,
+    overnet: std::sync::Arc<std::sync::RwLock<std::sync::Arc<crate::overnet::Overnet>>>,
+) -> std::io::Result<std::net::SocketAddr> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
@@ -25,6 +28,7 @@ pub async fn spawn_tcp_listener(dns: std::sync::Arc<DnsServer>) -> std::io::Resu
         loop {
             let Ok((mut s, peer)) = listener.accept().await else { continue };
             let dns = dns.clone();
+            let overnet = overnet.clone();
             tokio::spawn(async move {
                 loop {
                     let mut len = [0u8; 2];
@@ -37,7 +41,14 @@ pub async fn spawn_tcp_listener(dns: std::sync::Arc<DnsServer>) -> std::io::Resu
                     if s.read_exact(&mut q).await.is_err() {
                         break;
                     }
-                    let Some(a) = dns.handle(&q, peer.ip()).await else { break };
+                    let ov = overnet.read().unwrap().answer_dns(&q);
+                    let a = match ov {
+                        Some(a) => a,
+                        None => match dns.handle(&q, peer.ip()).await {
+                            Some(a) => a,
+                            None => break,
+                        },
+                    };
                     let mut out = Vec::with_capacity(a.len() + 2);
                     out.extend_from_slice(&(a.len() as u16).to_be_bytes());
                     out.extend_from_slice(&a);

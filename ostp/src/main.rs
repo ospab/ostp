@@ -1946,6 +1946,11 @@ async fn run_app() -> Result<()> {
                 .map(serde_json::from_value)
                 .transpose()
                 .map_err(|e| anyhow!("Invalid 'dns' section in server config: {e}"))?;
+            let overnet_cfg: Option<ostp_server::OvernetConfig> = server_cfg
+                .overnet
+                .map(serde_json::from_value)
+                .transpose()
+                .map_err(|e| anyhow!("Invalid 'overnet' section in server config: {e}"))?;
             ostp_server::run_server(ostp_server::ServerParams {
                 bind_addrs: listen_addrs,
                 server_public_ip: Some(host),
@@ -1959,6 +1964,7 @@ async fn run_app() -> Result<()> {
                 config_path: Some(args.config),
                 tls,
                 subscription,
+                overnet: overnet_cfg,
             })
             .await?;
         }

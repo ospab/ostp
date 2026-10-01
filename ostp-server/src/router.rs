@@ -3,6 +3,7 @@ use tokio::net::TcpStream;
 use anyhow::Result;
 use crate::outbound::{OutboundConfig, connect_target};
 use crate::dns::DnsServer;
+use crate::overnet::{Overnet, OvernetConfig, Route};
 
 #[derive(Clone)]
 pub struct Router {
@@ -12,6 +13,9 @@ pub struct Router {
     /// Loopback listener answering DNS over TCP with `dns_server`: client
     /// connections to any :53 are sent here instead.
     pub dns_tcp: Arc<std::sync::OnceLock<std::net::SocketAddr>>,
+    /// The `.ov` zone and the overnet exit; off unless configured, and even
+    /// then `.ov` never goes to the internet.
+    pub overnet: Arc<RwLock<Arc<Overnet>>>,
     pub debug: bool,
 }
 
@@ -22,12 +26,26 @@ impl Router {
             bind_ip,
             dns_server,
             dns_tcp: Arc::new(std::sync::OnceLock::new()),
+            overnet: Arc::new(RwLock::new(Overnet::new(OvernetConfig::default()))),
             debug,
         }
     }
 
+    pub fn overnet(&self) -> Arc<Overnet> {
+        self.overnet.read().unwrap().clone()
+    }
+
     /// TCP Target Routing
     pub async fn route_tcp(&self, target: &str, client: std::net::IpAddr) -> Result<TcpStream> {
+        // `.ov` (by name, or by the fake address the DNS gave for it) goes to
+        // the overnet gateway on this machine, or nowhere.
+        let overnet = self.overnet();
+        if let Route::Gateway(ov_target) = overnet.route(target)? {
+            let gateway = overnet.config().gateway.clone();
+            return crate::outbound::connect_via_socks5(&gateway, &ov_target, None, "", "")
+                .await
+                .map_err(|e| anyhow::anyhow!("overnet gateway {gateway}: {e}"));
+        }
         let cfg = {
             let lock = self.outbound_cfg.read().unwrap();
             lock.clone()
@@ -67,6 +85,37 @@ impl Router {
             }
         }
         connect_target(&target, cfg.as_ref(), self.bind_ip.as_deref(), self.debug).await
+    }
+
+    /// Whether a connection to `target` would be made by the upstream proxy
+    /// (which then resolves the name on its own machine) rather than from
+    /// this server.
+    pub async fn resolves_remotely(&self, target: &str) -> bool {
+        let cfg = self.outbound_cfg.read().unwrap().clone();
+        match cfg {
+            Some(c) if c.enabled => {
+                crate::outbound::select_outbound_action(target, "tcp", &c, self.debug).await.0
+                    == crate::outbound::OutboundAction::Proxy
+            }
+            _ => false,
+        }
+    }
+
+    /// A connection for the overnet exit. The target is already checked (see
+    /// `overnet::vet_exit_target`): unlike `route_tcp`, nothing here is
+    /// special-cased to reach this machine.
+    pub async fn route_tcp_exit(&self, target: &str) -> Result<TcpStream> {
+        let cfg = self.outbound_cfg.read().unwrap().clone();
+        if let Some((host, _)) = target.rsplit_once(':') {
+            if host.parse::<std::net::IpAddr>().is_err() {
+                // Only names the proxy resolves get here; the blocklists apply.
+                let me = std::net::IpAddr::from([127, 0, 0, 1]);
+                if let Err(reason) = self.dns_server.resolve_host(host, me).await {
+                    return Err(anyhow::anyhow!("{host}: {reason}"));
+                }
+            }
+        }
+        connect_target(target, cfg.as_ref(), self.bind_ip.as_deref(), self.debug).await
     }
 
     /// UDP Target Routing
@@ -137,6 +186,9 @@ pub struct UdpSessionRouter {
 
 impl UdpSessionRouter {
     pub async fn send_to(&self, data: &[u8], target: &str) -> Result<usize> {
+        if target.rsplit_once(':').is_some_and(|(h, _)| crate::overnet::is_ov(h)) {
+            return Err(anyhow::anyhow!("{target}: overnet carries TCP only"));
+        }
         if let Some(cfg) = &self.cfg {
             if cfg.enabled {
                 let (action, _rule_src) = crate::outbound::select_outbound_action(target, "udp", cfg, self.debug).await;

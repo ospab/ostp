@@ -60,6 +60,7 @@ async fn start_server_on(binds: Vec<SocketAddr>) -> SocketAddr {
         config_path: None,
         tls: None,
         subscription: None,
+        overnet: None,
     };
     tokio::spawn(async move {
         if let Err(e) = ostp_server::run_server(params).await {

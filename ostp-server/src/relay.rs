@@ -254,6 +254,12 @@ pub async fn handle_relay_message(
             if let Some(remote) = remotes.get_mut(&(session_id, stream_id)) {
                 // Если целевой порт 53 — пробуем перехватить через встроенный DNS
                 if target.ends_with(":53") {
+                    // `.ov` is answered here whatever the DNS settings: a fake
+                    // address for the overnet gateway, never a public resolver.
+                    if let Some(response) = router.overnet().answer_dns(&data) {
+                        let _ = udp_reply_tx.send((session_id, stream_id, target, response));
+                        return Ok(());
+                    }
                     let should_intercept = router.dns_server.intercepts();
 
                     if should_intercept {

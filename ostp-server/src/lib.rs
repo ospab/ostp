@@ -29,6 +29,7 @@ mod relay;
 mod signal;
 pub mod dns;
 pub mod router;
+pub mod overnet;
 mod subscription;
 
 pub use subscription::SubscriptionSettings;
@@ -38,6 +39,7 @@ pub use api::ApiConfig;
 pub use dispatcher::UserStatsSnapshot;
 pub use fallback::FallbackConfig;
 pub use relay_node::RelayConfig;
+pub use overnet::OvernetConfig;
 
 // ── Internal event types ─────────────────────────────────────────────────────
 
@@ -88,6 +90,8 @@ pub struct ServerParams {
     pub tls: Option<tls::TlsSettings>,
     /// Enabled `subscription` section, resolved (needs `tls`).
     pub subscription: Option<SubscriptionSettings>,
+    /// The `overnet` section: `.ov` for clients and the overnet exit.
+    pub overnet: Option<OvernetConfig>,
 }
 
 pub async fn run_server(params: ServerParams) -> Result<()> {
@@ -104,6 +108,7 @@ pub async fn run_server(params: ServerParams) -> Result<()> {
         config_path,
         tls,
         subscription,
+        overnet,
     } = params;
     let mut keys_map = HashMap::new();
     for (key, meta) in access_keys {
@@ -296,7 +301,19 @@ pub async fn run_server(params: ServerParams) -> Result<()> {
         dns_server.clone(),
         debug,
     ));
-    match dns::spawn_tcp_listener(dns_server.clone()).await {
+    if let Some(cfg) = overnet.filter(|o| o.enabled) {
+        *router.overnet.write().unwrap() = overnet::Overnet::new(cfg.clone());
+        if cfg.entry {
+            tracing::info!("overnet: .ov for clients through the gateway at {}", cfg.gateway);
+        }
+        if cfg.exit {
+            match overnet::spawn_exit(&cfg, router.clone()).await {
+                Ok(addr) => tracing::info!("overnet: exit open to the local node at socks5://{addr}"),
+                Err(e) => tracing::error!("overnet: exit is off: {e:#}"),
+            }
+        }
+    }
+    match dns::spawn_tcp_listener(dns_server.clone(), router.overnet.clone()).await {
         Ok(addr) => {
             let _ = router.dns_tcp.set(addr);
         }
