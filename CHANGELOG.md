@@ -8,6 +8,8 @@ Older history is on the [Releases](https://github.com/ospab/ostp/releases) page 
 
 ## [Unreleased]
 
+## [0.4.7-beta.2] - 2026-10-04
+
 ### Added
 - `ostp overnet`: `install` (overnet's own installer with the gateway role), `enable`, `disable`, `exit on|off`, `status`. The section is still off until the owner turns it on; nothing installs by itself.
 - overnet in the web panel (an overnet page, applied live without a restart) and in the desktop and mobile apps (the server's management tab: install the gateway, turn `.ov` and the exit on and off). `ostp check` shows the section.
