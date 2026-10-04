@@ -178,24 +178,27 @@ if ($IsNewTarget -or -not $State) {
         [System.IO.File]::WriteAllText($full, $updated)
     }
 
-    Set-VersionLine "Cargo.toml" '(?m)^version = "[0-9]+\.[0-9]+\.[0-9]+"' "version = `"$TargetVersion`""
+    $OldVersion = (Select-String -Path (Join-Path $RepoRoot "Cargo.toml") -Pattern '^version = "([0-9]+\.[0-9]+\.[0-9]+)"').Matches[0].Groups[1].Value
+    Set-VersionLine "Cargo.toml" '(?m)^version ="[0-9]+\.[0-9]+\.[0-9]+"' "version = `"$TargetVersion`""
     Set-VersionLine "ostp-gui/src-tauri/Cargo.toml" '(?m)^version = "[0-9]+\.[0-9]+\.[0-9]+"' "version = `"$TargetVersion`""
     Set-VersionLine "ostp-gui/src-tauri/tauri.conf.json" '"version": "[0-9]+\.[0-9]+\.[0-9]+"' "`"version`": `"$TargetVersion`""
     Set-VersionLine "ostp-gui/package.json" '"version": "[0-9]+\.[0-9]+\.[0-9]+"' "`"version`": `"$TargetVersion`""
 
-    # Refresh Cargo.lock's per-package version entries. ostp-gui/src-tauri is
-    # excluded from the main workspace (its own Tauri build graph), so it has
-    # its own separate Cargo.lock that the main `cargo check` never touches.
-    Write-Step "Running cargo check to refresh Cargo.lock (main workspace)"
-    cargo check --workspace --exclude ostp-jni --quiet
-    if ($LASTEXITCODE -ne 0) { Fail "cargo check failed after the version bump - not committing a broken build." }
-
-    Write-Step "Running cargo check to refresh Cargo.lock (ostp-gui/src-tauri)"
-    Push-Location (Join-Path $RepoRoot "ostp-gui/src-tauri")
-    cargo check --quiet
-    $tauriCheckExit = $LASTEXITCODE
-    Pop-Location
-    if ($tauriCheckExit -ne 0) { Fail "cargo check failed in ostp-gui/src-tauri after the version bump." }
+    # Refresh the version of our own packages in both lockfiles (ostp-gui/src-tauri
+    # is outside the main workspace and has its own Cargo.lock). Nothing is built
+    # here: builds happen on GHA only. Our packages are the [[package]] entries
+    # without a `source =` line (path crates); registry and git crates always
+    # have one. Only entries still at the old version change, so ostp-jni & co.
+    # with their own 0.1.0 stay as they are.
+    Write-Step "Refreshing our package versions in Cargo.lock files ($OldVersion -> $TargetVersion)"
+    foreach ($lock in @("Cargo.lock", "ostp-gui/src-tauri/Cargo.lock")) {
+        $full = Join-Path $RepoRoot $lock
+        $text = [System.IO.File]::ReadAllText($full)
+        $pattern = '(?m)^(name = "[^"]+"\r?\nversion = )"' + [regex]::Escape($OldVersion) + '"(?=\r?\n(?!source = ))'
+        $updated = [regex]::Replace($text, $pattern, "`${1}`"$TargetVersion`"")
+        if ($updated -eq $text) { Fail "No package at $OldVersion in $lock - refusing to proceed with a stale lockfile." }
+        [System.IO.File]::WriteAllText($full, $updated)
+    }
 }
 
 # Flutter's build number (Android versionCode) must strictly increase on
