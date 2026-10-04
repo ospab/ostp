@@ -179,7 +179,7 @@ if ($IsNewTarget -or -not $State) {
     }
 
     $OldVersion = (Select-String -Path (Join-Path $RepoRoot "Cargo.toml") -Pattern '^version = "([0-9]+\.[0-9]+\.[0-9]+)"').Matches[0].Groups[1].Value
-    Set-VersionLine "Cargo.toml" '(?m)^version ="[0-9]+\.[0-9]+\.[0-9]+"' "version = `"$TargetVersion`""
+    Set-VersionLine "Cargo.toml" '(?m)^version = "[0-9]+\.[0-9]+\.[0-9]+"' "version = `"$TargetVersion`""
     Set-VersionLine "ostp-gui/src-tauri/Cargo.toml" '(?m)^version = "[0-9]+\.[0-9]+\.[0-9]+"' "version = `"$TargetVersion`""
     Set-VersionLine "ostp-gui/src-tauri/tauri.conf.json" '"version": "[0-9]+\.[0-9]+\.[0-9]+"' "`"version`": `"$TargetVersion`""
     Set-VersionLine "ostp-gui/package.json" '"version": "[0-9]+\.[0-9]+\.[0-9]+"' "`"version`": `"$TargetVersion`""
