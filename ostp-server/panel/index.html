@@ -241,6 +241,9 @@ tr:last-child td { border-bottom: 0; }
     <button class="nav" data-page="dns">
       <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
       <span>DNS</span></button>
+    <button class="nav" data-page="overnet">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><circle cx="5" cy="5" r="2"/><circle cx="19" cy="5" r="2"/><circle cx="5" cy="19" r="2"/><circle cx="19" cy="19" r="2"/><path d="M6.5 6.5 10 10M17.5 6.5 14 10M6.5 17.5 10 14M17.5 17.5 14 14"/></svg>
+      <span>overnet</span></button>
     <button class="nav" data-page="activity">
       <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
       <span data-t="activity">Activity</span></button>
@@ -439,6 +442,29 @@ tr:last-child td { border-bottom: 0; }
       <div class="row" style="justify-content:flex-end;margin-top:14px"><span class="note" id="dns-save-note"></span><button class="btn primary" id="btn-dns-save" data-t="save">Save</button></div>
     </section>
 
+    <!-- overnet -->
+    <section id="page-overnet" class="hidden">
+      <div class="page-head">
+        <div><h1>overnet</h1><div class="sub" data-t="ov_sub">.ov sites for this server's clients in any browser, through the overnet gateway on this machine. Off unless you turn it on.</div></div>
+        <div class="row"><span class="pill" id="ov-state"></span></div>
+      </div>
+      <div class="dns-grid" style="grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:14px">
+        <div class="card"><div class="stat-label" data-t="ov_entry">.ov for clients</div><div class="stat-value" id="ov-entry-v">–</div><div class="stat-sub" id="ov-entry-sub"></div></div>
+        <div class="card"><div class="stat-label" data-t="ov_gateway">Gateway</div><div class="stat-value" id="ov-gw-v">–</div><div class="stat-sub" id="ov-gw-sub"></div></div>
+        <div class="card"><div class="stat-label" data-t="ov_exit">Exit</div><div class="stat-value" id="ov-exit-v">–</div><div class="stat-sub" id="ov-exit-sub"></div></div>
+      </div>
+      <div class="card" style="margin-top:14px">
+        <h3 data-t="ov_settings">Settings</h3>
+        <label class="chk"><input type="checkbox" id="ov-enabled"> <span data-t="ov_enabled">overnet on this server</span></label>
+        <label class="chk" style="margin-top:8px"><input type="checkbox" id="ov-entry"> <span data-t="ov_entry_chk">Serve .ov to clients</span></label>
+        <div class="row" style="margin-top:8px"><label class="lbl" style="margin:0;min-width:180px" data-t="ov_gateway_addr">Gateway (SOCKS5)</label><input class="input" id="ov-gateway" placeholder="127.0.0.1:9150" style="max-width:220px"></div>
+        <label class="chk" style="margin-top:12px"><input type="checkbox" id="ov-exit"> <span data-t="ov_exit_chk">Exit: overnet users reach the internet through this server</span></label>
+        <div class="row" style="margin-top:8px"><label class="lbl" style="margin:0;min-width:180px" data-t="ov_exit_addr">Exit listens on</label><input class="input" id="ov-exit-listen" placeholder="127.0.0.1:9151" style="max-width:220px"></div>
+        <p class="mini" data-t="ov_help">The gateway is overnet's own program: on the server run ostp overnet install. While .ov is served, browsers' encrypted DNS to public resolvers is refused so they ask the server, which answers .ov. An exit answers for what leaves it: overnet users' traffic goes out from this server's IP.</p>
+        <div class="row" style="justify-content:flex-end;margin-top:10px"><span class="note" id="ov-save-note"></span><button class="btn primary" id="btn-ov-save" data-t="save">Save</button></div>
+      </div>
+    </section>
+
     <!-- Activity -->
     <section id="page-activity" class="hidden">
       <div class="page-head">
@@ -547,6 +573,12 @@ const I18N = {
     dns_add: 'Add', dns_allowlist: 'allow list', dns_rules_own: 'Your rules',
     dns_rules_help: '||domain^ blocks it with subdomains, @@ allows, $important wins over exceptions, * is a wildcard, hosts lines work.',
     dns_rewrites: 'Your names', dns_rewrites_help: '10.1.0.1 is this server as clients see it through the tunnel: panel.ostp → 10.1.0.1 opens the panel by name. *.lan covers every subdomain.',
+    ov_sub: ".ov sites for this server's clients in any browser, through the overnet gateway on this machine. Off unless you turn it on.",
+    ov_entry: '.ov for clients', ov_gateway: 'Gateway', ov_exit: 'Exit', ov_settings: 'Settings', ov_enabled: 'overnet on this server',
+    ov_entry_chk: 'Serve .ov to clients', ov_gateway_addr: 'Gateway (SOCKS5)', ov_exit_chk: 'Exit: overnet users reach the internet through this server',
+    ov_exit_addr: 'Exit listens on', ov_help: "The gateway is overnet's own program: on the server run ostp overnet install. While .ov is served, browsers' encrypted DNS to public resolvers is refused so they ask the server, which answers .ov. An exit answers for what leaves it: overnet users' traffic goes out from this server's IP.",
+    ov_serving: 'Serving .ov', ov_off: 'Off', ov_down: 'Gateway not answering', ov_on: 'on', ov_no: 'off', ov_up: 'answers', ov_not_up: 'not answering',
+    ov_unprobed: 'not checked (.ov off)', ov_listening: 'listening on {a}', ov_saved: 'Applied without a restart and saved',
     dns_services: 'Block services', dns_on: 'Filtering on', dns_off: 'Filtering off', dns_turn_on: 'Turn on', dns_turn_off: 'Turn off',
     dns_block: 'Block', dns_allow: 'Allow', dns_cached_n: '{n} from cache', dns_pct: '{p}% of queries', dns_lists_n: '{n} lists',
     dns_saved: 'Applied without a restart and saved', dns_updated: 'Lists updated: {ok} of {n}', dns_rules_count: '{n} rules', dns_unsupported: '{n} unsupported',
@@ -601,6 +633,12 @@ const I18N = {
     dns_add: 'Добавить', dns_allowlist: 'список разрешений', dns_rules_own: 'Свои правила',
     dns_rules_help: '||домен^ блокирует его с поддоменами, @@ разрешает, $important сильнее исключений, * — шаблон, строки hosts тоже работают.',
     dns_rewrites: 'Свои имена', dns_rewrites_help: '10.1.0.1 — это сервер, каким его видят клиенты через туннель: panel.ostp → 10.1.0.1 открывает панель по имени. *.lan — все поддомены.',
+    ov_sub: '.ov-сайты для клиентов этого сервера в любом браузере, через шлюз overnet на этой машине. Выключено, пока вы сами не включите.',
+    ov_entry: '.ov для клиентов', ov_gateway: 'Шлюз', ov_exit: 'Выход', ov_settings: 'Настройки', ov_enabled: 'overnet на этом сервере',
+    ov_entry_chk: 'Раздавать .ov клиентам', ov_gateway_addr: 'Шлюз (SOCKS5)', ov_exit_chk: 'Выход: пользователи overnet выходят в интернет через этот сервер',
+    ov_exit_addr: 'Адрес выхода', ov_help: 'Шлюз — отдельная программа overnet: на сервере выполните ostp overnet install. Пока .ov раздаётся, шифрованный DNS браузеров к публичным резолверам отклоняется: они спрашивают сервер, а он отвечает за .ov. За выход отвечает его владелец: трафик пользователей overnet уходит с IP этого сервера.',
+    ov_serving: '.ov раздаётся', ov_off: 'Выключено', ov_down: 'Шлюз не отвечает', ov_on: 'вкл', ov_no: 'выкл', ov_up: 'отвечает', ov_not_up: 'не отвечает',
+    ov_unprobed: 'не проверяется (.ov выкл)', ov_listening: 'слушает {a}', ov_saved: 'Применено без перезапуска и сохранено',
     dns_services: 'Блокировать сервисы', dns_on: 'Фильтрация включена', dns_off: 'Фильтрация выключена', dns_turn_on: 'Включить', dns_turn_off: 'Выключить',
     dns_block: 'Блок', dns_allow: 'Разрешить', dns_cached_n: 'из кэша: {n}', dns_pct: '{p}% запросов', dns_lists_n: 'списков: {n}',
     dns_saved: 'Применено без перезапуска и сохранено', dns_updated: 'Списки обновлены: {ok} из {n}', dns_rules_count: 'правил: {n}', dns_unsupported: 'не поддерживается: {n}',
@@ -717,10 +755,48 @@ function go(p) {
   if (p === 'routing') loadRules();
   if (p === 'activity') loadLog();
   if (p === 'dns') loadDns(true);
+  if (p === 'overnet') loadOvernet(true);
   if (p === 'overview') drawChart();
   location.hash = p;
 }
 document.querySelectorAll('.nav').forEach(n => n.addEventListener('click', () => go(n.dataset.page)));
+
+
+// ── overnet ───────────────────────────────────────────────────────────
+function renderOvernet(st, withForm) {
+  const c = st.config;
+  const wanted = c.enabled && c.entry;
+  $('ov-state').className = 'pill ' + (st.serving ? 'ok' : (wanted ? 'bad' : ''));
+  $('ov-state').textContent = t(st.serving ? 'ov_serving' : (wanted ? 'ov_down' : 'ov_off'));
+  $('ov-entry-v').textContent = t(wanted ? 'ov_on' : 'ov_no');
+  $('ov-entry-sub').textContent = c.gateway;
+  $('ov-gw-v').textContent = st.gateway_up == null ? '–' : t(st.gateway_up ? 'ov_up' : 'ov_not_up');
+  $('ov-gw-sub').textContent = st.gateway_up == null ? t('ov_unprobed') : c.gateway;
+  $('ov-exit-v').textContent = t(st.exit_listening ? 'ov_on' : 'ov_no');
+  $('ov-exit-sub').textContent = st.exit_listening ? t('ov_listening', { a: st.exit_listening }) : c.exit_listen;
+  if (withForm) {
+    $('ov-enabled').checked = c.enabled;
+    $('ov-entry').checked = c.entry;
+    $('ov-gateway').value = c.gateway;
+    $('ov-exit').checked = c.exit;
+    $('ov-exit-listen').value = c.exit_listen;
+  }
+}
+async function loadOvernet(withForm) {
+  try { renderOvernet(await api('overnet'), withForm); }
+  catch (err) { if (withForm) toast(t('err', { err: err.message }), true); }
+}
+$('btn-ov-save').addEventListener('click', async () => {
+  const body = {
+    enabled: $('ov-enabled').checked, entry: $('ov-entry').checked, gateway: $('ov-gateway').value.trim() || '127.0.0.1:9150',
+    exit: $('ov-exit').checked, exit_listen: $('ov-exit-listen').value.trim() || '127.0.0.1:9151',
+  };
+  try {
+    renderOvernet(await api('overnet', { method: 'PUT', body }), true);
+    $('ov-save-note').textContent = '';
+    toast(t('ov_saved'));
+  } catch (err) { $('ov-save-note').textContent = t('err', { err: err.message }); toast(t('err', { err: err.message }), true); }
+});
 
 // ── polling ───────────────────────────────────────────────────────────
 async function refresh() {
@@ -1206,13 +1282,14 @@ async function start() {
   if (!await refresh()) return;
   $('app').classList.remove('hidden');
   const p = location.hash.slice(1);
-  go(['overview', 'users', 'routing', 'config', 'activity', 'dns'].includes(p) ? p : 'overview');
+  go(['overview', 'users', 'routing', 'config', 'activity', 'dns', 'overnet'].includes(p) ? p : 'overview');
   loadLog();
   clearInterval(timer);
   timer = setInterval(async () => {
     if (await refresh()) {
       if (page === 'overview') loadLog();
       if (page === 'dns') loadDns(false);
+      if (page === 'overnet') loadOvernet(false);
     }
   }, 5000);
 }

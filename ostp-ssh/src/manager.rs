@@ -64,6 +64,13 @@ pub enum Action {
     CertIssue { domain: String, email: Option<String> },
     SubEnable,
     SubDisable,
+    /// Install overnet with its SOCKS5 gateway (overnet's own installer)
+    OvernetInstall,
+    /// Serve .ov to the server's clients
+    OvernetEnable,
+    OvernetDisable,
+    /// The overnet exit on or off
+    OvernetExit(bool),
 }
 
 impl Action {
@@ -93,6 +100,11 @@ impl Action {
             }
             "sub-enable" => Action::SubEnable,
             "sub-disable" => Action::SubDisable,
+            "overnet-install" => Action::OvernetInstall,
+            "overnet-enable" => Action::OvernetEnable,
+            "overnet-disable" => Action::OvernetDisable,
+            "overnet-exit-on" => Action::OvernetExit(true),
+            "overnet-exit-off" => Action::OvernetExit(false),
             other => bail!("unknown action {other}"),
         })
     }
@@ -119,6 +131,10 @@ impl Action {
             }
             Action::SubEnable => (format!("{OSTP} sub enable"), None),
             Action::SubDisable => (format!("{OSTP} sub disable"), None),
+            Action::OvernetInstall => (format!("{OSTP} overnet install"), None),
+            Action::OvernetEnable => (format!("{OSTP} overnet enable"), None),
+            Action::OvernetDisable => (format!("{OSTP} overnet disable"), None),
+            Action::OvernetExit(on) => (format!("{OSTP} overnet exit {}", if *on { "on" } else { "off" }), None),
         }
     }
 }

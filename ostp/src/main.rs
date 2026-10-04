@@ -8,6 +8,7 @@ mod cert_cmd;
 mod sub_cmd;
 mod panel_cmd;
 mod dns_cmd;
+mod overnet_cmd;
 mod changelog_cmd;
 mod manage_cmd;
 mod webserver;
@@ -110,6 +111,11 @@ enum Commands {
     Dns {
         #[command(subcommand)]
         action: dns_cmd::DnsAction,
+    },
+    /// overnet: .ov sites for clients and the overnet exit; off unless enabled (server only)
+    Overnet {
+        #[command(subcommand)]
+        action: overnet_cmd::OvernetAction,
     },
     /// Server state and everyday changes as JSON, for the desktop app (server only)
     #[command(hide = true)]
@@ -1089,6 +1095,7 @@ fn run_setup_wizard(config_path: &std::path::Path) -> Result<Option<PathBuf>> {
                     "password_hash": ""
                 },
                 "fallback": { "enabled": false, "listen": "0.0.0.0:443", "target": "127.0.0.1:8080" },
+                "overnet": serde_json::to_value(ostp_server::OvernetConfig::default()).unwrap_or_default(),
                 "debug": false
             });
             if let Some(ip) = &bind_ip {
@@ -1205,6 +1212,7 @@ fn run_setup_wizard(config_path: &std::path::Path) -> Result<Option<PathBuf>> {
                     "password_hash": pass_hash
                 },
                 "fallback": { "enabled": false, "listen": "0.0.0.0:443", "target": "127.0.0.1:8080" },
+                "overnet": serde_json::to_value(ostp_server::OvernetConfig::default()).unwrap_or_default(),
                 "debug": false
             });
             if let Some(ip) = &bind_ip {
@@ -1424,6 +1432,7 @@ async fn run_app() -> Result<()> {
             Commands::Panel { action } => return panel_cmd::run(action, &args.config),
             Commands::Manage { action } => manage_cmd::run(action, &args.config),
             Commands::Dns { action } => return dns_cmd::run(action, &args.config).await,
+            Commands::Overnet { action } => return overnet_cmd::run(action, &args.config),
             Commands::Changelog { all, last, version, lang } => {
                 return changelog_cmd::run(changelog_cmd::Options { all, last, version, lang });
             }
@@ -1624,6 +1633,18 @@ async fn run_app() -> Result<()> {
                                 t.frontend(), t.cert_source()),
                             None => println!("  HTTPS: disabled (set up with: ostp cert issue)"),
                         }
+                        let ov: ostp_server::OvernetConfig = match s.overnet.clone() {
+                            Some(o) => serde_json::from_value(o).map_err(|e| anyhow!("Invalid 'overnet' section: {e}"))?,
+                            None => Default::default(),
+                        };
+                        ov.validate()?;
+                        if ov.enabled {
+                            println!("  overnet: .ov for clients {}, exit {} - details: ostp overnet status",
+                                if ov.entry { format!("on (gateway {})", ov.gateway) } else { "off".into() },
+                                if ov.exit { format!("on ({})", ov.exit_listen) } else { "off".into() });
+                        } else {
+                            println!("  overnet: disabled (.ov sites for clients: ostp overnet install, then ostp overnet enable)");
+                        }
                     }
                     AppMode::Client(c) => {
                         println!("{} Config OK: client mode", "[ostp]".green().bold());
@@ -1656,7 +1677,7 @@ async fn run_app() -> Result<()> {
             format!(r#"{{
   // OSTP Server Configuration
   "mode": "server",
-  "config_version": 2,
+  "config_version": {cv},
   "log_level": "info",
   
   // The address and port the server listens on for incoming OSTP connections.
@@ -1728,13 +1749,24 @@ async fn run_app() -> Result<()> {
     "include": ["tls", "udp"]
   }},
 
+  // overnet (github.com/ospab/overnet): .ov sites for this server's clients
+  // through the local overnet gateway, and an optional exit for overnet users.
+  // Off until you turn it on: `ostp overnet install`, then `ostp overnet enable`.
+  "overnet": {{
+    "enabled": false,
+    "entry": true,
+    "gateway": "127.0.0.1:9150",
+    "exit": false,
+    "exit_listen": "127.0.0.1:9151"
+  }},
+
   "debug": false
-}}"#, key, ws = cert_cmd::random_path())
+}}"#, key, ws = cert_cmd::random_path(), cv = ostp_client::migrate::CURRENT_VERSION)
         } else if mode_str == "relay" {
             r#"{
   // OSTP Relay Node Configuration
   "mode": "relay",
-  "config_version": 2,
+  "config_version": {cv},
   "listen": "0.0.0.0:50000",
   "upstream_tcp": "TARGET_SERVER_IP:50000",
   "upstream_udp": "TARGET_SERVER_IP:50000",
@@ -1742,12 +1774,12 @@ async fn run_app() -> Result<()> {
   // authenticated end-to-end by the target server, which drops anything that
   // fails. Nothing else needs configuring here.
   "debug": false
-}"#.to_string()
+}"#.replace("{cv}", &ostp_client::migrate::CURRENT_VERSION.to_string())
         } else {
             format!(r#"{{
   // OSTP Client Configuration
   "mode": "client",
-  "config_version": 2,
+  "config_version": {cv},
   "log_level": "info",
   
   // Address of the remote OSTP server
@@ -1784,7 +1816,7 @@ async fn run_app() -> Result<()> {
     "sessions": 1
   }},
   "debug": false
-}}"#, key)
+}}"#, key, cv = ostp_client::migrate::CURRENT_VERSION)
         };
         if let Some(parent) = args.config.parent() {
             if !parent.as_os_str().is_empty() {
@@ -1843,10 +1875,24 @@ async fn run_app() -> Result<()> {
             "[warn]".yellow().bold(), args.config
         ),
         Some(v) if v == current => {}
-        _ => println!(
-            "{} {:?} predates config schema v{current}; `ostp migrate --dry-run` shows what would change.",
-            "[note]".cyan().bold(), args.config
-        ),
+        // Only when a migration step applies to this kind of config: a newer
+        // schema can add steps for servers alone.
+        _ => {
+            let mut raw = String::new();
+            use std::io::Read;
+            let has_steps = json_comments::StripComments::new(config_content.as_bytes())
+                .read_to_string(&mut raw)
+                .ok()
+                .and_then(|_| serde_json::from_str(&raw).ok())
+                .and_then(|v| ostp_client::migrate::migrate(v).ok())
+                .is_some_and(|m| !m.steps.is_empty());
+            if has_steps {
+                println!(
+                    "{} {:?} predates config schema v{current}; `ostp migrate --dry-run` shows what would change.",
+                    "[note]".cyan().bold(), args.config
+                );
+            }
+        }
     }
 
     if args.links {

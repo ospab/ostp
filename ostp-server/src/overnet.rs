@@ -53,6 +53,34 @@ impl Default for OvernetConfig {
     }
 }
 
+impl OvernetConfig {
+    pub fn validate(&self) -> Result<()> {
+        self.gateway
+            .parse::<SocketAddr>()
+            .map_err(|e| anyhow!("overnet.gateway '{}' is not an ip:port ({e})", self.gateway))?;
+        let exit: SocketAddr = self
+            .exit_listen
+            .parse()
+            .map_err(|e| anyhow!("overnet.exit_listen '{}' is not an ip:port ({e})", self.exit_listen))?;
+        if !exit.ip().is_loopback() {
+            bail!("overnet.exit_listen must be a loopback address, not {exit}: the exit has no authentication");
+        }
+        Ok(())
+    }
+}
+
+/// What overnet is doing on this server now: for the panel and `ostp overnet status`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OvernetStatus {
+    pub config: OvernetConfig,
+    /// `.ov` is offered to clients: entry on and the gateway answering.
+    pub serving: bool,
+    /// The last gateway probe; `None` while entry is off (nothing probes).
+    pub gateway_up: Option<bool>,
+    /// Where the exit listens, when it is open.
+    pub exit_listening: Option<String>,
+}
+
 /// Fake addresses handed out for `.ov` names in TUN mode: 198.18.0.0/15
 /// (RFC 2544 benchmarking), not routed on the internet.
 const FAKE_NET: u32 = 0xC612_0000; // 198.18.0.0
@@ -135,27 +163,57 @@ impl Overnet {
     }
 
     /// Checks every few seconds that the overnet gateway accepts connections,
-    /// so `.ov` is only offered while it does (see `gateway_up`).
+    /// so `.ov` is only offered while it does (see `gateway_up`). Stops when
+    /// this `Overnet` is replaced (new settings from the panel).
     pub fn spawn_gateway_probe(self: &Arc<Self>) {
-        let me = self.clone();
+        let weak = Arc::downgrade(self);
+        let gateway = self.cfg.gateway.clone();
         tokio::spawn(async move {
+            let mut first = true;
             loop {
-                let gateway = me.cfg.gateway.clone();
                 let up = matches!(
                     tokio::time::timeout(std::time::Duration::from_secs(2), TcpStream::connect(&gateway)).await,
                     Ok(Ok(_))
                 );
+                let Some(me) = weak.upgrade() else { break };
                 let was = me.gateway_up.swap(up, std::sync::atomic::Ordering::Relaxed);
-                if up != was {
+                if up != was || (first && !up) {
                     if up {
                         tracing::info!("overnet: the gateway at {gateway} is up, .ov is served again");
                     } else {
                         tracing::warn!("overnet: no gateway at {gateway}; .ov is refused until it starts (is `overnet gateway` running?)");
                     }
                 }
+                first = false;
+                drop(me);
                 tokio::time::sleep(std::time::Duration::from_secs(5)).await;
             }
         });
+    }
+
+    pub fn status(&self) -> OvernetStatus {
+        OvernetStatus {
+            config: self.cfg.clone(),
+            serving: self.entry() && self.gateway_up(),
+            gateway_up: self.entry().then(|| self.gateway_up()),
+            exit_listening: EXIT.lock().unwrap().as_ref().map(|(a, _)| a.to_string()),
+        }
+    }
+
+    /// Encrypted DNS to a public resolver (DoT/DoQ on 853, DoH to a resolver's
+    /// address on 443) would ask the internet about `.ov` and get NXDOMAIN:
+    /// Chrome and Edge upgrade to it on their own when the system DNS is
+    /// 1.1.1.1 or 8.8.8.8, Android with "Private DNS: automatic". While `.ov`
+    /// is served it is refused, the device falls back to port 53, and the
+    /// server answers `.ov` there.
+    pub fn refuses_encrypted_dns(&self, target: &str) -> bool {
+        if !(self.entry() && self.gateway_up()) {
+            return false;
+        }
+        match target.parse::<SocketAddr>() {
+            Ok(addr) => addr.port() == 853 || (addr.port() == 443 && ostp_dns::services::is_public_resolver(addr.ip())),
+            Err(_) => target.rsplit_once(':').is_some_and(|(_, p)| p == "853"),
+        }
     }
 
     /// Classifies a client's `host:port` target. Errors when the target is
@@ -251,10 +309,40 @@ fn forbidden_for_exit(ip: IpAddr) -> bool {
     }
 }
 
+/// The open exit listener: its address and the accept loop.
+static EXIT: Mutex<Option<(SocketAddr, tokio::task::JoinHandle<()>)>> = Mutex::new(None);
+
+/// Applies overnet settings to a running server, at start and from the panel:
+/// `.ov` for clients switches over at once, the exit opens, moves or closes.
+pub async fn apply(cfg: OvernetConfig, router: &Arc<crate::router::Router>) -> Result<()> {
+    cfg.validate()?;
+    let ov = Overnet::new(cfg.clone());
+    if cfg.enabled && cfg.entry {
+        tracing::info!("overnet: .ov for clients through the gateway at {}", cfg.gateway);
+        ov.spawn_gateway_probe();
+    }
+    *router.overnet.write().unwrap() = ov;
+
+    let want_exit = cfg.enabled && cfg.exit;
+    let exit_bind: SocketAddr = cfg.exit_listen.parse()?;
+    let running = EXIT.lock().unwrap().as_ref().map(|(a, _)| *a);
+    if running.is_some() && (!want_exit || running != Some(exit_bind)) {
+        if let Some((addr, task)) = EXIT.lock().unwrap().take() {
+            task.abort();
+            tracing::info!("overnet: exit at socks5://{addr} closed");
+        }
+    }
+    if want_exit && running != Some(exit_bind) {
+        let addr = spawn_exit(&cfg, router.clone()).await?;
+        tracing::info!("overnet: exit open to the local node at socks5://{addr}");
+    }
+    Ok(())
+}
+
 /// Starts the exit listener. Every CONNECT goes through `router` like a
 /// client's would, except that `.ov`, the server itself and private
 /// networks are refused.
-pub async fn spawn_exit(cfg: &OvernetConfig, router: Arc<crate::router::Router>) -> Result<SocketAddr> {
+async fn spawn_exit(cfg: &OvernetConfig, router: Arc<crate::router::Router>) -> Result<SocketAddr> {
     let bind: SocketAddr = cfg
         .exit_listen
         .parse()
@@ -262,9 +350,9 @@ pub async fn spawn_exit(cfg: &OvernetConfig, router: Arc<crate::router::Router>)
     if !bind.ip().is_loopback() {
         bail!("overnet.exit_listen must be a loopback address, not {bind}: the exit has no authentication");
     }
-    let listener = TcpListener::bind(bind).await?;
+    let listener = TcpListener::bind(bind).await.map_err(|e| anyhow!("overnet exit on {bind}: {e}"))?;
     let addr = listener.local_addr()?;
-    tokio::spawn(async move {
+    let task = tokio::spawn(async move {
         loop {
             let Ok((s, _)) = listener.accept().await else { continue };
             let router = router.clone();
@@ -275,6 +363,7 @@ pub async fn spawn_exit(cfg: &OvernetConfig, router: Arc<crate::router::Router>)
             });
         }
     });
+    *EXIT.lock().unwrap() = Some((addr, task));
     Ok(addr)
 }
 
@@ -404,6 +493,30 @@ mod tests {
             RData::A(a) => Some(Ipv4Addr::from(a.address)),
             _ => None,
         })
+    }
+
+    #[test]
+    fn encrypted_dns_to_public_resolvers_is_refused_only_while_ov_is_served() {
+        let o = on();
+        assert!(o.refuses_encrypted_dns("1.1.1.1:443"));
+        assert!(o.refuses_encrypted_dns("8.8.8.8:853"));
+        assert!(o.refuses_encrypted_dns("dns.example:853"));
+        assert!(!o.refuses_encrypted_dns("93.184.216.34:443"));
+        assert!(!o.refuses_encrypted_dns("1.1.1.1:80"));
+        o.gateway_up.store(false, std::sync::atomic::Ordering::Relaxed);
+        assert!(!o.refuses_encrypted_dns("1.1.1.1:443"), "gateway down: .ov is not served, DoH is left alone");
+        let off = Overnet::new(OvernetConfig::default());
+        assert!(!off.refuses_encrypted_dns("1.1.1.1:443"));
+    }
+
+    #[test]
+    fn exit_listen_must_be_loopback() {
+        let mut cfg = OvernetConfig::default();
+        assert!(cfg.validate().is_ok());
+        cfg.exit_listen = "0.0.0.0:9151".into();
+        assert!(cfg.validate().is_err());
+        cfg = OvernetConfig { gateway: "nonsense".into(), ..Default::default() };
+        assert!(cfg.validate().is_err());
     }
 
     #[test]

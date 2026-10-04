@@ -22,7 +22,7 @@ use serde_json::{json, Map, Value};
 /// - `1`: flat configs up to 0.4.5, no version stamp; may carry settings of
 ///   features that no longer exist.
 /// - `2`: 0.4.6+, stamped `config_version`.
-pub const CURRENT_VERSION: u32 = 2;
+pub const CURRENT_VERSION: u32 = 3;
 
 /// Which config this file is (mirrors `AppMode`'s `"mode"` tag). Old configs
 /// from before that tag existed are sniffed structurally as a fallback.
@@ -86,6 +86,7 @@ const STEPS: &[Step] = &[
     Step { kind: ConfigKind::Client, from: 0, title: "0.3.x modular client config to the flat format", run: client_modular_to_flat },
     Step { kind: ConfigKind::Client, from: 1, title: "remove settings of removed features", run: client_drop_removed },
     Step { kind: ConfigKind::Relay, from: 1, title: "remove relay-side authentication settings", run: relay_drop_auth },
+    Step { kind: ConfigKind::Server, from: 2, title: "add the overnet section (off)", run: server_add_overnet },
 ];
 
 fn remove_with_reason(obj: &mut Map<String, Value>, path: &str, key: &str, reason: &str, notes: &mut Vec<String>) {
@@ -212,6 +213,22 @@ fn client_modular_to_flat(v: &mut Value, notes: &mut Vec<String>) {
     }
     notes.push(format!("kept server {server}"));
     *v = out;
+}
+
+/// 0.4.7: the `overnet` section, written out off so the owner sees it in the
+/// config. Off is what a config without it means anyway; nothing turns on.
+fn server_add_overnet(v: &mut Value, notes: &mut Vec<String>) {
+    if v.get("overnet").is_some_and(|o| !o.is_null()) {
+        return;
+    }
+    v["overnet"] = json!({
+        "enabled": false,
+        "entry": true,
+        "gateway": "127.0.0.1:9150",
+        "exit": false,
+        "exit_listen": "127.0.0.1:9151",
+    });
+    notes.push("added overnet (off): .ov sites for clients with `ostp overnet install` and `ostp overnet enable`".into());
 }
 
 // ── Driver ───────────────────────────────────────────────────────────────────
@@ -499,7 +516,7 @@ mod tests {
     /// API token is still used by the server and must survive, and no section
     /// the user did not write is invented.
     #[test]
-    fn server_gets_only_the_version_stamp() {
+    fn server_gets_the_version_stamp_and_overnet_off() {
         let m = run(json!({
             "mode": "server",
             "listen": "0.0.0.0:50000",
@@ -511,7 +528,11 @@ mod tests {
         assert_eq!(m.output["api"], json!({ "enabled": true, "token": "relay-token" }));
         assert!(m.output.get("outbound").is_none());
         assert_eq!(m.output["tls"], json!({ "enabled": true, "ws_path": "/Xk3pQ9aZr2" }));
-        assert_eq!(m.changes, vec![Change::Added { path: "config_version".into(), value: json!(CURRENT_VERSION) }]);
+        // The version stamp and, since v3, the overnet section switched off.
+        assert_eq!(m.changes.len(), 2, "{:?}", m.changes);
+        assert!(m.changes.contains(&Change::Added { path: "config_version".into(), value: json!(CURRENT_VERSION) }));
+        assert!(matches!(&m.changes[..], [Change::Added { path, .. }, _] | [_, Change::Added { path, .. }] if path == "overnet"));
+        assert_eq!(m.output["overnet"]["enabled"], false);
         assert!(m.unknown_keys.is_empty(), "{:?}", m.unknown_keys);
         assert_idempotent(&m);
     }
@@ -607,5 +628,25 @@ mod tests {
             assert!(m.is_up_to_date(), "the generated {name} config needs migrating: {:?}", m.changes);
             assert!(m.unknown_keys.is_empty(), "the generated {name} config has unknown keys: {:?}", m.unknown_keys);
         }
+    }
+
+    #[test]
+    fn server_gets_an_overnet_section_that_is_off() {
+        let m = migrate(json!({
+            "mode": "server", "config_version": 2, "listen": "0.0.0.0:50000", "access_keys": ["k"],
+        }))
+        .unwrap();
+        assert_eq!(m.output["overnet"]["enabled"], false);
+        assert_eq!(m.output["overnet"]["exit"], false);
+        // An owner's own section stays as it is.
+        let m = migrate(json!({
+            "mode": "server", "config_version": 2, "listen": "0.0.0.0:50000", "access_keys": ["k"],
+            "overnet": { "enabled": true, "gateway": "127.0.0.1:9999" },
+        }))
+        .unwrap();
+        assert_eq!(m.output["overnet"], json!({ "enabled": true, "gateway": "127.0.0.1:9999" }));
+        // Clients have no step for v3: only the version number moves.
+        let m = migrate(json!({ "mode": "client", "config_version": 2, "server": "h:1", "access_key": "k" })).unwrap();
+        assert!(m.steps.is_empty());
     }
 }

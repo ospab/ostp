@@ -556,6 +556,46 @@ async function renderConnection(body, id) {
     s.subscription ? 'Turn subscriptions off?' : null, s.subscription ? 'Subscription links stop updating in the apps.' : null);
 }
 
+// overnet (github.com/ospab/overnet): .ov sites for this server's clients
+// through the overnet gateway on the server. Off until the owner turns it on.
+function overnetSection(ov) {
+  if (!ov) return ''; // a server older than 0.4.7
+  const pill = (on, yes = 'on', no = 'off') => on ? `<span class="pill ok">${yes}</span>` : `<span class="pill warn">${no}</span>`;
+  const gw = !ov.installed ? '<span class="pill warn">not installed</span>'
+    : ov.gateway_up ? '<span class="pill ok">answers</span>' : '<span class="pill bad">not answering</span>';
+  return `
+    <div class="section-divider"><span>overnet</span></div>
+    <div class="kv-card">
+      ${kv('.ov sites for clients', pill(ov.entry))}
+      ${kv('overnet gateway', gw)}
+      ${kv('Exit', pill(ov.exit))}
+    </div>
+    <div class="btn-row">
+      ${ov.installed ? '' : '<button class="btn secondary" id="btn-ov-install">Install overnet gateway</button>'}
+      ${ov.entry ? '<button class="btn secondary" id="btn-ov-off">Turn .ov off</button>'
+                 : '<button class="btn primary" id="btn-ov-on">Turn .ov on</button>'}
+      <button class="btn secondary" id="btn-ov-exit">${ov.exit ? 'Close the exit' : 'Open an exit'}</button>
+    </div>
+    <p class="card-note">With .ov on, devices connected through this server open .ov sites (try http://search.ov/) in any browser.
+      The gateway is overnet's own program; nothing is installed until you press the button.
+      An exit lets overnet users reach the internet from this server's IP.</p>`;
+}
+
+function bindOvernet(id, ov) {
+  if (!ov) return;
+  const b = x => document.getElementById(x);
+  if (b('btn-ov-install')) b('btn-ov-install').onclick = () => runAction(id, 'overnet-install',
+    'Install the overnet gateway?', 'Runs overnet\'s installer from github.com/ospab/overnet on the server and starts the overnet-gateway service. OSTP settings do not change.');
+  if (b('btn-ov-on')) b('btn-ov-on').onclick = () => runAction(id, 'overnet-enable',
+    'Turn .ov on?', ov.gateway_up ? 'The OSTP service restarts; connected clients drop for a few seconds.'
+      : 'The overnet gateway is not answering yet: clients get "not found" for .ov until it runs. The OSTP service restarts.');
+  if (b('btn-ov-off')) b('btn-ov-off').onclick = () => runAction(id, 'overnet-disable',
+    'Turn .ov off?', 'The OSTP service restarts; connected clients drop for a few seconds.');
+  b('btn-ov-exit').onclick = () => runAction(id, ov.exit ? 'overnet-exit-off' : 'overnet-exit-on',
+    ov.exit ? 'Close the exit?' : 'Open an overnet exit?',
+    ov.exit ? 'The OSTP service restarts.' : 'overnet users\' internet traffic will leave from this server\'s IP, and you answer for it. The OSTP service restarts.');
+}
+
 async function renderManage(body, id) {
   const s = await call('server_manage', { id, args: ['status'] });
   if (id !== currentId) return;
@@ -574,6 +614,8 @@ async function renderManage(body, id) {
     ${panel.enabled ? `<div class="kv-card">${kv('Through the VPN', esc(vpnPanelUrl(panel)), 'mono')}</div>` : ''}
     <p class="card-note">"Open the panel" goes through this SSH connection and needs no open port.
       The VPN address works in any browser on a device connected through this server, phones included.</p>
+
+    ${overnetSection(s.overnet)}
 
     <div class="section-divider"><span>Server log</span></div>
     <div class="btn-row"><button class="btn secondary" id="btn-logs">Show the last 300 lines</button></div>
@@ -609,6 +651,7 @@ async function renderManage(body, id) {
       runAction(id, 'panel-enable', null, null, { user: v.user, password: v.password });
     };
   }
+  bindOvernet(id, s.overnet);
   $('btn-logs').onclick = async () => {
     const pre = $('server-log');
     pre.style.display = '';
@@ -651,7 +694,8 @@ function vpnPanelUrl(panel) {
 // connected through the same server: the answer would never arrive.
 async function runAction(id, action, confirmTitle, confirmText, params = null) {
   const server = serversCache.find(s => s.id === id);
-  const disruptive = ['restart', 'update', 'reboot', 'uninstall', 'panel-enable', 'panel-disable', 'cert-issue'].includes(action);
+  const disruptive = ['restart', 'update', 'reboot', 'uninstall', 'panel-enable', 'panel-disable', 'cert-issue',
+    'overnet-enable', 'overnet-disable', 'overnet-exit-on', 'overnet-exit-off'].includes(action);
   if (disruptive && server && app.connectedThrough(server.host)) {
     await confirmBox('Disconnect first', 'This app is connected through this server, and this change interrupts that connection. Disconnect, then try again.', 'OK', false);
     return;

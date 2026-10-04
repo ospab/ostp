@@ -76,6 +76,10 @@ pub async fn handle_relay_message(
                 // automatic", Chrome's secure DNS upgrade).
                 let _ = connect_tx.send((session_id, stream_id, target, Err("encrypted DNS is blocked: this server filters DNS".into())));
                 return Ok(());
+            } else if router.overnet().refuses_encrypted_dns(&connect_target) {
+                // Same fallback, so `.ov` names reach the server's port-53 answer.
+                let _ = connect_tx.send((session_id, stream_id, target, Err("encrypted DNS is blocked: this server serves .ov".into())));
+                return Ok(());
             }
 
             let target_clone = connect_target.clone();
@@ -293,7 +297,7 @@ pub async fn handle_relay_message(
                 // DNS over QUIC (853) and DoH over HTTP/3 to a public resolver
                 // (443) skip the filtering the same way; dropped, so the device
                 // falls back to plain port 53.
-                if router.dns_server.is_dns_bypass(&target) {
+                if router.dns_server.is_dns_bypass(&target) || router.overnet().refuses_encrypted_dns(&target) {
                     if router.debug {
                         let _ = ui_event_tx.send(UiEvent::Log(format!("DNS [{session_id}:{stream_id}] encrypted DNS over UDP to {target} dropped")));
                     }

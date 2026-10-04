@@ -299,7 +299,8 @@ pub fn create_api_router(state: ApiState) -> Router {
         .route("/dns/settings", get(handle_dns_get_settings).put(handle_dns_put_settings))
         .route("/dns/update", post(handle_dns_update))
         .route("/dns/test", post(handle_dns_test))
-        .route("/dns/meta", get(handle_dns_meta));
+        .route("/dns/meta", get(handle_dns_meta))
+        .route("/overnet", get(handle_overnet_status).put(handle_overnet_put));
 
     let webpath = state.webpath.clone();
     let webpath = webpath.trim_matches('/');
@@ -1369,6 +1370,44 @@ async fn handle_dns_test(
         return api_unauthorized::<ostp_dns::Explanation>();
     }
     (StatusCode::OK, ApiResponse::success(state.dns_server.explain(&req.domain)))
+}
+
+async fn handle_overnet_status(State(state): State<ApiState>, headers: axum::http::HeaderMap) -> impl IntoResponse {
+    if !check_token(&state, &headers) {
+        return api_unauthorized::<crate::overnet::OvernetStatus>();
+    }
+    (StatusCode::OK, ApiResponse::success(state.router.overnet().status()))
+}
+
+/// Applies the overnet section live (no restart) and writes it to config.json.
+async fn handle_overnet_put(
+    State(state): State<ApiState>,
+    headers: axum::http::HeaderMap,
+    Json(cfg): Json<crate::overnet::OvernetConfig>,
+) -> impl IntoResponse {
+    if !check_token(&state, &headers) {
+        return api_unauthorized::<crate::overnet::OvernetStatus>();
+    }
+    if let Err(e) = crate::overnet::apply(cfg.clone(), &state.router).await {
+        return api_error(&format!("{e:#}"));
+    }
+    if let Some(path) = &state.config_path {
+        let saved = (|| -> Result<(), String> {
+            let content = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+            let mut stripped = json_comments::StripComments::new(content.as_bytes());
+            let mut text = String::new();
+            use std::io::Read;
+            stripped.read_to_string(&mut text).map_err(|e| e.to_string())?;
+            let mut v: serde_json::Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+            v["overnet"] = serde_json::to_value(&cfg).map_err(|e| e.to_string())?;
+            let _ = std::fs::copy(path, path.with_extension("json.bak"));
+            std::fs::write(path, serde_json::to_string_pretty(&v).map_err(|e| e.to_string())?).map_err(|e| e.to_string())
+        })();
+        if let Err(e) = saved {
+            return api_error(&format!("applied, but config.json was not written: {e}"));
+        }
+    }
+    (StatusCode::OK, ApiResponse::success(state.router.overnet().status()))
 }
 
 #[derive(Serialize)]

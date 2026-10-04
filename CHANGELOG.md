@@ -8,6 +8,15 @@ Older history is on the [Releases](https://github.com/ospab/ostp/releases) page 
 
 ## [Unreleased]
 
+### Added
+- `ostp overnet`: `install` (overnet's own installer with the gateway role), `enable`, `disable`, `exit on|off`, `status`. The section is still off until the owner turns it on; nothing installs by itself.
+- overnet in the web panel (an overnet page, applied live without a restart) and in the desktop and mobile apps (the server's management tab: install the gateway, turn `.ov` and the exit on and off). `ostp check` shows the section.
+- Config schema v3: `ostp migrate` writes the `overnet` section, switched off, into an older server config. Client configs have nothing to migrate and no longer get the hint.
+
+### Fixed
+- `.ov` did not open in Chrome, Edge or on Android even with the gateway running: with the system DNS at 1.1.1.1 or 8.8.8.8 they switch to their own encrypted DNS, which asks the internet about `.ov`. While `.ov` is served, encrypted DNS to public resolvers is refused, so they fall back to port 53, which the server answers.
+- 0.4.7-beta.1 did not build for 32-bit MIPS (`AtomicU64`).
+
 ## [0.4.7-beta.1] - 2026-10-04
 
 ### Added

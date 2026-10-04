@@ -252,6 +252,29 @@ fn install(config_path: &Path, port: u16, host: Option<&str>, user: &str) -> Res
     Ok(out)
 }
 
+/// The overnet section plus what is actually running: the program, the
+/// gateway answering, so the app can say why .ov does not work.
+fn overnet_status(v: &Value) -> Value {
+    let cfg: ostp_server::OvernetConfig = v
+        .get("overnet")
+        .filter(|o| !o.is_null())
+        .and_then(|o| serde_json::from_value(o.clone()).ok())
+        .unwrap_or_default();
+    let installed = std::process::Command::new("overnet").arg("--version").output().is_ok_and(|o| o.status.success());
+    let gateway_up = cfg.gateway.parse::<std::net::SocketAddr>().is_ok_and(|a| {
+        std::net::TcpStream::connect_timeout(&a, std::time::Duration::from_secs(2)).is_ok()
+    });
+    json!({
+        "enabled": cfg.enabled,
+        "entry": cfg.enabled && cfg.entry,
+        "exit": cfg.enabled && cfg.exit,
+        "gateway": cfg.gateway,
+        "exit_listen": cfg.exit_listen,
+        "installed": installed,
+        "gateway_up": gateway_up,
+    })
+}
+
 fn status(config_path: &Path) -> Result<Value> {
     let (v, server) = load(config_path)?;
     let stats = read_stats(config_path);
@@ -297,6 +320,7 @@ fn status(config_path: &Path) -> Result<Value> {
             },
             "login": !str_of("username").is_empty() && !str_of("password_hash").is_empty(),
         },
+        "overnet": overnet_status(&v),
         "system": system_info(),
     }))
 }

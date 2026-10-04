@@ -302,17 +302,8 @@ pub async fn run_server(params: ServerParams) -> Result<()> {
         debug,
     ));
     if let Some(cfg) = overnet.filter(|o| o.enabled) {
-        let ov = overnet::Overnet::new(cfg.clone());
-        if cfg.entry {
-            tracing::info!("overnet: .ov for clients through the gateway at {}", cfg.gateway);
-            ov.spawn_gateway_probe();
-        }
-        *router.overnet.write().unwrap() = ov;
-        if cfg.exit {
-            match overnet::spawn_exit(&cfg, router.clone()).await {
-                Ok(addr) => tracing::info!("overnet: exit open to the local node at socks5://{addr}"),
-                Err(e) => tracing::error!("overnet: exit is off: {e:#}"),
-            }
+        if let Err(e) = overnet::apply(cfg, &router).await {
+            tracing::error!("overnet: {e:#}");
         }
     }
     match dns::spawn_tcp_listener(dns_server.clone(), router.overnet.clone()).await {
@@ -886,7 +877,7 @@ fn final_stats(stats: &Arc<RwLock<HashMap<String, Arc<dispatcher::UserStats>>>>,
 }
 
 /// Frames dropped because a TCP/TLS client's send queue was full.
-static TCP_QUEUE_DROPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static TCP_QUEUE_DROPS: portable_atomic::AtomicU64 = portable_atomic::AtomicU64::new(0);
 
 /// Hands a frame to a TCP/TLS client's writer. The queue is bounded, and the
 /// main loop must not wait on one slow client, so a full queue drops the

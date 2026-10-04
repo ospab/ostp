@@ -175,6 +175,20 @@ By default the server proxies decrypted client traffic directly to the internet 
 
 The section is **off by default**: nothing about overnet runs, and the OSTP installer does not install it. The owner of the server turns it on and installs the overnet gateway themselves (`scripts/install.sh --role gateway` in the overnet repository). With entry on, the server checks every 5 seconds that the gateway accepts connections; while it does not, `.ov` gets NXDOMAIN and connections are refused, exactly as with entry off, and the log says so. A fake 198.18.0.0/15 answer therefore always means the gateway is there, which is what `overnet browser` relies on.
 
+### Turning it on
+
+```bash
+sudo ostp overnet install    # overnet's own installer with the gateway role (systemd unit overnet-gateway)
+sudo ostp overnet enable     # serve .ov to clients; restarts ostp (--no-restart to skip)
+ostp overnet status          # the section, the program, whether the gateway answers, the exit
+sudo ostp overnet exit on    # optional: the exit, then `overnet relay --exit socks5://127.0.0.1:9151`
+sudo ostp overnet disable    # .ov off (the exit has its own switch: exit off)
+```
+
+The same switches are on the **overnet** page of the web panel (applied live, without a restart) and in the desktop and mobile apps under the server's management tab. `ostp check` prints the state of the section. `ostp migrate` writes the section into an older server config, switched off.
+
+Clients need nothing new: in TUN mode and with the system proxy, `http://search.ov/` opens in any browser. While `.ov` is served, encrypted DNS to public resolvers (DoT/DoQ on 853, DoH to a resolver's address on 443) is refused, as with `dns.block_doh_bypass`: Chrome and Edge upgrade to DoH on their own when the system DNS is 1.1.1.1 or 8.8.8.8, Android does with "Private DNS: automatic", and such a resolver answers NXDOMAIN for `.ov`. After the refusal the device asks plain port 53, which the server answers. A browser with DoH set to a fixed provider by hand (Firefox "Max protection", Chrome with a custom provider) keeps failing on `.ov`; turn that off for this connection.
+
 ---
 
 ## Relay-Node Federation

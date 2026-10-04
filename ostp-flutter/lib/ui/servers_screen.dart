@@ -215,12 +215,17 @@ class _ServerScreenState extends State<ServerScreen> {
     'update': 'Updating OSTP', 'restart': 'Restarting OSTP', 'reboot': 'Rebooting', 'uninstall': 'Removing OSTP',
     'panel-enable': 'Turning on the panel', 'panel-disable': 'Turning off the panel', 'cert-issue': 'Getting a certificate',
     'sub-enable': 'Turning on subscriptions', 'sub-disable': 'Turning off subscriptions',
+    'overnet-install': 'Installing the overnet gateway', 'overnet-enable': 'Turning .ov on', 'overnet-disable': 'Turning .ov off',
+    'overnet-exit-on': 'Opening the overnet exit', 'overnet-exit-off': 'Closing the overnet exit',
   };
 
   /// Runs a change on the server with its output shown live. Changes that
   /// restart the service are refused while the VPN goes through this server.
   Future<void> _action(String action, {String? confirmTitle, String? confirmText, Map<String, dynamic>? params}) async {
-    const disruptive = {'restart', 'update', 'reboot', 'uninstall', 'panel-enable', 'panel-disable', 'cert-issue'};
+    const disruptive = {
+      'restart', 'update', 'reboot', 'uninstall', 'panel-enable', 'panel-disable', 'cert-issue',
+      'overnet-enable', 'overnet-disable', 'overnet-exit-on', 'overnet-exit-off',
+    };
     if (disruptive.contains(action) && await ServersApi.connectedThrough(widget.prefs, _server['host'] as String)) {
       if (!mounted) return;
       await _confirm('Disconnect first',
@@ -501,6 +506,54 @@ class _ServerScreenState extends State<ServerScreen> {
     ]);
   }
 
+  // ── overnet ───────────────────────────────────────────────────────────
+  // .ov sites for this server's clients through the overnet gateway on the
+  // server (github.com/ospab/overnet). Off until the owner turns it on.
+  List<Widget> _overnet(Map<String, dynamic>? ov) {
+    if (ov == null) return const []; // a server older than 0.4.7
+    final entry = ov['entry'] == true, exit = ov['exit'] == true;
+    final installed = ov['installed'] == true, up = ov['gateway_up'] == true;
+    const restart = 'The OSTP service restarts; connected clients drop for a few seconds.';
+    return [
+      const _Section('overnet'),
+      _Card([
+        _Row('.ov sites for clients', pill: entry ? ('on', _green) : ('off', _amber)),
+        _Row('overnet gateway', pill: !installed ? ('not installed', _amber) : up ? ('answers', _green) : ('not answering', _amber)),
+        _Row('Exit', pill: exit ? ('on', _green) : ('off', _amber)),
+      ]),
+      if (!installed) ...[
+        OutlinedButton(
+          onPressed: () => _action('overnet-install',
+              confirmTitle: 'Install the overnet gateway?',
+              confirmText: "Runs overnet's installer from github.com/ospab/overnet on the server and starts the overnet-gateway service. "
+                  'OSTP settings do not change.'),
+          child: const Text('Install overnet gateway'),
+        ),
+        const SizedBox(height: 8),
+      ],
+      entry
+          ? OutlinedButton(
+              onPressed: () => _action('overnet-disable', confirmTitle: 'Turn .ov off?', confirmText: restart),
+              child: const Text('Turn .ov off'),
+            )
+          : FilledButton(
+              onPressed: () => _action('overnet-enable',
+                  confirmTitle: 'Turn .ov on?',
+                  confirmText: up ? restart : 'The overnet gateway is not answering yet: clients get "not found" for .ov until it runs. $restart'),
+              child: const Text('Turn .ov on'),
+            ),
+      const SizedBox(height: 8),
+      OutlinedButton(
+        onPressed: () => _action(exit ? 'overnet-exit-off' : 'overnet-exit-on',
+            confirmTitle: exit ? 'Close the exit?' : 'Open an overnet exit?',
+            confirmText: exit ? restart : "overnet users' internet traffic will leave from this server's IP, and you answer for it. $restart"),
+        child: Text(exit ? 'Close the exit' : 'Open an exit'),
+      ),
+      const _Note('With .ov on, devices connected through this server open .ov sites (try http://search.ov/) in any browser. '
+          "The gateway is overnet's own program; nothing is installed until you press the button."),
+    ];
+  }
+
   // ── Management ────────────────────────────────────────────────────────
   Widget _management(Map<String, dynamic> s) {
     final panel = (s['panel'] as Map?)?.cast<String, dynamic>() ?? {};
@@ -535,6 +588,7 @@ class _ServerScreenState extends State<ServerScreen> {
         ),
       const _Note('"Open the panel" goes through this SSH connection and needs no open port; it works while this app stays open. '
           'The VPN address works in any browser on a device connected through this server.'),
+      ..._overnet((s['overnet'] as Map?)?.cast<String, dynamic>()),
       const _Section('Server log'),
       _LogView(load: () async => ((await _manage(['logs', '-n', '300']))['lines'] as List? ?? const []).cast<String>()),
       const _Section('This server'),
