@@ -8,6 +8,10 @@ use std::time::{Duration, Instant};
 /// is applied to the adaptive RTO. Past this the session is dead from the
 /// user's point of view, and waiting longer only delays recovery.
 const MAX_EFFECTIVE_RTO: Duration = Duration::from_secs(8);
+/// On a reliable carrier (TCP, TLS) a frame is resent on a timer only when it
+/// has gone unacknowledged this long: far above any queueing delay, so the
+/// timer no longer duplicates frames that are merely queued.
+const RELIABLE_CARRIER_RTO: Duration = Duration::from_secs(5);
 
 use crate::congestion::CongestionController;
 use crate::crypto::{NoiseRole, NoiseSession, SessionCipher};
@@ -109,6 +113,22 @@ pub struct ProtocolMachine {
     authenticated_recv_count: u64,
     /// Congestion controller (BBR-inspired adaptive window)
     cc: CongestionController,
+    /// The datagrams ride a reliable byte stream (UDP-over-TCP, TLS): nothing
+    /// is lost on the way, so timer-driven retransmission only duplicates.
+    /// Worse, it feeds on itself: the RTO times the queue in front of the TCP
+    /// socket, fires while the frame is merely queued, and every duplicate
+    /// lengthens that queue (TCP over TCP). With this set, frames are resent
+    /// only when the peer NACKs a gap or after the session moved to another
+    /// connection, where what was in flight on the old one is gone.
+    reliable_carrier: bool,
+    /// When the session last moved (`on_path_change`): on a reliable carrier,
+    /// frames sent before this are resent once.
+    path_changed_at: Option<Instant>,
+    /// The nonce the peer last NACKed. A receiver NACKs the same gap again
+    /// (every RTO/2) until it is filled; only the first NACK of a gap is a
+    /// new loss for the congestion controller. Counting each one cut the
+    /// window by 0.7 per NACK, down to the minimum for one lost frame.
+    last_nacked_nonce: Option<u64>,
         /// Key-derived handshake padding range
     handshake_pad_min: usize,
     handshake_pad_max: usize,
@@ -169,6 +189,9 @@ impl ProtocolMachine {
             highest_authenticated_recv_nonce: None,
             authenticated_recv_count: 0,
             cc: CongestionController::new(config.mtu as u64),
+            reliable_carrier: false,
+            path_changed_at: None,
+            last_nacked_nonce: None,
             handshake_pad_min: config.handshake_pad_min.max(8),
             handshake_pad_max: config.handshake_pad_max.max(config.handshake_pad_min + 16),
             _mtu: config.mtu,
@@ -199,6 +222,7 @@ impl ProtocolMachine {
     /// server moves the session's address on.
     pub fn on_path_change(&mut self) {
         self.cc.reset_path();
+        self.path_changed_at = Some(Instant::now());
         let due = Instant::now()
             .checked_sub(Duration::from_secs(3600))
             .unwrap_or_else(Instant::now);
@@ -209,6 +233,13 @@ impl ProtocolMachine {
         self.last_nack_sent = due;
         self.last_ack_sent = due;
         self.ack_pending = true;
+    }
+
+    /// Whether datagrams ride a reliable byte stream (UDP-over-TCP or TLS)
+    /// rather than UDP; see the `reliable_carrier` field. Safe to change at
+    /// any time, the peer is not affected.
+    pub fn set_reliable_carrier(&mut self, reliable: bool) {
+        self.reliable_carrier = reliable;
     }
 
     pub fn in_flight_count(&self) -> usize {
@@ -530,14 +561,20 @@ impl ProtocolMachine {
         if packet.header.kind == FrameKind::Nack
             && packet.payload.len() >= 8 {
                 let req_nonce = u64::from_be_bytes(packet.payload[..8].try_into().map_err(|_| ProtocolError::Framing("nack payload too short".into()))?);
+                let new_gap = self.last_nacked_nonce != Some(req_nonce);
+                self.last_nacked_nonce = Some(req_nonce);
                 if let Some(cached_frame) = self.lookup_sent_frame(req_nonce) {
                     tracing::debug!("NACK received: retransmitting nonce={}", req_nonce);
-                    self.cc.on_loss(cached_frame.len() as u64);
+                    if new_gap {
+                        self.cc.on_loss(cached_frame.len() as u64);
+                    }
                     outbound_actions.push(ProtocolAction::SendDatagram(cached_frame));
                 } else {
                     tracing::debug!("NACK received: nonce={} not found in sent_history (evicted)", req_nonce);
-                    // Estimate ~1200 bytes lost for evicted frames
-                    self.cc.on_loss(1200);
+                    if new_gap {
+                        // Estimate ~1200 bytes lost for evicted frames
+                        self.cc.on_loss(1200);
+                    }
                 }
             }
 
@@ -750,7 +787,16 @@ impl ProtocolMachine {
             let effective_rto = Duration::from_millis(base_rto_ms.saturating_mul(backoff_factor))
                 .min(MAX_EFFECTIVE_RTO);
 
-            if now.duration_since(frame.last_sent) >= effective_rto {
+            let due = if self.reliable_carrier {
+                // What was in flight on a connection the session left, and a
+                // slow safety net for a frame the sending side dropped from a
+                // full queue with nothing after it (no gap, so no NACK).
+                self.path_changed_at.is_some_and(|t| frame.last_sent < t)
+                    || now.duration_since(frame.last_sent) >= effective_rto.max(RELIABLE_CARRIER_RTO)
+            } else {
+                now.duration_since(frame.last_sent) >= effective_rto
+            };
+            if due {
                 // Only burn the retry counter and reset the RTO timer when the
                 // frame is ACTUALLY put on the wire. Doing it unconditionally
                 // meant that whenever the per-tick budget ran out — which is
@@ -1393,5 +1439,69 @@ mod tests {
 
         server.on_event(OstpEvent::Inbound(frames[1].clone())).unwrap();
         assert_eq!(server.authenticated_recv_count(), 2);
+    }
+
+    fn datagrams(action: ProtocolAction) -> Vec<Bytes> {
+        match action {
+            ProtocolAction::SendDatagram(d) => vec![d],
+            ProtocolAction::Multiple(list) => list.into_iter().flat_map(datagrams).collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_reliable_carrier_resends_only_after_a_path_change() {
+        let (mut client, _server) = do_handshake();
+        client.set_reliable_carrier(true);
+        let sent = datagrams(client.on_event(OstpEvent::Outbound(1, Bytes::from_static(b"payload"))).unwrap());
+        assert_eq!(sent.len(), 1);
+
+        // Long past any RTO: over TCP the frame is queued, not lost.
+        std::thread::sleep(Duration::from_millis(250));
+        let resent = datagrams(client.on_event(OstpEvent::Tick).unwrap());
+        assert!(!resent.contains(&sent[0]), "no timer-driven resend on a reliable carrier");
+
+        // The session moved to a new connection: what was in flight is gone,
+        // so it is resent, once.
+        client.on_path_change();
+        let resent = datagrams(client.on_event(OstpEvent::Tick).unwrap());
+        assert!(resent.contains(&sent[0]), "in-flight frames are resent after a path change");
+        std::thread::sleep(Duration::from_millis(250));
+        let again = datagrams(client.on_event(OstpEvent::Tick).unwrap());
+        assert!(!again.contains(&sent[0]), "and only once");
+
+        // UDP keeps timer-driven retransmission.
+        client.set_reliable_carrier(false);
+        std::thread::sleep(Duration::from_millis(250));
+        let udp = datagrams(client.on_event(OstpEvent::Tick).unwrap());
+        assert!(udp.contains(&sent[0]), "UDP still retransmits on RTO");
+    }
+
+    #[test]
+    fn repeated_nacks_for_one_gap_shrink_the_window_once() {
+        let (mut client, mut server) = do_handshake();
+        // The server sends three frames; the client misses the first.
+        let frames: Vec<Bytes> = (0..3)
+            .map(|i| datagrams(server.on_event(OstpEvent::Outbound(1, Bytes::from(vec![i as u8; 100]))).unwrap()).remove(0))
+            .collect();
+        let mut nacks = Vec::new();
+        for f in &frames[1..] {
+            client.last_nack_sent = Instant::now() - Duration::from_secs(1); // no cooldown in the test
+            nacks.extend(datagrams(client.on_event(OstpEvent::Inbound(f.clone())).unwrap()));
+        }
+        assert!(nacks.len() >= 2, "the client NACKs the same gap twice");
+
+        let before = server.cc.cwnd();
+        for n in &nacks {
+            let _ = server.on_event(OstpEvent::Inbound(n.clone()));
+        }
+        let after_first_gap = server.cc.cwnd();
+        assert!(after_first_gap < before, "the first NACK of a gap is a loss");
+
+        // The same gap NACKed again: no further cut.
+        for n in &nacks {
+            let _ = server.on_event(OstpEvent::Inbound(n.clone()));
+        }
+        assert_eq!(server.cc.cwnd(), after_first_gap, "repeated NACKs of one gap do not shrink the window again");
     }
 }

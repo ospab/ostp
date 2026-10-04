@@ -11,6 +11,11 @@ Older history is on the [Releases](https://github.com/ospab/ostp/releases) page 
 ### Added
 - Server: an `overnet` section. With `entry`, clients reach the overnet `.ov` zone through the server: `.ov` connections go to the local overnet gateway over SOCKS5, and in TUN mode the server's DNS gives `.ov` names fake addresses from `198.18.0.0/15` that lead there. `.ov` names never go to the DNS upstreams or the internet, even with the section off. With `exit` (off by default), a loopback-only SOCKS5 listener lets the local overnet node send clearnet traffic out through the server's usual route; the server itself and private networks are refused. No protocol change. See `docs/en/server.md`.
 
+### Fixed
+- TLS and UDP-over-TCP: downloads went in bursts with 20–30 s pauses. Over a TCP carrier the protocol still resent frames on its 100 ms timer: the timer measured the queue in front of the TCP socket, fired while frames were merely queued, and every duplicate lengthened that queue (TCP over TCP), until the server's per-client queue overflowed and dropped frames. On TCP carriers frames are now resent only when the peer reports a gap, after the session moved to another connection, or after 5 s unacknowledged. A frame dropped from a full queue is logged instead of disappearing silently.
+- Repeated NACKs for the same missing frame each cut the sender's window by 0.7, down to the minimum for a single loss; only the first NACK of a gap counts now.
+- overnet: with entry on and the gateway not running, the server's DNS still handed out 198.18.0.0/15 addresses for `.ov`, so `overnet browser` assumed `.ov` was served and the sites did not open. The gateway is now checked every 5 s; while it is down, `.ov` is refused as with entry off.
+
 ## [0.4.6] - 2026-09-29
 
 The stable 0.4.6: everything from the betas below. In short:

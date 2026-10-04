@@ -1264,6 +1264,8 @@ impl Bridge {
                 mtu: self.mtu,
                 max_padding: self.mtu.saturating_sub(48).max(256),
             })?;
+            // UoT and TLS ride TCP: no timer-driven resends (TCP over TCP).
+            machine.set_reliable_carrier(self.transport_mode != "udp");
 
             let start = Instant::now();
             let action = match machine.on_event(OstpEvent::Start) {

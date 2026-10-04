@@ -302,10 +302,12 @@ pub async fn run_server(params: ServerParams) -> Result<()> {
         debug,
     ));
     if let Some(cfg) = overnet.filter(|o| o.enabled) {
-        *router.overnet.write().unwrap() = overnet::Overnet::new(cfg.clone());
+        let ov = overnet::Overnet::new(cfg.clone());
         if cfg.entry {
             tracing::info!("overnet: .ov for clients through the gateway at {}", cfg.gateway);
+            ov.spawn_gateway_probe();
         }
+        *router.overnet.write().unwrap() = ov;
         if cfg.exit {
             match overnet::spawn_exit(&cfg, router.clone()).await {
                 Ok(addr) => tracing::info!("overnet: exit open to the local node at socks5://{addr}"),
@@ -883,6 +885,23 @@ fn final_stats(stats: &Arc<RwLock<HashMap<String, Arc<dispatcher::UserStats>>>>,
     }
 }
 
+/// Frames dropped because a TCP/TLS client's send queue was full.
+static TCP_QUEUE_DROPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Hands a frame to a TCP/TLS client's writer. The queue is bounded, and the
+/// main loop must not wait on one slow client, so a full queue drops the
+/// frame; the client then NACKs the gap. That used to happen silently, which
+/// hid the cause of stalls on TLS: now it is logged (the first time, then at
+/// every power of two).
+pub(crate) fn queue_to_tcp(tx: &tokio::sync::mpsc::Sender<bytes::Bytes>, frame: bytes::Bytes) {
+    if let Err(tokio::sync::mpsc::error::TrySendError::Full(_)) = tx.try_send(frame) {
+        let n = TCP_QUEUE_DROPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        if n.is_power_of_two() {
+            tracing::warn!("a TCP/TLS client does not keep up: frame dropped from its full send queue ({n} so far)");
+        }
+    }
+}
+
 fn unix_secs(t: std::time::SystemTime) -> u64 {
     t.duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
@@ -927,9 +946,10 @@ async fn handle_udp_packet(
             let peer_ip = peer_addr.ip();
             let now = Instant::now();
             peer_last_seen.insert(peer_ip, now);
+            let is_tcp = tcp_map.read().await.contains_key(&peer_addr);
+            dispatcher.set_carrier_reliable(peer_addr, is_tcp);
             if !peer_available.get(&peer_ip).copied().unwrap_or(false) {
                 peer_available.insert(peer_ip, true);
-                let is_tcp = tcp_map.read().await.contains_key(&peer_addr);
                 let proto = if is_tcp { "TCP (UoT)" } else { "UDP" };
                 let _ = ui_event_tx.send(UiEvent::Log(format!("Client {peer_ip} connected via {proto}")));
             }
@@ -949,7 +969,7 @@ async fn handle_udp_packet(
                 {
                     let map = tcp_map.read().await;
                     if let Some(tx) = map.get(&peer_addr) {
-                        let _ = tx.try_send(resp.clone());
+                        queue_to_tcp(tx, resp.clone());
                         sent_tcp = true;
                     }
                 }
@@ -1030,7 +1050,7 @@ async fn handle_tick(
         {
             let map = tcp_map.read().await;
             if let Some(tx) = map.get(&peer_addr) {
-                let _ = tx.try_send(frame.clone());
+                queue_to_tcp(tx, frame.clone());
                 sent_tcp = true;
             }
         }

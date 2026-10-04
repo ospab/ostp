@@ -327,7 +327,7 @@ pub async fn send_relay_to_stream(
         {
             let map = tcp_map.read().await;
             if let Some(tx) = map.get(&peer_addr) {
-                let _ = tx.try_send(frame.clone());
+                crate::queue_to_tcp(tx, frame.clone());
                 sent_tcp = true;
             }
         }

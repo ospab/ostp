@@ -98,6 +98,11 @@ impl FakePool {
 pub struct Overnet {
     cfg: OvernetConfig,
     fake: Mutex<FakePool>,
+    /// The gateway answered the last probe (`spawn_gateway_probe`). While it
+    /// does not, `.ov` is answered as with entry off: `overnet browser`
+    /// decides from a 198.18.0.0/15 answer that this server serves `.ov`, and
+    /// a fake address for a gateway that is down would only break the sites.
+    gateway_up: std::sync::atomic::AtomicBool,
 }
 
 /// What the router should do with a client's TCP target.
@@ -110,7 +115,11 @@ pub enum Route {
 
 impl Overnet {
     pub fn new(cfg: OvernetConfig) -> Arc<Self> {
-        Arc::new(Self { cfg, fake: Mutex::new(FakePool::default()) })
+        Arc::new(Self {
+            cfg,
+            fake: Mutex::new(FakePool::default()),
+            gateway_up: std::sync::atomic::AtomicBool::new(true),
+        })
     }
 
     pub fn config(&self) -> &OvernetConfig {
@@ -119,6 +128,34 @@ impl Overnet {
 
     fn entry(&self) -> bool {
         self.cfg.enabled && self.cfg.entry
+    }
+
+    fn gateway_up(&self) -> bool {
+        self.gateway_up.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Checks every few seconds that the overnet gateway accepts connections,
+    /// so `.ov` is only offered while it does (see `gateway_up`).
+    pub fn spawn_gateway_probe(self: &Arc<Self>) {
+        let me = self.clone();
+        tokio::spawn(async move {
+            loop {
+                let gateway = me.cfg.gateway.clone();
+                let up = matches!(
+                    tokio::time::timeout(std::time::Duration::from_secs(2), TcpStream::connect(&gateway)).await,
+                    Ok(Ok(_))
+                );
+                let was = me.gateway_up.swap(up, std::sync::atomic::Ordering::Relaxed);
+                if up != was {
+                    if up {
+                        tracing::info!("overnet: the gateway at {gateway} is up, .ov is served again");
+                    } else {
+                        tracing::warn!("overnet: no gateway at {gateway}; .ov is refused until it starts (is `overnet gateway` running?)");
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            }
+        });
     }
 
     /// Classifies a client's `host:port` target. Errors when the target is
@@ -143,6 +180,9 @@ impl Overnet {
         if !self.entry() {
             bail!("{name}: overnet (.ov) is not enabled on this server");
         }
+        if !self.gateway_up() {
+            bail!("{name}: the overnet gateway at {} is not running", self.cfg.gateway);
+        }
         Ok(Route::Gateway(format!("{name}:{port}")))
     }
 
@@ -158,7 +198,7 @@ impl Overnet {
         let mut reply = Packet::new_reply(q.id());
         reply.set_flags(PacketFlag::RECURSION_DESIRED | PacketFlag::RECURSION_AVAILABLE | PacketFlag::AUTHORITATIVE_ANSWER);
         reply.questions.push(question.clone());
-        if !self.entry() || name == "ov" {
+        if !self.entry() || !self.gateway_up() || name == "ov" {
             *reply.rcode_mut() = RCODE::NameError;
         } else if question.qtype == QTYPE::TYPE(TYPE::A) {
             let ip = self.fake.lock().unwrap().get(&name);
@@ -403,6 +443,37 @@ mod tests {
         assert!(p.answers.is_empty());
         // A fake address nobody handed out is refused too.
         assert!(o.route("198.18.0.9:80").is_err());
+    }
+
+    #[test]
+    fn with_the_gateway_down_ov_is_refused_like_entry_off() {
+        let o = on();
+        o.gateway_up.store(false, std::sync::atomic::Ordering::Relaxed);
+        let resp = o.answer_dns(&a_query("search.ov", TYPE::A)).unwrap();
+        let p = Packet::parse(&resp).unwrap();
+        assert_eq!(p.rcode(), RCODE::NameError, "no fake address while the gateway is down");
+        let err = o.route("search.ov:80").err().expect("refused").to_string();
+        assert!(err.contains("not running"), "{err}");
+        o.gateway_up.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(answer_ip(&o.answer_dns(&a_query("search.ov", TYPE::A)).unwrap()).is_some());
+    }
+
+    #[tokio::test]
+    async fn the_probe_follows_the_gateway() {
+        // A port with nothing listening: the probe marks the gateway down.
+        let free = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = free.local_addr().unwrap();
+        drop(free);
+        let o = Overnet::new(OvernetConfig { enabled: true, gateway: addr.to_string(), ..Default::default() });
+        o.spawn_gateway_probe();
+        // Windows answers a closed loopback port only after ~2 s of retries;
+        // the probe gives up at 2 s either way.
+        tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
+        assert!(!o.gateway_up(), "nothing listens at {addr}");
+        // The gateway starts: the next probe (5 s after the last) sees it.
+        let _gw = TcpListener::bind(addr).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(5200)).await;
+        assert!(o.gateway_up(), "the gateway at {addr} is listening now");
     }
 
     #[test]

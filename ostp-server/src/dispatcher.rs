@@ -243,6 +243,18 @@ impl Dispatcher {
         });
     }
 
+    /// Tells the session now reachable at `peer` whether it rides TCP (UoT,
+    /// TLS) or UDP. On TCP the core stops timer-driven resends: see
+    /// `ProtocolMachine::set_reliable_carrier`. Cheap; called per packet, so
+    /// a session that moves between carriers follows along.
+    pub fn set_carrier_reliable(&mut self, peer: SocketAddr, reliable: bool) {
+        if let Some(sid) = self.addr_to_session.get(&peer) {
+            if let Some(ps) = self.peer_machines.get_mut(sid) {
+                ps.machine.set_reliable_carrier(reliable);
+            }
+        }
+    }
+
     /// Active session count.
     pub fn active_sessions(&self) -> usize {
         self.peer_machines.len()
