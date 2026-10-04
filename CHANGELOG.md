@@ -8,6 +8,8 @@ Older history is on the [Releases](https://github.com/ospab/ostp/releases) page 
 
 ## [Unreleased]
 
+## [0.4.7-beta.1] - 2026-10-04
+
 ### Added
 - Server: an `overnet` section. With `entry`, clients reach the overnet `.ov` zone through the server: `.ov` connections go to the local overnet gateway over SOCKS5, and in TUN mode the server's DNS gives `.ov` names fake addresses from `198.18.0.0/15` that lead there. `.ov` names never go to the DNS upstreams or the internet, even with the section off. With `exit` (off by default), a loopback-only SOCKS5 listener lets the local overnet node send clearnet traffic out through the server's usual route; the server itself and private networks are refused. No protocol change. See `docs/en/server.md`.
 

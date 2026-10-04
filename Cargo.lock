@@ -2174,7 +2174,7 @@ checksum = "7c87def4c32ab89d880effc9e097653c8da5d6ef28e6b539d313baaacfbafcbe"
 
 [[package]]
 name = "ostp"
-version = "0.4.6"
+version = "0.4.7"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -2201,7 +2201,7 @@ dependencies = [
 
 [[package]]
 name = "ostp-client"
-version = "0.4.6"
+version = "0.4.7"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -2237,7 +2237,7 @@ dependencies = [
 
 [[package]]
 name = "ostp-core"
-version = "0.4.6"
+version = "0.4.7"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -2259,7 +2259,7 @@ dependencies = [
 
 [[package]]
 name = "ostp-dns"
-version = "0.4.6"
+version = "0.4.7"
 dependencies = [
  "anyhow",
  "rand 0.8.5",
@@ -2294,7 +2294,7 @@ dependencies = [
 
 [[package]]
 name = "ostp-server"
-version = "0.4.6"
+version = "0.4.7"
 dependencies = [
  "anyhow",
  "axum",
@@ -2338,7 +2338,7 @@ dependencies = [
 
 [[package]]
 name = "ostp-ssh"
-version = "0.4.6"
+version = "0.4.7"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -2353,7 +2353,7 @@ dependencies = [
 
 [[package]]
 name = "ostp-tun"
-version = "0.4.6"
+version = "0.4.7"
 dependencies = [
  "anyhow",
  "libc",
@@ -2365,7 +2365,7 @@ dependencies = [
 
 [[package]]
 name = "ostp-tun-helper"
-version = "0.4.6"
+version = "0.4.7"
 dependencies = [
  "anyhow",
  "chrono",
