@@ -98,6 +98,20 @@ pub struct ProtocolMachine {
     last_ack_sent: Instant,
     /// Rate-limit: prevents sending a NACK more than once per 30ms to avoid storms
     last_nack_sent: Instant,
+    /// When the frame at `expected_recv_nonce` was first missed while later
+    /// ones arrived, i.e. how old the current gap is. `None`: no gap.
+    gap_since: Option<Instant>,
+    /// A NACK went out for the current gap. The tick sends one for a gap no
+    /// new frame has prompted a NACK for, never a stream of them.
+    gap_nacked: bool,
+    /// The nonce the last NACK asked for. If that frame then arrives twice,
+    /// the original was only late: the NACK was spurious.
+    nacked_nonce: Option<u64>,
+    /// Multiplier of the reorder window, doubled on each spurious NACK (the
+    /// path reorders more than the window allows) and halved after
+    /// REORDER_MULT_DECAY without one; RFC 8985 §7.2 does the same.
+    reorder_mult: u32,
+    reorder_mult_at: Instant,
     /// Tracks when expected_recv_nonce last advanced. Used for gap recovery:
     /// if the receiver is stuck waiting for a lost frame that the sender already
     /// evicted from sent_history, this timer detects the deadlock and skips
@@ -143,6 +157,20 @@ pub struct ProtocolMachine {
 // that is merely late, the ceiling bounds how long a stall can be visible to
 // the user before the tunnel unblocks itself.
 const GAP_RECOVERY_RTO_MULTIPLIER: u32 = 8;
+/// How long a gap may be a reordering before it is NACKed as a loss: a
+/// quarter of the smoothed RTT, as RACK does (RFC 8985), within these bounds.
+/// A NACK makes the sender retransmit and shrink its window, so NACKing the
+/// first frame that arrives out of order turned every reordering (Wi-Fi,
+/// LTE, ECMP) into a loss. A packet-count threshold (TCP's three duplicate
+/// ACKs) would not help: at a few thousand packets a second, more than
+/// three arrive while a frame is a few milliseconds late.
+const REORDER_WINDOW_MIN: Duration = Duration::from_millis(5);
+const REORDER_WINDOW_MAX: Duration = Duration::from_millis(100);
+/// A receiver that only sends ACKs (a plain download) has no RTT samples of
+/// its own, so its estimate stays at the initial 30 ms and the window at
+/// 7.5 ms. Spurious NACKs widen it from there.
+const REORDER_MULT_MAX: u32 = 16;
+const REORDER_MULT_DECAY: Duration = Duration::from_secs(10);
 const GAP_RECOVERY_MIN: Duration = Duration::from_secs(2);
 const GAP_RECOVERY_MAX: Duration = Duration::from_secs(10);
 
@@ -185,6 +213,11 @@ impl ProtocolMachine {
             ack_pending: false,
             last_ack_sent: Instant::now(),
             last_nack_sent: Instant::now() - Duration::from_secs(1),
+            gap_since: None,
+            gap_nacked: false,
+            nacked_nonce: None,
+            reorder_mult: 1,
+            reorder_mult_at: Instant::now(),
             last_recv_advance: Instant::now(),
             highest_authenticated_recv_nonce: None,
             authenticated_recv_count: 0,
@@ -478,6 +511,7 @@ impl ProtocolMachine {
             }
         }
         self.last_recv_advance = Instant::now();
+        self.gap_moved();
         // The peer must learn the sequence moved on, or it will keep
         // retransmitting into the void.
         self.ack_pending = true;
@@ -519,6 +553,21 @@ impl ProtocolMachine {
         let nonce = u64::from_be_bytes(raw_vec[4..12].try_into().map_err(|_| ProtocolError::Framing("data datagram too short for nonce".into()))?);
         
         if nonce < self.expected_recv_nonce {
+            // A second copy of the frame we NACKed: the original was late,
+            // not lost. Authenticated first, so nobody can widen the window
+            // with forged copies.
+            if self.nacked_nonce == Some(nonce) {
+                let authentic = self
+                    .recv_cipher
+                    .as_ref()
+                    .is_some_and(|c| c.decrypt(nonce, &raw_vec[12..], &self.session_id.to_be_bytes()).is_ok());
+                if authentic {
+                    self.nacked_nonce = None;
+                    self.reorder_mult = (self.reorder_mult * 2).min(REORDER_MULT_MAX);
+                    self.reorder_mult_at = Instant::now();
+                    tracing::debug!("Spurious NACK for nonce={nonce}: reorder window x{}", self.reorder_mult);
+                }
+            }
             // Duplicate — the ACK we sent was likely lost or delayed.
             tracing::debug!("Duplicate frame nonce={} (expected {}), forcing ACK", nonce, self.expected_recv_nonce);
             if let Some(ack_frame) = self.force_build_ack()? {
@@ -617,6 +666,7 @@ impl ProtocolMachine {
                 })?;
             }
             self.last_recv_advance = Instant::now();
+            self.gap_moved();
         } else {
             // Gap detected
             if nonce >= self.expected_recv_nonce {
@@ -629,16 +679,12 @@ impl ProtocolMachine {
                 tracing::debug!("Frame nonce={} arrived too late after gap recovery, dropping", nonce);
             }
 
-            // Rate-limited NACK: send at most once per (rto/2) to prevent retransmit storms.
-            // Using rto/2 means we send a NACK before the sender's timer fires, prompting
-            // fast retransmit without flooding. Floor at 10ms to handle very low-RTT links.
-            let nack_cooldown = (self.cc.rto() / 2).max(Duration::from_millis(10));
-            if self.last_nack_sent.elapsed() >= nack_cooldown {
-                self.last_nack_sent = Instant::now();
-                let nack_payload = self.expected_recv_nonce.to_be_bytes();
-                if let Ok(nack_frame) = self.build_control_datagram(0, FrameKind::Nack, Bytes::copy_from_slice(&nack_payload)) {
-                    outbound_actions.push(ProtocolAction::SendDatagram(nack_frame));
-                }
+            if self.gap_since.is_none() && !self.reorder_buffer.is_empty() {
+                self.gap_since = Some(Instant::now());
+                self.gap_nacked = false;
+            }
+            if let Some(nack_frame) = self.nack_if_due() {
+                outbound_actions.push(ProtocolAction::SendDatagram(nack_frame));
             }
         }
 
@@ -737,12 +783,58 @@ impl ProtocolMachine {
         self.obfuscation_key = obfuscation_key;
     }
 
+    /// How long a gap waits before it counts as a loss; see REORDER_WINDOW_MIN.
+    fn reorder_window(&mut self) -> Duration {
+        if self.reorder_mult > 1 && self.reorder_mult_at.elapsed() >= REORDER_MULT_DECAY {
+            self.reorder_mult /= 2;
+            self.reorder_mult_at = Instant::now();
+        }
+        (self.cc.smoothed_rtt() / 4)
+            .saturating_mul(self.reorder_mult)
+            .clamp(REORDER_WINDOW_MIN, REORDER_WINDOW_MAX)
+    }
+
+    /// `expected_recv_nonce` moved: the gap closed, or the next one starts now.
+    fn gap_moved(&mut self) {
+        self.gap_since = (!self.reorder_buffer.is_empty()).then(Instant::now);
+        self.gap_nacked = false;
+    }
+
+    /// A NACK for the frame at `expected_recv_nonce`, once the gap is older
+    /// than the reorder window, at most once per rto/2 so a lost frame is
+    /// asked for again without a retransmit storm (floor 10 ms for low-RTT
+    /// links).
+    fn nack_if_due(&mut self) -> Option<Bytes> {
+        let since = self.gap_since?;
+        if since.elapsed() < self.reorder_window() {
+            return None;
+        }
+        let nack_cooldown = (self.cc.rto() / 2).max(Duration::from_millis(10));
+        if self.last_nack_sent.elapsed() < nack_cooldown {
+            return None;
+        }
+        self.last_nack_sent = Instant::now();
+        self.gap_nacked = true;
+        self.nacked_nonce = Some(self.expected_recv_nonce);
+        let nack_payload = self.expected_recv_nonce.to_be_bytes();
+        self.build_control_datagram(0, FrameKind::Nack, Bytes::copy_from_slice(&nack_payload)).ok()
+    }
+
     fn handle_tick(&mut self) -> Result<ProtocolAction, ProtocolError> {
         let mut actions = Vec::new();
 
         // ── Pending ACK flush ─────────────────────────────────────────
         if let Some(ack_frame) = self.build_ack_if_due()? {
             actions.push(ProtocolAction::SendDatagram(ack_frame));
+        }
+
+        // ── A gap older than the reorder window, nothing new since ────
+        // Inbound frames NACK a gap once it is old enough; when none arrive
+        // after that point (the tail of a burst) the tick has to.
+        if !self.gap_nacked {
+            if let Some(nack_frame) = self.nack_if_due() {
+                actions.push(ProtocolAction::SendDatagram(nack_frame));
+            }
         }
 
         let now = Instant::now();
@@ -1488,6 +1580,8 @@ mod tests {
         for f in &frames[1..] {
             client.last_nack_sent = Instant::now() - Duration::from_secs(1); // no cooldown in the test
             nacks.extend(datagrams(client.on_event(OstpEvent::Inbound(f.clone())).unwrap()));
+            // The gap outlives the reorder window before the next frame.
+            client.gap_since = Some(Instant::now() - REORDER_WINDOW_MAX);
         }
         assert!(nacks.len() >= 2, "the client NACKs the same gap twice");
 
@@ -1503,5 +1597,84 @@ mod tests {
             let _ = server.on_event(OstpEvent::Inbound(n.clone()));
         }
         assert_eq!(server.cc.cwnd(), after_first_gap, "repeated NACKs of one gap do not shrink the window again");
+    }
+
+    /// A frame a few milliseconds late is a reordering, not a loss: no NACK,
+    /// so no retransmission and no smaller window at the sender.
+    #[test]
+    fn a_reordered_frame_inside_the_window_is_not_a_loss() {
+        let (mut client, mut server) = do_handshake();
+        let frames: Vec<Bytes> = (0..3)
+            .map(|i| datagrams(server.on_event(OstpEvent::Outbound(1, Bytes::from(vec![i as u8; 100]))).unwrap()).remove(0))
+            .collect();
+        let before = server.cc.cwnd();
+        let mut to_server = Vec::new();
+        for f in [&frames[1], &frames[2], &frames[0]] {
+            to_server.extend(datagrams(client.on_event(OstpEvent::Inbound(f.clone())).unwrap()));
+        }
+        to_server.extend(datagrams(client.on_event(OstpEvent::Tick).unwrap()));
+        assert!(client.gap_since.is_none(), "the gap closed");
+        for d in &to_server {
+            let back = datagrams(server.on_event(OstpEvent::Inbound(d.clone())).unwrap());
+            assert!(!back.contains(&frames[0]), "a reordered frame was retransmitted");
+        }
+        assert!(server.cc.cwnd() >= before, "a reordering shrank the window");
+    }
+
+    /// A gap older than the reorder window with nothing arriving after it
+    /// (the tail of a burst) is NACKed by the tick, once.
+    #[test]
+    fn the_tick_nacks_an_old_gap_once() {
+        let (mut client, mut server) = do_handshake();
+        let frames: Vec<Bytes> = (0..3)
+            .map(|i| datagrams(server.on_event(OstpEvent::Outbound(1, Bytes::from(vec![i as u8; 100]))).unwrap()).remove(0))
+            .collect();
+        for f in &frames[1..] {
+            let _ = client.on_event(OstpEvent::Inbound(f.clone())).unwrap();
+        }
+        client.gap_since = Some(Instant::now() - REORDER_WINDOW_MAX);
+        let before = server.cc.cwnd();
+        let mut resent = false;
+        for d in datagrams(client.on_event(OstpEvent::Tick).unwrap()) {
+            resent |= datagrams(server.on_event(OstpEvent::Inbound(d)).unwrap()).contains(&frames[0]);
+        }
+        assert!(resent, "the old gap was not NACKed");
+        assert!(server.cc.cwnd() < before, "a real loss shrinks the window");
+
+        client.last_nack_sent = Instant::now() - Duration::from_secs(1);
+        let mut again = false;
+        for d in datagrams(client.on_event(OstpEvent::Tick).unwrap()) {
+            again |= datagrams(server.on_event(OstpEvent::Inbound(d)).unwrap()).contains(&frames[0]);
+        }
+        assert!(!again, "the tick NACKs one gap once; retransmission timers do the rest");
+    }
+
+    /// The NACKed frame arriving twice (late original, then the retransmit)
+    /// shows the path reorders beyond the window: the window widens. A forged
+    /// copy does not count.
+    #[test]
+    fn a_spurious_nack_widens_the_reorder_window() {
+        let (mut client, mut server) = do_handshake();
+        let frames: Vec<Bytes> = (0..3)
+            .map(|i| datagrams(server.on_event(OstpEvent::Outbound(1, Bytes::from(vec![i as u8; 100]))).unwrap()).remove(0))
+            .collect();
+        for f in &frames[1..] {
+            let _ = client.on_event(OstpEvent::Inbound(f.clone())).unwrap();
+        }
+        client.gap_since = Some(Instant::now() - REORDER_WINDOW_MAX);
+        let _ = client.on_event(OstpEvent::Tick).unwrap();
+        assert_eq!(client.nacked_nonce, Some(0));
+        let narrow = client.reorder_window();
+
+        let _ = client.on_event(OstpEvent::Inbound(frames[0].clone())).unwrap(); // the late original
+        let mut forged = frames[0].to_vec();
+        let last = forged.len() - 1;
+        forged[last] ^= 1;
+        let _ = client.on_event(OstpEvent::Inbound(Bytes::from(forged)));
+        assert_eq!(client.reorder_mult, 1, "a forged copy must not widen the window");
+
+        let _ = client.on_event(OstpEvent::Inbound(frames[0].clone())).unwrap(); // the retransmit
+        assert_eq!(client.reorder_mult, 2);
+        assert!(client.reorder_window() > narrow);
     }
 }
