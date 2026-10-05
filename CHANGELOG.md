@@ -16,6 +16,9 @@ Older history is on the [Releases](https://github.com/ospab/ostp/releases) page 
 - Desktop apps (Windows, Linux, macOS): IPv6 went past the tunnel with the user's real address on dual-stack networks. It is routed through the tunnel now, as on Android, unless the server itself is reached over IPv6.
 - Removed an unused key generator that made predictable keys from the current time.
 
+### Fixed
+- Out-of-order packets were treated as lost: the receiver asked for a frame again the moment a later one arrived first, so the sender retransmitted it and shrank its window although nothing was lost. With 1% of packets reordered (common on Wi-Fi, LTE and multipath routes) a download ran at less than half speed. A gap is now asked for only after a quarter of the RTT; when a frame turns out to have been merely late, that wait grows. In a simulated 40 ms path with 1% reordering: 2.2 to 4.9 Mbit/s, retransmissions from 23 to 2. No protocol change.
+
 ## [0.4.7-beta.2] - 2026-10-04
 
 ### Added
