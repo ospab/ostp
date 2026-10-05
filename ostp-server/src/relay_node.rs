@@ -261,42 +261,41 @@ async fn run_tcp_relay(cfg: RelayConfig) -> Result<()> {
             .await
             .with_context(|| format!("relay: failed to bind TCP on {bind_addr}"))?;
         tracing::info!("Relay TCP (UoT) listening on {bind_addr} -> {}", cfg.upstream_tcp);
-
-        let upstream = cfg.upstream_tcp.clone();
-        let live = live.clone();
-
-        tokio::spawn(async move {
-            loop {
-                let (client, peer) = match listener.accept().await {
-                    Ok(v) => v,
-                    Err(e) => {
-                        tracing::warn!("Relay TCP accept error: {e}");
-                        continue;
-                    }
-                };
-
-                use std::sync::atomic::Ordering;
-                if live.load(Ordering::Relaxed) >= MAX_TCP_CONNECTIONS {
-                    // Close immediately rather than queueing unbounded work.
-                    drop(client);
-                    continue;
-                }
-                live.fetch_add(1, Ordering::Relaxed);
-
-                let upstream = upstream.clone();
-                let live = live.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = splice_tcp(client, &upstream).await {
-                        tracing::debug!("Relay TCP {peer} closed: {e}");
-                    }
-                    live.fetch_sub(1, Ordering::Relaxed);
-                });
-            }
-        });
+        tokio::spawn(serve_tcp_relay(listener, cfg.upstream_tcp.clone(), live.clone()));
     }
 
     futures_util::future::pending::<()>().await;
     Ok(())
+}
+
+/// Accepts on `listener` and splices every connection to `upstream`.
+async fn serve_tcp_relay(listener: TcpListener, upstream: String, live: Arc<std::sync::atomic::AtomicUsize>) {
+    loop {
+        let (client, peer) = match listener.accept().await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!("Relay TCP accept error: {e}");
+                continue;
+            }
+        };
+
+        use std::sync::atomic::Ordering;
+        if live.load(Ordering::Relaxed) >= MAX_TCP_CONNECTIONS {
+            // Close immediately rather than queueing unbounded work.
+            drop(client);
+            continue;
+        }
+        live.fetch_add(1, Ordering::Relaxed);
+
+        let upstream = upstream.clone();
+        let live = live.clone();
+        tokio::spawn(async move {
+            if let Err(e) = splice_tcp(client, &upstream).await {
+                tracing::debug!("Relay TCP {peer} closed: {e}");
+            }
+            live.fetch_sub(1, Ordering::Relaxed);
+        });
+    }
 }
 
 /// Splice a client connection to the upstream, byte for byte.
@@ -428,19 +427,13 @@ mod tests {
             }
         });
 
-        let relay_listen = {
-            let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let a = probe.local_addr().unwrap();
-            drop(probe);
-            a
-        };
-
-        tokio::spawn(run_tcp_relay(RelayConfig {
-            listen_addrs: vec![relay_listen.to_string()],
-            upstream_tcp: upstream_addr.to_string(),
-            upstream_udp: upstream_addr.to_string(),
-        }));
-        tokio::time::sleep(Duration::from_millis(150)).await;
+        // The relay gets a listener already bound. Binding a probe port,
+        // closing it and having the relay bind it again let a test running in
+        // parallel take that port in between: the client then reached the
+        // wrong server and was reset.
+        let relay = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let relay_listen = relay.local_addr().unwrap();
+        tokio::spawn(serve_tcp_relay(relay, upstream_addr.to_string(), Default::default()));
 
         let mut client = TcpStream::connect(relay_listen).await.unwrap();
         client.write_all(b"opaque-stream").await.unwrap();

@@ -73,7 +73,7 @@ const MIN_RTT_EXPIRY: Duration = Duration::from_secs(10);
 /// product of any link this protocol realistically runs over, so anything
 /// beyond it is standing queue, not throughput. The client previously allowed
 /// up to 16384 packets (~20 MB), which on a mobile uplink is minutes of buffer.
-const MAX_CWND_PACKETS: u64 = 1024;
+pub const MAX_CWND_PACKETS: u64 = 1024;
 /// SRTT/min_rtt ratio at which slow start stops. Doubling is what fills a deep
 /// buffer fastest, so growth must end when the queue starts building rather
 /// than waiting for a loss that a deep buffer may never produce.

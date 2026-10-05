@@ -8,6 +8,11 @@ Older history is on the [Releases](https://github.com/ospab/ostp/releases) page 
 
 ## [Unreleased]
 
+### Fixed
+- Server: a client's DNS query that missed the cache stopped every packet of every client until the upstream answered (up to 4 s per resolver), and so did setting up UDP for a client through an outbound SOCKS5 proxy. Both run in the background now.
+- After a side sent Close, everything the peer sent was dropped: the ACK for the Close, data still in flight and the peer's own Close. The session waited for the idle timeout instead of ending; it now ends once its Close is acknowledged.
+- The reorder buffer kept up to 8,192 frames a session (about 11 MB). It is bounded by two congestion windows (2,048 frames) now, more than any real reordering or loss leaves waiting.
+
 ## [0.4.7-beta.3] - 2026-10-06
 
 ### Security

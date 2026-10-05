@@ -253,8 +253,6 @@ pub(crate) fn write_atomic(path: &Path, data: &[u8], private: bool) -> Result<()
 
 #[cfg(test)]
 pub(crate) mod test_util {
-    use super::*;
-
     /// A CA and a leaf for `name` signed by it: (ca_pem, leaf_cert_pem, leaf_key_pem).
     pub fn ca_and_leaf(name: &str) -> (String, String, String) {
         let ca_key = rcgen::KeyPair::generate().unwrap();

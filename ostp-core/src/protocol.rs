@@ -208,7 +208,14 @@ impl ProtocolMachine {
             padder: AdaptivePadder::new(config.mtu, config.max_padding, config.padding_strategy),
             obfuscation_key: config.obfuscation_key,
             max_reorder: config.max_reorder.max(1),
-            max_reorder_buffer: config.max_reorder_buffer.max(1),
+            // A sender never has more than MAX_CWND_PACKETS frames in flight,
+            // so a buffer of two windows holds every frame a real reordering
+            // or loss can leave waiting. The configured 8192 (about 11 MB of
+            // payloads a session) only let a key holder make the server keep
+            // frames sent far ahead on purpose.
+            max_reorder_buffer: config
+                .max_reorder_buffer
+                .clamp(1, 2 * crate::congestion::MAX_CWND_PACKETS as usize),
             ack_delay: Duration::from_millis(config.ack_delay_ms.max(1)),
             rto: Duration::from_millis(config.rto_ms.max(1)),
             max_retries: config.max_retries.max(1),
@@ -402,7 +409,10 @@ impl ProtocolMachine {
 
         if self.state == OstpState::Handshaking {
             self.handle_handshake_inbound(&raw_vec)
-        } else if self.state == OstpState::Established {
+        } else if matches!(self.state, OstpState::Established | OstpState::Closing) {
+            // Closing too: the ACK for our Close, data still in flight and the
+            // peer's own Close arrive after we sent ours. Dropping them left
+            // the session waiting for the caller's idle timeout.
             self.handle_data_inbound(&raw_vec)
         } else {
             Ok(ProtocolAction::Noop)
@@ -937,6 +947,14 @@ impl ProtocolMachine {
                 actions.push(ProtocolAction::SendDatagram(frame.bytes.clone()));
                 retransmit_budget -= 1;
             }
+        }
+
+        // Our Close was acknowledged, or retransmitted until given up: the
+        // session is over even if the peer never sends its own Close (it
+        // crashed, or the path died). It used to sit in Closing until the
+        // caller's idle timeout.
+        if self.state == OstpState::Closing && !self.sent_history.iter().any(|f| f.is_retransmittable) {
+            self.state = OstpState::Closed;
         }
 
         if actions.is_empty() {
@@ -1690,6 +1708,35 @@ mod tests {
         assert!(!again, "the tick NACKs one gap once; retransmission timers do the rest");
     }
 
+    /// Once our Close is acknowledged the session is Closed, even if the peer
+    /// never sends a Close of its own.
+    #[test]
+    fn an_acknowledged_close_ends_the_session() {
+        let (mut client, mut server) = do_handshake();
+        let close = datagrams(client.on_event(OstpEvent::Close).unwrap()).remove(0);
+        assert_eq!(client.state(), OstpState::Closing);
+        let _ = client.on_event(OstpEvent::Tick).unwrap();
+        assert_eq!(client.state(), OstpState::Closing, "the Close is still unacknowledged");
+
+        // The peer receives it and ACKs, but (gone after that) sends no Close back.
+        server.last_ack_sent = Instant::now() - Duration::from_secs(1);
+        let acks = datagrams(server.on_event(OstpEvent::Inbound(close)).unwrap());
+        assert!(!acks.is_empty(), "the peer ACKs the Close");
+        for ack in acks {
+            let _ = client.on_event(OstpEvent::Inbound(ack)).unwrap();
+        }
+        let _ = client.on_event(OstpEvent::Tick).unwrap();
+        assert_eq!(client.state(), OstpState::Closed);
+    }
+
+    #[test]
+    fn the_reorder_buffer_is_bounded_by_the_window() {
+        let mut cfg = make_config(NoiseRole::Initiator);
+        cfg.max_reorder_buffer = 8192;
+        let m = ProtocolMachine::new(cfg).unwrap();
+        assert_eq!(m.max_reorder_buffer, 2 * crate::congestion::MAX_CWND_PACKETS as usize);
+    }
+
     /// The NACKed frame arriving twice (late original, then the retransmit)
     /// shows the path reorders beyond the window: the window widens. A forged
     /// copy does not count.
@@ -1756,9 +1803,11 @@ mod tests {
         let (mut client, mut server) = do_handshake();
         // The client ACKs a frame from the server; that ACK sits in its history.
         let f = datagrams(server.on_event(OstpEvent::Outbound(1, Bytes::from_static(b"x"))).unwrap()).remove(0);
-        let _ = client.on_event(OstpEvent::Inbound(f)).unwrap();
+        // The ACK goes out with the answer to the frame or on the next tick,
+        // depending on how long ago the last one went.
+        let mut acks = datagrams(client.on_event(OstpEvent::Inbound(f)).unwrap());
         client.last_ack_sent = Instant::now() - Duration::from_secs(1);
-        let acks = datagrams(client.on_event(OstpEvent::Tick).unwrap());
+        acks.extend(datagrams(client.on_event(OstpEvent::Tick).unwrap()));
         assert!(!acks.is_empty());
         for frame in client.sent_history.iter_mut() {
             frame.last_sent = Instant::now() - Duration::from_secs(3);

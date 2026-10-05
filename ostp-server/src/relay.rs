@@ -201,31 +201,36 @@ pub async fn handle_relay_message(
                 }
             };
             
-            let session_router = std::sync::Arc::new(router.route_udp_associate(server_udp.clone()).await);
-
             let (udp_tx, mut udp_rx) = mpsc::unbounded_channel::<(String, Bytes)>();
             let (cancel_tx, mut cancel_rx) = mpsc::channel::<()>(1);
             let (dummy_data_tx, _) = mpsc::unbounded_channel::<Bytes>();
 
-            // Outbound UDP loop (tunnel -> target)
-            let tx_router = session_router.clone();
-            tokio::spawn(async move {
-                // Ends when the stream is closed (udp_tx dropped).
-                let _permit = permit;
-                while let Some((target, data)) = udp_rx.recv().await {
-                    let mut forward_target = target.clone();
-                    if forward_target.starts_with("10.1.0.1:") {
-                        forward_target = forward_target.replace("10.1.0.1:", "127.0.0.1:");
-                    }
-                    let _ = tx_router.send_to(&data, &forward_target).await;
-                }
-            });
-
-            // Inbound UDP loop (target -> tunnel)
-            let rx_sock = server_udp.clone();
+            // Set up in its own task: with an outbound SOCKS5 proxy this is a
+            // UDP ASSOCIATE handshake with it, and awaited on the server's
+            // packet loop a slow or dead proxy stopped every client. Datagrams
+            // the client sends meanwhile wait in `udp_rx`.
+            let router_task = router.clone();
             let udp_reply_clone = udp_reply_tx.clone();
-            let proxy_sock = session_router.get_proxy_sock();
             tokio::spawn(async move {
+                let session_router = std::sync::Arc::new(router_task.route_udp_associate(server_udp.clone()).await);
+
+                // Outbound UDP loop (tunnel -> target)
+                let tx_router = session_router.clone();
+                tokio::spawn(async move {
+                    // Ends when the stream is closed (udp_tx dropped).
+                    let _permit = permit;
+                    while let Some((target, data)) = udp_rx.recv().await {
+                        let mut forward_target = target.clone();
+                        if forward_target.starts_with("10.1.0.1:") {
+                            forward_target = forward_target.replace("10.1.0.1:", "127.0.0.1:");
+                        }
+                        let _ = tx_router.send_to(&data, &forward_target).await;
+                    }
+                });
+
+                // Inbound UDP loop (target -> tunnel)
+                let rx_sock = server_udp.clone();
+                let proxy_sock = session_router.get_proxy_sock();
                 let mut direct_buf = vec![0u8; 65536];
                 let mut proxy_buf = vec![0u8; 65536];
                 loop {
@@ -279,23 +284,32 @@ pub async fn handle_relay_message(
                     let should_intercept = router.dns_server.intercepts();
 
                     if should_intercept {
-                        match router.route_dns(peer_addr.ip(), &data).await {
-                            Some(response) => {
-                                let _ = udp_reply_tx.send((session_id, stream_id, target, response));
-                                return Ok(());
-                            }
-                            None => {
-                                // route_dns вернул None — значит DoH упал и enabled=true
-                                // в режиме перехвата уже вернул SERVFAIL
-                                // просто блокируем, не пускаем к 8.8.8.8 с IP сервера
-                                if router.debug {
-                                    let _ = ui_event_tx.send(UiEvent::Log(format!(
-                                        "DNS [{session_id}:{stream_id}] DoH failed for {target}, dropping (intercept=true)"
-                                    )));
+                        // Resolved in its own task: this runs on the server's
+                        // only packet loop, and a cache miss waits for the
+                        // upstream (up to 4 s per resolver). Awaited here, it
+                        // stopped every packet of every client meanwhile.
+                        let router = router.clone();
+                        let udp_reply_tx = udp_reply_tx.clone();
+                        let ui_event_tx = ui_event_tx.clone();
+                        let client_ip = peer_addr.ip();
+                        tokio::spawn(async move {
+                            match router.route_dns(client_ip, &data).await {
+                                Some(response) => {
+                                    let _ = udp_reply_tx.send((session_id, stream_id, target, response));
                                 }
-                                return Ok(());
+                                None => {
+                                    // route_dns вернул None — значит DoH упал и enabled=true
+                                    // в режиме перехвата уже вернул SERVFAIL
+                                    // просто блокируем, не пускаем к 8.8.8.8 с IP сервера
+                                    if router.debug {
+                                        let _ = ui_event_tx.send(UiEvent::Log(format!(
+                                            "DNS [{session_id}:{stream_id}] DoH failed for {target}, dropping (intercept=true)"
+                                        )));
+                                    }
+                                }
                             }
-                        }
+                        });
+                        return Ok(());
                     } else {
                         // intercept отключён: forward как обычный UDP
                         if router.debug {
