@@ -8,11 +8,17 @@ struct LinuxRouteGuard {
     real_gw: Option<String>,
     real_dev: Option<String>,
     kill_switch: bool,
+    ipv6: bool,
 }
 
 impl Drop for LinuxRouteGuard {
     fn drop(&mut self) {
         let _ = Command::new("ip").args(["route", "del", "default", "dev", "ostp_tun"]).output();
+        if self.ipv6 {
+            for prefix in crate::IPV6_HALVES {
+                let _ = Command::new("ip").args(["-6", "route", "del", prefix, "dev", "ostp_tun"]).output();
+            }
+        }
         let _ = Command::new("ip").args(["route", "del", &format!("{}/32", self.server_ip)]).output();
         for route in &self.bypass_routes {
             let _ = Command::new("ip").args(["route", "del", route]).output();
@@ -75,13 +81,30 @@ pub async fn create(opts: OstpTunOptions) -> Result<OstpTunInterface> {
         }
 
         let _ = Command::new("ip").args(["route", "add", "default", "dev", "ostp_tun"]).output();
-        
+
         if opts.kill_switch {
             tracing::info!("Kill Switch: deleting original default route to prevent leakage.");
             let _ = Command::new("ip").args(["route", "del", "default", "via", gw, "dev", dev_name]).output();
         }
     } else {
         tracing::warn!("Could not detect physical default gateway. Tunnel routing might not work correctly.");
+    }
+
+    // IPv6 through the tunnel too (see ostp_tun::IPV6_HALVES).
+    let ipv6 = crate::capture_ipv6(opts.server_ip);
+    if ipv6 {
+        let _ = Command::new("ip").args(["-6", "addr", "add", &format!("{}/128", crate::TUN_IPV6), "dev", "ostp_tun"]).output();
+        let ok = crate::IPV6_HALVES.iter().all(|prefix| {
+            Command::new("ip")
+                .args(["-6", "route", "replace", prefix, "dev", "ostp_tun", "metric", "1"])
+                .output()
+                .is_ok_and(|o| o.status.success())
+        });
+        if ok {
+            tracing::info!("IPv6 routed through the tunnel.");
+        } else {
+            tracing::error!("Could not route IPv6 through the tunnel (IPv6 disabled on ostp_tun?): IPv6 connections may bypass the VPN.");
+        }
     }
 
     if let Some(ref dns) = opts.dns_server {
@@ -101,6 +124,7 @@ pub async fn create(opts: OstpTunOptions) -> Result<OstpTunInterface> {
             real_gw,
             real_dev,
             kill_switch: opts.kill_switch,
+            ipv6,
         }),
     })
 }

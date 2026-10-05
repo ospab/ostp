@@ -30,6 +30,9 @@ mod signal;
 pub mod dns;
 pub mod router;
 pub mod overnet;
+pub mod password;
+pub mod target_policy;
+mod admission;
 mod subscription;
 
 pub use subscription::SubscriptionSettings;
@@ -46,7 +49,6 @@ pub use overnet::OvernetConfig;
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 enum UiCommand {
-    CreateClientKey,
     Shutdown,
 }
 
@@ -92,6 +94,8 @@ pub struct ServerParams {
     pub subscription: Option<SubscriptionSettings>,
     /// The `overnet` section: `.ov` for clients and the overnet exit.
     pub overnet: Option<OvernetConfig>,
+    /// Clients may reach this machine's services and private networks.
+    pub local_access: bool,
 }
 
 pub async fn run_server(params: ServerParams) -> Result<()> {
@@ -109,6 +113,7 @@ pub async fn run_server(params: ServerParams) -> Result<()> {
         tls,
         subscription,
         overnet,
+        local_access,
     } = params;
     let mut keys_map = HashMap::new();
     for (key, meta) in access_keys {
@@ -301,6 +306,17 @@ pub async fn run_server(params: ServerParams) -> Result<()> {
         dns_server.clone(),
         debug,
     ));
+    {
+        let panel_port = api_config
+            .as_ref()
+            .filter(|a| a.enabled)
+            .and_then(|a| a.bind.rsplit_once(':'))
+            .and_then(|(_, p)| p.parse::<u16>().ok());
+        router.set_local_policy(local_access, panel_port);
+        if local_access {
+            tracing::warn!("local_access: clients may reach this server's own services and private networks");
+        }
+    }
     if let Some(cfg) = overnet.filter(|o| o.enabled) {
         if let Err(e) = overnet::apply(cfg, &router).await {
             tracing::error!("overnet: {e:#}");
@@ -313,13 +329,17 @@ pub async fn run_server(params: ServerParams) -> Result<()> {
         Err(e) => tracing::warn!("DNS over TCP for clients is off: {e}"),
     }
 
-    // The panel is also served on the built-in HTTPS frontend at /{webpath}.
-    let panel_route = api_config.as_ref().filter(|a| a.enabled).map(|a| {
+    // The panel is also served on the built-in HTTPS frontend at /{webpath},
+    // but only at a secret path: at the default /panel/ anyone probing the
+    // site would find an OSTP sign-in page. Without one it stays on its bind
+    // address and the tunnel (10.1.0.1).
+    let panel_route = api_config.as_ref().filter(|a| a.enabled).and_then(|a| {
         let webpath = a.webpath.trim_matches('/');
-        transport::sniff::PanelRoute {
-            prefix: format!("/{}", if webpath.is_empty() { "panel" } else { webpath }),
-            upstream: loopback_for(&a.bind),
+        if webpath.is_empty() {
+            tracing::warn!("panel: no secret webpath, so it is not served on the HTTPS site (ostp panel set --webpath ...)");
+            return None;
         }
+        Some(transport::sniff::PanelRoute { prefix: format!("/{webpath}"), upstream: loopback_for(&a.bind) })
     });
 
     // Where clients reach this server, for subscription links.
@@ -734,11 +754,6 @@ async fn run_server_loop(
             }
             cmd = ui_cmd_rx.recv() => {
                 match cmd {
-                    Some(UiCommand::CreateClientKey) => {
-                        let key = format!("ostp_key_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs());
-                        shared_keys.write().unwrap_or_else(|e| e.into_inner()).insert(key.clone(), crate::api::UserMeta { name: None, limit_bytes: None });
-                        let _ = ui_event_tx.send(UiEvent::KeyCreated { key });
-                    }
                     Some(UiCommand::Shutdown) | None => {
                         let _ = ui_event_tx.send(UiEvent::Log("Shutdown command received".to_string()));
                         break;

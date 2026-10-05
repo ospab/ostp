@@ -4,6 +4,7 @@ use anyhow::Result;
 use crate::outbound::{OutboundConfig, connect_target};
 use crate::dns::DnsServer;
 use crate::overnet::{Overnet, OvernetConfig, Route};
+use crate::target_policy::TargetPolicy;
 
 #[derive(Clone)]
 pub struct Router {
@@ -16,6 +17,8 @@ pub struct Router {
     /// The `.ov` zone and the overnet exit; off unless configured, and even
     /// then `.ov` never goes to the internet.
     pub overnet: Arc<RwLock<Arc<Overnet>>>,
+    /// `local_access` and the panel's port: see `target_policy`.
+    pub local: Arc<RwLock<(bool, Option<u16>)>>,
     pub debug: bool,
 }
 
@@ -27,8 +30,25 @@ impl Router {
             dns_server,
             dns_tcp: Arc::new(std::sync::OnceLock::new()),
             overnet: Arc::new(RwLock::new(Overnet::new(OvernetConfig::default()))),
+            local: Arc::new(RwLock::new((false, None))),
             debug,
         }
+    }
+
+    /// `local_access` from the config and the port the panel listens on.
+    pub fn set_local_policy(&self, local_access: bool, panel_port: Option<u16>) {
+        *self.local.write().unwrap_or_else(|e| e.into_inner()) = (local_access, panel_port);
+    }
+
+    /// Where clients may connect: the internet, plus on this machine the
+    /// panel and DNS (port 53 and the DNS-over-TCP listener), unless the
+    /// owner opened everything with `local_access`.
+    pub fn policy(&self) -> TargetPolicy {
+        let (local_access, panel_port) = *self.local.read().unwrap_or_else(|e| e.into_inner());
+        let mut loopback_ports = vec![53];
+        loopback_ports.extend(panel_port);
+        loopback_ports.extend(self.dns_tcp.get().map(|a| a.port()));
+        TargetPolicy { local_access, loopback_ports }
     }
 
     pub fn overnet(&self) -> Arc<Overnet> {
@@ -78,13 +98,14 @@ impl Router {
             let ip = if addr.ip() == std::net::IpAddr::from([10, 1, 0, 1]) { std::net::IpAddr::from([127, 0, 0, 1]) } else { addr.ip() };
             if ip.is_loopback() {
                 let addr = std::net::SocketAddr::new(ip, addr.port());
+                self.policy().check(addr)?;
                 return match tokio::time::timeout(std::time::Duration::from_secs(10), TcpStream::connect(addr)).await {
                     Ok(r) => Ok(r?),
                     Err(_) => Err(anyhow::anyhow!("connect to {addr} timed out")),
                 };
             }
         }
-        connect_target(&target, cfg.as_ref(), self.bind_ip.as_deref(), self.debug).await
+        connect_target(&target, cfg.as_ref(), self.bind_ip.as_deref(), self.debug, Some(&self.policy())).await
     }
 
     /// Whether a connection to `target` would be made by the upstream proxy
@@ -115,7 +136,8 @@ impl Router {
                 }
             }
         }
-        connect_target(target, cfg.as_ref(), self.bind_ip.as_deref(), self.debug).await
+        // The public internet only, whatever `local_access` says.
+        connect_target(target, cfg.as_ref(), self.bind_ip.as_deref(), self.debug, Some(&TargetPolicy::public_only())).await
     }
 
     /// UDP Target Routing
@@ -165,6 +187,7 @@ impl Router {
         
         UdpSessionRouter {
             direct: server_udp,
+            policy: self.policy(),
             proxy,
             cfg,
             debug: self.debug,
@@ -179,6 +202,7 @@ impl Router {
 
 pub struct UdpSessionRouter {
     direct: Arc<tokio::net::UdpSocket>,
+    policy: TargetPolicy,
     proxy: Option<Arc<crate::outbound::UdpProxySocket>>,
     cfg: Option<OutboundConfig>,
     debug: bool,
@@ -221,7 +245,18 @@ impl UdpSessionRouter {
                 }
             }
         }
-        self.direct.send_to(data, target).await.map_err(Into::into)
+        // Resolved and checked here rather than by send_to, so a name that
+        // points at this machine or a private network is refused too.
+        let addr = match target.parse::<std::net::SocketAddr>() {
+            Ok(a) => a,
+            Err(_) => {
+                let mut addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host(target).await?.collect();
+                addrs.sort_by_key(|a| a.is_ipv6());
+                addrs.into_iter().next().ok_or_else(|| anyhow::anyhow!("no addresses for {target}"))?
+            }
+        };
+        self.policy.check(addr)?;
+        self.direct.send_to(data, addr).await.map_err(Into::into)
     }
 
     pub fn get_proxy_sock(&self) -> Option<Arc<crate::outbound::UdpProxySocket>> {
@@ -258,9 +293,16 @@ mod tests {
             default_action: OutboundAction::Proxy,
         };
         let router = Router::new(Some(outbound), Some("192.0.2.1".into()), DnsServer::new(Default::default(), None), false);
+        router.set_local_policy(false, Some(port));
         let me: std::net::IpAddr = "203.0.113.5".parse().unwrap();
         assert!(router.route_tcp(&format!("127.0.0.1:{port}"), me).await.is_ok());
         assert!(router.route_tcp(&format!("10.1.0.1:{port}"), me).await.is_ok());
+        // Other services on this machine are closed to clients.
+        let other = port.wrapping_add(1);
+        let e = router.route_tcp(&format!("127.0.0.1:{other}"), me).await.unwrap_err().to_string();
+        assert!(e.contains("server itself"), "{e}");
+        router.set_local_policy(true, Some(port));
+        assert!(!router.route_tcp(&format!("127.0.0.1:{other}"), me).await.is_err_and(|e| e.to_string().contains("server itself")));
         // Anything else still goes where the rules say: the dead proxy.
         assert!(router.route_tcp("198.51.100.7:80", me).await.is_err());
     }

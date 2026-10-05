@@ -32,9 +32,17 @@ To defend against man-in-the-middle adversaries intercepting and later replaying
 - Accepted handshakes are recorded in a bounded anti-replay cache (default capacity 50,000 entries) to categorically discard exact bitwise retransmissions within that window.
 
 ### 3. Session and Trial Caps
-- Concurrent sessions are hard-capped (default 1,024); handshakes beyond the cap are silently dropped rather than evicting an existing session.
+- Concurrent sessions are hard-capped (default 1,024); handshakes beyond the cap are silently dropped rather than evicting an existing session. One access key holds at most 32 sessions: a new one drops that key's oldest, so a single key cannot take every slot.
+- One access key holds at most 4,096 open connections (TCP streams and UDP associations) at a time; more are refused with an error to the client. Without this one key could use up the process's file descriptors.
+- Trying every key on an unknown datagram (one X25519 operation per key) is rate-limited per source (an IPv4 address or an IPv6 /64: 5 a second, bursts of 20) and server-wide (100 a second). Sources that completed a handshake in the last 24 hours skip the server-wide limit, so a flood, spoofed or not, cannot keep returning users out; a brand-new client can still be delayed by a flood of more than 100 datagrams a second.
 - Sessions idle for 600 seconds (10 minutes — generous enough to survive typical mobile-NAT rebinding delays) are evicted from the dispatcher.
 - A TCP or TLS connection (UoT) that delivers no complete datagram for 5 minutes is closed. Clients send a keepalive every few seconds, so only dead or abandoned connections reach this; the session itself survives and can continue over a new connection. Behind a web server, the site OSTP writes times out after the same 5 minutes (`proxy_read_timeout 5m` for nginx, `timeout=300` for Apache).
+
+### 4. What clients can reach
+
+A client's connection may go to the internet. On the server itself it reaches only what is meant for clients: the panel's port and DNS (port 53). Private networks (`10/8`, `172.16/12`, `192.168/16`, `100.64/10`, IPv6 `fc00::/7`) and the rest of the server's loopback are closed: they hold the provider's internal network, databases and admin interfaces. Link-local and reserved ranges, including the cloud metadata service at `169.254.169.254` with the instance's credentials, are always closed. The check is made on the address actually dialled, after name resolution, for TCP and UDP.
+
+A server on a home router that should let clients into its LAN, or expose another local service through `10.1.0.1`, opens this with `"local_access": true` at the top level of the config.
 
 ---
 
@@ -44,7 +52,7 @@ The server treats IP:port coordinates as fluid, tracking sessions by `session_id
 - Upon receiving **any successfully decrypted and authenticated** data frame, the dispatcher reads its source IP and port.
 - If this origin deviates from the recorded tracking coordinate for that session, the server executes an atomic in-place update — no handshake restart.
 - Subsequent outbound packets for the client are dispatched to the newly updated endpoint.
-- The rebind path is gated behind its own token bucket (50-token burst, refilled at 50/sec) so a flood of spoofed-source packets can't force unbounded roaming-scan work; this bucket does not affect already-current, already-authenticated traffic.
+- The rebind path is rate-limited per source (20 a second, bursts of 50) and server-wide (200 a second, except for sources that authenticated recently) so a flood of spoofed-source packets can't force unbounded roaming-scan work; this does not affect already-current, already-authenticated traffic.
 - This facilitates millisecond-level handoffs during cellular tower changes or Wi-Fi switches, fully preserving upper TCP sessions.
 
 ---
@@ -70,9 +78,9 @@ ostp panel token [--new | --clear]     # API token for scripts
 ostp panel disable
 ```
 
-`enable` does not turn on a panel without sign-in: it asks for a name and a password when they are missing. The password is never an argument (it would stay in shell history) and needs 8 or more characters. Every command keeps a copy of the config and restarts a running service (`--no-restart` to skip).
+`enable` does not turn on a panel without sign-in: it asks for a name and a password when they are missing. The password is never an argument (it would stay in shell history) and needs 8 or more characters. It is stored salted (PBKDF2-HMAC-SHA256, 300,000 rounds); a bare SHA-256 from an older version still signs in, and `ostp panel status` asks to set the password again. Failed sign-ins are limited server-wide to 10 a minute; past that every sign-in is refused for a while, the right password too, while signed-in sessions and the CLI keep working. `enable` picks a random `webpath` when none is set. Every command keeps a copy of the config and restarts a running service (`--no-restart` to skip).
 
-Open the panel on the server at `http://127.0.0.1:9090/<webpath>/`, from elsewhere through an SSH tunnel (`ssh -L 9090:127.0.0.1:9090 user@server`) or over HTTPS on the domain when the built-in frontend holds 443 or the web server forwards the panel path (`ostp panel set --vhost`). `ostp panel status` lists every address that works. A device connected through this server also reaches it at `http://10.1.0.1:<port>/<webpath>/`. The desktop and Android apps open it through their own SSH connection (*Server management → Management → Open the panel*), no open port needed. The panel's layout adapts to phone screens.
+Open the panel on the server at `http://127.0.0.1:9090/<webpath>/`, from elsewhere through an SSH tunnel (`ssh -L 9090:127.0.0.1:9090 user@server`) or over HTTPS on the domain when the built-in frontend holds 443 or the web server forwards the panel path (`ostp panel set --vhost`). The HTTPS site serves the panel only at a secret `webpath`: at the default `/panel/` anyone probing the site would see an OSTP sign-in page. `ostp panel status` lists every address that works. A device connected through this server also reaches it at `http://10.1.0.1:<port>/<webpath>/`. The desktop and Android apps open it through their own SSH connection (*Server management → Management → Open the panel*), no open port needed. The panel's layout adapts to phone screens.
 
 ---
 

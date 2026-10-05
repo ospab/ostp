@@ -117,7 +117,10 @@ pub(crate) fn panel_route(v: &serde_json::Value) -> Option<(String, String)> {
         return None;
     }
     let webpath = api.get("webpath").and_then(|w| w.as_str()).unwrap_or("").trim_matches('/').to_string();
-    let webpath = if webpath.is_empty() { "panel".to_string() } else { webpath };
+    // Only a secret path goes on the public site (see ostp-server's lib.rs).
+    if webpath.is_empty() {
+        return None;
+    }
     let bind = api.get("bind").and_then(|b| b.as_str()).unwrap_or("127.0.0.1:9090");
     let port = bind.rsplit_once(':').map(|(_, p)| p).unwrap_or("9090");
     Some((webpath, format!("127.0.0.1:{port}")))

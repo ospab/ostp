@@ -61,6 +61,8 @@ async fn start_server_on(binds: Vec<SocketAddr>) -> SocketAddr {
         tls: None,
         subscription: None,
         overnet: None,
+        // The echo target listens on this machine's loopback.
+        local_access: true,
     };
     tokio::spawn(async move {
         if let Err(e) = ostp_server::run_server(params).await {

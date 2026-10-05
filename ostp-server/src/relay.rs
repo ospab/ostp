@@ -55,8 +55,10 @@ pub async fn handle_relay_message(
 ) -> Result<()> {
     match RelayMessage::decode(&payload)? {
         RelayMessage::Connect(target) => {
-            // DNS interception disabled for stability
-            let _is_internal_dns = false;
+            let Some(permit) = dispatcher.stream_permit(session_id) else {
+                let _ = connect_tx.send((session_id, stream_id, target, Err("too many open connections for this key".into())));
+                return Ok(());
+            };
 
             let mut connect_target = target.clone();
             if connect_target.starts_with("10.1.0.1:") {
@@ -89,6 +91,9 @@ pub async fn handle_relay_message(
             let backpressure_clone = session_backpressure.clone();
             tokio::spawn(async move {
                 let stream_res = router_clone.route_tcp(&target_clone, peer_addr.ip()).await;
+                // Held by the reader below: released when the connection ends,
+                // or right here when it fails.
+                let permit = permit;
                 match stream_res {
                     Ok(stream) => {
                         let (mut reader, writer) = stream.into_split();
@@ -103,6 +108,7 @@ pub async fn handle_relay_message(
                             map.entry(session_id).or_insert_with(|| Arc::new(AtomicI64::new(32))).clone()
                         };
                         tokio::spawn(async move {
+                            let _permit = permit;
                             let mut buf = [0_u8; 4096];
                             loop {
                                 // Throttle to the client-facing OSTP session's
@@ -170,6 +176,10 @@ pub async fn handle_relay_message(
         }
         RelayMessage::Pong(_) => {}
         RelayMessage::UdpAssociate => {
+            let Some(permit) = dispatcher.stream_permit(session_id) else {
+                let _ = ui_event_tx.send(UiEvent::Log(format!("UDP associate refused for session {session_id}: too many open connections for its key")));
+                return Ok(());
+            };
             if router.debug {
                 let _ = ui_event_tx.send(UiEvent::Log(format!("Relay UDP ASSOCIATE stream_id={stream_id}")));
             }
@@ -200,6 +210,8 @@ pub async fn handle_relay_message(
             // Outbound UDP loop (tunnel -> target)
             let tx_router = session_router.clone();
             tokio::spawn(async move {
+                // Ends when the stream is closed (udp_tx dropped).
+                let _permit = permit;
                 while let Some((target, data)) = udp_rx.recv().await {
                     let mut forward_target = target.clone();
                     if forward_target.starts_with("10.1.0.1:") {

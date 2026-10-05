@@ -8,6 +8,14 @@ Older history is on the [Releases](https://github.com/ospab/ostp/releases) page 
 
 ## [Unreleased]
 
+### Security
+- Clients could connect to any service on the server itself (databases, admin interfaces on 127.0.0.1) and to private networks and the cloud metadata service (169.254.169.254, with the instance's credentials). Now the server's loopback is open to clients only for the panel and DNS, private networks are closed, link-local and reserved ranges always. Checked after name resolution, for TCP and UDP. **A server on a home router that let clients into its LAN needs `"local_access": true` in the config.**
+- About 100 garbage datagrams a second from anywhere were enough to keep new clients and roaming clients from connecting. The limits are per source now, and addresses that authenticated in the last day skip the server-wide one.
+- One access key could hold all 1,024 sessions and every file descriptor. Now at most 32 sessions per key (a new one drops the oldest) and 4,096 open connections.
+- Panel: the password is stored salted (PBKDF2-HMAC-SHA256) instead of a bare SHA-256; an old hash still signs in, and `ostp panel status` asks to set the password again. Failed sign-ins are limited to 10 a minute. `ostp panel enable` picks a random path, and the HTTPS site no longer serves the panel at the default `/panel/`, where it gave the server away to anyone probing it. The setup wizard no longer opens the panel to the internet over plain HTTP (`127.0.0.1` now). The API no longer allows requests from any web origin (CORS).
+- Desktop apps (Windows, Linux, macOS): IPv6 went past the tunnel with the user's real address on dual-stack networks. It is routed through the tunnel now, as on Android, unless the server itself is reached over IPv6.
+- Removed an unused key generator that made predictable keys from the current time.
+
 ## [0.4.7-beta.2] - 2026-10-04
 
 ### Added

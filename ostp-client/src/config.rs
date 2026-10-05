@@ -504,6 +504,11 @@ pub struct ServerConfig {
     /// reason as `dns`; the CLI reads it as `ostp_server::OvernetConfig`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub overnet: Option<serde_json::Value>,
+    /// Clients may reach this server's own services (beyond the panel and
+    /// DNS) and private networks, e.g. a home LAN behind a router running
+    /// OSTP. Off: only the internet. Cloud metadata stays closed either way.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub local_access: bool,
 }
 
 /// Per-user subscription URLs: `https://<domain>[:port]<path>/<token>`

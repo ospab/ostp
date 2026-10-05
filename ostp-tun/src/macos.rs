@@ -7,11 +7,17 @@ struct MacosRouteGuard {
     bypass_routes: Vec<String>,
     real_gw: Option<String>,
     kill_switch: bool,
+    ipv6: bool,
 }
 
 impl Drop for MacosRouteGuard {
     fn drop(&mut self) {
         let _ = Command::new("route").args(["delete", "-net", "default", "-interface", "utun5"]).output();
+        if self.ipv6 {
+            for prefix in crate::IPV6_HALVES {
+                let _ = Command::new("route").args(["-q", "delete", "-inet6", prefix, "-interface", "utun5"]).output();
+            }
+        }
         let _ = Command::new("route").args(["delete", "-host", &self.server_ip]).output();
         for route in &self.bypass_routes {
             let _ = Command::new("route").args(["delete", "-host", route]).output();
@@ -77,6 +83,23 @@ pub async fn create(opts: OstpTunOptions) -> Result<OstpTunInterface> {
         tracing::warn!("Could not detect physical default gateway on macOS.");
     }
 
+    // IPv6 through the tunnel too (see ostp_tun::IPV6_HALVES).
+    let ipv6 = crate::capture_ipv6(opts.server_ip);
+    if ipv6 {
+        let _ = Command::new("ifconfig").args(["utun5", "inet6", crate::TUN_IPV6, "prefixlen", "128"]).output();
+        let ok = crate::IPV6_HALVES.iter().all(|prefix| {
+            Command::new("route")
+                .args(["-q", "add", "-inet6", prefix, "-interface", "utun5"])
+                .output()
+                .is_ok_and(|o| o.status.success())
+        });
+        if ok {
+            tracing::info!("IPv6 routed through the tunnel.");
+        } else {
+            tracing::error!("Could not route IPv6 through the tunnel: IPv6 connections may bypass the VPN.");
+        }
+    }
+
     Ok(OstpTunInterface {
         device: dev,
         guard: Box::new(MacosRouteGuard {
@@ -84,6 +107,7 @@ pub async fn create(opts: OstpTunOptions) -> Result<OstpTunInterface> {
             bypass_routes,
             real_gw,
             kill_switch: opts.kill_switch,
+            ipv6,
         }),
     })
 }

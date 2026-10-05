@@ -50,6 +50,7 @@ pub async fn connect_target(
     outbound: Option<&OutboundConfig>,
     bind_ip: Option<&str>,
     debug: bool,
+    policy: Option<&crate::target_policy::TargetPolicy>,
 ) -> Result<TcpStream> {
     let connect_timeout = Duration::from_secs(10);
     if let Some(outbound) = outbound {
@@ -84,11 +85,11 @@ pub async fn connect_target(
             // action == Direct: egress directly, but still honour this rule's
             // send_from (falling back to the global bind_ip) — that is the whole
             // point of "direct from THIS ip to that destination".
-            return connect_direct(target, connect_timeout, eff_bind).await;
+            return connect_direct(target, connect_timeout, eff_bind, policy).await;
         }
     }
 
-    connect_direct(target, connect_timeout, bind_ip).await
+    connect_direct(target, connect_timeout, bind_ip, policy).await
 }
 
 /// Per-candidate-address connect attempt, tried in turn (see `connect_direct`
@@ -126,7 +127,12 @@ async fn connect_tcp_with_bind(addr: std::net::SocketAddr, bind_ip: Option<&str>
     }
 }
 
-async fn connect_direct(target: &str, connect_timeout: Duration, bind_ip: Option<&str>) -> Result<TcpStream> {
+async fn connect_direct(
+    target: &str,
+    connect_timeout: Duration,
+    bind_ip: Option<&str>,
+    policy: Option<&crate::target_policy::TargetPolicy>,
+) -> Result<TcpStream> {
     tokio::time::timeout(connect_timeout, async {
         let mut addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host(target)
             .await
@@ -134,6 +140,16 @@ async fn connect_direct(target: &str, connect_timeout: Duration, bind_ip: Option
             .collect();
         if addrs.is_empty() {
             return Err(anyhow::anyhow!("no addresses resolved for {}", target));
+        }
+        // Checked on the resolved addresses: a name that points at this
+        // machine or the metadata service is refused like the address.
+        if let Some(policy) = policy {
+            if let Some(refused) = addrs.iter().find(|a| !policy.allows(**a)).copied() {
+                addrs.retain(|a| policy.allows(*a));
+                if addrs.is_empty() {
+                    return Err(policy.check(refused).unwrap_err());
+                }
+            }
         }
         prefer_ipv4_first(&mut addrs);
 
@@ -733,7 +749,7 @@ mod tests {
             let _ = listener.accept().await;
         });
 
-        let result = connect_direct(&addr.to_string(), Duration::from_secs(2), None).await;
+        let result = connect_direct(&addr.to_string(), Duration::from_secs(2), None, None).await;
         assert!(result.is_ok(), "expected connect_direct to reach a live local listener: {:?}", result.err());
     }
 
@@ -746,7 +762,7 @@ mod tests {
         drop(listener);
 
         let start = std::time::Instant::now();
-        let result = connect_direct(&addr.to_string(), Duration::from_secs(5), None).await;
+        let result = connect_direct(&addr.to_string(), Duration::from_secs(5), None, None).await;
         assert!(result.is_err(), "connecting to a closed port should fail");
         assert!(start.elapsed() < Duration::from_secs(4), "a refused connection must not wait out the full timeout");
     }

@@ -88,8 +88,9 @@ pub struct Dispatcher {
     access_keys: Arc<RwLock<HashMap<String, crate::api::UserMeta>>>,
     user_stats: Arc<RwLock<HashMap<String, Arc<UserStats>>>>,
     replay_cache: std::collections::HashMap<Vec<u8>, u64>,
-    roaming_tokens: f64,
-    last_token_regen: std::time::Instant,
+    /// Scanning the sessions for one that roamed to a new address, per
+    /// source; see `admission`.
+    roaming: crate::admission::Admission,
     /// Cache of per-key derived secrets (obf key / psk / padding). These are a
     /// pure function of the access key + PROTOCOL_VERSION, so they never change
     /// for a given key — computing the HKDF on every unknown datagram, for every
@@ -100,18 +101,32 @@ pub struct Dispatcher {
     /// when the window rolls; within a window it's an HMAC we compute once, not
     /// twice per key per packet.
     junk_cache: HashMap<String, (u64, [u8; 4], [u8; 4])>,
-    /// Token bucket bounding how many expensive new-handshake key-trials we run
-    /// per second. The existing-session fast path and roaming path are NOT gated
-    /// by this; only the O(N_keys) trial over unknown datagrams is, so a garbage
-    /// flood from spoofed sources can't force unbounded per-packet crypto work.
-    trial_tokens: f64,
-    last_trial_regen: std::time::Instant,
+    /// Trying every key on a would-be handshake (an X25519 operation per key),
+    /// per source with a server-wide cap that sources which authenticated
+    /// recently skip; see `admission`.
+    trials: crate::admission::Admission,
+    /// Open connections (TCP streams, UDP associations) per key; see
+    /// `stream_permit`.
+    stream_limits: HashMap<String, Arc<tokio::sync::Semaphore>>,
 }
 
-/// Sustained rate (and burst ceiling) of new-handshake trials per second. Legit
-/// first-connect packets are rare, so this is generous for real use while still
-/// capping flood-driven trial work at TRIAL_RATE × num_keys crypto ops/sec.
+/// Server-wide key trials per second for sources not seen authenticating.
+/// It bounds what a flood costs: TRIAL_RATE × number of keys X25519 a second.
 const TRIAL_RATE: f64 = 100.0;
+/// Per source: a real client sends one handshake and a few retries.
+const TRIAL_SOURCE_RATE: f64 = 5.0;
+const TRIAL_SOURCE_BURST: f64 = 20.0;
+/// Session scans for a roamed client (one HMAC per session each).
+const ROAMING_RATE: f64 = 200.0;
+const ROAMING_SOURCE_RATE: f64 = 20.0;
+const ROAMING_SOURCE_BURST: f64 = 50.0;
+/// Sessions one key may hold. A client that reconnects leaves the old session
+/// until it times out, so the oldest is dropped rather than the new refused;
+/// one key can no longer take all MAX_SESSIONS slots.
+const MAX_SESSIONS_PER_KEY: usize = 32;
+/// Connections one key may hold open at once. The process has 65535 file
+/// descriptors (LimitNOFILE); without this one key could take them all.
+const MAX_STREAMS_PER_KEY: usize = 4096;
 
 /// Short, non-reversible fingerprint of an access key for logs. The access key
 /// is a shared secret, so it must never be written to logs verbatim; this lets
@@ -136,12 +151,11 @@ impl Dispatcher {
             access_keys,
             user_stats: Arc::new(RwLock::new(initial_stats)),
             replay_cache: std::collections::HashMap::new(),
-            roaming_tokens: 50.0,
-            last_token_regen: std::time::Instant::now(),
+            roaming: crate::admission::Admission::new(ROAMING_SOURCE_RATE, ROAMING_SOURCE_BURST, ROAMING_RATE),
             secrets_cache: HashMap::new(),
             junk_cache: HashMap::new(),
-            trial_tokens: TRIAL_RATE,
-            last_trial_regen: std::time::Instant::now(),
+            trials: crate::admission::Admission::new(TRIAL_SOURCE_RATE, TRIAL_SOURCE_BURST, TRIAL_RATE),
+            stream_limits: HashMap::new(),
         }
     }
 
@@ -318,14 +332,8 @@ impl Dispatcher {
         }
 
         if session_id_opt.is_none() {
-            // Token Bucket rate limiter: mitigate seamless roaming CPU DoS vector
-            let now = std::time::Instant::now();
-            let elapsed = now.duration_since(self.last_token_regen).as_secs_f64();
-            self.last_token_regen = now;
-            self.roaming_tokens = (self.roaming_tokens + elapsed * 50.0).min(50.0);
-
-            if self.roaming_tokens >= 1.0 {
-                self.roaming_tokens -= 1.0;
+            // Rate-limited per source: each scan is one HMAC per session.
+            if self.roaming.admit(peer.ip()) {
 
                 // Try seamless roaming over all peers
                 for (&sid, peer_state) in &self.peer_machines {
@@ -386,6 +394,8 @@ impl Dispatcher {
                     self.addr_to_session.remove(&peer_state.last_addr);
                     peer_state.last_addr = peer;
                     self.addr_to_session.insert(peer, session_id);
+                    self.trials.mark_known(peer.ip());
+                    self.roaming.mark_known(peer.ip());
                 }
                 if peer_state.last_addr == peer {
                     peer_state.last_seen = std::time::Instant::now();
@@ -431,16 +441,9 @@ impl Dispatcher {
         // Gate it behind a token bucket so a garbage/spoofed-source flood cannot
         // force unbounded per-packet crypto work. Existing sessions (fast path
         // above) and roaming are unaffected. Regenerate at TRIAL_RATE/sec.
-        {
-            let now = std::time::Instant::now();
-            let elapsed = now.duration_since(self.last_trial_regen).as_secs_f64();
-            self.last_trial_regen = now;
-            self.trial_tokens = (self.trial_tokens + elapsed * TRIAL_RATE).min(TRIAL_RATE);
-            if self.trial_tokens < 1.0 {
-                // Out of budget: drop silently (no response, no state, no log spam).
-                return Ok(DispatchOutcome::Unauthorized);
-            }
-            self.trial_tokens -= 1.0;
+        if !self.trials.admit(peer.ip()) {
+            // Out of budget: drop silently (no response, no state, no log spam).
+            return Ok(DispatchOutcome::Unauthorized);
         }
 
         let keys_snapshot: Vec<String> = self.access_keys.read().unwrap_or_else(|e| e.into_inner()).keys().cloned().collect();
@@ -555,6 +558,20 @@ impl Dispatcher {
 
                             self.replay_cache.insert(payload.to_vec(), ts);
 
+                            // This key's oldest session makes room.
+                            let mine: Vec<(u32, std::time::Instant)> = self
+                                .peer_machines
+                                .iter()
+                                .filter(|(_, ps)| ps.access_key == candidate_key)
+                                .map(|(&sid, ps)| (sid, ps.last_seen))
+                                .collect();
+                            if mine.len() >= MAX_SESSIONS_PER_KEY {
+                                if let Some(&(oldest, _)) = mine.iter().min_by_key(|(_, seen)| *seen) {
+                                    tracing::info!("Key {} has {} sessions, dropping the oldest ({})", key_fp(&candidate_key), mine.len(), oldest);
+                                    self.drop_session(oldest);
+                                }
+                            }
+
                             machine.set_session_keys(candidate_session_id, secrets.obfuscation_key);
 
                             let user_stats = self.get_or_create_user_stats(&candidate_key);
@@ -574,6 +591,8 @@ impl Dispatcher {
                             });
                             self.addr_to_session.insert(peer, candidate_session_id);
                             user_stats.connections.fetch_add(1, Ordering::Relaxed);
+                            self.trials.mark_known(peer.ip());
+                            self.roaming.mark_known(peer.ip());
 
                             tracing::info!("New session authenticated: sid={} peer={} (active_sessions={}, replay_cache={})",
                                 candidate_session_id, peer, self.peer_machines.len(), self.replay_cache.len()
@@ -626,6 +645,7 @@ impl Dispatcher {
             let keys = self.access_keys.read().unwrap_or_else(|e| e.into_inner());
             self.secrets_cache.retain(|k, _| keys.contains_key(k));
             self.junk_cache.retain(|k, _| keys.contains_key(k));
+            self.stream_limits.retain(|k, _| keys.contains_key(k));
         }
 
         let mut frames = Vec::new();
@@ -694,6 +714,18 @@ impl Dispatcher {
         }
 
         (frames, expired)
+    }
+
+    /// A slot for one more connection of this session's key, held until the
+    /// connection ends; `None` when the key has MAX_STREAMS_PER_KEY open.
+    pub fn stream_permit(&mut self, session_id: u32) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        let key = self.peer_machines.get(&session_id)?.access_key.clone();
+        let sem = self
+            .stream_limits
+            .entry(key)
+            .or_insert_with(|| Arc::new(tokio::sync::Semaphore::new(MAX_STREAMS_PER_KEY)))
+            .clone();
+        sem.try_acquire_owned().ok()
     }
 
     pub fn drop_session(&mut self, session_id: u32) {

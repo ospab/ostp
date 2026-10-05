@@ -1169,25 +1169,18 @@ fn run_setup_wizard(config_path: &std::path::Path) -> Result<Option<PathBuf>> {
                 }) as char
             }).collect();
             let password  = wizard_prompt("Admin password (blank for random)", &rand_pass);
-            // Must match api.rs's handle_login exactly (format!("{:x}", Sha256::digest(..))) -
-            // this used to be a DefaultHasher (SipHash) placeholder that produced a
-            // differently-shaped digest, so a password set up through this wizard could
-            // never actually log into the panel it just configured.
-            // Trait-qualified so this compiles whether or not `sha2::Digest` happens
-            // to be in scope: `digest` is a trait method, and relying on the import
-            // alone broke the CI build once (v0.4.2-beta.3) while resolving fine
-            // locally.
-            let pass_hash = format!(
-                "{:x}",
-                <sha2::Sha256 as sha2::Digest>::digest(password.as_bytes())
-            );
+            // The same format api.rs checks at sign-in.
+            let pass_hash = ostp_server::password::hash(&password);
 
             // Auto-detect public IPs and offer multi-address egress.
             let config_dir = config_path.parent().unwrap_or_else(|| std::path::Path::new("."));
             let bind_ip = setup_public_ips(config_dir);
 
             wizard_step(4, TOTAL, "Saving configuration");
-            let panel_bind = format!("0.0.0.0:{}", panel_port);
+            // Loopback only: over plain HTTP from the internet the password
+            // would travel in clear. Reached through the tunnel (10.1.0.1),
+            // an SSH tunnel, or HTTPS on the domain.
+            let panel_bind = format!("127.0.0.1:{}", panel_port);
             let mut server_json = serde_json::json!({
                 "mode": "server",
                 "config_version": ostp_client::migrate::CURRENT_VERSION,
@@ -1238,7 +1231,8 @@ fn run_setup_wizard(config_path: &std::path::Path) -> Result<Option<PathBuf>> {
                 "",
                 &format!("Config:   {:?}", config_path),
                 &format!("Listen:   {}", listen),
-                &format!("Panel:    http://{}:{}/{}/", host, panel_port, webpath),
+                &format!("Panel:    http://10.1.0.1:{}/{}/ (through the VPN)", panel_port, webpath),
+                &format!("          or: ssh -L {p}:127.0.0.1:{p} root@{host}, then http://127.0.0.1:{p}/{w}/", p = panel_port, host = host, w = webpath),
                 &format!("Username: {}", username),
                 &format!("Password: {}", password),
             ]);
@@ -1404,11 +1398,8 @@ async fn run_app() -> Result<()> {
                 if password.is_empty() {
                     anyhow::bail!("password must not be empty");
                 }
-                // Must match api.rs's handle_login byte for byte.
-                let hash = format!(
-                    "{:x}",
-                    <sha2::Sha256 as sha2::Digest>::digest(password.as_bytes())
-                );
+                // The same format api.rs checks at sign-in.
+                let hash = ostp_server::password::hash(&password);
                 println!();
                 println!("Add this to the \"api\" section of your config:");
                 println!();
@@ -1633,6 +1624,11 @@ async fn run_app() -> Result<()> {
                                 t.frontend(), t.cert_source()),
                             None => println!("  HTTPS: disabled (set up with: ostp cert issue)"),
                         }
+                        println!("  Local access: {}", if s.local_access {
+                            "on (clients reach this server's services and private networks)".yellow().to_string()
+                        } else {
+                            "off (clients reach the internet, the panel and DNS)".to_string()
+                        });
                         let ov: ostp_server::OvernetConfig = match s.overnet.clone() {
                             Some(o) => serde_json::from_value(o).map_err(|e| anyhow!("Invalid 'overnet' section: {e}"))?,
                             None => Default::default(),
@@ -2011,6 +2007,7 @@ async fn run_app() -> Result<()> {
                 tls,
                 subscription,
                 overnet: overnet_cfg,
+                local_access: server_cfg.local_access,
             })
             .await?;
         }

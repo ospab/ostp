@@ -27,9 +27,7 @@ use axum::{
     Json, Router,
 };
 use rust_embed::RustEmbed;
-use sha2::Digest;
 use serde::{Deserialize, Serialize};
-use tower_http::cors::{Any, CorsLayer};
 
 use crate::dispatcher::{UserStats, UserStatsSnapshot};
 use crate::outbound::OutboundRule;
@@ -262,11 +260,6 @@ async fn static_handler(State(state): State<ApiState>, uri: Uri) -> impl IntoRes
 // ── API router ───────────────────────────────────────────────────────────────
 
 pub fn create_api_router(state: ApiState) -> Router {
-    let cors = CorsLayer::new()
-        .allow_origin(Any)
-        .allow_methods(Any)
-        .allow_headers(Any);
-
     let api_router = Router::new()
         .route("/server/status", get(handle_status))
         .route("/server/config", get(handle_get_config).put(handle_put_config))
@@ -325,7 +318,6 @@ pub fn create_api_router(state: ApiState) -> Router {
         .route(&format!("{}/{{*path}}", base_route), get(static_handler))
         // /{webpath}/api/* → API handlers
         .nest(&format!("{}/api", base_route), api_router)
-        .layer(cors)
         .with_state(state)
 }
 
@@ -451,21 +443,60 @@ async fn handle_login(
         return api_error("Auth not configured");
     }
 
-    if payload.username != state.username {
-        return api_unauthorized::<LoginResponse>();
+    if !login_attempt_allowed() {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(ApiResponse { ok: false, data: None, error: Some("too many sign-in attempts, wait a minute".into()) }),
+        );
     }
 
     let password = payload.password.unwrap_or_default();
-    let hash = sha2::Sha256::digest(password.as_bytes());
-    let hash_hex = format!("{:x}", hash);
+    let stored = state.password_hash.clone();
+    // PBKDF2 is meant to be slow: off the async workers.
+    let password_ok = tokio::task::spawn_blocking(move || crate::password::verify(&password, &stored))
+        .await
+        .unwrap_or(false);
 
-    if secure_eq(&hash_hex, &state.password_hash) {
+    if secure_eq(&payload.username, &state.username) && password_ok {
         let token = uuid::Uuid::new_v4().to_string();
         *state.session_token.write().unwrap_or_else(|e| e.into_inner()) = Some(token.clone());
         (StatusCode::OK, ApiResponse::success(LoginResponse { token }))
     } else {
+        login_failed();
         api_unauthorized::<LoginResponse>()
     }
+}
+
+/// Failed sign-ins, server-wide: a bucket of 10 refilled at 10 a minute. Not
+/// per address: through the tunnel and the built-in HTTPS frontend every
+/// request comes from 127.0.0.1, and a forwarded-for header is the client's
+/// to forge. While it is empty every sign-in is refused, the right password
+/// too; signed-in sessions keep working and the CLI is unaffected.
+const LOGIN_BURST: f64 = 10.0;
+const LOGIN_REFILL_PER_SEC: f64 = 10.0 / 60.0;
+
+static LOGIN_BUCKET: std::sync::Mutex<Option<(f64, Instant)>> = std::sync::Mutex::new(None);
+
+fn login_bucket(take: f64) -> bool {
+    let mut b = LOGIN_BUCKET.lock().unwrap_or_else(|e| e.into_inner());
+    let now = Instant::now();
+    let (tokens, last) = b.get_or_insert((LOGIN_BURST, now));
+    *tokens = (*tokens + now.duration_since(*last).as_secs_f64() * LOGIN_REFILL_PER_SEC).min(LOGIN_BURST);
+    *last = now;
+    if *tokens < take {
+        return false;
+    }
+    *tokens -= take;
+    true
+}
+
+fn login_attempt_allowed() -> bool {
+    login_bucket(0.0) && LOGIN_BUCKET.lock().unwrap_or_else(|e| e.into_inner()).is_some_and(|(t, _)| t >= 1.0)
+}
+
+fn login_failed() {
+    let _ = login_bucket(1.0);
+    tracing::warn!("panel: failed sign-in");
 }
 
 fn save_config_keys(state: &ApiState) -> Result<(), String> {

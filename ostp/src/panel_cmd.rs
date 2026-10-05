@@ -86,6 +86,11 @@ pub fn run(action: PanelAction, config_path: &Path) -> Result<()> {
             if str_of(&api, "bind").is_empty() {
                 api["bind"] = DEFAULT_BIND.into();
             }
+            // A secret path: at a guessable /panel/ the HTTPS site would show
+            // an OSTP sign-in page to anyone probing it.
+            if str_of(&api, "webpath").trim_matches('/').is_empty() {
+                api["webpath"] = crate::cert_cmd::random_path().trim_start_matches('/').into();
+            }
             if str_of(&api, "username").is_empty() {
                 let name = if std::io::stdin().is_terminal() { prompt_line("Sign-in name [admin]: ")? } else { String::new() };
                 api["username"] = if name.is_empty() { "admin".into() } else { name.into() };
@@ -264,6 +269,12 @@ fn print_settings(v: &serde_json::Value) {
     if on && user.is_empty() && !has_pass && !has_token {
         println!("    {} Without sign-in anyone who reaches {bind} controls the server.", "!".red());
     }
+    if has_pass && ostp_server::password::is_legacy(&str_of(&api, "password_hash")) {
+        println!("    {} The password is stored as a bare SHA-256, quick to crack from a leaked config. Set it again: ostp panel passwd", "!".yellow());
+    }
+    if on && str_of(&api, "webpath").trim_matches('/').is_empty() {
+        println!("    {} No secret path: the panel is not served on the HTTPS site, only on {bind} and through the tunnel. Set one: ostp panel set --webpath <random>", "!".yellow());
+    }
     if on && (bind.starts_with("0.0.0.0") || bind.starts_with("[::]")) {
         println!("    {} {bind} is reachable from the internet over plain HTTP: passwords travel unencrypted. Prefer 127.0.0.1 and HTTPS through the domain or an SSH tunnel.", "!".yellow());
     }
@@ -318,8 +329,8 @@ fn status(config_path: &Path) -> Result<()> {
 }
 
 fn hash(password: &str) -> String {
-    // Must match api.rs's handle_login byte for byte.
-    format!("{:x}", <sha2::Sha256 as sha2::Digest>::digest(password.as_bytes()))
+    // The same format api.rs checks at sign-in.
+    ostp_server::password::hash(password)
 }
 
 fn prompt_line(prompt: &str) -> Result<String> {

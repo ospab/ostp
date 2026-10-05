@@ -10,6 +10,8 @@ pub mod windows_route {
 struct WindowsRouteGuard {
     bypass_routes: Vec<(std::net::Ipv4Addr, std::net::Ipv4Addr, u32)>,
     kill_switch: bool,
+    /// The TUN interface index when IPv6 routes were added through it.
+    ipv6_if: Option<u32>,
 }
 
 impl Drop for WindowsRouteGuard {
@@ -20,7 +22,16 @@ impl Drop for WindowsRouteGuard {
         tracing::info!("Removed {} bypass routes.", self.bypass_routes.len());
 
         let is_kill_switch = self.kill_switch;
+        let ipv6_if = self.ipv6_if;
         let _ = std::thread::spawn(move || {
+            if let Some(idx) = ipv6_if {
+                for prefix in crate::IPV6_HALVES {
+                    let _ = Command::new("netsh")
+                        .creation_flags(CREATE_NO_WINDOW)
+                        .args(["interface", "ipv6", "delete", "route", &format!("prefix={prefix}"), &format!("interface={idx}")])
+                        .output();
+                }
+            }
             let _ = Command::new("netsh")
                 .creation_flags(CREATE_NO_WINDOW)
                 .args(["advfirewall", "firewall", "delete", "rule", "name=OSTP Tunnel In"])
@@ -143,6 +154,28 @@ pub async fn create(opts: OstpTunOptions) -> Result<OstpTunInterface> {
         tracing::error!("Could not find ostp_tun index in routing table after 15s — traffic will NOT be captured.");
     }
 
+    // IPv6 through the tunnel too (see ostp_tun::IPV6_HALVES). The routes are
+    // `store=active`: they go away with the adapter even if the guard never runs.
+    let ipv6_if = tun_index.filter(|_| crate::capture_ipv6(opts.server_ip));
+    if let Some(idx) = ipv6_if {
+        let ok = tokio::task::spawn_blocking(move || {
+            let run = |args: &[&str]| {
+                Command::new("netsh").creation_flags(CREATE_NO_WINDOW).args(args).output().is_ok_and(|o| o.status.success())
+            };
+            let _ = run(&["interface", "ipv6", "add", "address", &format!("interface={idx}"), &format!("address={}", crate::TUN_IPV6), "store=active"]);
+            crate::IPV6_HALVES.iter().all(|prefix| {
+                run(&["interface", "ipv6", "add", "route", &format!("prefix={prefix}"), &format!("interface={idx}"), "metric=1", "store=active"])
+            })
+        })
+        .await
+        .unwrap_or(false);
+        if ok {
+            tracing::info!("IPv6 routed through the tunnel (if_index={idx}).");
+        } else {
+            tracing::error!("Could not route IPv6 through the tunnel: IPv6 connections may bypass the VPN.");
+        }
+    }
+
     let exe1 = current_exe.clone();
     let exe2 = current_exe.clone();
     let _ = tokio::task::spawn_blocking(move || {
@@ -194,6 +227,7 @@ pub async fn create(opts: OstpTunOptions) -> Result<OstpTunInterface> {
         guard: Box::new(WindowsRouteGuard {
             bypass_routes,
             kill_switch: opts.kill_switch,
+            ipv6_if,
         }),
     })
 }
