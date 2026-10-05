@@ -8,14 +8,7 @@ Older history is on the [Releases](https://github.com/ospab/ostp/releases) page 
 
 ## [Unreleased]
 
-## [0.4.7-beta.4] - 2026-10-06
-
-### Fixed
-- Server: a client's DNS query that missed the cache stopped every packet of every client until the upstream answered (up to 4 s per resolver), and so did setting up UDP for a client through an outbound SOCKS5 proxy. Both run in the background now.
-- After a side sent Close, everything the peer sent was dropped: the ACK for the Close, data still in flight and the peer's own Close. The session waited for the idle timeout instead of ending; it now ends once its Close is acknowledged.
-- The reorder buffer kept up to 8,192 frames a session (about 11 MB). It is bounded by two congestion windows (2,048 frames) now, more than any real reordering or loss leaves waiting.
-
-## [0.4.7-beta.3] - 2026-10-06
+The tags v0.4.7-beta.3 and v0.4.7-beta.4 were never released (a test failed in CI); their changes are all here.
 
 ### Security
 - Clients could connect to any service on the server itself (databases, admin interfaces on 127.0.0.1) and to private networks and the cloud metadata service (169.254.169.254, with the instance's credentials). Now the server's loopback is open to clients only for the panel and DNS, private networks are closed, link-local and reserved ranges always. Checked after name resolution, for TCP and UDP. **A server on a home router that let clients into its LAN needs `"local_access": true` in the config.**
@@ -33,6 +26,9 @@ Older history is on the [Releases](https://github.com/ospab/ostp/releases) page 
 - A replayed or forged copy of an old frame got an ACK, and one far ahead got a NACK, per packet and before it was authenticated. Both are now answered only once they authenticate, at most every 10 ms.
 - Retransmissions are paced like new data instead of going out in a burst on top of the rate limit, and the in-flight byte count no longer drifts on losses and on frames the sender gave up on.
 - Padding left datagrams up to 2 bytes over the MTU (the overhead was counted as 38 bytes instead of 40).
+- Server: a client's DNS query that missed the cache stopped every packet of every client until the upstream answered (up to 4 s per resolver), and so did setting up UDP for a client through an outbound SOCKS5 proxy. Both run in the background now.
+- After a side sent Close, everything the peer sent was dropped: the ACK for the Close, data still in flight and the peer's own Close. The session waited for the idle timeout instead of ending; it now ends once its Close is acknowledged.
+- The reorder buffer kept up to 8,192 frames a session (about 11 MB). It is bounded by two congestion windows (2,048 frames) now, more than any real reordering or loss leaves waiting.
 
 ## [0.4.7-beta.2] - 2026-10-04
 

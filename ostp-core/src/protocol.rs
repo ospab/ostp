@@ -1631,31 +1631,38 @@ mod tests {
     #[test]
     fn repeated_nacks_for_one_gap_shrink_the_window_once() {
         let (mut client, mut server) = do_handshake();
-        // The server sends three frames; the client misses the first.
-        let frames: Vec<Bytes> = (0..3)
+        // The server sends four frames; the client misses the first.
+        let frames: Vec<Bytes> = (0..4)
             .map(|i| datagrams(server.on_event(OstpEvent::Outbound(1, Bytes::from(vec![i as u8; 100]))).unwrap()).remove(0))
             .collect();
-        let mut nacks = Vec::new();
-        for f in &frames[1..] {
-            client.last_nack_sent = Instant::now() - Duration::from_secs(1); // no cooldown in the test
-            nacks.extend(datagrams(client.on_event(OstpEvent::Inbound(f.clone())).unwrap()));
-            // The gap outlives the reorder window before the next frame.
-            client.gap_since = Some(Instant::now() - REORDER_WINDOW_MAX);
-        }
-        assert!(nacks.len() >= 2, "the client NACKs the same gap twice");
+        let _ = client.on_event(OstpEvent::Inbound(frames[1].clone())).unwrap(); // the gap opens
 
-        let before = server.cc.cwnd();
-        for n in &nacks {
-            let _ = server.on_event(OstpEvent::Inbound(n.clone()));
+        // Each later frame finds the gap older than the reorder window and the
+        // NACK cooldown over, so each answer carries a NACK (and maybe an ACK:
+        // which datagrams go out depends on timing, so they are all fed in).
+        let mut answers = Vec::new();
+        for f in &frames[2..] {
+            client.gap_since = Some(Instant::now() - REORDER_WINDOW_MAX);
+            client.last_nack_sent = Instant::now() - Duration::from_secs(1);
+            answers.push(datagrams(client.on_event(OstpEvent::Inbound(f.clone())).unwrap()));
         }
+
+        let feed = |server: &mut ProtocolMachine, datagrams_in: &[Bytes]| {
+            datagrams_in
+                .iter()
+                .flat_map(|d| datagrams(server.on_event(OstpEvent::Inbound(d.clone())).unwrap()))
+                .any(|out| out == frames[0])
+        };
+        let before = server.cc.cwnd();
+        assert!(feed(&mut server, &answers[0]), "the client NACKs the gap");
         let after_first_gap = server.cc.cwnd();
         assert!(after_first_gap < before, "the first NACK of a gap is a loss");
 
-        // The same gap NACKed again: no further cut.
-        for n in &nacks {
-            let _ = server.on_event(OstpEvent::Inbound(n.clone()));
-        }
-        assert_eq!(server.cc.cwnd(), after_first_gap, "repeated NACKs of one gap do not shrink the window again");
+        // The same gap NACKed again: retransmitted, but no further cut.
+        // An ACK riding along may grow the window a little; a second cut would
+        // take it to 0.7 of where it was.
+        assert!(feed(&mut server, &answers[1]), "the client NACKs the same gap again");
+        assert!(server.cc.cwnd() >= after_first_gap, "repeated NACKs of one gap do not shrink the window again");
     }
 
     /// A frame a few milliseconds late is a reordering, not a loss: no NACK,
@@ -1666,6 +1673,8 @@ mod tests {
         let frames: Vec<Bytes> = (0..3)
             .map(|i| datagrams(server.on_event(OstpEvent::Outbound(1, Bytes::from(vec![i as u8; 100]))).unwrap()).remove(0))
             .collect();
+        // The widest window (100 ms), so a slow test machine stays inside it.
+        client.reorder_mult = REORDER_MULT_MAX;
         let before = server.cc.cwnd();
         let mut to_server = Vec::new();
         for f in [&frames[1], &frames[2], &frames[0]] {
@@ -1793,6 +1802,7 @@ mod tests {
 
         let first = datagrams(client.on_event(OstpEvent::Inbound(f.clone())).unwrap());
         assert_eq!(first.len(), 1, "an authentic duplicate is ACKed");
+        client.last_ack_sent = Instant::now(); // as if it had just gone out
         let second = datagrams(client.on_event(OstpEvent::Inbound(f)).unwrap());
         assert!(second.is_empty(), "but not again right away");
     }

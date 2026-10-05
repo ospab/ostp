@@ -44,10 +44,6 @@ pub async fn create(opts: OstpTunOptions) -> Result<OstpTunInterface> {
         .mtu(opts.mtu)
         .up();
 
-    tun_cfg.platform_config(|cfg| {
-        cfg.packet_information(false);
-    });
-
     let dev = tun::create(&tun_cfg).map_err(|e| anyhow!("Failed to create TUN device: {}", e))?;
     let dev = tun::AsyncDevice::new(dev).map_err(|e| anyhow!("TUN device async failed: {}", e))?;
     tracing::info!("TUN device 'ostp_tun' created.");

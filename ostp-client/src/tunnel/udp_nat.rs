@@ -99,7 +99,8 @@ pub async fn run_udp_nat(
 
 async fn start_udp_bypass_session(
     client_src: SocketAddr,
-    phys_if_index: Option<u32>,
+    // Windows binds bypass sockets by interface index, Linux by name.
+    #[cfg_attr(not(target_os = "windows"), allow(unused_variables))] phys_if_index: Option<u32>,
     _phys_if_name: Option<String>,
     session_rx: &mut mpsc::Receiver<(Vec<u8>, SocketAddr)>,
     smoltcp_tx: Arc<Mutex<netstack_smoltcp::udp::WriteHalf>>,
