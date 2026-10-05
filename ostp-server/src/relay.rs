@@ -336,6 +336,29 @@ pub async fn send_relay_to_stream(
     ui_event_tx: &mpsc::UnboundedSender<UiEvent>,
     tcp_map: &std::sync::Arc<tokio::sync::RwLock<HashMap<std::net::SocketAddr, tokio::sync::mpsc::Sender<Bytes>>>>,
 ) -> Result<()> {
+    // Stream data goes out in datagrams that fit the MTU (reads are up to
+    // 4 KiB: as one datagram that was three IP fragments).
+    if let RelayMessage::Data(data) = &msg {
+        let max = dispatcher.max_payload(session_id).unwrap_or(usize::MAX);
+        if data.len() + ostp_core::relay::DATA_OVERHEAD > max {
+            for chunk in ostp_core::relay::data_chunks(data, max) {
+                send_one(session_id, stream_id, RelayMessage::Data(chunk.to_vec()), dispatcher, socket, ui_event_tx, tcp_map).await?;
+            }
+            return Ok(());
+        }
+    }
+    send_one(session_id, stream_id, msg, dispatcher, socket, ui_event_tx, tcp_map).await
+}
+
+async fn send_one(
+    session_id: u32,
+    stream_id: u16,
+    msg: RelayMessage,
+    dispatcher: &mut Dispatcher,
+    socket: &crate::transport::udp::UdpSockets,
+    ui_event_tx: &mpsc::UnboundedSender<UiEvent>,
+    tcp_map: &std::sync::Arc<tokio::sync::RwLock<HashMap<std::net::SocketAddr, tokio::sync::mpsc::Sender<Bytes>>>>,
+) -> Result<()> {
     let payload = Bytes::from(msg.encode());
     if let Some((frame, peer_addr)) = dispatcher.outbound_to_session(session_id, stream_id, payload)? {
         let response_len = frame.len();

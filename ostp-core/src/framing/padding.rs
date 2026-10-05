@@ -72,8 +72,7 @@ impl AdaptivePadder {
         };
 
         // Strict clamp to ensure total packet size (including overhead) never exceeds mtu_hint
-        let overhead = 38;
-        let max_allowed = self.mtu_hint.saturating_sub(payload_len).saturating_sub(overhead);
+        let max_allowed = self.mtu_hint.saturating_sub(payload_len).saturating_sub(super::DATAGRAM_OVERHEAD);
         raw_pad.min(max_allowed)
     }
 

@@ -18,6 +18,12 @@ Older history is on the [Releases](https://github.com/ospab/ostp/releases) page 
 
 ### Fixed
 - Out-of-order packets were treated as lost: the receiver asked for a frame again the moment a later one arrived first, so the sender retransmitted it and shrank its window although nothing was lost. With 1% of packets reordered (common on Wi-Fi, LTE and multipath routes) a download ran at less than half speed. A gap is now asked for only after a quarter of the RTT; when a frame turns out to have been merely late, that wait grows. In a simulated 40 ms path with 1% reordering: 2.2 to 4.9 Mbit/s, retransmissions from 23 to 2. No protocol change.
+- Large uploads from the client corrupted the stream or broke the connection. Data read from a local app (up to 64 KiB at a time) went out as one datagram: over UDP a burst of IP fragments, which many networks drop and where one lost fragment loses the whole datagram; past 65,535 bytes the payload was silently cut and, over TCP and TLS, the length prefix overflowed. The server's downloads went out in 4 KiB datagrams, three fragments each. Both sides now split data into datagrams that fit the configured MTU.
+- The congestion controller compared every RTT with a 30 ms guess until a real minimum replaced it, which on paths slower than 30 ms took up to 10 seconds; it could read a normal path as a standing queue and leave slow start early. The first measured RTT now sets the minimum.
+- Our own ACKs being acknowledged fed the RTT estimate and the window, although they carry no data and wait for whatever the peer sends next; a download-only side could see seconds-long "RTT". Only data frames count now.
+- A replayed or forged copy of an old frame got an ACK, and one far ahead got a NACK, per packet and before it was authenticated. Both are now answered only once they authenticate, at most every 10 ms.
+- Retransmissions are paced like new data instead of going out in a burst on top of the rate limit, and the in-flight byte count no longer drifts on losses and on frames the sender gave up on.
+- Padding left datagrams up to 2 bytes over the MTU (the overhead was counted as 38 bytes instead of 40).
 
 ## [0.4.7-beta.2] - 2026-10-04
 

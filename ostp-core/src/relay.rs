@@ -96,7 +96,26 @@ impl RelayMessage {
     }
 }
 
+/// Bytes a `Data` message adds around its payload: tag and length.
+pub const DATA_OVERHEAD: usize = 3;
+
+/// `data` as payloads for `Data` messages that each fit a datagram carrying
+/// at most `max_payload` bytes (see `ProtocolMachine::max_payload`). A
+/// datagram larger than the path MTU is split into IP fragments, which many
+/// networks drop and where losing one fragment loses all of it; one over
+/// 64 KiB could not be framed at all.
+pub fn data_chunks(data: &[u8], max_payload: usize) -> std::slice::Chunks<'_, u8> {
+    let size = max_payload.saturating_sub(DATA_OVERHEAD).clamp(1, u16::MAX as usize);
+    data.chunks(size)
+}
+
 fn encode_with_len(tag: u8, payload: &[u8]) -> Vec<u8> {
+    // Callers split with `data_chunks`; a longer payload is a bug, and
+    // truncating it would corrupt the stream without a trace.
+    debug_assert!(payload.len() <= u16::MAX as usize, "relay payload of {} bytes", payload.len());
+    if payload.len() > u16::MAX as usize {
+        tracing::error!("relay payload of {} bytes truncated to 65535: the caller did not split it", payload.len());
+    }
     let len = payload.len().min(u16::MAX as usize) as u16;
     let mut out = Vec::with_capacity(1 + 2 + len as usize);
     out.push(tag);
@@ -191,6 +210,21 @@ mod tests {
         match RelayMessage::decode(&encoded).unwrap() {
             RelayMessage::Data(d) => assert!(d.is_empty()),
             _ => panic!("expected Data"),
+        }
+    }
+
+    #[test]
+    fn data_chunks_fit_the_datagram() {
+        let data = vec![7u8; 65_536];
+        let chunks: Vec<&[u8]> = data_chunks(&data, 1100).collect();
+        assert!(chunks.iter().all(|c| c.len() + DATA_OVERHEAD <= 1100));
+        assert_eq!(chunks.concat(), data, "nothing lost, nothing reordered");
+        // Each chunk encodes without truncation.
+        for c in chunks {
+            match RelayMessage::decode(&RelayMessage::Data(c.to_vec()).encode()).unwrap() {
+                RelayMessage::Data(d) => assert_eq!(d, c),
+                _ => panic!("expected Data"),
+            }
         }
     }
 }

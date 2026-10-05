@@ -1081,35 +1081,47 @@ impl Bridge {
                     stream_map.remove(&stream_id);
                 }
                 let session = &mut sessions[session_index];
-                let out_payload = Bytes::from(relay_msg.encode());
-                match session.machine.on_event(OstpEvent::Outbound(stream_id, out_payload)) {
-                    Ok(ProtocolAction::SendDatagram(frame)) => {
-                        if send_datagram(&session.socket, &frame, self.transport_mode == "udp" ).await.is_ok() {
-                            self.metrics.bytes_sent.fetch_add(frame.len() as u64, Ordering::Relaxed);
-                            tracing::trace!("Outbound datagram sent stream_id={stream_id} bytes={}", frame.len());
-                        }
-                    }
-                    Ok(ProtocolAction::Multiple(list)) => {
-                        let mut sent = 0usize;
-                        for item in list {
-                            if let ProtocolAction::SendDatagram(frame) = item {
-                                if send_datagram(&session.socket, &frame, self.transport_mode == "udp" ).await.is_ok() {
-                                    self.metrics.bytes_sent.fetch_add(frame.len() as u64, Ordering::Relaxed);
-                                    sent += 1;
-                                }
+                // Stream data goes out in datagrams that fit the MTU: reads from
+                // local apps are up to 64 KiB, which as one datagram was a burst of
+                // IP fragments over UDP and, past 65535 bytes, a truncated payload
+                // and a broken length prefix over TCP and TLS.
+                let messages: Vec<RelayMessage> = match relay_msg {
+                    RelayMessage::Data(data) => ostp_core::relay::data_chunks(&data, session.machine.max_payload())
+                        .map(|c| RelayMessage::Data(c.to_vec()))
+                        .collect(),
+                    other => vec![other],
+                };
+                for relay_msg in messages {
+                    let out_payload = Bytes::from(relay_msg.encode());
+                    match session.machine.on_event(OstpEvent::Outbound(stream_id, out_payload)) {
+                        Ok(ProtocolAction::SendDatagram(frame)) => {
+                            if send_datagram(&session.socket, &frame, self.transport_mode == "udp" ).await.is_ok() {
+                                self.metrics.bytes_sent.fetch_add(frame.len() as u64, Ordering::Relaxed);
+                                tracing::trace!("Outbound datagram sent stream_id={stream_id} bytes={}", frame.len());
                             }
                         }
-                        tracing::trace!("Outbound datagram batch stream_id={stream_id} sent={sent}");
-                    }
-                    Ok(ProtocolAction::Noop) => {
-                        tracing::trace!("Outbound datagram noop stream_id={stream_id}");
-                    }
-                    Ok(_) => {
-                        tracing::trace!("Outbound datagram unexpected action stream_id={stream_id}");
-                    }
-                    Err(e) => {
-                        tracing::warn!("Protocol error packing outbound stream_id={}: {}", stream_id, e);
-                        let _ = tx.send(UiEvent::Log(format!("Protocol error packing TCP: {e}"))).await;
+                        Ok(ProtocolAction::Multiple(list)) => {
+                            let mut sent = 0usize;
+                            for item in list {
+                                if let ProtocolAction::SendDatagram(frame) = item {
+                                    if send_datagram(&session.socket, &frame, self.transport_mode == "udp" ).await.is_ok() {
+                                        self.metrics.bytes_sent.fetch_add(frame.len() as u64, Ordering::Relaxed);
+                                        sent += 1;
+                                    }
+                                }
+                            }
+                            tracing::trace!("Outbound datagram batch stream_id={stream_id} sent={sent}");
+                        }
+                        Ok(ProtocolAction::Noop) => {
+                            tracing::trace!("Outbound datagram noop stream_id={stream_id}");
+                        }
+                        Ok(_) => {
+                            tracing::trace!("Outbound datagram unexpected action stream_id={stream_id}");
+                        }
+                        Err(e) => {
+                            tracing::warn!("Protocol error packing outbound stream_id={}: {}", stream_id, e);
+                            let _ = tx.send(UiEvent::Log(format!("Protocol error packing TCP: {e}"))).await;
+                        }
                     }
                 }
             } else {

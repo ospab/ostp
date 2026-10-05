@@ -612,6 +612,11 @@ impl Dispatcher {
         Ok(DispatchOutcome::Unauthorized)
     }
 
+    /// The largest payload one datagram of this session carries.
+    pub fn max_payload(&self, session_id: u32) -> Option<usize> {
+        self.peer_machines.get(&session_id).map(|ps| ps.machine.max_payload())
+    }
+
     pub fn outbound_to_session(&mut self, session_id: u32, stream_id: u16, payload: Bytes) -> Result<Option<(Bytes, SocketAddr)>> {
         let peer_state = if let Some(existing) = self.peer_machines.get_mut(&session_id) {
             existing

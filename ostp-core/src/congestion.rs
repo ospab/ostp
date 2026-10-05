@@ -344,9 +344,23 @@ impl CongestionController {
         }
     }
 
-    /// Record a loss event.
-    pub fn on_loss(&mut self, bytes_lost: u64) {
-        self.bytes_in_flight = self.bytes_in_flight.saturating_sub(bytes_lost);
+    /// A retransmission goes on the wire: it is paced like any other packet,
+    /// so retransmits under loss cannot burst into a queue that is already
+    /// full. It is not new data in flight: the frame was counted when first
+    /// sent and leaves when it is acknowledged or discarded.
+    pub fn on_retransmit(&mut self, bytes: u64) {
+        self.consume_pacing(bytes);
+    }
+
+    /// A frame left the sender without an acknowledgement (given up on, or
+    /// pushed out of the history): it is no longer in flight.
+    pub fn on_discard(&mut self, bytes: u64) {
+        self.bytes_in_flight = self.bytes_in_flight.saturating_sub(bytes);
+    }
+
+    /// Record a loss event. The lost frame stays in flight until it is
+    /// acknowledged (its retransmission) or discarded.
+    pub fn on_loss(&mut self, _bytes_lost: u64) {
         self.loss_count += 1;
 
         match self.phase {
@@ -395,9 +409,15 @@ impl CongestionController {
 
         // Update SRTT and RTTVAR per RFC 6298
         if !self.rtt_initialized {
-            // First measurement: initialize directly
+            // First measurement: initialize directly. min_rtt too: left at
+            // INITIAL_RTT (30 ms) it stayed below any real RTT over 30 ms for
+            // MIN_RTT_EXPIRY, so srtt/min_rtt read as a standing queue from the
+            // first ACK: slow start ended at once above 60 ms, and above
+            // 120 ms every ACK halved the window for the first 10 seconds.
             self.srtt = rtt;
             self.rttvar = rtt / 2;
+            self.min_rtt = rtt;
+            self.min_rtt_stamp = now;
             self.rtt_initialized = true;
         } else {
             // RTTVAR = (3/4) * RTTVAR + (1/4) * |SRTT - R|
@@ -670,5 +690,51 @@ mod tests {
         // Should be well below 100ms (the old hardcoded default)
         assert!(rto < Duration::from_millis(200));
         assert!(rto >= RTO_MIN);
+    }
+
+    /// On a 150 ms path the first ACKs must not read as a standing queue:
+    /// min_rtt comes from the first sample, not the 30 ms guess.
+    #[test]
+    fn slow_start_survives_a_long_path() {
+        let mut cc = CongestionController::new(1200);
+        let start = cc.cwnd();
+        for _ in 0..20 {
+            cc.on_send(1200);
+            cc.on_ack(1200, Duration::from_millis(150));
+        }
+        assert_eq!(cc.phase, Phase::SlowStart, "slow start ended on the first ACKs of a 150 ms path");
+        assert_eq!(cc.cwnd(), start + 20 * 1200, "the window grows by what was acknowledged");
+    }
+
+    /// The same after a path change, which resets the estimate.
+    #[test]
+    fn a_new_path_learns_its_own_min_rtt() {
+        let mut cc = CongestionController::new(1200);
+        cc.on_ack(1200, Duration::from_millis(20));
+        cc.reset_path();
+        for _ in 0..10 {
+            cc.on_ack(1200, Duration::from_millis(200));
+        }
+        assert_eq!(cc.phase, Phase::SlowStart);
+        assert!(cc.cwnd() >= INITIAL_CWND_PACKETS * 1200);
+    }
+
+    #[test]
+    fn a_loss_does_not_take_the_frame_out_of_flight() {
+        let mut cc = CongestionController::new(1200);
+        cc.on_send(1200);
+        cc.on_loss(1200);
+        assert_eq!(cc.bytes_in_flight, 1200, "it leaves when acknowledged or discarded");
+        cc.on_discard(1200);
+        assert_eq!(cc.bytes_in_flight, 0);
+    }
+
+    #[test]
+    fn retransmits_are_paced() {
+        let mut cc = CongestionController::new(1200);
+        let before = cc.pacing_available();
+        cc.on_retransmit(1200 * 8);
+        assert!(cc.pacing_available() < before);
+        assert_eq!(cc.bytes_in_flight, 0, "a retransmit is not new data in flight");
     }
 }

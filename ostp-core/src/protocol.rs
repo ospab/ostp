@@ -170,6 +170,9 @@ const REORDER_WINDOW_MAX: Duration = Duration::from_millis(100);
 /// its own, so its estimate stays at the initial 30 ms and the window at
 /// 7.5 ms. Spurious NACKs widen it from there.
 const REORDER_MULT_MAX: u32 = 16;
+/// The fastest an ACK or NACK goes out in answer to a frame that is not
+/// delivered (a duplicate, or one beyond the reorder window).
+const ANSWER_MIN_INTERVAL: Duration = Duration::from_millis(10);
 const REORDER_MULT_DECAY: Duration = Duration::from_secs(10);
 const GAP_RECOVERY_MIN: Duration = Duration::from_secs(2);
 const GAP_RECOVERY_MAX: Duration = Duration::from_secs(10);
@@ -296,6 +299,12 @@ impl ProtocolMachine {
 
     pub fn cwnd_packets(&self) -> usize {
         self.cc.cwnd_packets() as usize
+    }
+
+    /// The largest application payload one datagram carries within the
+    /// configured MTU; split anything larger (see `relay::data_chunks`).
+    pub fn max_payload(&self) -> usize {
+        self._mtu.saturating_sub(crate::framing::DATAGRAM_OVERHEAD).max(64)
     }
 
     /// Whether the pacing bucket currently allows releasing another packet.
@@ -552,40 +561,55 @@ impl ProtocolMachine {
         }
         let nonce = u64::from_be_bytes(raw_vec[4..12].try_into().map_err(|_| ProtocolError::Framing("data datagram too short for nonce".into()))?);
         
+        // Frames this receiver will not deliver (an old nonce, or one beyond
+        // the reorder window) still get an answer, so the sender learns what
+        // to do; but only once they authenticate, and not more often than
+        // ANSWER_MIN_INTERVAL. A replayed capture or a forged header (anyone
+        // holding the access key can produce one) used to get an ACK or NACK
+        // per packet without either.
+        let early = nonce < self.expected_recv_nonce || nonce > self.expected_recv_nonce.saturating_add(self.max_reorder);
+        if early {
+            let authentic = self
+                .recv_cipher
+                .as_ref()
+                .is_some_and(|c| c.decrypt(nonce, &raw_vec[12..], &self.session_id.to_be_bytes()).is_ok());
+            if !authentic {
+                return Err(ProtocolError::Crypto("aead-decrypt".to_string()));
+            }
+        }
+
         if nonce < self.expected_recv_nonce {
             // A second copy of the frame we NACKed: the original was late,
-            // not lost. Authenticated first, so nobody can widen the window
-            // with forged copies.
+            // not lost.
             if self.nacked_nonce == Some(nonce) {
-                let authentic = self
-                    .recv_cipher
-                    .as_ref()
-                    .is_some_and(|c| c.decrypt(nonce, &raw_vec[12..], &self.session_id.to_be_bytes()).is_ok());
-                if authentic {
-                    self.nacked_nonce = None;
-                    self.reorder_mult = (self.reorder_mult * 2).min(REORDER_MULT_MAX);
-                    self.reorder_mult_at = Instant::now();
-                    tracing::debug!("Spurious NACK for nonce={nonce}: reorder window x{}", self.reorder_mult);
-                }
+                self.nacked_nonce = None;
+                self.reorder_mult = (self.reorder_mult * 2).min(REORDER_MULT_MAX);
+                self.reorder_mult_at = Instant::now();
+                tracing::debug!("Spurious NACK for nonce={nonce}: reorder window x{}", self.reorder_mult);
             }
             // Duplicate — the ACK we sent was likely lost or delayed.
             tracing::debug!("Duplicate frame nonce={} (expected {}), forcing ACK", nonce, self.expected_recv_nonce);
-            if let Some(ack_frame) = self.force_build_ack()? {
-                return Ok(ProtocolAction::SendDatagram(ack_frame));
+            if self.last_ack_sent.elapsed() >= ANSWER_MIN_INTERVAL {
+                if let Some(ack_frame) = self.force_build_ack()? {
+                    return Ok(ProtocolAction::SendDatagram(ack_frame));
+                }
             }
             return Ok(ProtocolAction::Noop);
         }
 
-        if nonce > self.expected_recv_nonce + self.max_reorder {
+        if nonce > self.expected_recv_nonce.saturating_add(self.max_reorder) {
             tracing::debug!("Frame nonce={} exceeds max reorder window (expected={}, max_gap={}), sending NACK",
                 nonce, self.expected_recv_nonce, self.max_reorder
             );
-            if let Ok(nack_frame) = self.build_control_datagram(
-                0,
-                FrameKind::Nack,
-                Bytes::copy_from_slice(&self.expected_recv_nonce.to_be_bytes()),
-            ) {
-                return Ok(ProtocolAction::SendDatagram(nack_frame));
+            if self.last_nack_sent.elapsed() >= ANSWER_MIN_INTERVAL {
+                self.last_nack_sent = Instant::now();
+                if let Ok(nack_frame) = self.build_control_datagram(
+                    0,
+                    FrameKind::Nack,
+                    Bytes::copy_from_slice(&self.expected_recv_nonce.to_be_bytes()),
+                ) {
+                    return Ok(ProtocolAction::SendDatagram(nack_frame));
+                }
             }
             return Ok(ProtocolAction::Noop);
         }
@@ -617,6 +641,7 @@ impl ProtocolMachine {
                     if new_gap {
                         self.cc.on_loss(cached_frame.len() as u64);
                     }
+                    self.cc.on_retransmit(cached_frame.len() as u64);
                     outbound_actions.push(ProtocolAction::SendDatagram(cached_frame));
                 } else {
                     tracing::debug!("NACK received: nonce={} not found in sent_history (evicted)", req_nonce);
@@ -846,6 +871,13 @@ impl ProtocolMachine {
         // Evict frames that exceeded max_retries + 2 grace retries.
         let grace = self.max_retries.saturating_add(2);
         let before = self.sent_history.len();
+        let given_up: u64 = self
+            .sent_history
+            .iter()
+            .filter(|f| f.is_retransmittable && f.retries > grace)
+            .map(|f| f.bytes.len() as u64)
+            .sum();
+        self.cc.on_discard(given_up);
         self.sent_history.retain(|f| !f.is_retransmittable || f.retries <= grace);
         let evicted = before - self.sent_history.len();
         if evicted > 0 {
@@ -901,6 +933,7 @@ impl ProtocolMachine {
                 // frozen at 0 b/s but the session still up" symptom.
                 frame.last_sent = now;
                 frame.retries = frame.retries.saturating_add(1);
+                self.cc.on_retransmit(frame.bytes.len() as u64);
                 actions.push(ProtocolAction::SendDatagram(frame.bytes.clone()));
                 retransmit_budget -= 1;
             }
@@ -1023,7 +1056,11 @@ impl ProtocolMachine {
                 overflow, self.max_sent_history
             );
             while self.sent_history.len() > self.max_sent_history {
-                self.sent_history.pop_front();
+                if let Some(old) = self.sent_history.pop_front() {
+                    if old.is_retransmittable {
+                        self.cc.on_discard(old.bytes.len() as u64);
+                    }
+                }
             }
         }
     }
@@ -1033,7 +1070,11 @@ impl ProtocolMachine {
         let mut acked_bytes = 0u64;
         let mut min_rtt: Option<Duration> = None;
 
-        for frame in self.sent_history.iter() {
+        // Only frames that carry data count: our own ACKs and NACKs sit in the
+        // history too, but they were never charged as in flight, and their
+        // acknowledgement waits for whatever the peer next sends, which made
+        // seconds-long "RTT" samples on a download-only side.
+        for frame in self.sent_history.iter().filter(|f| f.is_retransmittable) {
             if nonce_in_ranges(frame.nonce, ranges) {
                 acked_bytes += frame.bytes.len() as u64;
                 // Karn's algorithm: never take an RTT sample from a frame that
@@ -1676,5 +1717,63 @@ mod tests {
         let _ = client.on_event(OstpEvent::Inbound(frames[0].clone())).unwrap(); // the retransmit
         assert_eq!(client.reorder_mult, 2);
         assert!(client.reorder_window() > narrow);
+    }
+
+    /// A payload of max_payload() bytes makes a datagram no larger than the MTU.
+    #[test]
+    fn max_payload_fits_the_mtu() {
+        let (_client, mut server) = do_handshake();
+        let max = server.max_payload();
+        for _ in 0..50 {
+            let d = datagrams(server.on_event(OstpEvent::Outbound(1, Bytes::from(vec![1u8; max]))).unwrap()).remove(0);
+            assert!(d.len() <= 1400, "{} bytes over an MTU of 1400", d.len());
+        }
+    }
+
+    /// A replayed or forged copy of an old frame gets no answer unless it
+    /// authenticates, and an authentic one at most every ANSWER_MIN_INTERVAL.
+    #[test]
+    fn undeliverable_frames_are_answered_only_when_authentic() {
+        let (mut client, mut server) = do_handshake();
+        let f = datagrams(server.on_event(OstpEvent::Outbound(1, Bytes::from_static(b"x"))).unwrap()).remove(0);
+        let _ = client.on_event(OstpEvent::Inbound(f.clone())).unwrap();
+
+        let mut forged = f.to_vec();
+        let last = forged.len() - 1;
+        forged[last] ^= 1;
+        client.last_ack_sent = Instant::now() - Duration::from_secs(1);
+        assert!(client.on_event(OstpEvent::Inbound(Bytes::from(forged))).is_err(), "a forged duplicate is rejected");
+
+        let first = datagrams(client.on_event(OstpEvent::Inbound(f.clone())).unwrap());
+        assert_eq!(first.len(), 1, "an authentic duplicate is ACKed");
+        let second = datagrams(client.on_event(OstpEvent::Inbound(f)).unwrap());
+        assert!(second.is_empty(), "but not again right away");
+    }
+
+    /// Our own ACKs being acknowledged must not feed the RTT estimate.
+    #[test]
+    fn acked_control_frames_give_no_rtt_sample() {
+        let (mut client, mut server) = do_handshake();
+        // The client ACKs a frame from the server; that ACK sits in its history.
+        let f = datagrams(server.on_event(OstpEvent::Outbound(1, Bytes::from_static(b"x"))).unwrap()).remove(0);
+        let _ = client.on_event(OstpEvent::Inbound(f)).unwrap();
+        client.last_ack_sent = Instant::now() - Duration::from_secs(1);
+        let acks = datagrams(client.on_event(OstpEvent::Tick).unwrap());
+        assert!(!acks.is_empty());
+        for frame in client.sent_history.iter_mut() {
+            frame.last_sent = Instant::now() - Duration::from_secs(3);
+        }
+        let srtt = client.cc.smoothed_rtt();
+        // The server acknowledges everything the client sent so far.
+        for a in acks {
+            let _ = server.on_event(OstpEvent::Inbound(a));
+        }
+        let keepalive = datagrams(client.on_event(OstpEvent::Outbound(1, Bytes::from_static(b"y"))).unwrap()).remove(0);
+        let _ = server.on_event(OstpEvent::Inbound(keepalive)).unwrap();
+        server.last_ack_sent = Instant::now() - Duration::from_secs(1);
+        for a in datagrams(server.on_event(OstpEvent::Tick).unwrap()) {
+            let _ = client.on_event(OstpEvent::Inbound(a));
+        }
+        assert!(client.cc.smoothed_rtt() < Duration::from_secs(1), "a 3 s old ACK frame became an RTT sample (srtt {:?} -> {:?})", srtt, client.cc.smoothed_rtt());
     }
 }
