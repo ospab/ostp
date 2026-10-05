@@ -8,6 +8,8 @@ Older history is on the [Releases](https://github.com/ospab/ostp/releases) page 
 
 ## [Unreleased]
 
+## [0.4.7-beta.3] - 2026-10-06
+
 ### Security
 - Clients could connect to any service on the server itself (databases, admin interfaces on 127.0.0.1) and to private networks and the cloud metadata service (169.254.169.254, with the instance's credentials). Now the server's loopback is open to clients only for the panel and DNS, private networks are closed, link-local and reserved ranges always. Checked after name resolution, for TCP and UDP. **A server on a home router that let clients into its LAN needs `"local_access": true` in the config.**
 - About 100 garbage datagrams a second from anywhere were enough to keep new clients and roaming clients from connecting. The limits are per source now, and addresses that authenticated in the last day skip the server-wide one.
