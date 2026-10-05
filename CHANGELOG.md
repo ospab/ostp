@@ -8,6 +8,8 @@ Older history is on the [Releases](https://github.com/ospab/ostp/releases) page 
 
 ## [Unreleased]
 
+## [0.4.7-beta.5] - 2026-10-06
+
 The tags v0.4.7-beta.3 and v0.4.7-beta.4 were never released (a test failed in CI); their changes are all here.
 
 ### Security
