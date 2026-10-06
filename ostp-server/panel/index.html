@@ -527,6 +527,7 @@ tr:last-child td { border-bottom: 0; }
 const I18N = {
   en: {
     username: 'Username', password: 'Password', sign_in: 'Sign in', bad_login: 'Wrong username or password',
+    too_many_logins: 'Too many sign-in attempts. Wait a minute and try again.',
     overview: 'Overview', users: 'Users', routing: 'Routing', config: 'Configuration', activity: 'Activity',
     live: 'Live', online_now: 'Online now', download: 'Download', upload: 'Upload', uptime: 'Uptime',
     throughput: 'Throughput', last_minutes: 'last 5 minutes', endpoints: 'How clients connect',
@@ -587,6 +588,7 @@ const I18N = {
   },
   ru: {
     username: 'Логин', password: 'Пароль', sign_in: 'Войти', bad_login: 'Неверный логин или пароль',
+    too_many_logins: 'Слишком много попыток входа. Подождите минуту и попробуйте снова.',
     overview: 'Обзор', users: 'Пользователи', routing: 'Маршрутизация', config: 'Конфигурация', activity: 'Журнал',
     live: 'Онлайн', online_now: 'Сейчас онлайн', download: 'Загрузка', upload: 'Отдача', uptime: 'Аптайм',
     throughput: 'Скорость', last_minutes: 'последние 5 минут', endpoints: 'Как подключаются клиенты',
@@ -708,11 +710,13 @@ function confirmBox(title, text, okLabel) {
 // The panel lives at /<webpath>/ and the API at /<webpath>/api/.
 let token = sessionStorage.getItem('ostp_panel_token') || '';
 class Unauthorized extends Error {}
+class TooMany extends Error {}
 async function api(path, opts = {}) {
   const headers = { 'Content-Type': 'application/json' };
   if (token) headers.Authorization = 'Bearer ' + token;
   const res = await fetch('api/' + path, { ...opts, headers, body: opts.body !== undefined ? JSON.stringify(opts.body) : undefined });
   if (res.status === 401) throw new Unauthorized();
+  if (res.status === 429) throw new TooMany();
   let json;
   try { json = await res.json(); } catch { throw new Error('HTTP ' + res.status); }
   if (!json.ok) throw new Error(json.error || 'HTTP ' + res.status);
@@ -740,7 +744,7 @@ $('login-form').addEventListener('submit', async e => {
     token = d.token; sessionStorage.setItem('ostp_panel_token', token);
     $('login').classList.add('hidden'); start();
   } catch (err) {
-    $('lg-err').textContent = err instanceof Unauthorized ? t('bad_login') : String(err.message || err);
+    $('lg-err').textContent = err instanceof Unauthorized ? t('bad_login') : err instanceof TooMany ? t('too_many_logins') : String(err.message || err);
     $('lg-err').classList.remove('hidden');
   }
 });

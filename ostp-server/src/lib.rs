@@ -66,8 +66,16 @@ pub(crate) enum UiEvent {
     KeyCount(usize),
 }
 
+/// Bytes a stream may have waiting for its target to accept them. Without a
+/// limit a client sending faster than the target reads (an upload to a slow
+/// site, or on purpose) grew the server's memory without bound. Past it the
+/// stream is reset; per-stream flow control is for protocol v6.
+pub(crate) const MAX_QUEUED_UPLOAD: usize = 32 * 1024 * 1024;
+
 pub(crate) struct RemoteState {
     pub data_tx: mpsc::UnboundedSender<Bytes>,
+    /// Bytes in `data_tx` not yet written to the target.
+    pub queued: Arc<std::sync::atomic::AtomicUsize>,
     pub udp_tx: Option<mpsc::UnboundedSender<(String, Bytes)>>,
     pub cancel_tx: mpsc::Sender<()>,
     #[allow(dead_code)]
@@ -790,15 +798,18 @@ async fn run_server_loop(
                 match res {
                     Ok((writer, cancel_tx)) => {
                         let (data_tx, mut data_rx) = mpsc::unbounded_channel::<Bytes>();
+                        let queued = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                        let writer_queued = queued.clone();
                         let mut writer_task = writer;
                         tokio::spawn(async move {
                             while let Some(data) = data_rx.recv().await {
                                 if tokio::io::AsyncWriteExt::write_all(&mut writer_task, &data).await.is_err() {
                                     break;
                                 }
+                                writer_queued.fetch_sub(data.len(), std::sync::atomic::Ordering::Relaxed);
                             }
                         });
-                        remotes.insert((session_id, stream_id), RemoteState { data_tx, udp_tx: None, cancel_tx, is_dns: false });
+                        remotes.insert((session_id, stream_id), RemoteState { data_tx, queued, udp_tx: None, cancel_tx, is_dns: false });
                         let _ = relay::send_relay_to_stream(session_id, stream_id, RelayMessage::ConnectOk, &mut dispatcher, &socket, &ui_event_tx, &tcp_map).await;
                         let _ = ui_event_tx.send(UiEvent::Log(format!("Relay CONNECT ok for [{session_id}:{stream_id}] -> {target}")));
                     }

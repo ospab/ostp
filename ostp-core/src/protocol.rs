@@ -150,13 +150,12 @@ pub struct ProtocolMachine {
 }
 
 // ── Gap recovery (see `ProtocolMachine::recover_stalled_gap`) ────────────────
-// How long the receive sequence may sit stuck behind a missing frame, with
-// later frames already buffered, before that frame is declared unrecoverable
-// and skipped. Derived from the live RTO so it scales with the path instead of
-// guessing, then clamped: the floor keeps a fast link from discarding a frame
-// that is merely late, the ceiling bounds how long a stall can be visible to
-// the user before the tunnel unblocks itself.
-const GAP_RECOVERY_RTO_MULTIPLIER: u32 = 8;
+/// The shortest the receive sequence sits stuck behind a missing frame before
+/// that frame is declared unrecoverable and skipped; the actual wait is how
+/// long the sender keeps retransmitting (`sender_gives_up_after`).
+const GAP_RECOVERY_MIN: Duration = Duration::from_secs(2);
+
+// ── Reordering (see `ProtocolMachine::nack_if_due`) ──────────────────────────
 /// How long a gap may be a reordering before it is NACKed as a loss: a
 /// quarter of the smoothed RTT, as RACK does (RFC 8985), within these bounds.
 /// A NACK makes the sender retransmit and shrink its window, so NACKing the
@@ -170,12 +169,10 @@ const REORDER_WINDOW_MAX: Duration = Duration::from_millis(100);
 /// its own, so its estimate stays at the initial 30 ms and the window at
 /// 7.5 ms. Spurious NACKs widen it from there.
 const REORDER_MULT_MAX: u32 = 16;
+const REORDER_MULT_DECAY: Duration = Duration::from_secs(10);
 /// The fastest an ACK or NACK goes out in answer to a frame that is not
 /// delivered (a duplicate, or one beyond the reorder window).
 const ANSWER_MIN_INTERVAL: Duration = Duration::from_millis(10);
-const REORDER_MULT_DECAY: Duration = Duration::from_secs(10);
-const GAP_RECOVERY_MIN: Duration = Duration::from_secs(2);
-const GAP_RECOVERY_MAX: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone)]
 struct SentFrame {
@@ -507,15 +504,11 @@ impl ProtocolMachine {
         }
 
         // Wait out the sender's full retransmit budget before giving up, so a
-        // frame that is merely late is never discarded. The sender backs off
-        // exponentially, so key this off the live RTO estimate rather than a
-        // flat constant, with a floor that keeps low-RTT links from skipping
-        // too eagerly and a ceiling that bounds the visible freeze.
-        let timeout = self
-            .cc
-            .rto()
-            .saturating_mul(GAP_RECOVERY_RTO_MULTIPLIER)
-            .clamp(GAP_RECOVERY_MIN, GAP_RECOVERY_MAX);
+        // frame that is merely late is never discarded. This waited 8 RTOs,
+        // 2 to 10 s, while the sender keeps retransmitting for ~38 s at a
+        // 100 ms RTO: after any outage of a few seconds a frame the sender was
+        // about to resend could be skipped, leaving a silent hole in a stream.
+        let timeout = self.sender_gives_up_after().max(GAP_RECOVERY_MIN);
         if self.last_recv_advance.elapsed() < timeout {
             return recovered;
         }
@@ -833,6 +826,26 @@ impl ProtocolMachine {
         self.obfuscation_key = obfuscation_key;
     }
 
+    /// The adaptive RTO (RFC 6298 SRTT + 4*RTTVAR), never below the configured
+    /// one, which is all there is before the first ACK.
+    fn base_rto(&self) -> Duration {
+        self.cc.rto().max(self.rto).max(Duration::from_millis(1))
+    }
+
+    /// A frame is retransmitted until it has been sent this many times more,
+    /// then given up on.
+    fn retry_limit(&self) -> u8 {
+        self.max_retries.saturating_add(2)
+    }
+
+    /// How long the sender keeps retransmitting a frame before it gives up,
+    /// by the same schedule `handle_tick` follows. Both ends run the same
+    /// configuration, so the receiver uses its own estimate of it.
+    fn sender_gives_up_after(&self) -> Duration {
+        let base = self.base_rto();
+        (0..=self.retry_limit()).map(|retries| retransmit_wait(base, retries, self.reliable_carrier)).sum()
+    }
+
     /// How long a gap waits before it counts as a loss; see REORDER_WINDOW_MIN.
     fn reorder_window(&mut self) -> Duration {
         if self.reorder_mult > 1 && self.reorder_mult_at.elapsed() >= REORDER_MULT_DECAY {
@@ -888,13 +901,11 @@ impl ProtocolMachine {
         }
 
         let now = Instant::now();
-        // Use the adaptive RTO from the congestion controller (RFC 6298 SRTT + 4*RTTVAR).
-        // Falls back to rto_initial before the first ACK is received.
-        let base_rto_ms = self.cc.rto().max(self.rto).as_millis().max(1) as u64;
+        let base_rto = self.base_rto();
 
         // ── Zombie frame eviction ────────────────────────────────────
         // Evict frames that exceeded max_retries + 2 grace retries.
-        let grace = self.max_retries.saturating_add(2);
+        let grace = self.retry_limit();
         let before = self.sent_history.len();
         let given_up: u64 = self
             .sent_history
@@ -926,24 +937,15 @@ impl ProtocolMachine {
                 break;
             }
 
-            // Exponential backoff, but bounded in absolute terms. base_rto is
-            // itself adaptive and can reach RTO_MAX (16s) on a congested path;
-            // multiplying that by the 64x backoff cap yields a frame that sits
-            // unretransmitted for ~17 MINUTES, long past the point where the
-            // session is simply dead to the user. Cap the product so backoff
-            // stays a backoff rather than an outage.
-            let backoff_factor = 1u64 << (frame.retries as u64).min(6);
-            let effective_rto = Duration::from_millis(base_rto_ms.saturating_mul(backoff_factor))
-                .min(MAX_EFFECTIVE_RTO);
-
+            let wait = retransmit_wait(base_rto, frame.retries, self.reliable_carrier);
             let due = if self.reliable_carrier {
                 // What was in flight on a connection the session left, and a
                 // slow safety net for a frame the sending side dropped from a
                 // full queue with nothing after it (no gap, so no NACK).
                 self.path_changed_at.is_some_and(|t| frame.last_sent < t)
-                    || now.duration_since(frame.last_sent) >= effective_rto.max(RELIABLE_CARRIER_RTO)
+                    || now.duration_since(frame.last_sent) >= wait
             } else {
-                now.duration_since(frame.last_sent) >= effective_rto
+                now.duration_since(frame.last_sent) >= wait
             };
             if due {
                 // Only burn the retry counter and reset the RTO timer when the
@@ -1134,6 +1136,23 @@ impl ProtocolMachine {
                 None => self.cc.on_ack_no_rtt(acked_bytes),
             }
         }
+    }
+}
+
+/// How long a frame sent `retries` times waits before the next retransmit.
+///
+/// Exponential backoff, but bounded in absolute terms. The base RTO is itself
+/// adaptive and can reach RTO_MAX (16 s) on a congested path; multiplied by
+/// the 64x backoff cap that is a frame unretransmitted for ~17 minutes, long
+/// past the point where the session is dead to the user. On a reliable
+/// carrier the timer is only a slow safety net (see `reliable_carrier`).
+fn retransmit_wait(base_rto: Duration, retries: u8, reliable_carrier: bool) -> Duration {
+    let backoff = 1u32 << u32::from(retries).min(6);
+    let wait = base_rto.saturating_mul(backoff).min(MAX_EFFECTIVE_RTO);
+    if reliable_carrier {
+        wait.max(RELIABLE_CARRIER_RTO)
+    } else {
+        wait
     }
 }
 
@@ -1501,7 +1520,7 @@ mod tests {
 
         // Stand in for "the sender exhausted its retries and dropped frame 1":
         // the sequence has not advanced for longer than the recovery timeout.
-        server.last_recv_advance = Instant::now() - GAP_RECOVERY_MAX - Duration::from_secs(1);
+        server.last_recv_advance = Instant::now() - server.sender_gives_up_after() - Duration::from_secs(1);
 
         // The next inbound frame (a retransmitted duplicate, which is exactly what
         // a real stalled session keeps receiving) must unblock the backlog.
@@ -1542,6 +1561,42 @@ mod tests {
         assert_eq!(delivered.len(), 2, "late frame plus the buffered one");
         assert_eq!(delivered[0][0], 1);
         assert_eq!(delivered[1][0], 2);
+    }
+
+    /// After an outage of 10 s (the old upper bound of the wait) the sender
+    /// is still retransmitting, so the receiver must still wait: skipping then
+    /// left a hole in a stream that the next retransmit would have filled.
+    #[test]
+    fn gap_recovery_waits_as_long_as_the_sender_retransmits() {
+        let (mut client, mut server) = do_handshake();
+        let frames = make_data_frames(&mut client, 3);
+        server.on_event(OstpEvent::Inbound(frames[0].clone())).unwrap();
+        server.on_event(OstpEvent::Inbound(frames[2].clone())).unwrap();
+
+        // At a 100 ms RTO and the max_retries the client and server run with
+        // (8), the sender retransmits for ~38 s.
+        server.max_retries = 8;
+        let gives_up = server.sender_gives_up_after();
+        assert!(gives_up > Duration::from_secs(30), "{gives_up:?}");
+
+        server.last_recv_advance = Instant::now() - Duration::from_secs(11);
+        let action = server.on_event(OstpEvent::Inbound(frames[0].clone())).unwrap();
+        assert!(delivered_payloads(&action).is_empty(), "skipped while the sender was still retransmitting");
+
+        // The retransmit arrives: nothing was lost.
+        let delivered = delivered_payloads(&server.on_event(OstpEvent::Inbound(frames[1].clone())).unwrap());
+        assert_eq!(delivered.len(), 2);
+    }
+
+    /// The receiver's wait and the sender's schedule come from one function.
+    #[test]
+    fn the_wait_matches_the_retransmit_schedule() {
+        let base = Duration::from_millis(100);
+        let total: Duration = (0..=10).map(|r| retransmit_wait(base, r, false)).sum();
+        // 0.1 + 0.2 + 0.4 + 0.8 + 1.6 + 3.2 + 6.4 x 5 = 38.3 s
+        assert_eq!(total, Duration::from_millis(38_300));
+        assert_eq!(retransmit_wait(Duration::from_secs(1), 9, false), MAX_EFFECTIVE_RTO);
+        assert_eq!(retransmit_wait(base, 0, true), RELIABLE_CARRIER_RTO);
     }
 
     /// Every datagram `action` would put on the wire, in order.

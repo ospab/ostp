@@ -141,6 +141,18 @@ pub async fn handle_relay_message(
         }
         RelayMessage::Data(data) => {
             if let Some(remote) = remotes.get_mut(&(session_id, stream_id)) {
+                use std::sync::atomic::Ordering;
+                let queued = remote.queued.fetch_add(data.len(), Ordering::Relaxed) + data.len();
+                if queued > crate::MAX_QUEUED_UPLOAD {
+                    // The target does not take the data as fast as the client
+                    // sends it; reset the stream rather than buffer without end.
+                    tracing::warn!("Stream [{session_id}:{stream_id}]: over {} MB waiting for the target, resetting it", crate::MAX_QUEUED_UPLOAD >> 20);
+                    if let Some(state) = remotes.remove(&(session_id, stream_id)) {
+                        let _ = state.cancel_tx.try_send(());
+                    }
+                    send_relay_to_stream(session_id, stream_id, RelayMessage::Error("the target does not accept data this fast".into()), dispatcher, socket, ui_event_tx, tcp_map).await?;
+                    return Ok(());
+                }
                 let _ = remote.data_tx.send(bytes::Bytes::from(data));
             } else {
                 let _ = ui_event_tx.send(UiEvent::Log(format!("Relay DATA for unknown stream [{session_id}:{stream_id}] ({})", data.len())));
@@ -250,6 +262,7 @@ pub async fn handle_relay_message(
 
             remotes.insert((session_id, stream_id), RemoteState {
                 data_tx: dummy_data_tx,
+                queued: Default::default(),
                 udp_tx: Some(udp_tx),
                 cancel_tx,
                 is_dns: false,
