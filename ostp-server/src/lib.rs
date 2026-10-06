@@ -1,6 +1,5 @@
 use anyhow::Result;
 use bytes::Bytes;
-use portable_atomic::AtomicI64;
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::{Arc, RwLock};
@@ -16,7 +15,7 @@ use tokio::time::{interval, Duration, Instant};
 /// published by `handle_tick` from `Dispatcher::snapshot_backpressure` and
 /// read lock-free by relay reader tasks. See that method's doc comment for
 /// why this exists.
-pub(crate) type SessionBackpressure = Arc<RwLock<HashMap<u32, Arc<AtomicI64>>>>;
+pub(crate) type SessionBackpressure = Arc<RwLock<HashMap<u32, Arc<send_gate::SendGate>>>>;
 
 mod dispatcher;
 pub mod outbound;
@@ -33,6 +32,7 @@ pub mod overnet;
 pub mod password;
 pub mod target_policy;
 mod admission;
+mod send_gate;
 mod subscription;
 
 pub use subscription::SubscriptionSettings;
@@ -954,6 +954,13 @@ async fn handle_udp_packet(
             peer_last_seen.insert(peer_ip, now);
             let is_tcp = tcp_map.read().await.contains_key(&peer_addr);
             dispatcher.set_carrier_reliable(peer_addr, is_tcp);
+            // An ACK may have opened the window: the readers learn it now, not
+            // at the next tick.
+            if let Some((sid, available)) = dispatcher.budget_for_addr(peer_addr) {
+                if let Some(gate) = session_backpressure.read().unwrap_or_else(|e| e.into_inner()).get(&sid) {
+                    gate.set(available);
+                }
+            }
             if !peer_available.get(&peer_ip).copied().unwrap_or(false) {
                 peer_available.insert(peer_ip, true);
                 let proto = if is_tcp { "TCP (UoT)" } else { "UDP" };
@@ -967,10 +974,7 @@ async fn handle_udp_packet(
                     responses.len()
                 )));
             }
-            let _ = ui_event_tx.send(UiEvent::Rx { peer: peer_ip, bytes: size });
-
             for resp in responses {
-                let resp_len = resp.len();
                 let mut sent_tcp = false;
                 {
                     let map = tcp_map.read().await;
@@ -982,14 +986,18 @@ async fn handle_udp_packet(
                 if !sent_tcp {
                     let _ = socket.send_to(&resp, peer_addr).await?;
                 }
-                let _ = ui_event_tx.send(UiEvent::Tx { peer: peer_ip, bytes: resp_len });
             }
 
+            // No per-packet events or log lines here: nothing consumes Rx/Tx,
+            // and a formatted line per data packet was work thrown away
+            // tens of thousands of times a second.
             for (session_id, stream_id, payload) in app_payloads {
-                let _ = ui_event_tx.send(UiEvent::Log(format!(
-                    "Deliver app payload sid={session_id} stream={stream_id} bytes={}",
-                    payload.len()
-                )));
+                if router.debug {
+                    let _ = ui_event_tx.send(UiEvent::Log(format!(
+                        "Deliver app payload sid={session_id} stream={stream_id} bytes={}",
+                        payload.len()
+                    )));
+                }
                 relay::handle_relay_message(
                     peer_addr,
                     session_id,
@@ -1044,8 +1052,8 @@ async fn handle_tick(
         let mut map = session_backpressure.write().unwrap_or_else(|e| e.into_inner());
         for (sid, available) in snapshot {
             match map.get(&sid) {
-                Some(slot) => slot.store(available, std::sync::atomic::Ordering::Relaxed),
-                None => { map.insert(sid, Arc::new(AtomicI64::new(available))); }
+                Some(gate) => gate.set(available),
+                None => { map.insert(sid, Arc::new(send_gate::SendGate::new(available))); }
             }
         }
     }

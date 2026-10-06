@@ -124,6 +124,9 @@ const ROAMING_SOURCE_BURST: f64 = 50.0;
 /// until it times out, so the oldest is dropped rather than the new refused;
 /// one key can no longer take all MAX_SESSIONS slots.
 const MAX_SESSIONS_PER_KEY: usize = 32;
+/// The send budget covers this long: the packet loop's tick, the longest the
+/// readers go without an update when no ACK arrives.
+const SEND_BUDGET_HORIZON: std::time::Duration = std::time::Duration::from_millis(10);
 /// Connections one key may hold open at once. The process has 65535 file
 /// descriptors (LimitNOFILE); without this one key could take them all.
 const MAX_STREAMS_PER_KEY: usize = 4096;
@@ -274,39 +277,29 @@ impl Dispatcher {
         self.peer_machines.len()
     }
 
-    /// Per-session download-direction congestion headroom, in packets:
-    /// `(session_id, available)` where `available = clamped cwnd - in_flight`.
+    /// Per-session download-direction send budget, in frames:
+    /// `(session_id, frames)` the congestion window and the pacing rate allow
+    /// until the next tick (`ProtocolMachine::send_budget`).
     ///
     /// Consumed by the relay's per-target-connection reader tasks (see
-    /// `relay::handle_relay_message`'s Connect handler) to throttle how fast
-    /// they pull bytes from the upstream target and forward them to the
-    /// client's OSTP session. Without this, a fast target (e.g. a CDN) gets
-    /// read and forwarded as fast as the target can serve, completely
-    /// ignoring the client-facing session's real congestion window - on a
-    /// lossy/jittery client path that self-inflicts a loss burst, which
-    /// wrecks the RTT/RTO estimate and can stall the session hard enough to
-    /// trip the client's keepalive reconnect. Same clamp(16, 16384) the
-    /// client uses for its own analogous uplink gate, for symmetry.
+    /// `relay::handle_relay_message`'s Connect handler and `send_gate`) so a
+    /// fast target (e.g. a CDN) is read no faster than the client-facing
+    /// session can carry. Over the whole tick, not "is the pacing bucket
+    /// empty this instant": that read zero after every burst and stopped
+    /// sending until the next tick.
     pub fn snapshot_backpressure(&self) -> Vec<(u32, i64)> {
         self.peer_machines
             .iter()
-            .map(|(&sid, ps)| {
-                // Ceiling matches MAX_CWND_PACKETS in ostp-core. The old 16384
-                // allowed ~20 MB outstanding toward one client — on a mobile
-                // downlink that is standing queue, not throughput, and it is the
-                // download direction that carries video.
-                let cwnd = (ps.machine.cwnd_packets() as i64).clamp(16, 1024);
-                let in_flight = ps.machine.in_flight_count() as i64;
-                // Pacing gates the RATE, cwnd only the outstanding amount. With
-                // the pacing bucket empty, report no headroom so the relay
-                // reader pauses instead of handing over another chunk that would
-                // leave back-to-back.
-                if !ps.machine.can_pace_packet() {
-                    return (sid, 0);
-                }
-                (sid, cwnd - in_flight)
-            })
+            .map(|(&sid, ps)| (sid, ps.machine.send_budget(SEND_BUDGET_HORIZON) as i64))
             .collect()
+    }
+
+    /// The send budget of the session a datagram from `addr` belongs to,
+    /// right after it was processed (an ACK may have opened the window).
+    pub fn budget_for_addr(&self, addr: SocketAddr) -> Option<(u32, i64)> {
+        let sid = *self.addr_to_session.get(&addr)?;
+        let ps = self.peer_machines.get(&sid)?;
+        Some((sid, ps.machine.send_budget(SEND_BUDGET_HORIZON) as i64))
     }
 
     pub fn on_datagram(&mut self, peer: SocketAddr, packet: Bytes) -> Result<DispatchOutcome> {

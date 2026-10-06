@@ -1,6 +1,5 @@
 use anyhow::Result;
 use bytes::Bytes;
-use portable_atomic::AtomicI64;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -9,19 +8,12 @@ use tokio::io::AsyncReadExt;
 use tokio::sync::mpsc;
 
 use crate::dispatcher::Dispatcher;
+use crate::send_gate::SendGate;
 use crate::{RemoteState, SessionBackpressure, UiEvent};
 
-/// How long a target-connection reader task waits before rechecking the
-/// client session's congestion headroom while throttled. Short enough that
-/// a freed-up window (checked every server tick, 10ms) is noticed promptly;
-/// long enough not to spin.
-const BACKPRESSURE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(5);
-/// Upper bound on total time a single read is throttled before proceeding
-/// anyway. Congestion state is a hint, not a hard guarantee - if the
-/// session's headroom never frees up (e.g. a stuck/buggy state), a stream
-/// must not be stalled forever; better to occasionally overshoot the window
-/// than deadlock a connection.
-const BACKPRESSURE_MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+/// Largest read from a target at once. 4 KiB meant a syscall and a message
+/// per three datagrams plus a short fourth one; 64 KiB fills whole frames.
+const READ_BUF: usize = 64 * 1024;
 
 fn clean_ipv6_mapped_v4(addr: std::net::SocketAddr) -> std::net::SocketAddr {
     match addr {
@@ -88,7 +80,18 @@ pub async fn handle_relay_message(
             let connect_tx_clone = connect_tx.clone();
             let stream_tx_clone = stream_tx.clone();
             let router_clone = router.clone();
-            let backpressure_clone = session_backpressure.clone();
+            // Get-or-create this session's gate. A brand new session may not
+            // have had its first update yet, so it starts open (a fresh
+            // congestion window) rather than stalling the very first read.
+            let gate: Arc<SendGate> = {
+                let mut map = session_backpressure.write().unwrap_or_else(|e| e.into_inner());
+                map.entry(session_id).or_insert_with(|| Arc::new(SendGate::new(32))).clone()
+            };
+            let frame_payload = dispatcher
+                .max_payload(session_id)
+                .unwrap_or(1300)
+                .saturating_sub(ostp_core::relay::DATA_OVERHEAD)
+                .max(1);
             tokio::spawn(async move {
                 let stream_res = router_clone.route_tcp(&target_clone, peer_addr.ip()).await;
                 // Held by the reader below: released when the connection ends,
@@ -98,44 +101,27 @@ pub async fn handle_relay_message(
                     Ok(stream) => {
                         let (mut reader, writer) = stream.into_split();
                         let (cancel_tx, mut cancel_rx) = mpsc::channel::<()>(1);
-                        // Get-or-create this session's headroom handle. A brand
-                        // new session may not have its first tick's snapshot
-                        // yet (up to 10ms), so default it open (matches a fresh
-                        // congestion window) rather than stalling the very
-                        // first read while nothing has been published.
-                        let headroom: Arc<AtomicI64> = {
-                            let mut map = backpressure_clone.write().unwrap_or_else(|e| e.into_inner());
-                            map.entry(session_id).or_insert_with(|| Arc::new(AtomicI64::new(32))).clone()
-                        };
                         tokio::spawn(async move {
                             let _permit = permit;
-                            let mut buf = [0_u8; 4096];
+                            let mut buf = vec![0_u8; READ_BUF];
                             loop {
-                                // Throttle to the client-facing OSTP session's
-                                // real congestion window instead of reading from
-                                // the target as fast as it'll send. Without this,
-                                // a fast target blasts a lossy/jittery client
-                                // path far beyond what it can sustain, which
-                                // self-inflicts a loss burst, wrecks the RTT/RTO
-                                // estimate, and can stall the session hard
-                                // enough to trip the client's keepalive
-                                // reconnect. See Dispatcher::snapshot_backpressure.
-                                let mut waited = std::time::Duration::ZERO;
-                                while headroom.load(std::sync::atomic::Ordering::Relaxed) <= 0
-                                    && waited < BACKPRESSURE_MAX_WAIT
-                                {
-                                    tokio::time::sleep(BACKPRESSURE_POLL_INTERVAL).await;
-                                    waited += BACKPRESSURE_POLL_INTERVAL;
-                                }
+                                // Read no more than the client-facing session may
+                                // send now (its congestion window and pacing), so a
+                                // fast target does not flood a slower client path.
+                                // The budget is updated on every ACK and tick and
+                                // wakes this task at once.
+                                let budget = gate.acquire().await;
+                                let want = (budget as usize).saturating_mul(frame_payload).clamp(1, READ_BUF);
                                 tokio::select! {
                                     _ = cancel_rx.recv() => break,
-                                    read_res = reader.read(&mut buf) => {
+                                    read_res = reader.read(&mut buf[..want]) => {
                                         match read_res {
                                             Ok(0) | Err(_) => {
                                                 let _ = stream_tx_clone.send((session_id, stream_id, Vec::new()));
                                                 break;
                                             }
                                             Ok(n) => {
+                                                gate.spend(n.div_ceil(frame_payload) as i64);
                                                 if stream_tx_clone.send((session_id, stream_id, buf[..n].to_vec())).is_err() {
                                                     break;
                                                 }
@@ -370,12 +356,11 @@ async fn send_one(
     msg: RelayMessage,
     dispatcher: &mut Dispatcher,
     socket: &crate::transport::udp::UdpSockets,
-    ui_event_tx: &mpsc::UnboundedSender<UiEvent>,
+    _ui_event_tx: &mpsc::UnboundedSender<UiEvent>,
     tcp_map: &std::sync::Arc<tokio::sync::RwLock<HashMap<std::net::SocketAddr, tokio::sync::mpsc::Sender<Bytes>>>>,
 ) -> Result<()> {
     let payload = Bytes::from(msg.encode());
     if let Some((frame, peer_addr)) = dispatcher.outbound_to_session(session_id, stream_id, payload)? {
-        let response_len = frame.len();
         let mut sent_tcp = false;
         {
             let map = tcp_map.read().await;
@@ -387,10 +372,6 @@ async fn send_one(
         if !sent_tcp {
             let _ = socket.send_to(&frame, peer_addr).await?;
         }
-        let _ = ui_event_tx.send(UiEvent::Tx {
-            peer: peer_addr.ip(),
-            bytes: response_len,
-        });
     }
     Ok(())
 }

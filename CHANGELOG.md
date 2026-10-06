@@ -8,6 +8,17 @@ Older history is on the [Releases](https://github.com/ospab/ostp/releases) page 
 
 ## [Unreleased]
 
+### Fixed
+Speed: things that slowed transfers down on purpose or by mistake.
+- The server stopped sending to a client for the rest of a 10 ms tick whenever its pacing bucket happened to be empty at the moment the tick looked, although the bucket refills in microseconds; on a fast link that was most ticks. Readers now get a budget for the whole tick, refreshed on every ACK as well, and are woken at once instead of polling every 5 ms.
+- The window grew like Reno, one packet per round trip, and lost 30% on every gap: with any random loss on the path it stayed around a hundred packets, tens of Mbit/s on a 300 Mbit/s line. It now follows CUBIC (RFC 9438), the algorithm of Linux, Windows and QUIC, which climbs back to its previous size in seconds.
+- Several frames lost from one burst each cut the window again; a standing queue halved it on every ACK until the smoothed RTT came down. Each is now one reduction per round trip.
+- The window was capped at 1,024 packets (1.4 MB), ~275 Mbit/s at 40 ms and ~180 Mbit/s at 60 ms however fast the line. The cap is 8,192 packets now, 1 Gbit/s at 90 ms.
+- The client's upload waited for the next event, up to 10 ms, when the window had room but the pacing bucket was momentarily empty. It now wakes when the next packet is allowed.
+- The server read from websites 4 KiB at a time (three full datagrams and a short one per read); it now reads up to 64 KiB, as much as the session may send.
+- Up to 64 retransmissions per 10 ms: after a network change a large window took more than a second to resend. Up to 512 now, paced.
+- The server formatted a log line and sent two events nobody read for every data packet.
+
 ## [0.4.7-beta.5] - 2026-10-06
 
 The tags v0.4.7-beta.3 and v0.4.7-beta.4 were never released (a test failed in CI); their changes are all here.

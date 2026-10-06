@@ -1,9 +1,13 @@
 //! Congestion control for the OSTP protocol.
 //!
-//! Implements a simplified BBR-inspired algorithm that estimates bottleneck
-//! bandwidth and minimum RTT to determine the optimal sending rate.
-//! This replaces the fixed `retransmit_budget = 8` with an adaptive
-//! congestion window that responds to network conditions.
+//! Slow start, then CUBIC (RFC 9438) for window growth and loss response,
+//! with a delay signal on top: a smoothed RTT far above the path's minimum is
+//! a standing queue and is treated as congestion. Sending is paced at
+//! cwnd / min_rtt.
+//!
+//! CUBIC replaced Reno-style growth (+1 packet per RTT, x0.7 on every gap):
+//! with any random loss that held the window near 1.2 / sqrt(p) packets,
+//! about 120 packets at 0.01% loss, tens of Mbit/s on a 300 Mbit/s path.
 //!
 //! RTO calculation follows RFC 6298:
 //!   SRTT = (1 - α) * SRTT + α * RTT       (α = 1/8)
@@ -51,6 +55,20 @@ pub struct CongestionController {
     slow_start_losses: u32,
     /// Start of the current loss-tolerance window.
     slow_start_loss_window_start: Instant,
+    /// CUBIC (RFC 9438): the window, in packets, before the last reduction.
+    w_max: f64,
+    /// CUBIC: start of the current growth epoch (`None` until the first ACK
+    /// after a reduction or the end of slow start).
+    epoch_start: Option<Instant>,
+    /// CUBIC: time from the epoch start to reach `w_max` again, seconds.
+    k: f64,
+    /// CUBIC: the window standard TCP would have now, packets (RFC 9438 §4.3).
+    w_est: f64,
+    /// When the window was last reduced. Losses within one smoothed RTT of a
+    /// reduction belong to the same congestion event and do not reduce it
+    /// again: several frames lost from one burst used to cut the window by
+    /// 0.7 for each of them.
+    last_reduction: Option<Instant>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -67,13 +85,16 @@ const INITIAL_CWND_PACKETS: u64 = 32;
 const MIN_CWND_PACKETS: u64 = 2;
 /// Min RTT expiry window (after which we re-probe)
 const MIN_RTT_EXPIRY: Duration = Duration::from_secs(10);
-/// Minimum RTO (RFC 6298: 1s in TCP; we use 50ms since we own the protocol)
-/// Absolute ceiling on the congestion window, in packets. At a ~1200-byte MTU
-/// this is roughly 1.2 MB in flight — already far above the bandwidth-delay
-/// product of any link this protocol realistically runs over, so anything
-/// beyond it is standing queue, not throughput. The client previously allowed
-/// up to 16384 packets (~20 MB), which on a mobile uplink is minutes of buffer.
-pub const MAX_CWND_PACKETS: u64 = 1024;
+/// Absolute ceiling on the congestion window, in packets: about 11 MB at a
+/// 1350-byte MTU, the bandwidth-delay product of 1 Gbit/s at 90 ms. The old
+/// 1024 (1.4 MB) capped one session at ~275 Mbit/s at 40 ms and ~180 Mbit/s
+/// at 60 ms however fast the path. A deep buffer does not get to fill this:
+/// the delay signal (RTT_INFLATION_*) ends growth when the queue builds.
+pub const MAX_CWND_PACKETS: u64 = 8192;
+/// CUBIC constants (RFC 9438 §5): multiplicative decrease and the scaling
+/// constant, in packets and seconds.
+const CUBIC_BETA: f64 = 0.7;
+const CUBIC_C: f64 = 0.4;
 /// SRTT/min_rtt ratio at which slow start stops. Doubling is what fills a deep
 /// buffer fastest, so growth must end when the queue starts building rather
 /// than waiting for a loss that a deep buffer may never produce.
@@ -132,6 +153,11 @@ impl CongestionController {
             slow_start_loss_window_start: now,
             pacing_tokens: (INITIAL_CWND_PACKETS * mtu) as f64,
             pacing_last_refill: now,
+            w_max: 0.0,
+            epoch_start: None,
+            k: 0.0,
+            w_est: 0.0,
+            last_reduction: None,
         }
     }
 
@@ -226,9 +252,12 @@ impl CongestionController {
 
     /// Returns the recommended retransmit budget per tick.
     pub fn retransmit_budget(&self) -> usize {
-        // Allow retransmitting up to 1/4 of the cwnd in packets per tick
+        // Allow retransmitting up to 1/4 of the cwnd in packets per tick.
+        // Capped at 512 a 10 ms tick: 64 left an 8192-frame window more than
+        // a second to resend after a path change. Retransmits are paced too
+        // (on_retransmit), so a large budget does not mean a burst of new data.
         let budget = (self.cwnd_packets() / 4).max(2);
-        budget.min(64) // cap at 64 to prevent burst
+        budget.min(512)
     }
 
     /// Check whether we can send more data.
@@ -294,12 +323,12 @@ impl CongestionController {
         };
 
         if inflation >= RTT_INFLATION_BACKOFF {
-            // Standing queue is severe — actively drain it.
-            self.cwnd = (self.cwnd / 2).max(MIN_CWND_PACKETS * self.mtu);
-            self.ssthresh = self.cwnd;
-            self.phase = Phase::ProbeBandwidth;
-            tracing::debug!(cwnd = self.cwnd, inflation, "congestion: draining standing queue");
-            self.clamp_cwnd();
+            // Standing queue is severe — actively drain it. Once per congestion
+            // event, like a loss: SRTT falls slowly, and halving on every ACK
+            // while it did took the window to the minimum within a few ACKs.
+            if self.reduce(0.5) {
+                tracing::debug!(cwnd = self.cwnd, inflation, "congestion: draining standing queue");
+            }
             return;
         }
 
@@ -310,7 +339,7 @@ impl CongestionController {
                 // than waiting for the loss that may never come.
                 if inflation >= RTT_INFLATION_EXIT_SLOW_START {
                     self.ssthresh = self.cwnd;
-                    self.phase = Phase::ProbeBandwidth;
+                    self.enter_congestion_avoidance();
                     tracing::debug!(cwnd = self.cwnd, inflation, "congestion: RTT inflation ended slow start");
                     self.clamp_cwnd();
                     return;
@@ -318,17 +347,79 @@ impl CongestionController {
                 // Exponential growth: increase cwnd by acked bytes (doubles per RTT)
                 self.cwnd = self.cwnd.saturating_add(bytes);
                 if self.cwnd >= self.ssthresh {
-                    self.phase = Phase::ProbeBandwidth;
+                    self.enter_congestion_avoidance();
                     tracing::debug!(cwnd = self.cwnd, "congestion: exiting slow start");
                 }
             }
-            Phase::ProbeBandwidth => {
-                // TCP Reno Additive Increase: increase cwnd by ~1 MTU per RTT
-                self.cwnd = self.cwnd.saturating_add(bytes * self.mtu / self.cwnd.max(1));
-            }
+            Phase::ProbeBandwidth => self.cubic_grow(bytes),
         }
 
         self.clamp_cwnd();
+    }
+
+    fn cwnd_packets_f(&self) -> f64 {
+        self.cwnd as f64 / self.mtu as f64
+    }
+
+    /// Slow start is over: CUBIC continues from the current window.
+    fn enter_congestion_avoidance(&mut self) {
+        self.phase = Phase::ProbeBandwidth;
+        self.w_max = self.cwnd_packets_f();
+        self.epoch_start = None;
+    }
+
+    /// CUBIC window growth for `bytes` newly acknowledged (RFC 9438 §4).
+    fn cubic_grow(&mut self, bytes: u64) {
+        let now = Instant::now();
+        let cwnd = self.cwnd_packets_f();
+        let acked = bytes as f64 / self.mtu as f64;
+        let epoch = match self.epoch_start {
+            Some(e) => e,
+            None => {
+                // A new epoch: K is the time to climb back to w_max.
+                self.k = if cwnd < self.w_max { ((self.w_max - cwnd) / CUBIC_C).cbrt() } else { 0.0 };
+                if cwnd > self.w_max {
+                    self.w_max = cwnd;
+                }
+                self.w_est = cwnd;
+                self.epoch_start = Some(now);
+                now
+            }
+        };
+        let t = now.duration_since(epoch).as_secs_f64();
+        let rtt = self.srtt.as_secs_f64();
+        // Where the cubic curve is one RTT from now, bounded to 1.5x per RTT.
+        let target = (CUBIC_C * (t + rtt - self.k).powi(3) + self.w_max).clamp(cwnd, 1.5 * cwnd);
+        // Standard TCP's window for the same path (the "Reno-friendly" region):
+        // CUBIC is never slower than Reno would be.
+        let alpha = 3.0 * (1.0 - CUBIC_BETA) / (1.0 + CUBIC_BETA);
+        self.w_est += alpha * acked / cwnd.max(1.0);
+        let goal = target.max(self.w_est);
+        let increase = if goal > cwnd { (goal - cwnd) * acked / cwnd.max(1.0) } else { acked / (100.0 * cwnd.max(1.0)) };
+        self.cwnd = self.cwnd.saturating_add((increase * self.mtu as f64) as u64);
+    }
+
+    /// One congestion event: the window becomes `factor` of what it was,
+    /// unless it was already reduced within the last smoothed RTT (the same
+    /// event, e.g. several frames lost from one burst). Returns whether it
+    /// reduced.
+    fn reduce(&mut self, factor: f64) -> bool {
+        let now = Instant::now();
+        if self.last_reduction.is_some_and(|t| now.duration_since(t) < self.srtt) {
+            return false;
+        }
+        self.last_reduction = Some(now);
+        let cwnd = self.cwnd_packets_f();
+        // Fast convergence (RFC 9438 §4.7): a window that peaked below the
+        // last one releases bandwidth to newer flows.
+        self.w_max = if cwnd < self.w_max { cwnd * (1.0 + CUBIC_BETA) / 2.0 } else { cwnd };
+        self.cwnd = ((self.cwnd as f64 * factor) as u64).max(MIN_CWND_PACKETS * self.mtu);
+        self.ssthresh = self.cwnd;
+        self.phase = Phase::ProbeBandwidth;
+        self.epoch_start = None;
+        self.clamp_cwnd();
+        self.update_pacing_rate();
+        true
     }
 
     /// Hard ceiling on the congestion window.
@@ -374,12 +465,11 @@ impl CongestionController {
                 self.slow_start_losses += 1;
 
                 if self.slow_start_losses >= SLOW_START_LOSS_TOLERANCE {
-                    // Sustained loss within the window: treat as real congestion.
-                    // Exit slow start, set ssthresh to half of cwnd.
-                    self.ssthresh = self.cwnd / 2;
-                    self.cwnd = self.ssthresh.max(MIN_CWND_PACKETS * self.mtu);
-                    self.phase = Phase::ProbeBandwidth;
-                    tracing::debug!(cwnd = self.cwnd, ssthresh = self.ssthresh, "congestion: sustained loss during slow start, exiting");
+                    // Sustained loss within the window: treat as real congestion
+                    // and continue with CUBIC from beta of the window.
+                    if self.reduce(CUBIC_BETA) {
+                        tracing::debug!(cwnd = self.cwnd, "congestion: sustained loss during slow start, exiting");
+                    }
                 } else {
                     // Isolated loss: likely non-congestive noise. Take a mild,
                     // temporary haircut but keep exponential growth going -
@@ -389,13 +479,31 @@ impl CongestionController {
                 }
             }
             Phase::ProbeBandwidth => {
-                // Multiplicative decrease: cwnd *= 0.7 (BBR-style, less aggressive than Cubic's 0.5)
-                self.cwnd = (self.cwnd * 7 / 10).max(MIN_CWND_PACKETS * self.mtu);
-                tracing::debug!(cwnd = self.cwnd, "congestion: loss, cwnd reduced");
+                if self.reduce(CUBIC_BETA) {
+                    tracing::debug!(cwnd = self.cwnd, "congestion: loss, cwnd reduced");
+                }
             }
         }
 
         self.update_pacing_rate();
+    }
+
+    /// Bytes that may leave within `horizon` at the pacing rate, counting the
+    /// allowance already in the bucket. For a sender that is woken
+    /// periodically rather than per packet.
+    pub fn pacing_budget(&self, horizon: Duration) -> f64 {
+        let elapsed = self.pacing_last_refill.elapsed().as_secs_f64();
+        let now = (self.pacing_tokens + elapsed * self.pacing_rate as f64).min(self.pacing_burst());
+        now + horizon.as_secs_f64() * self.pacing_rate as f64
+    }
+
+    /// How long until one full packet of pacing allowance is there.
+    pub fn time_to_pace(&self) -> Duration {
+        let missing = self.mtu as f64 - self.pacing_available();
+        if missing <= 0.0 || self.pacing_rate == 0 {
+            return Duration::ZERO;
+        }
+        Duration::from_secs_f64(missing / self.pacing_rate as f64)
     }
 
     // ── Private ──────────────────────────────────────────────────────────────
@@ -479,6 +587,60 @@ mod tests {
         let initial = cc.cwnd();
         cc.on_loss(1200);
         assert!(cc.cwnd() < initial);
+    }
+
+    /// A controller past slow start with a real RTT sample, at `packets`.
+    fn in_avoidance(packets: u64, rtt: Duration) -> CongestionController {
+        let mut cc = CongestionController::new(1200);
+        cc.on_ack(1200, rtt);
+        cc.cwnd = packets * 1200;
+        cc.enter_congestion_avoidance();
+        cc
+    }
+
+    #[test]
+    fn several_losses_in_one_rtt_are_one_reduction() {
+        let mut cc = in_avoidance(1000, Duration::from_millis(40));
+        cc.on_loss(1200);
+        let once = cc.cwnd();
+        assert_eq!(once, 700 * 1200);
+        for _ in 0..5 {
+            cc.on_loss(1200);
+        }
+        assert_eq!(cc.cwnd(), once, "a burst of losses within one RTT cut the window again");
+    }
+
+    /// CUBIC climbs back towards the window it had before a loss far faster
+    /// than one packet per RTT.
+    #[test]
+    fn cubic_recovers_much_faster_than_reno() {
+        let mut cc = in_avoidance(1000, Duration::from_millis(40));
+        cc.on_loss(1200);
+        cc.epoch_start = None;
+        // Two seconds of ACKs (50 RTTs at 40 ms), a window's worth per RTT.
+        let start = Instant::now() - Duration::from_secs(2);
+        cc.cubic_grow(1200);
+        cc.epoch_start = Some(start);
+        for _ in 0..50 {
+            let w = cc.cwnd();
+            cc.on_ack(w, Duration::from_millis(40));
+        }
+        let packets = cc.cwnd() / 1200;
+        assert!(packets > 750, "{packets} packets: Reno would be near 750");
+        assert!(packets <= MAX_CWND_PACKETS);
+    }
+
+    #[test]
+    fn a_standing_queue_halves_the_window_once_per_rtt() {
+        let mut cc = in_avoidance(1000, Duration::from_millis(20));
+        cc.srtt = Duration::from_millis(100); // 5x the minimum
+        cc.on_ack(1200, Duration::from_millis(100));
+        let once = cc.cwnd();
+        assert!(once <= 501 * 1200);
+        for _ in 0..20 {
+            cc.on_ack(1200, Duration::from_millis(100));
+        }
+        assert!(cc.cwnd() >= once, "every ACK halved the window again");
     }
 
     /// The bufferbloat case: a deep buffer absorbs everything, so NOTHING is

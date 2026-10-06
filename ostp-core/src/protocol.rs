@@ -209,13 +209,12 @@ impl ProtocolMachine {
             obfuscation_key: config.obfuscation_key,
             max_reorder: config.max_reorder.max(1),
             // A sender never has more than MAX_CWND_PACKETS frames in flight,
-            // so a buffer of two windows holds every frame a real reordering
-            // or loss can leave waiting. The configured 8192 (about 11 MB of
-            // payloads a session) only let a key holder make the server keep
-            // frames sent far ahead on purpose.
+            // so a buffer of one window holds every frame a real reordering
+            // or loss can leave waiting; anything beyond it only let a key
+            // holder make the server keep frames sent far ahead on purpose.
             max_reorder_buffer: config
                 .max_reorder_buffer
-                .clamp(1, 2 * crate::congestion::MAX_CWND_PACKETS as usize),
+                .clamp(1, crate::congestion::MAX_CWND_PACKETS as usize),
             ack_delay: Duration::from_millis(config.ack_delay_ms.max(1)),
             rto: Duration::from_millis(config.rto_ms.max(1)),
             max_retries: config.max_retries.max(1),
@@ -306,6 +305,22 @@ impl ProtocolMachine {
 
     pub fn cwnd_packets(&self) -> usize {
         self.cc.cwnd_packets() as usize
+    }
+
+    /// Data frames that may go out within `horizon`: what the congestion
+    /// window leaves room for, limited by the pacing rate over that time. For
+    /// a sender that is woken periodically (a tick, an ACK) and must not
+    /// stop between wake-ups merely because the pacing bucket was empty at
+    /// the moment it looked.
+    pub fn send_budget(&self, horizon: Duration) -> usize {
+        let window = self.cc.cwnd_packets().saturating_sub(self.in_flight_count());
+        let paced = (self.cc.pacing_budget(horizon) / self._mtu.max(1) as f64).max(0.0) as usize;
+        window.min(paced)
+    }
+
+    /// How long until the pacing bucket holds one more full packet.
+    pub fn time_to_pace(&self) -> Duration {
+        self.cc.time_to_pace()
     }
 
     /// The largest application payload one datagram carries within the
@@ -1741,9 +1756,9 @@ mod tests {
     #[test]
     fn the_reorder_buffer_is_bounded_by_the_window() {
         let mut cfg = make_config(NoiseRole::Initiator);
-        cfg.max_reorder_buffer = 8192;
+        cfg.max_reorder_buffer = 1 << 20;
         let m = ProtocolMachine::new(cfg).unwrap();
-        assert_eq!(m.max_reorder_buffer, 2 * crate::congestion::MAX_CWND_PACKETS as usize);
+        assert_eq!(m.max_reorder_buffer, crate::congestion::MAX_CWND_PACKETS as usize);
     }
 
     /// The NACKed frame arriving twice (late original, then the retransmit)

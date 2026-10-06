@@ -344,8 +344,19 @@ impl Bridge {
         let mut stream_map: std::collections::HashMap<u16, usize> = std::collections::HashMap::new();
 
         loop {
+            // Upload is held back when the window has room but the pacing
+            // bucket is empty this instant. It refills in microseconds, so
+            // wake exactly then; otherwise nothing re-checked until the next
+            // event, up to the 10 ms retransmit tick.
+            let pace_wait = sessions_opt.as_ref().and_then(|s| {
+                s.iter()
+                    .filter(|ses| ses.machine.in_flight_count() < ses.machine.cwnd_packets() && !ses.machine.can_pace_packet())
+                    .map(|ses| ses.machine.time_to_pace())
+                    .min()
+            });
             tokio::select! {
                 biased;
+                _ = tokio::time::sleep(pace_wait.unwrap_or_default()), if pace_wait.is_some() => {}
                 _ = shutdown.changed() => {
                     if *shutdown.borrow() {
                         // Tell the server the session is over, so it frees it now
@@ -474,18 +485,16 @@ impl Bridge {
                     }
                 }
                 proxy_ev = proxy_rx.recv(), if self.running && sessions_opt.as_ref().map(|s| {
-                    // Upper bound matches MAX_CWND_PACKETS in ostp-core's congestion
-                    // controller. The old 16384 ceiling let ~20 MB sit in flight,
-                    // which on a mobile uplink is minutes of buffered queue rather
-                    // than throughput — the app kept handing over data long after
-                    // the path had stopped draining it.
                     // Two independent gates. cwnd bounds how much may be in
-                    // flight; pacing bounds how FAST it is released. Without the
+                    // flight (the controller caps it at MAX_CWND_PACKETS);
+                    // pacing bounds how FAST it is released. Without the
                     // second, a full window goes out back-to-back and lands in
                     // the bottleneck's buffer as standing queue rather than
                     // throughput — the thing that produced multi-second RTT.
+                    // The `pace_wait` branch above wakes the loop when pacing
+                    // allows the next packet.
                     s.iter().any(|ses| {
-                        ses.machine.in_flight_count() < ses.machine.cwnd_packets().clamp(16, 1024)
+                        ses.machine.in_flight_count() < ses.machine.cwnd_packets()
                             && ses.machine.can_pace_packet()
                     })
                 }).unwrap_or(true) => {
