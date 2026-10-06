@@ -8,6 +8,8 @@ Older history is on the [Releases](https://github.com/ospab/ostp/releases) page 
 
 ## [Unreleased]
 
+## [0.4.7-beta.8] - 2026-10-07
+
 ### Fixed
 - After a connection outage of a few seconds (a lift, a switch between Wi-Fi and mobile data) a TCP connection through the tunnel could lose a piece of data without any error: the receiver gave up on a missing frame after 2 to 10 seconds while the sender was still retransmitting it for about 40. The receiver now waits as long as the sender keeps trying.
 - Server: data from a client to a website queued without limit while the site accepted it more slowly, so one fast upload to a slow site (or a client doing it on purpose) could take all of the server's memory. Past 32 MB waiting, that connection is reset with an error.
