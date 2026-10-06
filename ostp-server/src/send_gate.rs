@@ -10,7 +10,9 @@
 //! sending stopped for the rest of the tick although the bucket refills in
 //! microseconds.
 
-use std::sync::atomic::{AtomicI64, Ordering};
+// portable_atomic: 32-bit MIPS has no 64-bit atomics in std.
+use portable_atomic::AtomicI64;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tokio::sync::Notify;
 

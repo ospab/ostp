@@ -8,6 +8,9 @@ Older history is on the [Releases](https://github.com/ospab/ostp/releases) page 
 
 ## [Unreleased]
 
+### Fixed
+- 0.4.7-beta.6 did not build for 32-bit MIPS routers (`AtomicI64`); that release has no mipsel binary.
+
 ## [0.4.7-beta.6] - 2026-10-06
 
 ### Fixed
