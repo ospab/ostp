@@ -8,6 +8,8 @@ Older history is on the [Releases](https://github.com/ospab/ostp/releases) page 
 
 ## [Unreleased]
 
+## [0.4.7-beta.6] - 2026-10-06
+
 ### Fixed
 Speed: things that slowed transfers down on purpose or by mistake.
 - The server stopped sending to a client for the rest of a 10 ms tick whenever its pacing bucket happened to be empty at the moment the tick looked, although the bucket refills in microseconds; on a fast link that was most ticks. Readers now get a budget for the whole tick, refreshed on every ACK as well, and are woken at once instead of polling every 5 ms.
