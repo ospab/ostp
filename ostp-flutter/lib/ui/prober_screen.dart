@@ -335,14 +335,20 @@ class _ProberScreenState extends State<ProberScreen> {
     }).toList();
   }
 
-  Widget _dpiFindingRow(String label, bool triggered, String verdict, String method) {
-    final color = triggered ? Colors.orangeAccent : Colors.greenAccent;
+  /// [measured] false: the test had nothing to compare against, so it says
+  /// nothing either way (grey, not a green "clean").
+  Widget _dpiFindingRow(String label, bool triggered, String verdict, String method, {bool measured = true}) {
+    if (!measured) {
+      triggered = false;
+      verdict = 'not measured';
+    }
+    final color = !measured ? Colors.white54 : (triggered ? Colors.orangeAccent : Colors.greenAccent);
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 4),
       child: Row(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Icon(triggered ? Icons.warning_amber_rounded : Icons.check_circle, color: color, size: 18),
+          Icon(!measured ? Icons.remove_circle_outline : (triggered ? Icons.warning_amber_rounded : Icons.check_circle), color: color, size: 18),
           const SizedBox(width: 8),
           Expanded(
             child: Column(
@@ -404,18 +410,26 @@ class _ProberScreenState extends State<ProberScreen> {
               final score = ((report['dpi_score'] as num?) ?? 0).toDouble();
               final pct = (score * 100).round();
               final color = pct >= 60 ? Colors.redAccent : (pct >= 25 ? Colors.orangeAccent : Colors.greenAccent);
+              if (report['whitelist'] == true) {
+                return const Text(
+                  'Allowlist mode: only allowlisted addresses are reachable (100%)',
+                  style: TextStyle(color: Colors.redAccent, fontSize: 14, fontWeight: FontWeight.bold),
+                );
+              }
               return Text(
-                'Filtering score: $pct% ${pct >= 60 ? '(heavy)' : (pct >= 25 ? '(moderate)' : '(clean)')}',
+                'Filtering score: $pct% ${pct >= 60 ? '(heavy)' : (pct >= 25 ? '(moderate)' : '(little)')}',
                 style: TextStyle(color: color, fontSize: 14, fontWeight: FontWeight.bold),
               );
             }),
             const SizedBox(height: 12),
             _dpiFindingRow('SNI filter', _dpiReport!['sni_blocked'] == true,
                 _dpiReport!['sni_blocked'] == true ? 'blocks by domain name' : 'clean',
-                'differential TLS to clean RU hosts: blocked SNI gets RST/drop faster than RTT'),
+                'differential TLS to clean RU hosts: blocked SNI gets RST/drop faster than RTT',
+                measured: !((_dpiReport!['unmeasured'] as List<dynamic>? ?? []).contains('sni'))),
             _dpiFindingRow('HTTP Host filter', _dpiReport!['http_host_blocked'] == true,
                 _dpiReport!['http_host_blocked'] == true ? 'blocks by Host header' : 'clean',
-                'differential HTTP GET to vk.com / ya.ru: blocked Host gets cut off'),
+                'differential HTTP GET to vk.com / ya.ru: blocked Host gets cut off',
+                measured: !((_dpiReport!['unmeasured'] as List<dynamic>? ?? []).contains('http_host'))),
             _dpiFindingRow(
                 'DNS hijack',
                 _dpiReport!['dns_hijacked'] == true,

@@ -1113,16 +1113,21 @@ async function runDpi() {
   try {
     const r = await invoke('run_dpi_battery');
     if (!r) throw new Error('the prober needs the desktop app');
-    const line = (bad, text, okText) => `<tr><td>${bad ? '<span class="pr-bad">✕</span>' : '<span class="pr-ok">✓</span>'}</td><td>${escHtml(bad ? text : okText)}</td></tr>`;
+    const unmeasured = r.unmeasured || [];
+    const line = (bad, text, okText, id) => unmeasured.includes(id)
+      ? `<tr><td><span class="pr-dim">–</span></td><td>${escHtml(okText)} <span class="pr-dim">(not measured: no clean baseline answered)</span></td></tr>`
+      : `<tr><td>${bad ? '<span class="pr-bad">✕</span>' : '<span class="pr-ok">✓</span>'}</td><td>${escHtml(bad ? text : okText)}</td></tr>`;
     const score = Math.round((r.dpi_score || 0) * 100) / 100;
-    const verdict = score >= 0.5
+    const verdict = r.whitelist
+      ? '<div class="pr-verdict bad">Allowlist mode: only allowlisted addresses are reachable; foreign servers refuse even TCP.</div>'
+      : score >= 0.5
       ? `<div class="pr-verdict bad">Heavy filtering (score ${score}).</div>`
       : score > 0
         ? `<div class="pr-verdict warn">Some filtering (score ${score}).</div>`
         : '<div class="pr-verdict ok">No filtering detected.</div>';
     const rows = [
-      line(r.sni_blocked, 'TLS by server name (SNI) is blocked', 'TLS server names are not filtered'),
-      line(r.http_host_blocked, 'HTTP by Host header is blocked', 'HTTP Host headers are not filtered'),
+      line(r.sni_blocked, 'TLS by server name (SNI) is blocked', 'TLS server names are not filtered', 'sni'),
+      line(r.http_host_blocked, 'HTTP by Host header is blocked', 'HTTP Host headers are not filtered', 'http_host'),
       line(r.rst_injection_detected, 'Forged TCP resets are injected', 'No forged TCP resets'),
       line(r.udp_throttled, 'UDP is throttled', 'UDP is not throttled'),
       line(r.dns_hijacked, `DNS is hijacked${r.dns_hijacker_ip ? ' by ' + r.dns_hijacker_ip : ''}`, 'DNS answers are not hijacked'),

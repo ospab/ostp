@@ -8,6 +8,9 @@ Older history is on the [Releases](https://github.com/ospab/ostp/releases) page 
 
 ## [Unreleased]
 
+### Fixed
+- Network prober, DPI test: under an allowlist ("white lists", when only allowlisted addresses are reachable) it showed "10% (clean)". Foreign hosts that refuse even a TCP connection counted as "no result" instead of filtering, and every content test talks to Russian hosts, which an allowlist lets through. The test now recognises an allowlist (Russian hosts answer, Hetzner, OVH, Cloudflare, Google and Quad9 refuse TCP), says so first and scores it 100%; an unreachable foreign hosting counts as filtered. The SNI and HTTP Host tests show "not measured" instead of "clean" when no clean baseline answered.
+
 ## [0.4.7-beta.8] - 2026-10-07
 
 ### Fixed

@@ -155,7 +155,9 @@ fn looks_like_block_page(resp: &str) -> bool {
 // blocked SNIs to the SAME IP. Without DPI the server itself replies with a
 // TLS alert (ServerResponded); with DPI a RST/drop arrives faster than RTT
 // would allow.
-async fn test_differential_sni() -> bool {
+/// (blocked, measured): `measured` is false when no clean baseline answered,
+/// so nothing was compared and "not blocked" would be a guess.
+async fn test_differential_sni() -> (bool, bool) {
     let mut votes_dpi = 0usize;
     let mut votes_total = 0usize;
 
@@ -177,10 +179,10 @@ async fn test_differential_sni() -> bool {
         }
     }
 
-    votes_total >= 2 && votes_dpi * 2 > votes_total
+    (votes_total >= 2 && votes_dpi * 2 > votes_total, votes_total >= 2)
 }
 
-async fn test_differential_http_host() -> bool {
+async fn test_differential_http_host() -> (bool, bool) {
     let http_targets: &[(&str, &str)] = &[("87.240.132.78", "vk.com"), ("77.88.55.242", "ya.ru")];
 
     let mut votes_dpi = 0usize;
@@ -203,7 +205,7 @@ async fn test_differential_http_host() -> bool {
             }
         }
     }
-    votes_total >= 1 && votes_dpi * 2 > votes_total
+    (votes_total >= 1 && votes_dpi * 2 > votes_total, votes_total >= 1)
 }
 
 // ── Test: RST injection ─────────────────────────────────────────────────────
@@ -375,7 +377,16 @@ async fn resolve_v4(name: &str, fallback: &str) -> IpAddr {
     fallback.parse().unwrap()
 }
 
-async fn check_foreign(name: &'static str, fallback: &'static str, label: &'static str) -> Check {
+/// The check and whether a TCP connection to the host could be opened at all.
+async fn check_foreign(name: &'static str, fallback: &'static str, label: &'static str) -> (Check, bool) {
+    let c = check_foreign_inner(name, fallback, label).await;
+    let connected = !c.detail.ends_with(FOREIGN_NO_TCP);
+    (c, connected)
+}
+
+const FOREIGN_NO_TCP: &str = "TCP connect failed";
+
+async fn check_foreign_inner(name: &'static str, fallback: &'static str, label: &'static str) -> Check {
     let ip = resolve_v4(name, fallback).await;
     let tls: SocketAddr = (ip, 443).into();
     let window = window_for(measure_rtt(&ip.to_string(), 443).await);
@@ -383,7 +394,7 @@ async fn check_foreign(name: &'static str, fallback: &'static str, label: &'stat
     let junk = junk_payload();
     let raw = react(tls, &junk, None, window).await;
     let Ok((raw_r, _, _)) = raw else {
-        return Check { id: "foreign", title, ok: None, detail: format!("{ip}: TCP connect failed"), locate: None };
+        return Check { id: "foreign", title, ok: None, detail: format!("{ip}: {FOREIGN_NO_TCP}"), locate: None };
     };
     if raw_r == Reaction::None {
         return Check { id: "foreign", title, ok: Some(false), detail: format!("{ip}: nothing gets an answer, even raw bytes"), locate: None };
@@ -856,6 +867,13 @@ pub struct DpiBatteryReport {
     pub connect_hijacked: bool,
     pub dns_servers: Vec<DnsServerStatus>,
     pub dpi_score: f32,
+    /// Only allowlisted (mostly Russian) addresses are reachable: foreign
+    /// hosts refuse even a TCP connection while Russian ones answer. Every
+    /// content test below is moot then, and the score is 100%.
+    pub whitelist: bool,
+    /// Tests that could not compare anything (no clean baseline answered):
+    /// "sni", "http_host". Their `false` means "not measured", not "clean".
+    pub unmeasured: Vec<String>,
     /// Checks with a verdict, detail and, where measurable, the censor's hop.
     pub checks: Vec<Check>,
     /// Routers toward a foreign host, hop by hop (ICMP via the system ping):
@@ -866,6 +884,40 @@ pub struct DpiBatteryReport {
     pub path_summary: Option<String>,
 }
 
+/// Foreign addresses besides the hosting checks, for telling an allowlist from
+/// one unlucky provider: Cloudflare and Google on 443.
+const WHITELIST_FOREIGN: &[&str] = &["1.1.1.1:443", "8.8.8.8:443", "9.9.9.9:443"];
+
+/// Whether a TCP connection opens to any of `addrs`.
+async fn any_tcp(addrs: &[&str]) -> bool {
+    let tries = addrs.iter().filter_map(|a| a.parse::<SocketAddr>().ok()).map(|a| async move {
+        protected_tcp_connect(a, Duration::from_secs(4)).await.is_ok()
+    });
+    futures::future::join_all(tries).await.into_iter().any(|ok| ok)
+}
+
+fn whitelist_check(whitelist: bool, ru_rtt: Option<u64>, more_foreign: bool, hosting: bool) -> Check {
+    let title = "Allowlist (\"white lists\")".to_string();
+    let ru = match ru_rtt {
+        Some(ms) => format!("vk.com answers in {ms} ms"),
+        None => "vk.com does not answer either".to_string(),
+    };
+    let (ok, detail) = if whitelist {
+        (Some(false), format!(
+            "{ru}, but no foreign address accepts even a TCP connection (Hetzner, OVH, Cloudflare, Google, Quad9): \
+             only allowlisted addresses are reachable. The content tests below talk to Russian hosts, which the \
+             allowlist lets through, so they cannot see it. A VPN works here only through an allowlisted address"
+        ))
+    } else if ru_rtt.is_none() {
+        (None, "Russian hosts do not answer: no network, or everything is blocked".to_string())
+    } else if !hosting && more_foreign {
+        (None, format!("{ru}; the hosting checks get no TCP, but Cloudflare/Google do: foreign hosting is filtered, not everything foreign"))
+    } else {
+        (Some(true), format!("{ru}, and foreign addresses accept TCP"))
+    };
+    Check { id: "whitelist", title, ok, detail, locate: None }
+}
+
 /// Runs the full battery against fixed, well-known public targets (not the
 /// user's ostp server) to characterize what the current network path filters
 /// in general. Takes ~10s. Every socket is protected against the VPN tunnel
@@ -874,8 +926,8 @@ pub async fn run_dpi_battery() -> DpiBatteryReport {
     let (path_target_name, path_fallback, _) = FOREIGN_HOSTS[0];
     let path_ip = resolve_v4(path_target_name, path_fallback).await;
     let (
-        sni_blocked,
-        http_host_blocked,
+        (sni_blocked, sni_measured),
+        (http_host_blocked, http_measured),
         unknown_443,
         udp_throttled,
         (dns_hijacked, dns_hijacker_ip),
@@ -883,7 +935,7 @@ pub async fn run_dpi_battery() -> DpiBatteryReport {
         transparent_proxy,
         connect_hijacked,
         dns_servers,
-        (foreign_a, foreign_b),
+        ((foreign_a, foreign_a_tcp), (foreign_b, foreign_b_tcp), more_foreign_tcp, ru_rtt),
         freeze,
         quic,
         path,
@@ -897,7 +949,14 @@ pub async fn run_dpi_battery() -> DpiBatteryReport {
         test_transparent_proxy(),
         test_connect_hijacking(),
         test_system_dns_servers(),
-        async { tokio::join!(check_foreign(FOREIGN_HOSTS[0].0, FOREIGN_HOSTS[0].1, FOREIGN_HOSTS[0].2), check_foreign(FOREIGN_HOSTS[1].0, FOREIGN_HOSTS[1].1, FOREIGN_HOSTS[1].2)) },
+        async {
+            tokio::join!(
+                check_foreign(FOREIGN_HOSTS[0].0, FOREIGN_HOSTS[0].1, FOREIGN_HOSTS[0].2),
+                check_foreign(FOREIGN_HOSTS[1].0, FOREIGN_HOSTS[1].1, FOREIGN_HOSTS[1].2),
+                any_tcp(WHITELIST_FOREIGN),
+                measure_rtt(CROSS_SNI_TARGETS[0].0, CROSS_SNI_TARGETS[0].2),
+            )
+        },
         check_freeze(),
         check_quic(),
         crate::path_probe::path(path_ip, 24),
@@ -906,7 +965,17 @@ pub async fn run_dpi_battery() -> DpiBatteryReport {
     crate::path_probe::annotate_owners(&mut path).await;
     let path_summary = crate::path_probe::path_summary(&path);
     let random_payload_blocked = unknown_443.ok == Some(false);
-    let foreign_filtered = foreign_a.ok == Some(false) || foreign_b.ok == Some(false);
+    // A foreign host that refuses even TCP is the strongest filtering there is,
+    // not an inconclusive result.
+    let foreign_filtered = foreign_a.ok == Some(false) || foreign_b.ok == Some(false) || !foreign_a_tcp || !foreign_b_tcp;
+    let whitelist = !foreign_a_tcp && !foreign_b_tcp && !more_foreign_tcp && ru_rtt.is_some();
+    let mut unmeasured = Vec::new();
+    if !sni_measured {
+        unmeasured.push("sni".to_string());
+    }
+    if !http_measured {
+        unmeasured.push("http_host".to_string());
+    }
     let frozen = freeze.ok == Some(false);
     let quic_blocked = quic.ok == Some(false);
 
@@ -934,11 +1003,13 @@ pub async fn run_dpi_battery() -> DpiBatteryReport {
     if foreign_filtered { score += 0.25; }
     if frozen { score += 0.25; }
     if quic_blocked { score += 0.10; }
+    if whitelist { score = 1.0; }
 
     let mut checks = vec![unknown_443, foreign_a, foreign_b, freeze, quic];
     if let Some(c) = sni_position {
         checks.insert(0, c);
     }
+    checks.insert(0, whitelist_check(whitelist, ru_rtt, more_foreign_tcp, foreign_a_tcp || foreign_b_tcp));
 
     DpiBatteryReport {
         rst_injection_detected: rst_injection,
@@ -955,9 +1026,28 @@ pub async fn run_dpi_battery() -> DpiBatteryReport {
         connect_hijacked,
         dns_servers,
         dpi_score: score.min(1.0),
+        whitelist,
+        unmeasured,
         checks,
         path_target: format!("{path_target_name} ({path_ip})"),
         path,
         path_summary,
+    }
+}
+
+#[cfg(test)]
+mod whitelist_tests {
+    use super::whitelist_check;
+
+    #[test]
+    fn allowlist_is_a_failure_not_inconclusive() {
+        let c = whitelist_check(true, Some(30), false, false);
+        assert_eq!(c.ok, Some(false));
+        assert!(c.detail.contains("allowlisted"));
+        // Hosting blocked but Cloudflare/Google reachable: not an allowlist.
+        assert_eq!(whitelist_check(false, Some(30), true, false).ok, None);
+        assert_eq!(whitelist_check(false, Some(30), true, true).ok, Some(true));
+        // Nothing answers at all: no verdict.
+        assert_eq!(whitelist_check(false, None, false, false).ok, None);
     }
 }
