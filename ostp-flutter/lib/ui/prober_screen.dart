@@ -335,6 +335,9 @@ class _ProberScreenState extends State<ProberScreen> {
     }).toList();
   }
 
+  /// Whether the prober listed test [id] as not measured.
+  bool _unmeasured(String id) => (_dpiReport?['unmeasured'] as List<dynamic>? ?? []).contains(id);
+
   /// [measured] false: the test had nothing to compare against, so it says
   /// nothing either way (grey, not a green "clean").
   Widget _dpiFindingRow(String label, bool triggered, String verdict, String method, {bool measured = true}) {
@@ -382,13 +385,12 @@ class _ProberScreenState extends State<ProberScreen> {
           ),
           const SizedBox(height: 6),
           const Text(
-            'Differential tests against fixed public hosts (not your server) — the same '
-            'checks the standalone ostp-prober desktop tool runs: SNI/HTTP-Host filtering, '
-            'DNS hijack/injection, CONNECT hijacking, RST injection, UDP throttling. Tells '
-            'you whether the network filters in general, independent of whether your own '
-            'server works. Also: foreign hosting, the TLS freeze, QUIC, and the path hop by hop '
-            'with who owns each hop. A censor that resets is placed by TTL. Takes 10–30 seconds; '
-            'safe to run while connected (the probes go around the tunnel).',
+            'Differential tests against fixed public hosts (not your server): allowlists, '
+            'foreign hosting, the TLS freeze, QUIC, SNI/HTTP-Host filtering, DNS hijack/injection, '
+            'injected block pages and forged resets, and the path hop by hop with who owns each '
+            'hop. A test with nothing to compare against says "not measured" rather than "clean". '
+            'Ends with a verdict and what to use with OSTP. Takes 10–30 seconds; safe to run while '
+            'connected (the probes go around the tunnel).',
             style: TextStyle(fontSize: 12, color: Colors.white54),
           ),
           const SizedBox(height: 12),
@@ -406,19 +408,25 @@ class _ProberScreenState extends State<ProberScreen> {
           if (_dpiReport != null) ...[
             const SizedBox(height: 16),
             Builder(builder: (context) {
+              // The verdict and advice come from the prober: the level of the
+              // worst finding, and what to do about it with OSTP.
               final report = _dpiReport!;
               final score = ((report['dpi_score'] as num?) ?? 0).toDouble();
-              final pct = (score * 100).round();
-              final color = pct >= 60 ? Colors.redAccent : (pct >= 25 ? Colors.orangeAccent : Colors.greenAccent);
-              if (report['whitelist'] == true) {
-                return const Text(
-                  'Allowlist mode: only allowlisted addresses are reachable (100%)',
-                  style: TextStyle(color: Colors.redAccent, fontSize: 14, fontWeight: FontWeight.bold),
-                );
-              }
-              return Text(
-                'Filtering score: $pct% ${pct >= 60 ? '(heavy)' : (pct >= 25 ? '(moderate)' : '(little)')}',
-                style: TextStyle(color: color, fontSize: 14, fontWeight: FontWeight.bold),
+              final color = score >= 0.6 ? Colors.redAccent : (score > 0 ? Colors.orangeAccent : Colors.greenAccent);
+              final advice = (report['advice'] as List<dynamic>? ?? []).map((a) => a.toString()).toList();
+              return Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    '${report['verdict'] ?? 'No filtering found'}',
+                    style: TextStyle(color: color, fontSize: 14, fontWeight: FontWeight.bold),
+                  ),
+                  for (final a in advice)
+                    Padding(
+                      padding: const EdgeInsets.only(top: 4),
+                      child: Text('• $a', style: const TextStyle(fontSize: 12, color: Colors.white70)),
+                    ),
+                ],
               );
             }),
             const SizedBox(height: 12),
@@ -436,21 +444,25 @@ class _ProberScreenState extends State<ProberScreen> {
                 _dpiReport!['dns_hijacked'] == true
                     ? 'intercepted, answered by ${_dpiReport!['dns_hijacker_ip'] ?? '?'}'
                     : 'clean',
-                'query to 8.8.8.8:53 — checking who actually answered'),
+                'query to 8.8.8.8:53 — checking who actually answered',
+                measured: !_unmeasured('dns_hijack')),
             _dpiFindingRow(
                 'DNS injection',
                 _dpiReport!['dns_injected'] == true,
                 (_dpiReport!['dns_injected'] == true ? _dpiReport!['dns_injection_msg']?.toString() : null) ?? 'clean',
                 'blocked-domain query to a non-DNS host: any answer is a forged one'),
-            _dpiFindingRow('CONNECT hijack', _dpiReport!['connect_hijacked'] == true,
+            _dpiFindingRow('Block page injection', _dpiReport!['connect_hijacked'] == true,
                 _dpiReport!['connect_hijacked'] == true ? 'block page injected' : 'clean',
-                'CONNECT to a blocked domain — looking for an injected 403/451'),
+                'CONNECT to a blocked and to a clean name: a 403/451 or registry page only for the blocked one',
+                measured: !_unmeasured('connect')),
             _dpiFindingRow('Transparent proxy', _dpiReport!['transparent_proxy_detected'] == true,
                 _dpiReport!['transparent_proxy_detected'] == true ? 'detected' : 'clean',
-                'CONNECT to a clean host intercepted by a proxy'),
-            _dpiFindingRow('RST injection', _dpiReport!['rst_injection_detected'] == true,
+                'a web server refuses CONNECT; something agreeing (200) or asking for credentials (407) is a proxy',
+                measured: !_unmeasured('proxy')),
+            _dpiFindingRow('Forged resets', _dpiReport!['rst_injection_detected'] == true,
                 _dpiReport!['rst_injection_detected'] == true ? 'middlebox on path' : 'not seen',
-                'RST on a closed port arrived faster than RTT — timing heuristic'),
+                'a blocked name reset faster than the server could, or a hop before the server resetting',
+                measured: !_unmeasured('rst')),
             ...((_dpiReport!['checks'] as List<dynamic>? ?? []).map((raw) {
               final c = raw as Map<String, dynamic>;
               final ok = c['ok'];
@@ -477,9 +489,6 @@ class _ProberScreenState extends State<ProberScreen> {
                 ),
               );
             })),
-            _dpiFindingRow('UDP throttling', _dpiReport!['udp_throttled'] == true,
-                _dpiReport!['udp_throttled'] == true ? 'abnormal latency spread' : 'not seen',
-                'UDP/53 RTT variance — heuristic, can false-positive'),
             if (_dpiReport!['sni_blocked'] == true)
               _dpiFindingRow('Split-TLS bypass', _dpiReport!['vulnerable_to_fragmentation'] != true,
                   _dpiReport!['vulnerable_to_fragmentation'] == true ? 'works — DPI does not reassemble' : 'did not help',

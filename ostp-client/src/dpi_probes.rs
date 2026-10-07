@@ -52,15 +52,51 @@ async fn protected_udp_socket(v6: bool) -> std::io::Result<UdpSocket> {
 
 // ── Probe primitives ─────────────────────────────────────────────────────────
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProbeOutcome {
+    /// The server answered the request.
     ServerResponded,
+    /// Closed or reset sooner than half the RTT after the request went out:
+    /// faster than the server could have, so something on the path did it.
     FastReset,
+    /// Closed without an answer, but no sooner than the server itself could.
     SlowClose,
+    /// No answer and no close within the window.
     Dropped,
+    /// No TCP connection at all. Nothing was sent, so this says nothing
+    /// about what is in the request (SNI, Host).
+    Unreachable,
 }
 
 fn is_blocked(outcome: &ProbeOutcome) -> bool {
     matches!(outcome, ProbeOutcome::FastReset | ProbeOutcome::Dropped)
+}
+
+/// Sends `request` on a new connection to `addr` and classifies what comes
+/// back. The clock starts when the request is sent: started before the
+/// connect, it counted the handshake too, and a reset injected right after
+/// the request never looked faster than the RTT.
+async fn probe_request(addr: SocketAddr, request: &[u8], rtt: u64) -> ProbeOutcome {
+    let timeout = Duration::from_millis((rtt * 5).max(2000));
+    let Ok(mut stream) = protected_tcp_connect(addr, timeout).await else {
+        return ProbeOutcome::Unreachable;
+    };
+    let sent = Instant::now();
+    if stream.write_all(request).await.is_err() {
+        return ProbeOutcome::FastReset;
+    }
+    let mut buf = [0u8; 128];
+    match tokio::time::timeout(timeout, stream.read(&mut buf)).await {
+        Ok(Ok(n)) if n > 0 => ProbeOutcome::ServerResponded,
+        Ok(Ok(_)) | Ok(Err(_)) => {
+            if (sent.elapsed().as_millis() as u64) < rtt / 2 {
+                ProbeOutcome::FastReset
+            } else {
+                ProbeOutcome::SlowClose
+            }
+        }
+        Err(_) => ProbeOutcome::Dropped,
+    }
 }
 
 async fn measure_rtt(ip: &str, port: u16) -> Option<u64> {
@@ -81,54 +117,48 @@ async fn measure_rtt(ip: &str, port: u16) -> Option<u64> {
 }
 
 async fn probe_tls(ip: &str, port: u16, sni: &str, rtt: u64) -> ProbeOutcome {
-    let timeout_ms = (rtt * 5).max(2000);
-    let Ok(addr) = format!("{ip}:{port}").parse::<SocketAddr>() else { return ProbeOutcome::Dropped };
-    let t = Instant::now();
-
-    let mut stream = match protected_tcp_connect(addr, Duration::from_millis(timeout_ms)).await {
-        Ok(s) => s,
-        Err(_) => return ProbeOutcome::FastReset,
-    };
-
-    let hello = build_tls_client_hello(sni);
-    if stream.write_all(&hello).await.is_err() {
-        return ProbeOutcome::FastReset;
-    }
-
-    let mut buf = [0u8; 128];
-    match tokio::time::timeout(Duration::from_millis(timeout_ms), stream.read(&mut buf)).await {
-        Ok(Ok(n)) if n > 0 => ProbeOutcome::ServerResponded,
-        Ok(Ok(0)) | Ok(Err(_)) => {
-            let elapsed = t.elapsed().as_millis() as u64;
-            if elapsed < rtt / 2 { ProbeOutcome::FastReset } else { ProbeOutcome::SlowClose }
-        }
-        _ => ProbeOutcome::Dropped,
-    }
+    let Ok(addr) = format!("{ip}:{port}").parse::<SocketAddr>() else { return ProbeOutcome::Unreachable };
+    probe_request(addr, &build_tls_client_hello(sni), rtt).await
 }
 
 async fn probe_http(ip: &str, host: &str, rtt: u64) -> ProbeOutcome {
-    let timeout_ms = (rtt * 5).max(2000);
-    let Ok(addr) = format!("{ip}:80").parse::<SocketAddr>() else { return ProbeOutcome::Dropped };
-    let t = Instant::now();
-
-    let mut stream = match protected_tcp_connect(addr, Duration::from_millis(timeout_ms)).await {
-        Ok(s) => s,
-        Err(_) => return ProbeOutcome::FastReset,
-    };
-
+    let Ok(addr) = format!("{ip}:80").parse::<SocketAddr>() else { return ProbeOutcome::Unreachable };
     let req = format!("GET / HTTP/1.1\r\nHost: {host}\r\nUser-Agent: curl/8.0\r\nConnection: close\r\n\r\n");
-    if stream.write_all(req.as_bytes()).await.is_err() {
-        return ProbeOutcome::FastReset;
+    probe_request(addr, req.as_bytes(), rtt).await
+}
+
+/// What a differential test (blocked names against a clean baseline on the
+/// same IP) saw.
+#[derive(Debug, Default, Clone, Copy)]
+struct Differential {
+    /// Comparisons made (the baseline answered, the blocked name was sent).
+    votes: usize,
+    /// Of them, blocked (a fast reset or a drop).
+    blocked: usize,
+    /// Of the blocked, by a reset faster than the server could send one.
+    forged_resets: usize,
+}
+
+impl Differential {
+    fn measured(&self, min_votes: usize) -> bool {
+        self.votes >= min_votes
     }
 
-    let mut buf = [0u8; 128];
-    match tokio::time::timeout(Duration::from_millis(timeout_ms), stream.read(&mut buf)).await {
-        Ok(Ok(n)) if n > 0 => ProbeOutcome::ServerResponded,
-        Ok(Ok(0)) | Ok(Err(_)) => {
-            let elapsed = t.elapsed().as_millis() as u64;
-            if elapsed < rtt / 2 { ProbeOutcome::FastReset } else { ProbeOutcome::SlowClose }
+    fn is_blocked(&self, min_votes: usize) -> bool {
+        self.measured(min_votes) && self.blocked * 2 > self.votes
+    }
+
+    fn add(&mut self, outcome: ProbeOutcome) {
+        if outcome == ProbeOutcome::Unreachable {
+            return;
         }
-        _ => ProbeOutcome::Dropped,
+        self.votes += 1;
+        if is_blocked(&outcome) {
+            self.blocked += 1;
+        }
+        if outcome == ProbeOutcome::FastReset {
+            self.forged_resets += 1;
+        }
     }
 }
 
@@ -155,75 +185,41 @@ fn looks_like_block_page(resp: &str) -> bool {
 // blocked SNIs to the SAME IP. Without DPI the server itself replies with a
 // TLS alert (ServerResponded); with DPI a RST/drop arrives faster than RTT
 // would allow.
-/// (blocked, measured): `measured` is false when no clean baseline answered,
-/// so nothing was compared and "not blocked" would be a guess.
-async fn test_differential_sni() -> (bool, bool) {
-    let mut votes_dpi = 0usize;
-    let mut votes_total = 0usize;
-
+/// Blocked SNIs against the same IP's own name. Counts only when the
+/// baseline answered, so "not blocked" is never a guess.
+async fn test_differential_sni() -> Differential {
+    let mut d = Differential::default();
     for &(ip, clean_sni, port) in CROSS_SNI_TARGETS {
         let rtt = match measure_rtt(ip, port).await {
             Some(r) if r < 1000 => r,
             _ => continue,
         };
-        let baseline = probe_tls(ip, port, clean_sni, rtt).await;
-        if !matches!(baseline, ProbeOutcome::ServerResponded) {
+        if probe_tls(ip, port, clean_sni, rtt).await != ProbeOutcome::ServerResponded {
             continue;
         }
         for &sni in BLOCKED_SNIS {
-            let result = probe_tls(ip, port, sni, rtt).await;
-            votes_total += 1;
-            if is_blocked(&result) {
-                votes_dpi += 1;
-            }
+            d.add(probe_tls(ip, port, sni, rtt).await);
         }
     }
-
-    (votes_total >= 2 && votes_dpi * 2 > votes_total, votes_total >= 2)
+    d
 }
 
-async fn test_differential_http_host() -> (bool, bool) {
+async fn test_differential_http_host() -> Differential {
     let http_targets: &[(&str, &str)] = &[("87.240.132.78", "vk.com"), ("77.88.55.242", "ya.ru")];
-
-    let mut votes_dpi = 0usize;
-    let mut votes_total = 0usize;
-
+    let mut d = Differential::default();
     for &(ip, clean_host) in http_targets {
         let rtt = match measure_rtt(ip, 80).await {
             Some(r) if r < 1000 => r,
             _ => continue,
         };
-        let baseline = probe_http(ip, clean_host, rtt).await;
-        if !matches!(baseline, ProbeOutcome::ServerResponded) {
+        if probe_http(ip, clean_host, rtt).await != ProbeOutcome::ServerResponded {
             continue;
         }
         for &host in BLOCKED_DOMAINS.iter().take(2) {
-            let result = probe_http(ip, host, rtt).await;
-            votes_total += 1;
-            if is_blocked(&result) {
-                votes_dpi += 1;
-            }
+            d.add(probe_http(ip, host, rtt).await);
         }
     }
-    (votes_total >= 1 && votes_dpi * 2 > votes_total, votes_total >= 1)
-}
-
-// ── Test: RST injection ─────────────────────────────────────────────────────
-// A closed port on a clean IP: a real RST from the server arrives ~RTT
-// later; a RST forged by an on-path DPI box arrives faster (it's closer).
-async fn test_rst_injection() -> bool {
-    let (ip, _, port) = CROSS_SNI_TARGETS[0];
-    let rtt = match measure_rtt(ip, port).await {
-        Some(r) => r,
-        None => return false,
-    };
-
-    let Ok(addr) = format!("{ip}:9999").parse::<SocketAddr>() else { return false };
-    let t = Instant::now();
-    let _ = protected_tcp_connect(addr, Duration::from_millis(rtt * 6)).await;
-    let elapsed = t.elapsed().as_millis() as u64;
-
-    elapsed > 0 && elapsed < rtt * 2 / 5
+    d
 }
 
 // ── Test: TCP fragmentation bypass (GoodbyeDPI-style) ───────────────────────
@@ -521,80 +517,71 @@ async fn check_quic() -> Check {
     }
 }
 
-// ── Test: transparent proxy ─────────────────────────────────────────────────
-async fn test_transparent_proxy() -> bool {
-    let (ip, clean_host, _) = CROSS_SNI_TARGETS[0];
-    let rtt = match measure_rtt(ip, 80).await {
-        Some(r) => r,
-        None => return false,
-    };
-    let Ok(addr) = format!("{ip}:80").parse::<SocketAddr>() else { return false };
-    let mut stream = match protected_tcp_connect(addr, Duration::from_millis(rtt * 4 + 500)).await {
-        Ok(s) => s,
-        Err(_) => return false,
-    };
-    let req = format!("CONNECT {clean_host}:443 HTTP/1.1\r\nHost: {clean_host}:443\r\nProxy-Connection: keep-alive\r\n\r\n");
-    if stream.write_all(req.as_bytes()).await.is_err() {
-        return false;
-    }
-    let mut buf = [0u8; 256];
-    match tokio::time::timeout(Duration::from_millis(rtt * 4 + 500), stream.read(&mut buf)).await {
-        Ok(Ok(n)) if n > 0 => {
-            let resp = String::from_utf8_lossy(&buf[..n]);
-            let first = resp.lines().next().unwrap_or("");
-            matches!(http_status(first), Some(200) | Some(407)) || resp.lines().any(|l| l.to_ascii_lowercase().starts_with("via:"))
-        }
-        _ => false,
+// ── CONNECT to a web server: transparent proxy, hijacked block pages ────────
+
+/// The first bytes a web server (vk.com on port 80) sends back to an HTTP
+/// CONNECT for `target`; `None` if nothing came back.
+async fn connect_answer(target: &str) -> Option<String> {
+    let (ip, _, _) = CROSS_SNI_TARGETS[0];
+    let rtt = measure_rtt(ip, 80).await?;
+    let addr: SocketAddr = format!("{ip}:80").parse().ok()?;
+    let mut stream = protected_tcp_connect(addr, Duration::from_millis(rtt * 4 + 500)).await.ok()?;
+    let req = format!("CONNECT {target}:443 HTTP/1.1\r\nHost: {target}:443\r\nProxy-Connection: keep-alive\r\n\r\n");
+    stream.write_all(req.as_bytes()).await.ok()?;
+    let mut buf = [0u8; 512];
+    match tokio::time::timeout(Duration::from_millis(rtt * 4 + 1000), stream.read(&mut buf)).await {
+        Ok(Ok(n)) if n > 0 => Some(String::from_utf8_lossy(&buf[..n]).into_owned()),
+        _ => None,
     }
 }
 
-async fn test_connect_hijacking() -> bool {
-    let (ip, _, _) = CROSS_SNI_TARGETS[0];
-    let rtt = match measure_rtt(ip, 80).await {
-        Some(r) => r,
-        None => return false,
-    };
-    let Ok(addr) = format!("{ip}:80").parse::<SocketAddr>() else { return false };
-    let mut stream = match protected_tcp_connect(addr, Duration::from_millis(rtt * 4 + 500)).await {
-        Ok(s) => s,
-        Err(_) => return false,
-    };
-    let req = "CONNECT instagram.com:443 HTTP/1.1\r\nHost: instagram.com:443\r\nProxy-Connection: keep-alive\r\n\r\n";
-    if stream.write_all(req.as_bytes()).await.is_err() {
-        return false;
-    }
-    let mut buf = [0u8; 512];
-    match tokio::time::timeout(Duration::from_millis(rtt * 4 + 1000), stream.read(&mut buf)).await {
-        Ok(Ok(n)) if n > 0 => {
-            let resp = String::from_utf8_lossy(&buf[..n]);
-            let first = resp.lines().next().unwrap_or("");
-            matches!(http_status(first), Some(403) | Some(451)) || looks_like_block_page(&resp)
-        }
-        _ => false,
-    }
+/// A web server refuses CONNECT (400 or 405). Agreeing to it (200) or asking
+/// for proxy credentials (407) is a proxy in between. `None`: no answer.
+/// (A `Via` header used to count as well; a site's own CDN adds one.)
+async fn test_transparent_proxy() -> Option<bool> {
+    let (_, clean_host, _) = CROSS_SNI_TARGETS[0];
+    let resp = connect_answer(clean_host).await?;
+    Some(matches!(http_status(resp.lines().next().unwrap_or("")), Some(200) | Some(407)))
+}
+
+/// A block page in place of the server's answer: CONNECT to a blocked name
+/// gets 403/451 or a page with registry wording while the same CONNECT to a
+/// clean name does not. Compared against that baseline, because the server
+/// may refuse every CONNECT with a 403 of its own. `None`: no baseline.
+async fn test_connect_hijacking() -> Option<bool> {
+    let (_, clean_host, _) = CROSS_SNI_TARGETS[0];
+    let baseline = connect_answer(clean_host).await?;
+    let blocked = connect_answer(BLOCKED_DOMAINS[0]).await?;
+    Some(connect_hijacked(&baseline, &blocked))
+}
+
+fn connect_hijacked(baseline: &str, blocked: &str) -> bool {
+    let status = |r: &str| http_status(r.lines().next().unwrap_or(""));
+    let block_page = looks_like_block_page(blocked) && !looks_like_block_page(baseline);
+    let block_status = matches!(status(blocked), Some(403) | Some(451)) && status(blocked) != status(baseline);
+    block_page || block_status
 }
 
 // ── DNS hijack / injection ──────────────────────────────────────────────────
 
-async fn test_dns_hijacking_detailed() -> (bool, Option<String>) {
-    let socket = match protected_udp_socket(false).await {
-        Ok(s) => s,
-        Err(_) => return (false, None),
-    };
+/// A query to 8.8.8.8 answered from another address. `None` in the first
+/// place: no answer at all, so nothing was learned. (An interceptor that
+/// answers from 8.8.8.8's own address is not seen here; the injection test
+/// below catches that kind.)
+async fn test_dns_hijacking_detailed() -> (Option<bool>, Option<String>) {
+    let Ok(socket) = protected_udp_socket(false).await else { return (None, None) };
     let target: SocketAddr = "8.8.8.8:53".parse().unwrap();
-    let query = build_dns_query("google.com");
-    if socket.send_to(&query, target).await.is_err() {
-        return (false, None);
+    if socket.send_to(&build_dns_query("google.com"), target).await.is_err() {
+        return (None, None);
     }
     let mut buf = [0u8; 512];
-    match tokio::time::timeout(Duration::from_millis(2000), socket.recv_from(&mut buf)).await {
+    match tokio::time::timeout(Duration::from_millis(3000), socket.recv_from(&mut buf)).await {
         Ok(Ok((_, from))) => {
             let from_ip = from.ip().to_string();
             let hijacked = from_ip != "8.8.8.8";
-            let hijacker = if hijacked { Some(from_ip) } else { None };
-            (hijacked, hijacker)
+            (Some(hijacked), hijacked.then_some(from_ip))
         }
-        _ => (false, None),
+        _ => (None, None),
     }
 }
 
@@ -641,7 +628,7 @@ async fn dns_race_two_answers(resolver_ip: &str, domain: &str) -> Option<String>
     if seen.len() >= 2 {
         let fmt = |a: &[u8; 4]| format!("{}.{}.{}.{}", a[0], a[1], a[2], a[3]);
         Some(format!(
-            "две разные A-записи в гонке ({}, {}) — поддельный ответ обогнал настоящий",
+            "two different A records for one query ({}, {}): a forged answer raced the real one",
             fmt(&seen[0]),
             fmt(&seen[1])
         ))
@@ -659,8 +646,8 @@ async fn test_dns_injection() -> (bool, Option<String>) {
     let dead_host = CROSS_SNI_TARGETS[0].0;
     for domain in BLOCKED_DOMAINS.iter().take(2) {
         if let Some((from_ip, a_rec)) = dns_query_collect(dead_host, domain).await {
-            let a = a_rec.map(|i| format!("{}.{}.{}.{}", i[0], i[1], i[2], i[3])).unwrap_or_else(|| "без A-записи".into());
-            return (true, Some(format!("{domain}: поддельный ответ на :53 от {from_ip} (вернул {a}); хост не DNS-сервер")));
+            let a = a_rec.map(|i| format!("{}.{}.{}.{}", i[0], i[1], i[2], i[3])).unwrap_or_else(|| "no A record".into());
+            return (true, Some(format!("{domain}: an answer came from {from_ip} ({a}) though that host runs no DNS server: forged on the way")));
         }
     }
     for domain in BLOCKED_DOMAINS.iter().take(2) {
@@ -669,37 +656,6 @@ async fn test_dns_injection() -> (bool, Option<String>) {
         }
     }
     (false, None)
-}
-
-// ── UDP throttling ───────────────────────────────────────────────────────────
-async fn test_udp_throttle() -> bool {
-    let socket = match protected_udp_socket(false).await {
-        Ok(s) => s,
-        Err(_) => return false,
-    };
-    let target: SocketAddr = "8.8.8.8:53".parse().unwrap();
-    let query = build_dns_query("vk.com");
-    let mut latencies: Vec<u64> = Vec::with_capacity(10);
-
-    for _ in 0..10 {
-        let t = Instant::now();
-        let _ = socket.send_to(&query, target).await;
-        let mut buf = [0u8; 512];
-        if tokio::time::timeout(Duration::from_millis(600), socket.recv_from(&mut buf)).await.is_ok() {
-            latencies.push(t.elapsed().as_millis() as u64);
-        }
-        tokio::time::sleep(Duration::from_millis(60)).await;
-    }
-
-    if latencies.len() < 5 {
-        return false;
-    }
-    let avg = latencies.iter().sum::<u64>() / latencies.len() as u64;
-    let max = *latencies.iter().max().unwrap_or(&0);
-    let variance = latencies.iter().map(|&x| { let d = x as i64 - avg as i64; (d * d) as u64 }).sum::<u64>() / latencies.len() as u64;
-    let std_dev = (variance as f64).sqrt() as u64;
-
-    (max > 5 * avg && avg > 10) || (std_dev > 2 * avg && avg > 15)
 }
 
 // ── DNS server reachability/interception table ──────────────────────────────
@@ -853,12 +809,13 @@ fn build_tls_client_hello(sni: &str) -> Vec<u8> {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct DpiBatteryReport {
+    /// A reset arrived faster than the server could send one, after a
+    /// blocked name, or a hop before the server reset the connection.
     pub rst_injection_detected: bool,
     pub http_host_blocked: bool,
     pub sni_blocked: bool,
     pub vulnerable_to_fragmentation: bool,
     pub random_payload_blocked: bool,
-    pub udp_throttled: bool,
     pub dns_hijacked: bool,
     pub dns_hijacker_ip: Option<String>,
     pub dns_injected: bool,
@@ -866,13 +823,19 @@ pub struct DpiBatteryReport {
     pub transparent_proxy_detected: bool,
     pub connect_hijacked: bool,
     pub dns_servers: Vec<DnsServerStatus>,
+    /// The most severe finding, 0 (none) to 1 (allowlist); see `assess`.
     pub dpi_score: f32,
+    /// One line: the most severe finding.
+    pub verdict: String,
+    /// What to do about it with OSTP, most important first.
+    pub advice: Vec<String>,
     /// Only allowlisted (mostly Russian) addresses are reachable: foreign
     /// hosts refuse even a TCP connection while Russian ones answer. Every
     /// content test below is moot then, and the score is 100%.
     pub whitelist: bool,
-    /// Tests that could not compare anything (no clean baseline answered):
-    /// "sni", "http_host". Their `false` means "not measured", not "clean".
+    /// Tests that could not compare anything: "sni", "http_host", "rst",
+    /// "dns_hijack", "proxy", "connect". Their `false` means "not measured",
+    /// not "clean".
     pub unmeasured: Vec<String>,
     /// Checks with a verdict, detail and, where measurable, the censor's hop.
     pub checks: Vec<Check>,
@@ -918,6 +881,80 @@ fn whitelist_check(whitelist: bool, ru_rtt: Option<u64>, more_foreign: bool, hos
     Check { id: "whitelist", title, ok, detail, locate: None }
 }
 
+/// What the battery found, for `assess`.
+#[derive(Debug, Default, Clone, Copy)]
+struct Findings {
+    whitelist: bool,
+    /// A foreign hosting address refuses even TCP (and it is not an allowlist).
+    hosting_unreachable: bool,
+    /// Random bytes on 443 to a clean Russian host are dropped or cut on the way.
+    random_dropped: bool,
+    /// TLS or HTTP to foreign hosting is filtered while TCP connects.
+    foreign_filtered: bool,
+    /// TLS from abroad stalls or is cut (the ~16 KB freeze).
+    frozen: bool,
+    sni_or_host: bool,
+    dns_tampered: bool,
+    quic_blocked: bool,
+    connect_hijacked: bool,
+    transparent_proxy: bool,
+}
+
+/// Severity of the worst finding (0 none .. 1 allowlist), a one-line verdict
+/// and advice for OSTP.
+///
+/// The score is the level of the most severe finding, not a sum: the old
+/// sum of hand-picked weights (with a "below 0.4" special case) gave numbers
+/// nobody could interpret, and two harmless findings outweighed a serious one.
+/// Levels, by what they do to a VPN:
+/// 1.0 allowlist · 0.9 foreign hosting unreachable · 0.8 unknown data dropped
+/// · 0.6 TLS/HTTP abroad filtered or frozen · 0.5 blocking by site name
+/// · 0.3 DNS tampering, QUIC blocked, CONNECT hijacked · 0.2 transparent proxy.
+fn assess(f: &Findings) -> (f32, String, Vec<String>) {
+    let levels: [(bool, f32, &str); 10] = [
+        (f.whitelist, 1.0, "Allowlist: only allowlisted (mostly Russian) addresses are reachable"),
+        (f.hosting_unreachable, 0.9, "Foreign hosting is blocked by address: no TCP connection opens"),
+        (f.random_dropped, 0.8, "Unrecognised data is dropped on the way"),
+        (f.foreign_filtered, 0.6, "TLS and HTTP to foreign hosting are filtered"),
+        (f.frozen, 0.6, "TLS from abroad stalls after the first kilobytes"),
+        (f.sni_or_host, 0.5, "Sites are blocked by name (SNI or HTTP Host)"),
+        (f.dns_tampered, 0.3, "DNS answers are forged or intercepted"),
+        (f.quic_blocked, 0.3, "QUIC (UDP 443) is blocked"),
+        (f.connect_hijacked, 0.3, "Block pages are injected in place of real answers"),
+        (f.transparent_proxy, 0.2, "A transparent proxy sits on the path"),
+    ];
+    let (score, verdict) = levels
+        .iter()
+        .filter(|(hit, _, _)| *hit)
+        .map(|(_, level, text)| (*level, text.to_string()))
+        .fold((0.0f32, "No filtering found".to_string()), |best, cur| if cur.0 > best.0 { cur } else { best });
+
+    let mut advice = Vec::new();
+    if f.whitelist {
+        advice.push("A server abroad cannot be reached directly from this network. Put a relay on an allowlisted address (a Russian VPS: `ostp init relay`) in front of it.".into());
+    } else if f.hosting_unreachable {
+        advice.push("A server at a blocked hoster is unreachable from here. Use a hoster this network reaches, or a relay on an address it allows.".into());
+    }
+    if f.random_dropped && !f.whitelist {
+        advice.push("OSTP over UDP and plain TCP (UoT) look like random data, which this network drops: use the TLS transport with your domain.".into());
+    } else if (f.foreign_filtered || f.frozen) && !f.whitelist && !f.hosting_unreachable {
+        advice.push("Recognised protocols to foreign servers are filtered while random data passes: OSTP over UDP or UoT is the carrier to use; TLS may stall here.".into());
+    }
+    if f.quic_blocked && !f.whitelist {
+        advice.push("UDP 443 is blocked: if OSTP over UDP does not connect, switch to UoT or TLS.".into());
+    }
+    if f.sni_or_host && advice.is_empty() {
+        advice.push("Blocking by site name does not affect OSTP: it never sends the names of the sites you open.".into());
+    }
+    if f.dns_tampered {
+        advice.push("Keep DNS inside the tunnel (the default) so forged answers do not reach your apps.".into());
+    }
+    if advice.is_empty() {
+        advice.push("Nothing found here gets in OSTP's way. Whether your own server is reachable is what the server check shows.".into());
+    }
+    (score, verdict, advice)
+}
+
 /// Runs the full battery against fixed, well-known public targets (not the
 /// user's ostp server) to characterize what the current network path filters
 /// in general. Takes ~10s. Every socket is protected against the VPN tunnel
@@ -926,10 +963,9 @@ pub async fn run_dpi_battery() -> DpiBatteryReport {
     let (path_target_name, path_fallback, _) = FOREIGN_HOSTS[0];
     let path_ip = resolve_v4(path_target_name, path_fallback).await;
     let (
-        (sni_blocked, sni_measured),
-        (http_host_blocked, http_measured),
+        sni,
+        http,
         unknown_443,
-        udp_throttled,
         (dns_hijacked, dns_hijacker_ip),
         (dns_injected, dns_injection_msg),
         transparent_proxy,
@@ -943,7 +979,6 @@ pub async fn run_dpi_battery() -> DpiBatteryReport {
         test_differential_sni(),
         test_differential_http_host(),
         check_unknown_443(),
-        test_udp_throttle(),
         test_dns_hijacking_detailed(),
         test_dns_injection(),
         test_transparent_proxy(),
@@ -964,46 +999,12 @@ pub async fn run_dpi_battery() -> DpiBatteryReport {
     let mut path = path;
     crate::path_probe::annotate_owners(&mut path).await;
     let path_summary = crate::path_probe::path_summary(&path);
-    let random_payload_blocked = unknown_443.ok == Some(false);
-    // A foreign host that refuses even TCP is the strongest filtering there is,
-    // not an inconclusive result.
-    let foreign_filtered = foreign_a.ok == Some(false) || foreign_b.ok == Some(false) || !foreign_a_tcp || !foreign_b_tcp;
+    let sni_blocked = sni.is_blocked(2);
+    let http_host_blocked = http.is_blocked(1);
     let whitelist = !foreign_a_tcp && !foreign_b_tcp && !more_foreign_tcp && ru_rtt.is_some();
-    let mut unmeasured = Vec::new();
-    if !sni_measured {
-        unmeasured.push("sni".to_string());
-    }
-    if !http_measured {
-        unmeasured.push("http_host".to_string());
-    }
-    let frozen = freeze.ok == Some(false);
-    let quic_blocked = quic.ok == Some(false);
-
-    let rst_injection = test_rst_injection().await;
 
     let vulnerable_to_fragmentation = if sni_blocked { test_tcp_fragmentation_bypass().await } else { false };
     let sni_position = if sni_blocked { Some(check_sni_position().await) } else { None };
-
-    let mut score: f32 = 0.0;
-    if sni_blocked && http_host_blocked { score += 0.90; }
-    else if sni_blocked { score += 0.75; }
-    else if http_host_blocked { score += 0.65; }
-
-    if dns_hijacked && dns_injected { score += 0.30; }
-    else if dns_hijacked || dns_injected { score += 0.20; }
-
-    if connect_hijacked { score += 0.20; }
-    if transparent_proxy { score += 0.10; }
-
-    if score < 0.4 {
-        if rst_injection { score += 0.35; }
-        if random_payload_blocked { score += 0.15; }
-    }
-    if udp_throttled { score += 0.10; }
-    if foreign_filtered { score += 0.25; }
-    if frozen { score += 0.25; }
-    if quic_blocked { score += 0.10; }
-    if whitelist { score = 1.0; }
 
     let mut checks = vec![unknown_443, foreign_a, foreign_b, freeze, quic];
     if let Some(c) = sni_position {
@@ -1011,21 +1012,61 @@ pub async fn run_dpi_battery() -> DpiBatteryReport {
     }
     checks.insert(0, whitelist_check(whitelist, ru_rtt, more_foreign_tcp, foreign_a_tcp || foreign_b_tcp));
 
+    // Forged resets: a blocked name reset faster than the server could, or a
+    // hop before the server resetting a connection (placed by TTL).
+    let reset_on_path = checks.iter().filter_map(|c| c.locate.as_ref()).any(|l| {
+        l.verdict == "on_path" && matches!(l.reaction, Some(Reaction::Rst) | Some(Reaction::Fin))
+    });
+    let located = checks.iter().any(|c| c.locate.is_some());
+    let rst_injection = reset_on_path || (sni_blocked && sni.forged_resets > 0) || (http_host_blocked && http.forged_resets > 0);
+    let rst_measured = rst_injection || sni.measured(2) || http.measured(1) || located;
+
+    let mut unmeasured = Vec::new();
+    for (id, measured) in [
+        ("sni", sni.measured(2)),
+        ("http_host", http.measured(1)),
+        ("rst", rst_measured),
+        ("dns_hijack", dns_hijacked.is_some()),
+        ("proxy", transparent_proxy.is_some()),
+        ("connect", connect_hijacked.is_some()),
+    ] {
+        if !measured {
+            unmeasured.push(id.to_string());
+        }
+    }
+
+    let check_failed = |id: &str| checks.iter().any(|c| c.id == id && c.ok == Some(false));
+    let findings = Findings {
+        whitelist,
+        hosting_unreachable: !whitelist && (!foreign_a_tcp || !foreign_b_tcp),
+        random_dropped: check_failed("unknown_443"),
+        foreign_filtered: check_failed("foreign"),
+        frozen: check_failed("freeze"),
+        sni_or_host: sni_blocked || http_host_blocked,
+        dns_tampered: dns_hijacked == Some(true) || dns_injected,
+        quic_blocked: check_failed("quic"),
+        connect_hijacked: connect_hijacked == Some(true),
+        transparent_proxy: transparent_proxy == Some(true),
+    };
+    let (score, verdict, advice) = assess(&findings);
+    let random_payload_blocked = findings.random_dropped;
+
     DpiBatteryReport {
         rst_injection_detected: rst_injection,
         http_host_blocked,
         sni_blocked,
         vulnerable_to_fragmentation,
         random_payload_blocked,
-        udp_throttled,
-        dns_hijacked,
+        dns_hijacked: dns_hijacked == Some(true),
         dns_hijacker_ip,
         dns_injected,
         dns_injection_msg,
-        transparent_proxy_detected: transparent_proxy,
-        connect_hijacked,
+        transparent_proxy_detected: findings.transparent_proxy,
+        connect_hijacked: findings.connect_hijacked,
         dns_servers,
-        dpi_score: score.min(1.0),
+        dpi_score: score,
+        verdict,
+        advice,
         whitelist,
         unmeasured,
         checks,
@@ -1049,5 +1090,43 @@ mod whitelist_tests {
         assert_eq!(whitelist_check(false, Some(30), true, true).ok, Some(true));
         // Nothing answers at all: no verdict.
         assert_eq!(whitelist_check(false, None, false, false).ok, None);
+    }
+}
+
+#[cfg(test)]
+mod assess_tests {
+    use super::*;
+
+    #[test]
+    fn the_score_is_the_worst_finding_not_a_sum() {
+        let minor = Findings { dns_tampered: true, quic_blocked: true, transparent_proxy: true, ..Default::default() };
+        assert_eq!(assess(&minor).0, 0.3, "three minor findings stay minor");
+        let serious = Findings { random_dropped: true, dns_tampered: true, ..Default::default() };
+        let (score, verdict, advice) = assess(&serious);
+        assert_eq!(score, 0.8);
+        assert!(verdict.contains("Unrecognised data"));
+        assert!(advice[0].contains("TLS transport"));
+        assert_eq!(assess(&Findings { whitelist: true, ..Default::default() }).0, 1.0);
+    }
+
+    #[test]
+    fn advice_points_to_the_carrier_that_passes() {
+        let (_, _, advice) = assess(&Findings { frozen: true, ..Default::default() });
+        assert!(advice.iter().any(|a| a.contains("UDP or UoT")), "{advice:?}");
+        let (_, _, advice) = assess(&Findings { whitelist: true, ..Default::default() });
+        assert!(advice[0].contains("relay"), "{advice:?}");
+        let (score, verdict, advice) = assess(&Findings::default());
+        assert_eq!(score, 0.0);
+        assert_eq!(verdict, "No filtering found");
+        assert_eq!(advice.len(), 1);
+    }
+
+    #[test]
+    fn a_server_that_refuses_every_connect_is_not_a_hijack() {
+        let refused = "HTTP/1.1 403 Forbidden\r\nServer: nginx\r\n\r\n";
+        assert!(!connect_hijacked(refused, refused));
+        let page = "HTTP/1.1 403 Forbidden\r\n\r\n<html>Доступ ограничен по решению ... eais.rkn.gov.ru</html>";
+        assert!(connect_hijacked(refused, page), "same status, but a registry block page");
+        assert!(connect_hijacked("HTTP/1.1 400 Bad Request\r\n\r\n", "HTTP/1.1 451 Unavailable\r\n\r\n"));
     }
 }

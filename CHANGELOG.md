@@ -10,6 +10,14 @@ Older history is on the [Releases](https://github.com/ospab/ostp/releases) page 
 
 ### Fixed
 - Network prober, DPI test: under an allowlist ("white lists", when only allowlisted addresses are reachable) it showed "10% (clean)". Foreign hosts that refuse even a TCP connection counted as "no result" instead of filtering, and every content test talks to Russian hosts, which an allowlist lets through. The test now recognises an allowlist (Russian hosts answer, Hetzner, OVH, Cloudflare, Google and Quad9 refuse TCP), says so first and scores it 100%; an unreachable foreign hosting counts as filtered. The SNI and HTTP Host tests show "not measured" instead of "clean" when no clean baseline answered.
+- Network prober, DPI test, reworked so that it reports only what it measured:
+  - The SNI and HTTP Host tests started their clock before connecting, so a reset injected right after the request never looked faster than the server and was not counted as a block; a failed connection, before any name was sent, was counted as one.
+  - "RST injection" connected to a closed port that the server silently drops and almost never saw anything; a local firewall made it fire falsely. Forged resets are now taken from the tests that see them: a blocked name reset faster than the server could, or a hop before the server resetting.
+  - "UDP throttling" judged the spread of ten DNS round trips, which one slow Wi-Fi answer was enough to trip. It measured nothing about throttling and is gone.
+  - A CONNECT refused with 403 by the web server itself counted as a hijack; it is now compared with the same request for a clean name. A `Via` header from the site's own CDN no longer counts as a transparent proxy.
+  - No answer from 8.8.8.8 showed "DNS not hijacked"; it is "not measured" now, like the CONNECT and reset tests when they have nothing to compare.
+  - The score was a sum of hand-picked weights; it is now the level of the worst finding, with a one-line verdict and advice on which OSTP carrier to use (a relay under an allowlist, UDP or UoT when TLS abroad is filtered, TLS when unknown data is dropped).
+  - All messages are in English, like the rest of the prober.
 
 ## [0.4.7-beta.8] - 2026-10-07
 

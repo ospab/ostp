@@ -1115,25 +1115,23 @@ async function runDpi() {
     if (!r) throw new Error('the prober needs the desktop app');
     const unmeasured = r.unmeasured || [];
     const line = (bad, text, okText, id) => unmeasured.includes(id)
-      ? `<tr><td><span class="pr-dim">–</span></td><td>${escHtml(okText)} <span class="pr-dim">(not measured: no clean baseline answered)</span></td></tr>`
+      ? `<tr><td><span class="pr-dim">–</span></td><td>${escHtml(okText)} <span class="pr-dim">(not measured: nothing to compare against)</span></td></tr>`
       : `<tr><td>${bad ? '<span class="pr-bad">✕</span>' : '<span class="pr-ok">✓</span>'}</td><td>${escHtml(bad ? text : okText)}</td></tr>`;
-    const score = Math.round((r.dpi_score || 0) * 100) / 100;
-    const verdict = r.whitelist
-      ? '<div class="pr-verdict bad">Allowlist mode: only allowlisted addresses are reachable; foreign servers refuse even TCP.</div>'
-      : score >= 0.5
-      ? `<div class="pr-verdict bad">Heavy filtering (score ${score}).</div>`
-      : score > 0
-        ? `<div class="pr-verdict warn">Some filtering (score ${score}).</div>`
-        : '<div class="pr-verdict ok">No filtering detected.</div>';
+    // The verdict and advice come from the prober: the level of the worst
+    // finding, and what to do about it with OSTP.
+    const score = r.dpi_score || 0;
+    const level = score >= 0.6 ? 'bad' : score > 0 ? 'warn' : 'ok';
+    const advice = (r.advice || []).map(a => `<li>${escHtml(a)}</li>`).join('');
+    const verdict = `<div class="pr-verdict ${level}">${escHtml(r.verdict || 'No filtering found')}.</div>`
+      + (advice ? `<ul class="field-hint" style="margin:6px 0 10px 18px">${advice}</ul>` : '');
     const rows = [
       line(r.sni_blocked, 'TLS by server name (SNI) is blocked', 'TLS server names are not filtered', 'sni'),
       line(r.http_host_blocked, 'HTTP by Host header is blocked', 'HTTP Host headers are not filtered', 'http_host'),
-      line(r.rst_injection_detected, 'Forged TCP resets are injected', 'No forged TCP resets'),
-      line(r.udp_throttled, 'UDP is throttled', 'UDP is not throttled'),
-      line(r.dns_hijacked, `DNS is hijacked${r.dns_hijacker_ip ? ' by ' + r.dns_hijacker_ip : ''}`, 'DNS answers are not hijacked'),
+      line(r.rst_injection_detected, 'Forged TCP resets are injected', 'No forged TCP resets seen', 'rst'),
+      line(r.dns_hijacked, `DNS is hijacked${r.dns_hijacker_ip ? ' by ' + r.dns_hijacker_ip : ''}`, 'DNS answers come from the server asked', 'dns_hijack'),
       line(r.dns_injected, `DNS answers are injected${r.dns_injection_msg ? ': ' + r.dns_injection_msg : ''}`, 'No injected DNS answers'),
-      line(r.transparent_proxy_detected, 'A transparent proxy sits on the path', 'No transparent proxy'),
-      line(r.connect_hijacked, 'Connections are hijacked', 'Connections reach their targets'),
+      line(r.transparent_proxy_detected, 'A transparent proxy sits on the path', 'No transparent proxy', 'proxy'),
+      line(r.connect_hijacked, 'Block pages are injected', 'No injected block pages', 'connect'),
     ].join('');
     const tip = r.vulnerable_to_fragmentation
       ? '<p class="field-hint">The filter misses fragmented handshakes: TCP fragmentation (UoT) helps here.</p>' : '';
