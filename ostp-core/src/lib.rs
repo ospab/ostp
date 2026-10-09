@@ -7,6 +7,8 @@ extern crate alloc;
 
 /// Re-exported so `no_std` embedders build `OstpEvent::Inbound(Bytes)` with the same `bytes` version.
 pub use bytes;
+/// Re-exported for `no_std` embedders that keep client configuration as JSON.
+pub use serde_json;
 
 pub mod congestion;
 pub mod crypto;
@@ -17,7 +19,6 @@ pub mod protocol;
 pub mod relay;
 pub mod share_link;
 pub mod sys;
-#[cfg(feature = "std")]
 pub mod subscription;
 
 pub use crypto::NoiseRole;

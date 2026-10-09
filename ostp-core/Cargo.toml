@@ -13,7 +13,7 @@ repository.workspace = true
 # handshake then uses the in-crate implementation (`crypto::noise_lite`).
 default = ["std"]
 std = [
-    "dep:snow", "dep:rand", "dep:sha1", "dep:base64", "dep:serde", "dep:serde_json",
+    "dep:snow", "dep:rand", "dep:sha1", "serde/std", "serde_json/std", "base64/std",
     "anyhow/std", "bytes/std", "chacha20poly1305/std", "sha2/std", "hmac/std",
     "percent-encoding/std", "tracing/std",
 ]
@@ -34,6 +34,6 @@ libm = "0.2"
 snow = { workspace = true, optional = true }
 rand = { workspace = true, optional = true }
 sha1 = { version = "0.10", optional = true }
-base64 = { version = "0.22", optional = true }
-serde = { version = "1.0", features = ["derive"], optional = true }
-serde_json = { version = "1.0", optional = true }
+base64 = { version = "0.22", default-features = false, features = ["alloc"] }
+serde = { version = "1.0", default-features = false, features = ["derive", "alloc"] }
+serde_json = { version = "1.0", default-features = false, features = ["alloc"] }
