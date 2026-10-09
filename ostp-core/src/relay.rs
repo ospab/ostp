@@ -1,3 +1,6 @@
+#[cfg(not(feature = "std"))]
+use alloc::{string::String, vec, vec::Vec};
+
 use anyhow::{anyhow, Result};
 
 #[derive(Debug, Clone)]
@@ -104,7 +107,7 @@ pub const DATA_OVERHEAD: usize = 3;
 /// datagram larger than the path MTU is split into IP fragments, which many
 /// networks drop and where losing one fragment loses all of it; one over
 /// 64 KiB could not be framed at all.
-pub fn data_chunks(data: &[u8], max_payload: usize) -> std::slice::Chunks<'_, u8> {
+pub fn data_chunks(data: &[u8], max_payload: usize) -> core::slice::Chunks<'_, u8> {
     let size = max_payload.saturating_sub(DATA_OVERHEAD).clamp(1, u16::MAX as usize);
     data.chunks(size)
 }

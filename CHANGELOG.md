@@ -8,6 +8,9 @@ Older history is on the [Releases](https://github.com/ospab/ostp/releases) page 
 
 ## [Unreleased]
 
+### Changed
+- `ostp-core` builds as `no_std + alloc` with `--no-default-features` (the default `std` feature keeps the previous behaviour, wire format unchanged), so the protocol can run inside a kernel or firmware. Platform services are injected through `ostp_core::sys::install` (monotonic clock, wall clock, entropy); without `std` the Noise handshake is the in-crate `crypto::noise_lite` (tested against snow in both directions), and `libm` provides the cube root for CUBIC. `ProtocolError` no longer uses `thiserror`.
+
 ### Fixed
 - Network prober, DPI test: under an allowlist ("white lists", when only allowlisted addresses are reachable) it showed "10% (clean)". Foreign hosts that refuse even a TCP connection counted as "no result" instead of filtering, and every content test talks to Russian hosts, which an allowlist lets through. The test now recognises an allowlist (Russian hosts answer, Hetzner, OVH, Cloudflare, Google and Quad9 refuse TCP), says so first and scores it 100%; an unreachable foreign hosting counts as filtered. The SNI and HTTP Host tests show "not measured" instead of "clean" when no clean baseline answered.
 - Network prober, DPI test, reworked so that it reports only what it measured:

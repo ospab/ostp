@@ -5,6 +5,9 @@
 //! The Dart (Android) and JS (desktop GUI) ports must stay in step with this;
 //! the vectors in the tests below are the shared reference.
 
+#[cfg(not(feature = "std"))]
+use alloc::{format, string::{String, ToString}, vec, vec::Vec};
+
 use anyhow::{anyhow, bail, Result};
 use percent_encoding::{percent_decode_str, utf8_percent_encode, AsciiSet, NON_ALPHANUMERIC};
 

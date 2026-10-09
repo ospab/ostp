@@ -1,3 +1,6 @@
+#[cfg(not(feature = "std"))]
+use alloc::{string::ToString, vec::Vec};
+
 use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
 

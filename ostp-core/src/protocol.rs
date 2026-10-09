@@ -1,8 +1,13 @@
 use bytes::Bytes;
-use rand::Rng;
-use thiserror::Error;
+use core::fmt;
+use core::time::Duration;
+
+#[cfg(feature = "std")]
 use std::collections::{BTreeMap, VecDeque};
-use std::time::{Duration, Instant};
+#[cfg(not(feature = "std"))]
+use alloc::{collections::{BTreeMap, VecDeque}, format, string::{String, ToString}, vec, vec::Vec};
+
+use crate::sys::Instant;
 
 /// Upper bound on a single frame's retransmit timer, after exponential backoff
 /// is applied to the adaptive RTO. Past this the session is dead from the
@@ -17,15 +22,25 @@ use crate::congestion::CongestionController;
 use crate::crypto::{NoiseRole, NoiseSession, SessionCipher};
 use crate::framing::{AdaptivePadder, FrameHeader, FrameKind, FramedPacket, PaddingStrategy};
 
-#[derive(Debug, Error)]
+#[derive(Debug)]
 pub enum ProtocolError {
-    #[error("state error: {0}")]
     State(String),
-    #[error("crypto error: {0}")]
     Crypto(String),
-    #[error("framing error: {0}")]
     Framing(String),
 }
+
+impl fmt::Display for ProtocolError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ProtocolError::State(m) => write!(f, "state error: {m}"),
+            ProtocolError::Crypto(m) => write!(f, "crypto error: {m}"),
+            ProtocolError::Framing(m) => write!(f, "framing error: {m}"),
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::error::Error for ProtocolError {}
 
 #[derive(Debug, Clone)]
 pub struct ProtocolConfig {
@@ -756,9 +771,9 @@ impl ProtocolMachine {
         // distributions — no universal filter can be built from the binary alone.
         //
         // Wire format: [session_id:4][noise_len:2][noise_payload:N][random_padding]
-        let pad_len: usize = rand::thread_rng().gen_range(self.handshake_pad_min..=self.handshake_pad_max);
+        let pad_len: usize = crate::sys::random_range_inclusive(self.handshake_pad_min, self.handshake_pad_max);
         let mut pad = vec![0u8; pad_len];
-        rand::thread_rng().fill(&mut pad[..]);
+        crate::sys::fill_random(&mut pad);
 
         let noise_len = noise_payload.len() as u16;
         let mut out = Vec::with_capacity(4 + 2 + noise_payload.len() + pad_len);
@@ -1242,7 +1257,7 @@ mod tests {
             }
             ProtocolAction::SendDatagram(d) => d,
             ProtocolAction::HandshakePayload(_, Some(d)) => d,
-            other => panic!("unexpected server response: {:?}", std::mem::discriminant(&other)),
+            other => panic!("unexpected server response: {:?}", core::mem::discriminant(&other)),
         };
 
         // Client receives msg2 -> Established

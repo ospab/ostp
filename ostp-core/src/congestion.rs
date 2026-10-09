@@ -15,7 +15,18 @@
 //!   RTO = SRTT + 4 * RTTVAR
 //!   clamped to [RTO_MIN, RTO_MAX]
 
-use std::time::{Duration, Instant};
+use core::time::Duration;
+
+use crate::sys::Instant;
+
+#[cfg(feature = "std")]
+fn cbrt(x: f64) -> f64 {
+    x.cbrt()
+}
+#[cfg(not(feature = "std"))]
+fn cbrt(x: f64) -> f64 {
+    libm::cbrt(x)
+}
 
 /// Congestion control state for a single OSTP session.
 pub struct CongestionController {
@@ -377,7 +388,7 @@ impl CongestionController {
             Some(e) => e,
             None => {
                 // A new epoch: K is the time to climb back to w_max.
-                self.k = if cwnd < self.w_max { ((self.w_max - cwnd) / CUBIC_C).cbrt() } else { 0.0 };
+                self.k = if cwnd < self.w_max { cbrt((self.w_max - cwnd) / CUBIC_C) } else { 0.0 };
                 if cwnd > self.w_max {
                     self.w_max = cwnd;
                 }
@@ -389,7 +400,7 @@ impl CongestionController {
         let t = now.duration_since(epoch).as_secs_f64();
         let rtt = self.srtt.as_secs_f64();
         // Where the cubic curve is one RTT from now, bounded to 1.5x per RTT.
-        let target = (CUBIC_C * (t + rtt - self.k).powi(3) + self.w_max).clamp(cwnd, 1.5 * cwnd);
+        let target = (CUBIC_C * { let d = t + rtt - self.k; d * d * d } + self.w_max).clamp(cwnd, 1.5 * cwnd);
         // Standard TCP's window for the same path (the "Reno-friendly" region):
         // CUBIC is never slower than Reno would be.
         let alpha = 3.0 * (1.0 - CUBIC_BETA) / (1.0 + CUBIC_BETA);

@@ -11,6 +11,9 @@
 // filter requires knowledge of the access key.
 // =============================================================================
 
+#[cfg(not(feature = "std"))]
+use alloc::vec::Vec;
+
 use sha2::Sha256;
 use hmac::{Hmac, Mac};
 type HmacSha256 = Hmac<Sha256>;
@@ -147,10 +150,7 @@ pub const JUNK_MARKER_WINDOW_SECS: u64 = 60;
 
 /// The current junk-marker time window (unix seconds / window length).
 pub fn current_junk_window() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() / JUNK_MARKER_WINDOW_SECS)
-        .unwrap_or(0)
+    crate::sys::unix_secs() / JUNK_MARKER_WINDOW_SECS
 }
 
 /// Derive the 4-byte junk marker for a given time `window`.

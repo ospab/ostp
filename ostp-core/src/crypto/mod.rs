@@ -1,5 +1,6 @@
 pub mod aead;
 pub mod noise;
+pub mod noise_lite;
 pub mod obfuscation;
 
 
