@@ -16,27 +16,6 @@ pub async fn run_native_tunnel(
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use futures::{StreamExt, SinkExt};
 
-    #[cfg(target_os = "linux")]
-    {
-        use std::io::{self, IsTerminal, Write};
-        if io::stdout().is_terminal() {
-            println!("\n===================================================================");
-            println!("WARNING: TUN mode will modify the system routing table.");
-            println!("If you are connected to a headless server via SSH, you may lose");
-            println!("your connection when default routes are redirected into the tunnel.");
-            println!("===================================================================\n");
-            print!("Are you sure you want to initialize the TUN interface? [yes/no]: ");
-            io::stdout().flush().unwrap();
-
-            let mut input = String::new();
-            io::stdin().read_line(&mut input).unwrap();
-            let ans = input.trim().to_lowercase();
-            if ans != "y" && ans != "yes" {
-                return Err(anyhow!("TUN initialization aborted by user."));
-            }
-        }
-    }
-
     let debug = config.debug;
     tracing::info!("Initializing NATIVE TUN tunnel (smoltcp)...");
 
@@ -98,8 +77,11 @@ pub async fn run_native_tunnel(
 
     let tun_interface = ostp_tun::OstpTunInterface::create(opts)
         .await
-        .map_err(|e| anyhow!("Failed to create OstpTunInterface: {}", e))?;
-        
+        .map_err(|e| anyhow!("Failed to create the TUN interface: {}", e))?;
+    // Printed only now: the server connection is reported separately, and
+    // "established" used to appear before the TUN device existed.
+    println!("[ostp] TUN interface is up: all traffic goes through the tunnel");
+
     let dev = tun_interface.device;
     let _route_guard = tun_interface.guard;
 

@@ -281,37 +281,9 @@ async fn run_client_once(
     config.ostp.server_addr = target_addr.to_string();
 
 
-    #[cfg(target_os = "linux")]
-    if config.mode == "tun" {
-        println!("\n[ostp] ===========================================================================");
-        println!("[ostp] WARNING: You are starting TUN mode on a Linux system.");
-        println!("[ostp] If this is a remote headless server, routing all traffic through the TUN");
-        println!("[ostp] interface WILL DROP your SSH connection and lock you out!");
-        println!("[ostp] ");
-        println!("[ostp] SOLUTION: Add a static route for your client IP to bypass the TUN.");
-        println!("[ostp] Find your default gateway (ip route | grep default) and run:");
-        println!("[ostp]   sudo ip route add <your-client-ip> via <default-gateway-ip>");
-        println!("[ostp] ===========================================================================\n");
-    }
-
-    #[cfg(target_os = "linux")]
-    if config.mode == "proxy" {
-        println!("\n[ostp] ===========================================================================");
-        println!("[ostp] Proxy mode initialized on {}", config.local_proxy.bind_addr);
-        println!("[ostp] ===========================================================================\n");
-    }
-
-    let _sysproxy_guard = if config.mode == "proxy" {
-        // Enable system proxy and set initial ProxyOverride with user exclusions
-        let guard = Some(crate::sysproxy::SystemProxyGuard::enable(&config.local_proxy.bind_addr));
-        crate::sysproxy::update_proxy_bypass_list(
-            &config.exclusions.domains,
-            &config.exclusions.ips,
-        );
-        guard
-    } else {
-        None
-    };
+    // The system proxy is set by the bridge while it is connected (proxy mode
+    // only). Setting it here as well enabled it twice, and the bridge's second
+    // enable reset the bypass list this one had just written.
 
     let (proxy_events_tx, proxy_events_rx) = mpsc::channel(256);
     let (client_msgs_tx, client_msgs_rx) = mpsc::unbounded_channel();

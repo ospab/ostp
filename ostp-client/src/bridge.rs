@@ -716,8 +716,19 @@ impl Bridge {
                     self.last_sample_at = Instant::now();
                     self.last_valid_recv = Instant::now();
                     
-                    let sys_proxy_addr = self.proxy_addr.replace("0.0.0.0:", "127.0.0.1:");
-                    *proxy_guard = Some(crate::sysproxy::SystemProxyGuard::enable(&sys_proxy_addr));
+                    // The system proxy is for proxy mode. In TUN mode the TUN
+                    // device carries the traffic: setting it too routed everything
+                    // through the proxy, so traffic flowed even when TUN never
+                    // came up, and the logs could not tell.
+                    if self.mode != "tun" {
+                        let sys_proxy_addr = self.proxy_addr.replace("0.0.0.0:", "127.0.0.1:");
+                        *proxy_guard = Some(crate::sysproxy::SystemProxyGuard::enable(&sys_proxy_addr));
+                        // Enabling resets the bypass list; put the exclusions back.
+                        if let Some(reload) = &self.reload_tx {
+                            let ex = reload.borrow();
+                            crate::sysproxy::update_proxy_bypass_list(&ex.domains, &ex.ips);
+                        }
+                    }
 
                     tx.send(UiEvent::Metrics {
                         status: ConnectionStatus::Established,
@@ -725,8 +736,8 @@ impl Bridge {
                         throughput_bps: 0,
                     }).await.ok();
                     self.metrics.connection_state.store(2, Ordering::Relaxed);
-                    let start_msg = if self.mode == "tun" { "TUN tunnel established" } else { "Connection established" };
-                    tx.send(UiEvent::Log(start_msg.to_string())).await.ok();
+                    // The connection to the server; the TUN device reports its own state.
+                    tx.send(UiEvent::Log("Connection established".to_string())).await.ok();
 
                     for session in sessions_opt.as_mut().unwrap().iter_mut() {
                         let ts = SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;

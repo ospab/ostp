@@ -15,7 +15,6 @@ Every document exists in English (`en/`) and Russian (`ru/`) with the same conte
 
 Also here:
 
-- [relay-config-example.json](relay-config-example.json): a commented config for a relay node that forwards clients to another server.
 - [CHANGELOG.md](../CHANGELOG.md) / [CHANGELOG.ru.md](../CHANGELOG.ru.md): what changed in each release, also shown by `ostp changelog`.
 - [CONTRIBUTING.md](../CONTRIBUTING.md) / [CONTRIBUTING.ru.md](../CONTRIBUTING.ru.md): repository layout, branches, how to send changes.
 - The [wiki](https://github.com/ospab/ostp/wiki): installation, configuration reference, share links, FAQ.
@@ -27,7 +26,6 @@ Also here:
 Каждый документ есть на английском (`en/`) и русском (`ru/`) с одинаковым содержанием. Установка и быстрый старт — в [README](../README.ru.md).
 Таблица документов — выше. Кроме неё:
 
-- [relay-config-example.json](relay-config-example.json): пример конфига узла-ретранслятора с комментариями.
 - [CHANGELOG.ru.md](../CHANGELOG.ru.md): что изменилось в каждом выпуске; то же показывает `ostp changelog`.
 - [CONTRIBUTING.ru.md](../CONTRIBUTING.ru.md): устройство репозитория, ветки, как присылать изменения.
 - [Wiki](https://github.com/ospab/ostp/wiki): установка, справочник по конфигу, ссылки для подключения, FAQ.
