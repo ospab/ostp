@@ -1,21 +1,10 @@
-//! Generic (non-ostp-specific) DPI/TSPU fingerprinting, ported from the
-//! standalone `ostp-prober` desktop tool's `probes/dpi.rs` — the same raw
-//! TCP/UDP differential tests, same target hosts and block-page signatures,
-//! so a report from this module reads the same way as one from the desktop
-//! tool. Where `prober.rs` in this crate answers "does *my* ostp server work
-//! from here", this module answers "what does this network filter in
-//! general" — useful context when the former fails: is it the network, or
-//! just this server/transport?
+//! Generic DPI/TSPU checks that do not involve an ostp server: what this network filters
+//! in general. `prober.rs` answers whether a particular ostp server works from here;
+//! this module tells whether the network or the server is at fault.
 //!
-//! Every socket here is opened through [`protected_tcp_connect`] /
-//! [`protected_udp_socket`], which calls [`crate::bridge::protect_socket`]
-//! on the raw fd before it touches the network. Without that, running this
-//! battery while the ostp VPN tunnel is active would route these probes
-//! through the tunnel itself and always report a clean network — exactly
-//! the case this module exists to diagnose.
-//!
-//! No stubbed results: a test that can't run on this platform/permission
-//! level is simply not run, never faked.
+//! Every socket is opened through `protected_tcp_connect` / `protected_udp_socket` so the
+//! probes bypass the VPN tunnel; otherwise they would measure the server's network.
+//! A test that cannot run on this platform is skipped, not faked.
 
 use std::net::{IpAddr, SocketAddr};
 use std::time::{Duration, Instant};
@@ -26,9 +15,7 @@ use tokio::net::{TcpStream, UdpSocket};
 
 use crate::path_probe::{locate, react, Hop, Localization, Reaction};
 
-// Cross-SNI targets: (IP, native SNI for that IP, port). Stable Russian IPs
-// that answer their own SNI — same pair the desktop tool uses, so results
-// from both tools are directly comparable.
+// Cross-SNI targets: (IP, SNI that IP answers, port).
 const CROSS_SNI_TARGETS: &[(&str, &str, u16)] = &[
     ("87.240.132.78", "vk.com", 443), // VKontakte
     ("77.88.55.242", "ya.ru", 443),   // Yandex
@@ -37,11 +24,7 @@ const CROSS_SNI_TARGETS: &[(&str, &str, u16)] = &[
 const BLOCKED_SNIS: &[&str] = &["instagram.com", "twitter.com", "facebook.com"];
 const BLOCKED_DOMAINS: &[&str] = &["instagram.com", "twitter.com", "facebook.com"];
 
-// ── Protected socket primitives ─────────────────────────────────────────────
-
-// Around the VPN tunnel on every platform: on Windows the tunnel used to
-// carry these probes, so a desktop with TUN on measured the VPN server's
-// network instead of its own.
+// Both go around the VPN tunnel.
 async fn protected_tcp_connect(addr: SocketAddr, timeout: Duration) -> std::io::Result<TcpStream> {
     crate::path_probe::bypass_tcp_connect(addr, timeout).await
 }
@@ -49,8 +32,6 @@ async fn protected_tcp_connect(addr: SocketAddr, timeout: Duration) -> std::io::
 async fn protected_udp_socket(v6: bool) -> std::io::Result<UdpSocket> {
     crate::path_probe::bypass_udp_socket(v6).await
 }
-
-// ── Probe primitives ─────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProbeOutcome {
@@ -179,7 +160,6 @@ fn looks_like_block_page(resp: &str) -> bool {
         .any(|m| low.contains(m))
 }
 
-// ── Test 1: Cross-SNI differential ──────────────────────────────────────────
 //
 // Measure RTT to a clean RU host, confirm its own SNI answers, then send
 // blocked SNIs to the SAME IP. Without DPI the server itself replies with a
@@ -222,7 +202,6 @@ async fn test_differential_http_host() -> Differential {
     d
 }
 
-// ── Test: TCP fragmentation bypass (GoodbyeDPI-style) ───────────────────────
 async fn test_tcp_fragmentation_bypass() -> bool {
     let (ip, _, port) = CROSS_SNI_TARGETS[0];
     let rtt = match measure_rtt(ip, port).await {
@@ -256,8 +235,6 @@ async fn test_tcp_fragmentation_bypass() -> bool {
         Ok(Ok(n)) if n > 0
     )
 }
-
-// ── Checks with a verdict and, where possible, the censor's position ────────
 
 /// One check for the report: `ok` true = passes, false = interference found,
 /// null = could not be tested from here.
@@ -476,7 +453,7 @@ async fn check_freeze() -> Check {
                 "{name}: {} after {} KB{}",
                 if stalled { "stalled" } else { "cut" },
                 got / 1024,
-                if (8 * 1024..=40 * 1024).contains(&got) { " — the typical TSPU freeze of foreign TLS" } else { "" }
+                if (8 * 1024..=40 * 1024).contains(&got) { "; typical of a TSPU freeze on foreign TLS" } else { "" }
             ),
             locate: None,
         },
@@ -516,8 +493,6 @@ async fn check_quic() -> Check {
         Check { id: "quic", title, ok: Some(true), detail: format!("answered: {}", answered.join(", ")), locate: None }
     }
 }
-
-// ── CONNECT to a web server: transparent proxy, hijacked block pages ────────
 
 /// The first bytes a web server (vk.com on port 80) sends back to an HTTP
 /// CONNECT for `target`; `None` if nothing came back.
@@ -561,8 +536,6 @@ fn connect_hijacked(baseline: &str, blocked: &str) -> bool {
     let block_status = matches!(status(blocked), Some(403) | Some(451)) && status(blocked) != status(baseline);
     block_page || block_status
 }
-
-// ── DNS hijack / injection ──────────────────────────────────────────────────
 
 /// A query to 8.8.8.8 answered from another address. `None` in the first
 /// place: no answer at all, so nothing was learned. (An interceptor that
@@ -657,8 +630,6 @@ async fn test_dns_injection() -> (bool, Option<String>) {
     }
     (false, None)
 }
-
-// ── DNS server reachability/interception table ──────────────────────────────
 
 #[derive(Debug, Clone, Serialize)]
 pub struct DnsServerStatus {
@@ -768,8 +739,6 @@ fn build_dns_query_id(id: u16, name: &str) -> Vec<u8> {
     msg
 }
 
-// ── TLS ClientHello builder ───────────────────────────────────────────────────
-
 fn build_tls_client_hello(sni: &str) -> Vec<u8> {
     let sni_bytes = sni.as_bytes();
     let sni_len = sni_bytes.len();
@@ -804,8 +773,6 @@ fn build_tls_client_hello(sni: &str) -> Vec<u8> {
     h[rec_len_pos] = (rec_len >> 8) as u8; h[rec_len_pos + 1] = (rec_len & 0xff) as u8;
     h
 }
-
-// ── Orchestrator ─────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize)]
 pub struct DpiBatteryReport {
