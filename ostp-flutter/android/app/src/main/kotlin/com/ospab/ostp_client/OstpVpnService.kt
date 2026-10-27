@@ -31,20 +31,19 @@ class OstpVpnService : VpnService() {
         private const val NOTIF_ID = 1001
         private const val CHANNEL_ID = "ostp_vpn_channel"
         private const val WAKE_LOCK_TAG = "ostp:vpn_wakelock"
-
-        /**
-         * Called by OstpClientSdk.notifyNetworkChanged() JNI thunk.
-         */
-        @Keep
-        @JvmStatic
-        fun onNetworkChanged() {
-            android.util.Log.d("OstpVpnService", "onNetworkChanged() signaled to Rust bridge")
-        }
     }
 
     private var vpnInterface: ParcelFileDescriptor? = null
     private var wakeLock: PowerManager.WakeLock? = null
     private var networkCallback: android.net.ConnectivityManager.NetworkCallback? = null
+    private val mainHandler = android.os.Handler(android.os.Looper.getMainLooper())
+    // The physical network the tunnel currently runs over. Only touched on the main thread.
+    private var currentNetwork: android.net.Network? = null
+    private var currentAddresses: Set<java.net.InetAddress> = emptySet()
+    private val notifyRust = Runnable {
+        Log.i("OstpVpnService", "Default network changed, signalling the core")
+        OstpClientSdk.notifyNetworkChanged()
+    }
 
     override fun onCreate() {
         super.onCreate()
@@ -146,39 +145,94 @@ class OstpVpnService : VpnService() {
         }
     }
 
+    /**
+     * Follows the system default network, which is the one a SIM or Wi-Fi switch changes.
+     * A general INTERNET request also matches our own VPN and a second SIM kept up in the
+     * background, which made the core reconnect at the wrong moment or for no reason.
+     */
     private fun registerNetworkCallback() {
         if (networkCallback != null) return
         try {
             val cm = getSystemService(android.content.Context.CONNECTIVITY_SERVICE) as android.net.ConnectivityManager
-            networkCallback = object : android.net.ConnectivityManager.NetworkCallback() {
+            // Baseline: the network we are starting on is not a change.
+            currentNetwork = cm.activeNetwork?.takeIf { !isVpn(cm, it) }
+            currentAddresses = currentNetwork?.let { addressesOf(cm, it) } ?: emptySet()
+            applyUnderlying(currentNetwork)
+
+            val cb = object : android.net.ConnectivityManager.NetworkCallback() {
                 override fun onAvailable(network: android.net.Network) {
-                    super.onAvailable(network)
-                    OstpClientSdk.notifyNetworkChanged()
+                    mainHandler.post {
+                        if (networkCallback == null || isVpn(cm, network)) return@post
+                        if (network == currentNetwork) return@post
+                        currentNetwork = network
+                        currentAddresses = addressesOf(cm, network)
+                        applyUnderlying(network)
+                        scheduleNotify()
+                    }
                 }
+
                 override fun onLost(network: android.net.Network) {
-                    super.onLost(network)
-                    OstpClientSdk.notifyNetworkChanged()
+                    mainHandler.post {
+                        if (networkCallback == null || network != currentNetwork) return@post
+                        // Nothing to reconnect to yet: the next onAvailable signals the core.
+                        currentNetwork = null
+                        currentAddresses = emptySet()
+                        mainHandler.removeCallbacks(notifyRust)
+                        applyUnderlying(null)
+                    }
+                }
+
+                override fun onLinkPropertiesChanged(network: android.net.Network, lp: android.net.LinkProperties) {
+                    mainHandler.post {
+                        if (networkCallback == null || network != currentNetwork) return@post
+                        val addrs = lp.linkAddresses.map { it.address }.toSet()
+                        if (addrs == currentAddresses) return@post
+                        currentAddresses = addrs
+                        scheduleNotify()
+                    }
                 }
             }
-            val request = android.net.NetworkRequest.Builder()
-                .addCapability(android.net.NetworkCapabilities.NET_CAPABILITY_INTERNET)
-                .build()
-            cm.registerNetworkCallback(request, networkCallback!!)
+            networkCallback = cb
+            cm.registerDefaultNetworkCallback(cb)
         } catch (e: Throwable) {
+            networkCallback = null
             Log.e("OstpVpnService", "Failed to register NetworkCallback", e)
         }
     }
 
-    private fun unregisterNetworkCallback() {
+    private fun isVpn(cm: android.net.ConnectivityManager, network: android.net.Network): Boolean =
+        cm.getNetworkCapabilities(network)?.hasTransport(android.net.NetworkCapabilities.TRANSPORT_VPN) == true
+
+    private fun addressesOf(cm: android.net.ConnectivityManager, network: android.net.Network): Set<java.net.InetAddress> =
+        cm.getLinkProperties(network)?.linkAddresses?.map { it.address }?.toSet() ?: emptySet()
+
+    private fun applyUnderlying(network: android.net.Network?) {
         try {
-            if (networkCallback != null) {
+            setUnderlyingNetworks(if (network != null) arrayOf(network) else null)
+        } catch (e: Throwable) {
+            Log.e("OstpVpnService", "setUnderlyingNetworks failed", e)
+        }
+    }
+
+    // A SIM switch delivers several callbacks within a second; one signal after they settle.
+    private fun scheduleNotify() {
+        mainHandler.removeCallbacks(notifyRust)
+        mainHandler.postDelayed(notifyRust, 800)
+    }
+
+    private fun unregisterNetworkCallback() {
+        mainHandler.removeCallbacks(notifyRust)
+        try {
+            networkCallback?.let {
                 val cm = getSystemService(android.content.Context.CONNECTIVITY_SERVICE) as android.net.ConnectivityManager
-                cm.unregisterNetworkCallback(networkCallback!!)
-                networkCallback = null
+                cm.unregisterNetworkCallback(it)
             }
         } catch (e: Throwable) {
             Log.e("OstpVpnService", "Failed to unregister NetworkCallback", e)
         }
+        networkCallback = null
+        currentNetwork = null
+        currentAddresses = emptySet()
     }
 
     private fun startVpn(configJson: String) {
@@ -265,6 +319,7 @@ class OstpVpnService : VpnService() {
                 Log.i("OstpVpnService", "OSTP Rust Core started successfully")
                 isRunning = true
                 updateNotification(connected = true)
+                registerNetworkCallback()
             } else {
                 Log.e("OstpVpnService", "Failed to start OSTP Rust Core")
                 stopVpn()
@@ -277,8 +332,6 @@ class OstpVpnService : VpnService() {
             }
             stopVpn()
         }
-        
-        registerNetworkCallback()
     }
 
     private fun stopVpn() {

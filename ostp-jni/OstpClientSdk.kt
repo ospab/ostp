@@ -3,8 +3,6 @@ package net.ostp.client
 import android.content.Context
 import android.net.ConnectivityManager
 import android.net.Network
-import android.net.NetworkCapabilities
-import android.net.NetworkRequest
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.*
 import org.json.JSONArray
@@ -261,31 +259,37 @@ class OstpClientSdk private constructor(private val context: Context) {
     private fun registerNetworkCallback(config: Config) {
         networkCallbackJob = scope.launch {
             val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
-            val request = NetworkRequest.Builder()
-                .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
-                .build()
+            // Only the system default network: a general INTERNET request also matches
+            // the VPN itself and background networks (a second SIM) and fires spuriously.
+            var current: Network? = cm.activeNetwork
+            var pending: Job? = null
 
             val callback = object : ConnectivityManager.NetworkCallback() {
                 override fun onAvailable(network: Network) {
-                    if (!started.get()) return
-                    // Network became available (WiFi→LTE, tower switch, etc.)
-                    // Send a lightweight BridgeCommand::NetworkChanged to Rust so the bridge
-                    // immediately reconnects on the new interface without a full stop/start.
-                    emitLog("Network available — signalling Rust bridge for immediate reconnect")
-                    _state.value = TunnelState.Connecting
-                    notifyNetworkChanged()
+                    if (!started.get() || network == current) return
+                    current = network
+                    // A switch delivers several callbacks in a row; signal once they settle.
+                    pending?.cancel()
+                    pending = scope.launch {
+                        delay(800L)
+                        emitLog("Default network changed, signalling Rust bridge")
+                        notifyNetworkChanged()
+                    }
                 }
 
                 override fun onLost(network: Network) {
+                    if (network != current) return
+                    current = null
+                    pending?.cancel()
                     if (_state.value is TunnelState.Connected) {
                         _state.value = TunnelState.Reconnecting("Network lost", 0)
-                        emitLog("Network lost — waiting for new network")
+                        emitLog("Network lost, waiting for a new network")
                     }
                 }
             }
 
             try {
-                cm.registerNetworkCallback(request, callback)
+                cm.registerDefaultNetworkCallback(callback)
                 awaitCancellation()
             } finally {
                 runCatching { cm.unregisterNetworkCallback(callback) }
