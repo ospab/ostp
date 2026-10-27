@@ -1,9 +1,33 @@
 import { initServers, renderServers, mountSshForm, confirmBox, fmtBytes } from './servers.js';
 
 // ── Tauri invoke shim ─────────────────────────────────────────────────
-let invoke = () => Promise.resolve(null);
+let rawInvoke = () => Promise.resolve(null);
 if (window.__TAURI__?.core) {
-  invoke = window.__TAURI__.core.invoke;
+  rawInvoke = window.__TAURI__.core.invoke;
+}
+
+// A backend call that never returns would freeze whatever waits on it. Every
+// call gets a limit; the work itself may still finish on the Rust side.
+const TIMEOUT_MS = {
+  get_tunnel_status: 5000, get_metrics: 5000, save_config: 10000, reload_tunnel: 10000,
+  stop_tunnel: 15000, start_tunnel: 150000, generate_qr: 10000, decode_qr: 30000,
+  fetch_subscription: 45000, check_updates: 45000, set_autostart: 15000, get_wintun_install_path: 5000,
+  app_build_tag: 5000, run_prober_matrix: 75000, run_prober_ttl: 75000, run_dpi_battery: 135000,
+  servers_list: 15000, server_rename: 15000, server_remove: 15000, server_add: 120000, server_probe: 120000,
+  server_open_panel: 60000, server_install: 20 * 60000, server_action: 20 * 60000,
+};
+const DEFAULT_TIMEOUT_MS = 60000;
+const TIMEOUT_MSG = 'The app core did not answer in time';
+
+function invoke(cmd, args) {
+  let ms = TIMEOUT_MS[cmd] ?? DEFAULT_TIMEOUT_MS;
+  // Reading a server's state is quick; changing it can take minutes.
+  if (cmd === 'server_manage') ms = ['status', 'users', 'logs'].includes(args?.args?.[0]) ? 90000 : 5 * 60000;
+  let timer;
+  const limit = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(TIMEOUT_MSG)), ms);
+  });
+  return Promise.race([rawInvoke(cmd, args), limit]).finally(() => clearTimeout(timer));
 }
 
 // ── PROFILE STORE ─────────────────────────────────────────────────────
@@ -19,30 +43,59 @@ const PROFILES_KEY  = 'ostp_profiles_v1';
 const ACTIVE_KEY    = 'ostp_active_profile';
 const SETTINGS_KEY  = 'ostp_client_settings';
 
+// localStorage can hold anything: another version, a hand edit, a half-written
+// value. Each loader returns only what the rest of the code can use.
+const MAX_PROFILES = 200;
+const MAX_SUBS = 20;
+const LIMITS = { name: 100, server: 255, key: 512, sni: 255, path: 255, link: 4096, url: 2048 };
+
+function readJson(key, fallback) {
+  try {
+    const v = JSON.parse(localStorage.getItem(key) || 'null');
+    return v == null ? fallback : v;
+  } catch { return fallback; }
+}
+
+let storageWarned = false;
+function writeJson(key, value) {
+  try { localStorage.setItem(key, JSON.stringify(value)); }
+  catch {
+    if (!storageWarned) {
+      storageWarned = true;
+      showToast('Could not save to the app storage. Changes will be lost when the app closes.', 'error');
+    }
+  }
+}
+
+const isObj = v => v && typeof v === 'object' && !Array.isArray(v);
+
 function loadProfiles() {
-  try { return JSON.parse(localStorage.getItem(PROFILES_KEY) || '[]'); }
-  catch { return []; }
+  const raw = readJson(PROFILES_KEY, []);
+  if (!Array.isArray(raw)) return [];
+  const seen = new Set();
+  return raw.filter(p => isObj(p) && typeof p.id === 'string' && typeof p.server === 'string'
+    && typeof p.key === 'string' && !seen.has(p.id) && seen.add(p.id)).slice(0, MAX_PROFILES);
 }
 
 function saveProfiles(profiles) {
-  localStorage.setItem(PROFILES_KEY, JSON.stringify(profiles));
+  writeJson(PROFILES_KEY, profiles);
 }
 
 function loadActiveId() {
-  return localStorage.getItem(ACTIVE_KEY) || null;
+  try { return localStorage.getItem(ACTIVE_KEY) || null; } catch { return null; }
 }
 
 function saveActiveId(id) {
-  localStorage.setItem(ACTIVE_KEY, id || '');
+  try { localStorage.setItem(ACTIVE_KEY, id || ''); } catch { /* reported by writeJson */ }
 }
 
 function loadClientSettings() {
-  try { return JSON.parse(localStorage.getItem(SETTINGS_KEY) || '{}'); }
-  catch { return {}; }
+  const v = readJson(SETTINGS_KEY, {});
+  return isObj(v) ? v : {};
 }
 
 function saveClientSettings(s) {
-  localStorage.setItem(SETTINGS_KEY, JSON.stringify(s));
+  writeJson(SETTINGS_KEY, s);
 }
 
 function genId() {
@@ -237,12 +290,20 @@ function clearError() {
 // The core reads its settings from the config file, so every change to the
 // active profile or the settings is written there. Resolves to false when the
 // write failed (the user has been told).
+// Writes go one after another so the last change is the one left in the file,
+// whatever order the backend finishes them in.
+let persistChain = Promise.resolve();
 function persistConfig() {
-  const cfg = buildConfig();
-  if (!cfg) return Promise.resolve(false);
-  return invoke('save_config', { jsonContent: JSON.stringify(cfg, null, 2) })
-    .then(() => true)
-    .catch(err => { showToast('Could not save the configuration: ' + err, 'error'); return false; });
+  const run = () => {
+    const cfg = buildConfig();
+    if (!cfg) return Promise.resolve(false);
+    return invoke('save_config', { jsonContent: JSON.stringify(cfg, null, 2) })
+      .then(() => true)
+      .catch(err => { showToast('Could not save the configuration: ' + (err?.message || err), 'error'); return false; });
+  };
+  const result = persistChain.then(run);
+  persistChain = result.catch(() => {});
+  return result;
 }
 
 // The tunnel stopped on its own: say so, with the reason.
@@ -299,21 +360,41 @@ function setState(next) {
       connInfo.classList.remove('hidden');
     }
 
+    // Counted from the clock, not by ticks: timers stall while the computer
+    // sleeps. A clock set backwards shows 0 rather than a negative time.
+    const since = Date.now();
     uptimeSecs = 0;
     uptimeText.textContent = 'Connected for ' + fmtTime(0);
+    clearInterval(uptimeTimer);
     uptimeTimer = setInterval(() => {
-      uptimeSecs++;
+      uptimeSecs = Math.max(0, Math.floor((Date.now() - since) / 1000));
       uptimeText.textContent = 'Connected for ' + fmtTime(uptimeSecs);
     }, 1000);
   }
 }
 
 // ── POLLING ───────────────────────────────────────────────────────────
+// A tick is skipped while the previous one is still waiting, so a core that
+// answers slowly never piles up requests.
+let pollBusy = false;
+let lastPollAt = 0;
+let pollStalls = 0;
+
 async function poll() {
-  if (!pollTimer) return;
+  if (!pollTimer || pollBusy) return;
+  pollBusy = true;
+  try {
+    await pollOnce();
+  } finally {
+    pollBusy = false;
+  }
+}
+
+async function pollOnce() {
   try {
     const code = await invoke('get_tunnel_status');
     if (!pollTimer) return;
+    pollStalls = 0;
 
     if      (code === 0) { setState('disconnected'); return; }
     else if (code === 1) setState('connecting');
@@ -329,9 +410,13 @@ async function poll() {
       metricDown.textContent = fmtBytes(recv);
       metricUp.textContent   = fmtBytes(sent);
 
-      // Throughput (delta per second)
-      const dRecv = Math.max(0, recv - prevBytesRecv);
-      const dSent = Math.max(0, sent - prevBytesSent);
+      // Throughput: bytes since the last answer over the time that really
+      // passed (ticks stretch after sleep or a slow core).
+      const now = Date.now();
+      const secs = Math.max(1, (now - lastPollAt) / 1000);
+      lastPollAt = now;
+      const dRecv = Math.max(0, recv - prevBytesRecv) / secs;
+      const dSent = Math.max(0, sent - prevBytesSent) / secs;
       prevBytesRecv = recv; prevBytesSent = sent;
       liveDown.textContent = fmtBytes(dRecv) + '/s';
       liveUp.textContent   = fmtBytes(dSent) + '/s';
@@ -343,18 +428,43 @@ async function poll() {
       }
     }
   } catch (err) {
+    if (!pollTimer) return;
+    // No answer is not the same as a stopped tunnel: say so, change nothing.
+    if (err instanceof Error && err.message === TIMEOUT_MSG) {
+      if (++pollStalls === 3) showToast('The app core is not answering. The state shown may be out of date.', 'error');
+      return;
+    }
     // get_tunnel_status reports the reason the tunnel ended as an error.
-    if (pollTimer) onTunnelError(String(err));
+    onTunnelError(String(err?.message || err));
   }
 }
 
 function startPolling() {
   clearInterval(pollTimer);
-  poll();
+  lastPollAt = Date.now();
+  pollStalls = 0;
   pollTimer = setInterval(poll, 1000);
+  poll();
 }
 
 // ── BUILD CONFIG from active profile + client settings ────────────────
+// Numbers go to the core as typed unless kept in range here: an inverted or
+// absurd range would fail (or stall) deep inside the core.
+function clampInt(v, lo, hi, dflt) {
+  const n = parseInt(v, 10);
+  return Number.isFinite(n) ? Math.min(hi, Math.max(lo, n)) : dflt;
+}
+
+function rangePair(a, b, lo, hi, d) {
+  const x = clampInt(a, lo, hi, d[0]), y = clampInt(b, lo, hi, d[1]);
+  return x <= y ? [x, y] : [y, x];
+}
+
+const MAX_LIST_ITEMS = 500;
+function listOf(text) {
+  return String(text || '').split(/[\n,]+/).map(x => x.trim().slice(0, 253)).filter(Boolean).slice(0, MAX_LIST_ITEMS);
+}
+
 function buildConfig() {
   const active = profiles.find(p => p.id === activeId);
   if (!active) return null;
@@ -370,10 +480,10 @@ function buildConfig() {
     transport: {
       mode: active.transport || 'udp',
       tcp_fragmentation: s.tcpFrag || !!active.tcp_fragmentation,
-      frag_chunk: s.tcpFrag ? (s.fragChunk || 2) : (active.frag_chunk || 2),
-      frag_sleep: s.tcpFrag ? (!isNaN(parseInt(s.fragSleep)) ? s.fragSleep : 2) : (active.frag_sleep !== undefined ? active.frag_sleep : 2),
-      junk_pc: s.junkEnabled ? [s.junkPcMin || 2, s.junkPcMax || 5] : (active.junk_pc || [2, 5]),
-      junk_ps: s.junkEnabled ? [s.junkPsMin || 100, s.junkPsMax || 1000] : (active.junk_ps || [100, 1000]),
+      frag_chunk: clampInt(s.tcpFrag ? s.fragChunk : active.frag_chunk, 1, 1400, 2),
+      frag_sleep: clampInt(s.tcpFrag ? s.fragSleep : active.frag_sleep, 0, 1000, 2),
+      junk_pc: s.junkEnabled ? rangePair(s.junkPcMin, s.junkPcMax, 0, 100, [2, 5]) : (active.junk_pc || [2, 5]),
+      junk_ps: s.junkEnabled ? rangePair(s.junkPsMin, s.junkPsMax, 1, 1400, [100, 1000]) : (active.junk_ps || [100, 1000]),
       ttl_desync: !!s.ttlDesync,
       ttl_desync_auto: true,
       tls: (active.transport === 'uot') && !!active.tls,
@@ -390,17 +500,17 @@ function buildConfig() {
       kill_switch: !!s.killSwitch,
     },
     exclude: {
-      domains: s.exDomains ? s.exDomains.split(/[\n,]+/).map(x => x.trim()).filter(Boolean) : [],
-      ips: s.exIps ? s.exIps.split(/[\n,]+/).map(x => x.trim()).filter(Boolean) : [],
-      processes: s.exProcs ? s.exProcs.split(/[\n,]+/).map(x => x.trim()).filter(Boolean) : [],
+      domains: listOf(s.exDomains),
+      ips: listOf(s.exIps),
+      processes: listOf(s.exProcs),
     },
-    mux: s.mux ? { enabled: true, sessions: parseInt(s.muxSessions, 10) || 2 } : undefined,
+    mux: s.mux ? { enabled: true, sessions: clampInt(s.muxSessions, 1, 8, 2) } : undefined,
     gui: {
       autoconnect: !!s.autoconnect,
       launch_startup: !!s.launchStartup,
     },
   };
-  if (s.mtu) cfg.mtu = parseInt(s.mtu, 10);
+  if (s.mtu) cfg.mtu = clampInt(s.mtu, 576, 1500, 1350);
   return cfg;
 }
 
@@ -422,7 +532,7 @@ async function handleToggle() {
         setState('disconnected');
         showToast('Disconnected');
       } catch (err) {
-        showError('Could not stop the connection: ' + err);
+        showError('Could not stop the connection: ' + (err?.message || err));
       }
       return;
     }
@@ -434,6 +544,8 @@ async function handleToggle() {
     }
     const cfg = buildConfig();
     if (!cfg) { showError('The selected profile is not valid. Open Settings and check it.'); return; }
+    const socksBad = socksProblem(cfg.socks5_bind || '');
+    if (socksBad) { showError(socksBad + '. Change it in More settings.'); return; }
 
     setState('connecting');
     try {
@@ -447,7 +559,7 @@ async function handleToggle() {
       }
     } catch (err) {
       setState('disconnected');
-      const msg = String(err);
+      const msg = String(err?.message || err);
       if (msg.includes('WINTUN_MISSING')) wintunModal.classList.remove('hidden');
       else showError('Could not connect: ' + msg);
     }
@@ -505,6 +617,7 @@ const REPO_URL = 'https://github.com/ospab/ostp';
 async function welcomeAdd(raw) {
   raw = String(raw || '').trim();
   if (!raw) return false;
+  if (raw.length > LIMITS.link) { showToast('The text is too long to be a link', 'error'); return false; }
   if (isSubscriptionUrl(raw)) {
     await addSubscription(raw);
     if (loadSubs().some(s => s.url === raw)) { finishWelcome(); return true; }
@@ -522,10 +635,16 @@ async function welcomeAdd(raw) {
   }
 }
 
+const MAX_QR_BYTES = 10 * 1024 * 1024;
+let qrBusy = false;
+
 // Reads the QR code in a picture (a File or Blob) on the Rust side.
 async function welcomeQrFrom(blob) {
   const status = $('welcome-qr-status');
   if (!blob || !/^image\//.test(blob.type || '')) { status.textContent = 'That file is not a picture'; return; }
+  if (blob.size > MAX_QR_BYTES) { status.textContent = 'The picture is too large (the limit is 10 MB)'; return; }
+  if (qrBusy) return;
+  qrBusy = true;
   status.textContent = 'Reading the code…';
   try {
     const b64 = await new Promise((resolve, reject) => {
@@ -540,6 +659,8 @@ async function welcomeQrFrom(blob) {
     if (!await welcomeAdd(text)) status.textContent = 'The code was read, but it is not an ostp:// link or a subscription URL';
   } catch (e) {
     status.textContent = String(e?.message || e);
+  } finally {
+    qrBusy = false;
   }
 }
 
@@ -552,9 +673,14 @@ function setupWelcome() {
     try { $('welcome-link').value = (await navigator.clipboard.readText()).trim(); }
     catch { showToast('The clipboard cannot be read here. Click the field and press Ctrl+V.', 'error'); }
   });
-  $('btn-welcome-link').addEventListener('click', () => {
+  $('btn-welcome-link').addEventListener('click', async () => {
     if (!$('welcome-link').value.trim()) { $('welcome-link').focus(); return; }
-    welcomeAdd($('welcome-link').value);
+    // A subscription is downloaded here: one request at a time.
+    const btn = $('btn-welcome-link');
+    if (btn.disabled) return;
+    btn.disabled = true;
+    try { await welcomeAdd($('welcome-link').value); }
+    finally { btn.disabled = false; }
   });
   $('btn-welcome-repo').addEventListener('click', () => openUrl(REPO_URL));
 
@@ -594,7 +720,8 @@ function importLinks(links, { baseName = '', serverId = null } = {}) {
     try { l = parseOstpLink(raw); } catch { continue; }
     const dup = profiles.some(p => p.key === l.key && p.server === l.server && carrierOf(p) === carrierOf(l));
     if (dup) continue;
-    const name = baseName ? `${baseName} · ${carrierOf(l).toUpperCase()}` : (l.name || l.server);
+    if (profiles.length >= MAX_PROFILES) { showToast(`The app keeps up to ${MAX_PROFILES} profiles. Delete some first.`, 'error'); break; }
+    const name = baseName ? cleanName(`${baseName} · ${carrierOf(l).toUpperCase()}`) : (l.name || l.server);
     const p = { ...l, id: genId(), name };
     if (serverId) p.server_id = serverId;
     profiles.push(p);
@@ -724,6 +851,19 @@ function saveProfileFromEditor() {
   try { splitHostPort(server); }
   catch { showToast('The server must be written as host:port, for example 203.0.113.10:50000', 'error'); pmServer.focus(); return; }
   if (!key)    { showToast('Enter the access key', 'error'); pmKey.focus(); return; }
+  if (server.length > LIMITS.server) { showToast('The server address is too long', 'error'); pmServer.focus(); return; }
+  if (key.length > LIMITS.key) { showToast('The access key is too long', 'error'); pmKey.focus(); return; }
+  if (/\s/.test(server)) { showToast('The server address cannot contain spaces', 'error'); pmServer.focus(); return; }
+  if (pmName.value.trim().length > LIMITS.name) { showToast(`The name is longer than ${LIMITS.name} characters`, 'error'); pmName.focus(); return; }
+  if (pmSni.value.trim().length > LIMITS.sni || pmWsPath.value.trim().length > LIMITS.path) {
+    showToast('The TLS name or the path is too long', 'error'); return;
+  }
+  const candidate = { server, key, transport: pmTransport.value, ...tlsFieldsFromEditor() };
+  const twin = profiles.find(p => p.id !== editingProfileId && p.key === key && p.server === server && carrierOf(p) === carrierOf(candidate));
+  if (twin) { showToast(`This profile already exists as "${twin.name || twin.server}"`, 'error'); return; }
+  if (!editingProfileId && profiles.length >= MAX_PROFILES) {
+    showToast(`The app keeps up to ${MAX_PROFILES} profiles. Delete some first.`, 'error'); return;
+  }
 
   if (editingProfileId) {
     const idx = profiles.findIndex(p => p.id === editingProfileId);
@@ -780,7 +920,10 @@ async function deleteEditingProfile() {
 // ── PARSE ostp:// link ─────────────────────────────────────────────────
 // Port of ostp-core/src/share_link.rs (and the Flutter copy): keep in step.
 const truthy = v => ['1', 'true', 'yes'].includes(String(v).toLowerCase());
-const linkDecode = s => decodeURIComponent(s.replace(/\+/g, ' '));
+const linkDecode = s => {
+  try { return decodeURIComponent(s.replace(/\+/g, ' ')); }
+  catch { throw new Error('The link has broken % escapes'); }
+};
 // RFC 3986 unreserved stay; encodeURIComponent also leaves !'()* alone.
 const linkEncode = s => encodeURIComponent(s).replace(/[!'()*]/g, c => '%' + c.charCodeAt(0).toString(16).toUpperCase());
 
@@ -799,12 +942,16 @@ function splitHostPort(hostPort) {
     port = hostPort.slice(c + 1);
   }
   const n = Number(port);
-  if (!host || !/^\d+$/.test(port) || n > 65535) throw new Error('Invalid host or port');
+  if (!host || !/^\d+$/.test(port) || n < 1 || n > 65535 || /\s/.test(host)) throw new Error('Invalid host or port');
   return { host, port: n };
 }
 
+// Printable text only, one line, of a sane length: names come from outside.
+const cleanName = s => String(s).replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]+/g, ' ').trim().slice(0, LIMITS.name);
+
 function parseOstpLink(raw) {
-  raw = raw.trim();
+  raw = String(raw).trim();
+  if (raw.length > LIMITS.link) throw new Error('The link is too long');
   if (!raw.toLowerCase().startsWith('ostp://')) throw new Error('Must start with ostp://');
   let rest = raw.slice(7).split('#')[0];
   const q = rest.indexOf('?');
@@ -814,8 +961,10 @@ function parseOstpLink(raw) {
   if (at < 0) throw new Error('Link has no access key');
   const key = linkDecode(authority.slice(0, at));
   if (!key) throw new Error('Link has an empty access key');
+  if (key.length > LIMITS.key) throw new Error('The access key in the link is too long');
   const { host, port } = splitHostPort(authority.slice(at + 1));
   const server = host.includes(':') ? `[${host}]:${port}` : `${host}:${port}`;
+  if (server.length > LIMITS.server) throw new Error('The server address in the link is too long');
 
   const out = { name: host, server, key, transport: 'udp', tls: false, tls_sni: '', tls_insecure: false, ws_path: '' };
   for (const pair of query.split('&').filter(Boolean)) {
@@ -827,14 +976,18 @@ function parseOstpLink(raw) {
     else if (k === 'sni') out.tls_sni = v;
     else if (k === 'insecure') out.tls_insecure = truthy(v);
     else if (k === 'path') out.ws_path = v;
-    else if (k === 'name' && v) out.name = v;
+    else if (k === 'name' && cleanName(v)) out.name = cleanName(v);
   }
+  out.tls_sni = out.tls_sni.trim().slice(0, LIMITS.sni);
+  out.ws_path = out.ws_path.trim().slice(0, LIMITS.path);
+  out.name = cleanName(out.name) || host;
   if (out.tls || out.ws_path) out.transport = 'uot';
   return out;
 }
 
 // Returns false when the text is not a usable link (the user has been told).
 function importFromLink(raw) {
+  if (raw.length > LIMITS.link) { showToast('The text is too long to be a link', 'error'); return false; }
   if (isSubscriptionUrl(raw)) { addSubscription(raw.trim()); return true; }
   try {
     const parsed = parseOstpLink(raw);
@@ -875,6 +1028,7 @@ async function openShare(id) {
   showShare('Share profile', buildShareLink(p));
 }
 
+let shareSeq = 0;
 async function showShare(title, text) {
   $('share-title').textContent = title;
   shareLink.value = text;
@@ -882,11 +1036,14 @@ async function showShare(title, text) {
   const err = $('share-qr-error');
   err.style.display = 'none';
   shareModal.classList.remove('hidden');
+  const mine = ++shareSeq;
   try {
     const svg = await invoke('generate_qr', { text });
+    if (mine !== shareSeq) return; // another link was opened meanwhile
     if (svg) shareQr.innerHTML = svg;
     else throw new Error('QR codes need the desktop app');
   } catch (e) {
+    if (mine !== shareSeq) return;
     err.textContent = 'The QR code could not be made: ' + (e?.message || e) + '. The link below still works.';
     err.style.display = '';
   }
@@ -899,10 +1056,20 @@ async function showShare(title, text) {
 const SUBS_KEY = 'ostp_subscriptions_v1';
 
 function loadSubs() {
-  try { return JSON.parse(localStorage.getItem(SUBS_KEY) || '[]'); }
-  catch { return []; }
+  const raw = readJson(SUBS_KEY, []);
+  if (!Array.isArray(raw)) return [];
+  return raw.filter(s => isObj(s) && typeof s.id === 'string' && typeof s.url === 'string').slice(0, MAX_SUBS);
 }
-function saveSubs(subs) { localStorage.setItem(SUBS_KEY, JSON.stringify(subs)); }
+function saveSubs(subs) { writeJson(SUBS_KEY, subs); }
+
+// Why a subscription URL cannot be used, or '' when it can.
+function subscriptionUrlProblem(url) {
+  if (url.length > LIMITS.url) return 'The subscription URL is too long';
+  let u;
+  try { u = new URL(url); } catch { return 'This is not a valid URL'; }
+  if (u.protocol !== 'https:' || !u.hostname) return 'A subscription URL must start with https://';
+  return '';
+}
 
 const isSubscriptionUrl = s => /^https:\/\//i.test(String(s).trim());
 const subIsDue = s => Date.now() - (s.updatedAt || 0) >= (s.intervalHours || 12) * 3600 * 1000;
@@ -921,17 +1088,25 @@ function carrierOf(p) { return p.transport === 'uot' && p.tls ? 'tls' : (p.trans
 
 // Rewrites the subscription's profiles from a fetched document, keeping the
 // active carrier and per-profile tweaks.
+const MAX_SUB_LINKS = 50;
+const finiteOrNull = v => (typeof v === 'number' && Number.isFinite(v) && v >= 0 ? v : null);
+
 function applySubscription(sub, doc) {
+  if (!isObj(doc)) throw new Error('the answer is not a subscription');
   const links = [];
-  for (const l of doc.links || []) {
+  const rawLinks = Array.isArray(doc.links) ? doc.links.slice(0, MAX_SUB_LINKS) : [];
+  for (const l of rawLinks) {
+    if (typeof l !== 'string') continue;
     try { links.push(parseOstpLink(l)); } catch { /* skip malformed */ }
   }
   if (!links.length) throw new Error('the subscription has no usable links');
+  const others = profiles.filter(p => p.sub_id !== sub.id).length;
+  if (others + links.length > MAX_PROFILES) throw new Error(`the app keeps up to ${MAX_PROFILES} profiles`);
 
-  sub.name = (doc.name || '').trim() || (() => { try { return new URL(sub.url).host; } catch { return sub.url; } })();
-  sub.intervalHours = Math.min(720, Math.max(1, doc.update_interval_hours || 12));
-  sub.usedBytes = doc.usage ? doc.usage.used_bytes : null;
-  sub.limitBytes = doc.usage ? doc.usage.limit_bytes : null;
+  sub.name = cleanName(doc.name || '') || (() => { try { return new URL(sub.url).host; } catch { return sub.url.slice(0, LIMITS.name); } })();
+  sub.intervalHours = clampInt(doc.update_interval_hours, 1, 720, 12);
+  sub.usedBytes = isObj(doc.usage) ? finiteOrNull(doc.usage.used_bytes) : null;
+  sub.limitBytes = isObj(doc.usage) ? finiteOrNull(doc.usage.limit_bytes) : null;
   sub.updatedAt = Date.now();
   sub.lastError = null;
 
@@ -964,31 +1139,49 @@ function applySubscription(sub, doc) {
 }
 
 async function refreshSubscription(id, { quiet = false } = {}) {
-  const subs = loadSubs();
-  const sub = subs.find(s => s.id === id);
-  if (!sub || refreshing.has(id)) return;
+  const url = loadSubs().find(s => s.id === id)?.url;
+  if (!url || refreshing.has(id)) return;
   refreshing.add(id);
   renderSubs();
+  let outcome = null;
   try {
-    const doc = await invoke('fetch_subscription', { url: sub.url });
+    const doc = await invoke('fetch_subscription', { url });
     if (!doc) throw new Error('subscriptions need the desktop app');
-    const n = applySubscription(sub, doc);
-    if (!quiet) showToast(`Subscription updated: ${n} ${n === 1 ? 'profile' : 'profiles'}`, 'ok');
+    outcome = { doc };
   } catch (e) {
-    sub.lastError = String(e?.message || e);
-    if (!quiet) showToast('Could not update the subscription: ' + sub.lastError, 'error');
-  } finally {
-    refreshing.delete(id);
-    saveSubs(subs);
-    renderSubs();
-    renderProfiles();
-    persistConfig();
+    outcome = { error: String(e?.message || e) };
   }
+  refreshing.delete(id);
+  // The list is read again: the subscription may have been removed, or the
+  // list changed, while the download ran.
+  const subs = loadSubs();
+  const sub = subs.find(s => s.id === id);
+  if (sub) {
+    try {
+      if (outcome.error) throw new Error(outcome.error);
+      const n = applySubscription(sub, outcome.doc);
+      if (!quiet) showToast(`Subscription updated: ${n} ${n === 1 ? 'profile' : 'profiles'}`, 'ok');
+    } catch (e) {
+      sub.lastError = String(e?.message || e).slice(0, 300);
+      if (!quiet) showToast('Could not update the subscription: ' + sub.lastError, 'error');
+    }
+    saveSubs(subs);
+  }
+  renderSubs();
+  renderProfiles();
+  persistConfig();
 }
 
 async function addSubscription(url) {
+  url = String(url).trim();
+  const problem = subscriptionUrlProblem(url);
+  if (problem) { showToast(problem, 'error'); return; }
   const subs = loadSubs();
   let sub = subs.find(s => s.url === url);
+  if (sub && refreshing.has(sub.id)) { showToast('This subscription is already being fetched'); return; }
+  if (!sub && subs.length >= MAX_SUBS) {
+    showToast(`The app keeps up to ${MAX_SUBS} subscriptions. Remove one first.`, 'error'); return;
+  }
   if (!sub) {
     sub = { id: 'sub' + genId(), url, name: '', updatedAt: 0, intervalHours: 12 };
     subs.push(sub);
@@ -1086,7 +1279,10 @@ function prCard(title, html) {
   const card = document.createElement('div');
   card.className = 'pr-card';
   card.innerHTML = `<h4>${escHtml(title)}</h4>${html}`;
-  $('pr-results').prepend(card);
+  const box = $('pr-results');
+  box.prepend(card);
+  // Old results scroll away; the page does not grow without end.
+  while (box.children.length > 8) box.lastElementChild.remove();
 }
 
 function setProberBusy(busy) {
@@ -1287,6 +1483,34 @@ function loadSettingsIntoForm() {
 let lastAppliedAutostart;
 let lastAppliedTunnelConfig;
 let hotReloadTimer;
+let autostartChain = Promise.resolve();
+
+// Number fields accept anything typed. When the user leaves a field, a value
+// out of range is replaced by the nearest allowed one and a reversed pair is
+// put in order, so what the form shows is what the core gets.
+const NUMBER_FIELDS = [
+  [() => inMuxSessions, 1, 8], [() => inMtu, 576, 1500],
+  [() => inJunkPcMin, 0, 100], [() => inJunkPcMax, 0, 100],
+  [() => inJunkPsMin, 1, 1400], [() => inJunkPsMax, 1, 1400],
+  [() => inFragChunk, 1, 1400], [() => inFragSleep, 0, 1000],
+];
+
+function normalizeNumberFields() {
+  for (const [get, lo, hi] of NUMBER_FIELDS) {
+    const el = get();
+    if (el.value.trim() === '') continue;
+    el.value = String(clampInt(el.value, lo, hi, lo));
+  }
+  for (const [a, b] of [[inJunkPcMin, inJunkPcMax], [inJunkPsMin, inJunkPsMax]]) {
+    if (a.value !== '' && b.value !== '' && +a.value > +b.value) [a.value, b.value] = [b.value, a.value];
+  }
+}
+
+function socksProblem(v) {
+  if (!v) return '';
+  try { splitHostPort(v); return ''; }
+  catch { return 'The local proxy address must be host:port, for example 127.0.0.1:1088'; }
+}
 
 function collectAndSaveSettings() {
   const s = {
@@ -1328,12 +1552,13 @@ function collectAndSaveSettings() {
   // Only touch autostart when it actually changed — this is a registry write.
   if (s.launchStartup !== lastAppliedAutostart) {
     lastAppliedAutostart = s.launchStartup;
-    invoke('set_autostart', { enable: s.launchStartup }).catch(err => {
+    // One registry write at a time, in the order the user flipped the switch.
+    autostartChain = autostartChain.then(() => invoke('set_autostart', { enable: s.launchStartup })).catch(err => {
       // Put the switch back: it must not claim something the system refused.
       lastAppliedAutostart = !s.launchStartup;
       inLaunchStartup.checked = !s.launchStartup;
       saveClientSettings({ ...loadClientSettings(), launchStartup: !s.launchStartup });
-      showToast('Could not change start with the system: ' + err, 'error');
+      showToast('Could not change start with the system: ' + (err?.message || err), 'error');
     });
   }
 
@@ -1415,6 +1640,8 @@ window.addEventListener('DOMContentLoaded', async () => {
     listen('tunnel-error', evt => onTunnelError(String(evt.payload)));
     listen('tray_connect', () => { if (appState === 'disconnected') handleToggle(); });
     listen('tray_disconnect', () => { if (appState !== 'disconnected') handleToggle(); });
+    // Quit from the tray was refused because a server job is running.
+    listen('exit-blocked', () => showToast('A server job is still running. Wait for it to finish, then quit again.', 'error'));
   }
 
   // Auto-connect on startup
@@ -1481,7 +1708,9 @@ window.addEventListener('DOMContentLoaded', async () => {
     addMenu.classList.add('hidden');
     try {
       const text = await navigator.clipboard.readText();
-      if (text.trim().startsWith('ostp://') || isSubscriptionUrl(text)) {
+      if (text.length > LIMITS.link) {
+        showToast('The clipboard text is too long to be a link', 'error');
+      } else if (text.trim().startsWith('ostp://') || isSubscriptionUrl(text)) {
         importFromLink(text.trim());
       } else {
         showToast('The clipboard has no ostp:// link or subscription URL', 'error');
@@ -1566,11 +1795,21 @@ window.addEventListener('DOMContentLoaded', async () => {
         clearTimeout(el._saveTimer);
         el._saveTimer = setTimeout(collectAndSaveSettings, 400);
       });
+      el.addEventListener('change', () => {
+        clearTimeout(el._saveTimer);
+        normalizeNumberFields();
+        collectAndSaveSettings();
+      });
     });
+  inSocks.addEventListener('change', () => {
+    const problem = socksProblem(inSocks.value.trim());
+    if (problem) showToast(problem, 'error');
+  });
 
   // Junk and Frag modals
   btnJunkSettings.addEventListener('click', () => junkModal.classList.remove('hidden'));
   btnJunkDone.addEventListener('click', () => {
+    normalizeNumberFields();
     collectAndSaveSettings();
     junkModal.classList.add('hidden');
   });
@@ -1578,13 +1817,30 @@ window.addEventListener('DOMContentLoaded', async () => {
 
   btnFragSettings.addEventListener('click', () => fragModal.classList.remove('hidden'));
   btnFragDone.addEventListener('click', () => {
+    normalizeNumberFields();
     collectAndSaveSettings();
     fragModal.classList.add('hidden');
   });
   fragModal.addEventListener('click', e => { if (e.target === fragModal) fragModal.classList.add('hidden'); });
 
+  setupInputLimits();
   setupAccessibility();
 });
+
+// A pasted multi-megabyte text would be copied into the page, saved and sent to
+// the core. The limit is one more than the allowed length, so a value that is
+// too long is seen as too long and refused, not silently cut.
+function setupInputLimits() {
+  const over = n => n + 1;
+  const max = {
+    'pm-name': over(LIMITS.name), 'pm-server': over(LIMITS.server), 'pm-key': over(LIMITS.key),
+    'pm-sni': over(LIMITS.sni), 'pm-ws-path': over(LIMITS.path),
+    'link-input': over(LIMITS.link), 'welcome-link': over(LIMITS.link),
+    'in-dns': 253, 'in-socks': 300,
+    'in-ex-domains': 60000, 'in-ex-ips': 60000, 'in-ex-procs': 60000,
+  };
+  for (const [id, n] of Object.entries(max)) $(id)?.setAttribute('maxlength', String(n));
+}
 
 // ── ACCESSIBILITY ─────────────────────────────────────────────────────
 // Names for controls whose text is elsewhere, dialog semantics, and the
