@@ -19,8 +19,13 @@ class ServersApi {
   /// kept for this run of the app only.
   static final Map<String, Map<String, dynamic>> typedAuth = {};
 
-  static Future<dynamic> raw(Map<String, dynamic> request) async {
-    final String? reply = await _channel.invokeMethod('serversCall', {'requestJson': jsonEncode(request)});
+  /// [timeout] only for short calls (list, lines); an install or update runs for minutes.
+  static Future<dynamic> raw(Map<String, dynamic> request, {Duration? timeout}) async {
+    var pending = _channel.invokeMethod<String>('serversCall', {'requestJson': jsonEncode(request)});
+    if (timeout != null) {
+      pending = pending.timeout(timeout, onTimeout: () => throw ServerError('The native core did not answer in time'));
+    }
+    final String? reply = await pending;
     if (reply == null) throw ServerError('no answer from the native core');
     final doc = jsonDecode(reply) as Map<String, dynamic>;
     if (doc['error'] != null) throw ServerError(doc['error'] as String);
@@ -51,7 +56,7 @@ class ServersApi {
   }
 
   static Future<ServersList> list() async {
-    final r = await raw({'op': 'list'}) as Map<String, dynamic>;
+    final r = await raw({'op': 'list'}, timeout: const Duration(seconds: 30)) as Map<String, dynamic>;
     return ServersList(
       (r['servers'] as List).cast<Map<String, dynamic>>(),
       r['can_remember'] as bool? ?? false,
@@ -60,7 +65,7 @@ class ServersApi {
 
   /// Output lines of running calls after [since]: (lines, next since).
   static Future<(List<Map<String, dynamic>>, int)> lines(int since) async {
-    final r = await raw({'op': 'lines', 'since': since}) as Map<String, dynamic>;
+    final r = await raw({'op': 'lines', 'since': since}, timeout: const Duration(seconds: 10)) as Map<String, dynamic>;
     return ((r['lines'] as List).cast<Map<String, dynamic>>(), (r['next'] as num).toInt());
   }
 
@@ -120,6 +125,7 @@ class ServersApi {
     final profiles = decodeProfiles(prefs.getString('profiles_json'));
     var added = 0;
     for (final u in users.take(limit ?? users.length)) {
+      if (profiles.length >= 100) break;
       final userName = (u['name'] as String?) ?? '';
       for (final link in (u['links'] as List? ?? const [])) {
         ShareLink l;
@@ -200,7 +206,7 @@ class ServersApi {
   /// would cut this very connection.
   static Future<bool> connectedThrough(SharedPreferences prefs, String host) async {
     try {
-      final running = await _channel.invokeMethod('isRunning');
+      final running = await _channel.invokeMethod('isRunning').timeout(const Duration(seconds: 3));
       if (running != true) return false;
     } catch (_) {
       return false;

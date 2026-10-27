@@ -51,7 +51,8 @@ class _AppRoutingScreenState extends State<AppRoutingScreen> {
 
   Future<void> _fetchInstalledApps() async {
     try {
-      final List<dynamic>? rawApps = await platform.invokeMethod('getInstalledApps');
+      final List<dynamic>? rawApps = await platform.invokeMethod<List<dynamic>>('getInstalledApps').timeout(const Duration(seconds: 90));
+      if (!mounted) return;
       if (rawApps != null) {
         final List<Map<String, dynamic>> apps = rawApps.map((e) {
           final Map<dynamic, dynamic> m = e as Map<dynamic, dynamic>;
@@ -67,14 +68,14 @@ class _AppRoutingScreenState extends State<AppRoutingScreen> {
         
         setState(() {
           _allApps = apps;
-          _isLoading = false;
         });
         _filterApps();
       }
     } catch (e) {
       debugPrint("Error fetching apps: $e");
-      setState(() => _isLoading = false);
     }
+    // Also when the list never came: the spinner must not stay forever.
+    if (mounted) setState(() => _isLoading = false);
   }
 
   void _filterApps() {

@@ -110,7 +110,14 @@ List<OstpProfile> decodeProfiles(String? json) {
   if (json == null || json.isEmpty) return [];
   try {
     final List<dynamic> decoded = jsonDecode(json);
-    return decoded.map((e) => OstpProfile.fromJson(e)).toList();
+    // One damaged entry must not make every profile disappear (and then be saved over).
+    final out = <OstpProfile>[];
+    for (final e in decoded) {
+      try {
+        out.add(OstpProfile.fromJson(e as Map<String, dynamic>));
+      } catch (_) {}
+    }
+    return out;
   } catch (_) {
     return [];
   }

@@ -19,6 +19,9 @@ class _LogsScreenState extends State<LogsScreen> {
   Timer? _pollTimer;
   final List<String> _logs = [];
   final ScrollController _scrollCtrl = ScrollController();
+  // The view keeps the newest lines only; the native buffer is bounded too.
+  static const _maxLines = 2000;
+  bool _fetching = false;
 
   @override
   void initState() {
@@ -35,13 +38,18 @@ class _LogsScreenState extends State<LogsScreen> {
   }
 
   Future<void> _fetchLogs() async {
+    // A slow call must not stack up behind the 1 s timer.
+    if (_fetching) return;
+    _fetching = true;
     try {
-      final String logsJson = await platform.invokeMethod('getLogs');
-      if (logsJson.isNotEmpty && logsJson != "[]") {
+      final String? logsJson = await platform.invokeMethod<String>('getLogs').timeout(const Duration(seconds: 5));
+      if (!mounted) return;
+      if (logsJson != null && logsJson.isNotEmpty && logsJson != "[]") {
         final List<dynamic> parsed = jsonDecode(logsJson);
         if (parsed.isNotEmpty) {
           setState(() {
             _logs.addAll(parsed.map((e) => e.toString()));
+            if (_logs.length > _maxLines) _logs.removeRange(0, _logs.length - _maxLines);
           });
           Future.delayed(const Duration(milliseconds: 100), () {
             if (_scrollCtrl.hasClients) {
@@ -52,6 +60,8 @@ class _LogsScreenState extends State<LogsScreen> {
       }
     } catch (e, stackTrace) {
       debugPrint("Failed to fetch logs: $e\n$stackTrace");
+      // Stop asking: every failed tick used to open another dialog.
+      _pollTimer?.cancel();
       if (mounted) {
         Navigator.of(context).popUntil((route) => route.isFirst);
         showDialog(
@@ -77,11 +87,19 @@ class _LogsScreenState extends State<LogsScreen> {
           ),
         );
       }
+    } finally {
+      _fetching = false;
     }
   }
 
   Future<void> _clearLogs() async {
-    await platform.invokeMethod('clearLogs');
+    try {
+      await platform.invokeMethod('clearLogs').timeout(const Duration(seconds: 5));
+    } catch (e) {
+      debugPrint('clearLogs failed: $e');
+      return;
+    }
+    if (!mounted) return;
     setState(() {
       _logs.clear();
     });

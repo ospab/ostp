@@ -51,10 +51,18 @@ class OstpTileService : TileService() {
                     action = "START"
                     putExtra("configJson", configJson)
                 }
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                    startForegroundService(startIntent)
-                } else {
-                    startService(startIntent)
+                try {
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                        startForegroundService(startIntent)
+                    } else {
+                        startService(startIntent)
+                    }
+                } catch (e: Throwable) {
+                    // The system may refuse a foreground start (background limits): the tile
+                    // stays off instead of showing a tunnel that does not exist.
+                    android.util.Log.e("OstpTileService", "Could not start the VPN service", e)
+                    updateTile()
+                    return
                 }
                 qsTile?.state = Tile.STATE_ACTIVE
                 qsTile?.label = "OSTP VPN"

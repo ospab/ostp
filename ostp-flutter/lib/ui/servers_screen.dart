@@ -910,13 +910,23 @@ class _ActionDialogState extends State<_ActionDialog> {
     try {
       since = (await ServersApi.lines(0)).$2;
     } catch (_) {}
+    var busy = false;
     _poll = Timer.periodic(const Duration(milliseconds: 600), (_) async {
+      // A slow answer must not be followed by a second request for the same lines.
+      if (busy) return;
+      busy = true;
       try {
         final (lines, next) = await ServersApi.lines(since);
         since = next;
         if (!mounted) return;
-        setState(() => _log.addAll(lines.where((l) => l['id'] == widget.serverId).map((l) => l['line'] as String)));
-      } catch (_) {}
+        setState(() {
+          _log.addAll(lines.where((l) => l['id'] == widget.serverId).map((l) => l['line'] as String));
+          if (_log.length > 500) _log.removeRange(0, _log.length - 500);
+        });
+      } catch (_) {
+      } finally {
+        busy = false;
+      }
     });
     try {
       await widget.run();

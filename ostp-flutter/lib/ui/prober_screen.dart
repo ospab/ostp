@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -25,6 +26,8 @@ class ProberScreen extends StatefulWidget {
 
 class _ProberScreenState extends State<ProberScreen> {
   static const platform = MethodChannel('com.ospab.ostp/vpn');
+  // The native tests have their own timeouts; this only frees the screen if one hangs.
+  static const _probeTimeout = Duration(minutes: 3);
 
   OstpProfile? _profile;
   bool _matrixRunning = false;
@@ -85,7 +88,8 @@ class _ProberScreenState extends State<ProberScreen> {
         'access_key': profile.accessKey,
         if (_tlsRequest(profile) != null) 'tls': _tlsRequest(profile),
       });
-      final String raw = await platform.invokeMethod('runProberMatrix', {'requestJson': requestJson});
+      final String raw = await platform.invokeMethod('runProberMatrix', {'requestJson': requestJson}).timeout(_probeTimeout);
+      if (!mounted) return;
       final decoded = jsonDecode(raw);
       if (decoded is Map && decoded.containsKey('error')) {
         setState(() => _matrixError = decoded['error'].toString());
@@ -96,7 +100,8 @@ class _ProberScreenState extends State<ProberScreen> {
         await widget.prefs.setString('last_prober_matrix', raw);
       }
     } catch (e) {
-      setState(() => _matrixError = e.toString());
+      if (!mounted) return;
+      setState(() => _matrixError = e is TimeoutException ? 'No answer in time. The test may still be running; try again later.' : e.toString());
     } finally {
       if (mounted) setState(() => _matrixRunning = false);
     }
@@ -121,7 +126,8 @@ class _ProberScreenState extends State<ProberScreen> {
         'max_ttl': maxTtl.clamp(1, 64),
         if (_tlsRequest(profile) != null) 'tls': _tlsRequest(profile),
       });
-      final String raw = await platform.invokeMethod('runProberTtlScan', {'requestJson': requestJson});
+      final String raw = await platform.invokeMethod('runProberTtlScan', {'requestJson': requestJson}).timeout(_probeTimeout);
+      if (!mounted) return;
       final decoded = jsonDecode(raw);
       if (decoded is Map && decoded.containsKey('error') && !decoded.containsKey('steps')) {
         setState(() => _ttlError = decoded['error'].toString());
@@ -130,7 +136,8 @@ class _ProberScreenState extends State<ProberScreen> {
         await widget.prefs.setString('last_prober_ttl', raw);
       }
     } catch (e) {
-      setState(() => _ttlError = e.toString());
+      if (!mounted) return;
+      setState(() => _ttlError = e is TimeoutException ? 'No answer in time. The test may still be running; try again later.' : e.toString());
     } finally {
       if (mounted) setState(() => _ttlRunning = false);
     }
@@ -143,7 +150,8 @@ class _ProberScreenState extends State<ProberScreen> {
       _dpiReport = null;
     });
     try {
-      final String raw = await platform.invokeMethod('runProberDpiBattery');
+      final String raw = await platform.invokeMethod('runProberDpiBattery').timeout(_probeTimeout);
+      if (!mounted) return;
       final decoded = jsonDecode(raw);
       if (decoded is Map && decoded.containsKey('error') && !decoded.containsKey('dpi_score')) {
         setState(() => _dpiError = decoded['error'].toString());
@@ -154,7 +162,8 @@ class _ProberScreenState extends State<ProberScreen> {
         await widget.prefs.setString('last_prober_dpi', raw);
       }
     } catch (e) {
-      setState(() => _dpiError = e.toString());
+      if (!mounted) return;
+      setState(() => _dpiError = e is TimeoutException ? 'No answer in time. The test may still be running; try again later.' : e.toString());
     } finally {
       if (mounted) setState(() => _dpiRunning = false);
     }

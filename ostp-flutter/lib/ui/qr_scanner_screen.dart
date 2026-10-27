@@ -42,6 +42,11 @@ class _QRScannerScreenState extends State<QRScannerScreen> {
   }
 
   DateTime? lastErrorTime;
+  // The camera reports the same code on several frames; only the first may close the screen.
+  bool _done = false;
+  // A real link is a few hundred bytes. A code carrying more is not one, and is
+  // not worth scanning with a regex or writing to the log.
+  static const _maxPayload = 4096;
 
   @override
   Widget build(BuildContext context) {
@@ -57,11 +62,14 @@ class _QRScannerScreenState extends State<QRScannerScreen> {
           MobileScanner(
             controller: controller,
             onDetect: (capture) {
+              if (_done) return;
               final List<Barcode> barcodes = capture.barcodes;
               for (final barcode in barcodes) {
+                if ((barcode.rawValue?.length ?? 0) > _maxPayload) continue;
                 // A share link, or a subscription URL (https://<domain>/sub/<token>).
                 final value = extractImportable(barcode);
                 if (value != null && (value.toLowerCase().startsWith('ostp://') || isSubscriptionUrl(value))) {
+                  _done = true;
                   controller.stop();
                   Navigator.pop(context, value);
                   return;
@@ -69,7 +77,8 @@ class _QRScannerScreenState extends State<QRScannerScreen> {
                 final now = DateTime.now();
                 if (lastErrorTime == null || now.difference(lastErrorTime!) > const Duration(seconds: 3)) {
                   lastErrorTime = now;
-                  final read = barcode.rawValue ?? barcode.displayValue ?? barcode.url?.url ?? '(no text)';
+                  var read = barcode.rawValue ?? barcode.displayValue ?? barcode.url?.url ?? '(no text)';
+                  if (read.length > 200) read = '${read.substring(0, 200)}…';
                   // Into the app log too, so a code that is not recognised can be traced.
                   _channel.invokeMethod('addLog', {'message': 'QR scanner: not importable (${barcode.format.name}): $read'}).catchError((_) => null);
                   final shown = read.length > 60 ? '${read.substring(0, 60)}…' : read;

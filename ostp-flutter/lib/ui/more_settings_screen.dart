@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../services/updates.dart' as updates;
@@ -106,6 +107,8 @@ class _MoreSettingsScreenState extends State<MoreSettingsScreen> {
         TextField(
           controller: controller,
           maxLines: 3,
+          // Roughly a thousand entries; the config sent to the core has its own limit.
+          inputFormatters: [LengthLimitingTextInputFormatter(30000)],
           style: const TextStyle(fontSize: 16),
           decoration: InputDecoration(
             hintText: hint,

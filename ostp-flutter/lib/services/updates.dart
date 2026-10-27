@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 
 import 'package:flutter/material.dart';
@@ -19,7 +20,7 @@ const _skipKey = 'skip_update_tag';
 /// This build's release tag, e.g. "v0.4.6-beta.2", or null if unknown.
 Future<String?> buildTag() async {
   try {
-    return await _channel.invokeMethod<String>('buildTag');
+    return await _channel.invokeMethod<String>('buildTag').timeout(const Duration(seconds: 5));
   } catch (_) {
     return null;
   }
@@ -30,9 +31,14 @@ Future<String?> buildTag() async {
 Future<void> checkForUpdates(BuildContext context, SharedPreferences prefs, {required bool manual}) async {
   Map<String, dynamic> r;
   try {
-    final raw = await _channel.invokeMethod<String>('checkForUpdates');
+    final raw = await _channel.invokeMethod<String>('checkForUpdates').timeout(const Duration(seconds: 30));
     r = jsonDecode(raw ?? '{}') as Map<String, dynamic>;
     if (r['error'] != null) throw Exception(r['error']);
+  } on TimeoutException {
+    if (manual && context.mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Update check failed: no answer in time')));
+    }
+    return;
   } catch (e) {
     if (manual && context.mounted) {
       ScaffoldMessenger.of(context).showSnackBar(
