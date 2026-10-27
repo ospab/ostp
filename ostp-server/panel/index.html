@@ -22,7 +22,7 @@
 :root.light {
   --bg: #f4f6f8; --surface: #ffffff; --card: #ffffff; --border: #e3e7ec; --hover: #f1f3f6;
   --fg: #14181d; --fg2: #5d6773; --fg3: #b3bbc5;
-  --accent: #14a44d; --accent-dim: rgba(20,164,77,.10);
+  --accent: #14a44d; --accent-dim: rgba(20,164,77,.10); --blue: #1f6fd1;
   --red: #d93636; --red-dim: rgba(217,54,54,.08); --amber: #c27d0e; --amber-dim: rgba(194,125,14,.10);
   color-scheme: light;
 }
@@ -34,8 +34,10 @@ body {
   -webkit-font-smoothing: antialiased;
 }
 button, input, select, textarea { font: inherit; color: inherit; }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 a { color: var(--accent); }
 .hidden { display: none !important; }
+.sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
 .mono { font-family: var(--mono); font-size: .92em; }
 .muted { color: var(--fg2); }
 .small { font-size: 12px; }
@@ -44,7 +46,7 @@ a { color: var(--accent); }
 .app { display: grid; grid-template-columns: 220px 1fr; min-height: 100vh; }
 .side { background: var(--surface); border-right: 1px solid var(--border); padding: 18px 12px; display: flex; flex-direction: column; gap: 4px; position: sticky; top: 0; height: 100vh; }
 .brand { display: flex; align-items: center; gap: 10px; padding: 4px 10px 18px; font-weight: 700; letter-spacing: 2px; }
-.brand-dot { width: 10px; height: 10px; border-radius: 50%; background: var(--accent); box-shadow: 0 0 12px var(--accent); }
+.brand-dot { width: 10px; height: 10px; border-radius: 50%; background: var(--accent); }
 .nav { display: flex; align-items: center; gap: 10px; padding: 9px 12px; border-radius: var(--r-sm); color: var(--fg2); cursor: pointer; border: 0; background: none; text-align: left; width: 100%; }
 .nav:hover { background: var(--hover); color: var(--fg); }
 .nav.active { background: var(--accent-dim); color: var(--fg); }
@@ -70,6 +72,7 @@ a { color: var(--accent); }
 .icon-btn.danger:hover { color: var(--red); background: var(--red-dim); }
 .input { width: 100%; padding: 9px 11px; border-radius: var(--r-sm); border: 1px solid var(--border); background: var(--surface); outline: none; }
 .input:focus { border-color: var(--accent); }
+.input:focus-visible { outline-offset: 0; }
 textarea.input { font-family: var(--mono); font-size: 12.5px; resize: vertical; }
 label.lbl { display: block; font-size: 12px; color: var(--fg2); margin: 0 0 6px; }
 .field { margin-bottom: 14px; }
@@ -84,7 +87,7 @@ label.lbl { display: block; font-size: 12px; color: var(--fg2); margin: 0 0 6px;
 .stats { grid-template-columns: repeat(4, minmax(0, 1fr)); }
 .two { grid-template-columns: 1.4fr 1fr; }
 .card { background: var(--card); border: 1px solid var(--border); border-radius: var(--r); padding: 16px 18px; }
-.card h3 { margin: 0 0 12px; font-size: 13px; font-weight: 600; color: var(--fg2); text-transform: uppercase; letter-spacing: .6px; }
+.card h3 { margin: 0 0 12px; font-size: 14px; font-weight: 600; color: var(--fg2); }
 .stat-label { color: var(--fg2); font-size: 12px; display: flex; align-items: center; gap: 7px; }
 .stat-value { font-size: 26px; font-weight: 650; margin-top: 6px; letter-spacing: -.3px; }
 .stat-sub { font-size: 12px; color: var(--fg2); margin-top: 3px; }
@@ -95,7 +98,7 @@ label.lbl { display: block; font-size: 12px; color: var(--fg2); margin: 0 0 6px;
 .pill.warn { background: var(--amber-dim); color: var(--amber); }
 .pill.bad { background: var(--red-dim); color: var(--red); }
 .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--fg3); display: inline-block; flex-shrink: 0; }
-.dot.on { background: var(--accent); box-shadow: 0 0 8px var(--accent); }
+.dot.on { background: var(--accent); }
 canvas.chart { width: 100%; height: 170px; display: block; }
 .legend { display: flex; gap: 16px; font-size: 12px; color: var(--fg2); margin-top: 8px; }
 .legend i { display: inline-block; width: 10px; height: 3px; border-radius: 2px; margin-right: 6px; vertical-align: middle; }
@@ -105,12 +108,13 @@ canvas.chart { width: 100%; height: 170px; display: block; }
 table { width: 100%; border-collapse: collapse; }
 th { text-align: left; font-size: 12px; font-weight: 500; color: var(--fg2); padding: 10px 10px; border-bottom: 1px solid var(--border); white-space: nowrap; cursor: default; }
 th.sortable { cursor: pointer; user-select: none; }
+th[aria-sort=ascending], th[aria-sort=descending] { color: var(--fg); border-bottom-color: var(--accent); }
 th.sortable:hover { color: var(--fg); }
 td { padding: 11px 10px; border-bottom: 1px solid var(--border); vertical-align: middle; font-size: 13px; }
 tr:hover td { background: var(--hover); }
 tr:last-child td { border-bottom: 0; }
 .user-name { font-weight: 600; }
-.key { font-family: var(--mono); font-size: 12px; color: var(--fg2); cursor: pointer; }
+.key { font-family: var(--mono); font-size: 12px; color: var(--fg2); cursor: pointer; background: none; border: 0; padding: 0; display: block; text-align: left; }
 .key:hover { color: var(--fg); }
 .usage { min-width: 150px; }
 .bar { height: 5px; border-radius: 999px; background: var(--hover); overflow: hidden; margin-top: 5px; }
@@ -123,7 +127,7 @@ tr:last-child td { border-bottom: 0; }
 .toolbar .input { max-width: 300px; }
 
 /* modal */
-.overlay { position: fixed; inset: 0; background: rgba(0,0,0,.55); display: flex; align-items: center; justify-content: center; z-index: 50; padding: 16px; backdrop-filter: blur(3px); }
+.overlay { position: fixed; inset: 0; background: rgba(0,0,0,.55); display: flex; align-items: center; justify-content: center; z-index: 50; padding: 16px; }
 .modal { background: var(--surface); border: 1px solid var(--border); border-radius: 16px; width: 100%; max-width: 460px; padding: 22px; max-height: 92vh; overflow: auto; }
 .modal.wide { max-width: 560px; }
 .modal h2 { margin: 0 0 4px; font-size: 17px; }
@@ -143,9 +147,8 @@ tr:last-child td { border-bottom: 0; }
 
 /* toast */
 .toasts { position: fixed; right: 18px; bottom: 18px; display: flex; flex-direction: column; gap: 8px; z-index: 80; }
-.toast { background: var(--surface); border: 1px solid var(--border); border-left: 3px solid var(--accent); padding: 10px 14px; border-radius: var(--r-sm); min-width: 220px; max-width: 360px; box-shadow: 0 8px 30px rgba(0,0,0,.35); font-size: 13px; animation: in .18s ease; }
+.toast { background: var(--surface); border: 1px solid var(--border); border-left: 3px solid var(--accent); padding: 10px 14px; border-radius: var(--r-sm); min-width: 220px; max-width: 360px; font-size: 13px; }
 .toast.err { border-left-color: var(--red); }
-@keyframes in { from { transform: translateY(8px); opacity: 0; } }
 
 .dns-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); gap: 8px; }
 .chk { display: flex; align-items: center; gap: 8px; font-size: 13px; cursor: pointer; }
@@ -164,7 +167,7 @@ tr:last-child td { border-bottom: 0; }
 
 @media (max-width: 1000px) { .stats { grid-template-columns: repeat(2, minmax(0, 1fr)); } .two { grid-template-columns: 1fr; } }
 @media (max-width: 760px) {
-  .app { grid-template-columns: 1fr; }
+  .app { grid-template-columns: 1fr; align-content: start; }
   .side { position: sticky; z-index: 10; height: auto; flex-direction: row; overflow-x: auto; padding: 8px; border-right: 0; border-bottom: 1px solid var(--border); }
   .brand, .side-foot .muted { display: none; }
   .nav span { display: none; }
@@ -173,9 +176,13 @@ tr:last-child td { border-bottom: 0; }
   .hide-sm { display: none; }
   /* Top bar: one row of icons, not stretched by the page below. */
   .side { align-items: center; gap: 2px; top: 0; }
-  .nav { width: auto; flex-shrink: 0; padding: 10px 11px; }
-  .icon-btn { width: 36px; height: 36px; }
+  .nav { width: auto; flex-shrink: 0; padding: 10px 7px; }
+  .icon-btn { width: 32px; height: 36px; }
   .toolbar .input { max-width: none; }
+  .input { font-size: 16px; }
+  .btn.sm { padding: 8px 11px; }
+  .toasts { left: 16px; right: 16px; }
+  .toast { max-width: none; }
   .row { flex-wrap: wrap; }
   .row > select.input { max-width: none !important; flex: 1 1 100%; }
   .mini { overflow-wrap: anywhere; }
@@ -215,10 +222,10 @@ tr:last-child td { border-bottom: 0; }
     </div>
     <div class="field">
       <label class="lbl" for="lg-pass" data-t="password">Password</label>
-      <input class="input" id="lg-pass" type="password" autocomplete="current-password" />
+      <input class="input" id="lg-pass" type="password" autocomplete="current-password" required />
     </div>
-    <button class="btn primary" style="width:100%" data-t="sign_in">Sign in</button>
-    <p id="lg-err" class="note warn hidden"></p>
+    <button class="btn primary" id="lg-btn" style="width:100%" data-t="sign_in">Sign in</button>
+    <p id="lg-err" class="note warn hidden" role="alert"></p>
   </form>
 </div>
 
@@ -226,33 +233,33 @@ tr:last-child td { border-bottom: 0; }
 <div id="app" class="app hidden">
   <aside class="side">
     <div class="brand"><span class="brand-dot"></span>OSTP</div>
-    <button class="nav active" data-page="overview">
+    <button class="nav active" data-page="overview" data-tt="overview">
       <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="9"/><rect x="14" y="3" width="7" height="5"/><rect x="14" y="12" width="7" height="9"/><rect x="3" y="16" width="7" height="5"/></svg>
       <span data-t="overview">Overview</span></button>
-    <button class="nav" data-page="users">
+    <button class="nav" data-page="users" data-tt="users">
       <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75"/></svg>
       <span data-t="users">Users</span></button>
-    <button class="nav" data-page="routing">
+    <button class="nav" data-page="routing" data-tt="routing">
       <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="6" cy="19" r="3"/><path d="M9 19h8.5a3.5 3.5 0 0 0 0-7h-11a3.5 3.5 0 0 1 0-7H15"/><circle cx="18" cy="5" r="3"/></svg>
       <span data-t="routing">Routing</span></button>
-    <button class="nav" data-page="config">
+    <button class="nav" data-page="config" data-tt="config">
       <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></svg>
       <span data-t="config">Configuration</span></button>
-    <button class="nav" data-page="dns">
+    <button class="nav" data-page="dns" data-tt="dns">
       <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
-      <span>DNS</span></button>
-    <button class="nav" data-page="overnet">
+      <span data-t="dns">DNS</span></button>
+    <button class="nav" data-page="overnet" data-tt="overnet">
       <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><circle cx="5" cy="5" r="2"/><circle cx="19" cy="5" r="2"/><circle cx="5" cy="19" r="2"/><circle cx="19" cy="19" r="2"/><path d="M6.5 6.5 10 10M17.5 6.5 14 10M6.5 17.5 10 14M17.5 17.5 14 14"/></svg>
-      <span>overnet</span></button>
-    <button class="nav" data-page="activity">
+      <span data-t="overnet">overnet</span></button>
+    <button class="nav" data-page="activity" data-tt="activity">
       <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
       <span data-t="activity">Activity</span></button>
     <div class="side-foot">
       <div class="side-row">
-        <button class="icon-btn" id="btn-lang" title="Language"><span id="lang-label" class="small">RU</span></button>
-        <button class="icon-btn" id="btn-theme" title="Theme">
+        <button class="icon-btn" id="btn-lang" data-tt="language"><span id="lang-label" class="small">RU</span></button>
+        <button class="icon-btn" id="btn-theme" data-tt="theme">
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg></button>
-        <button class="icon-btn" id="btn-logout" title="Sign out">
+        <button class="icon-btn" id="btn-logout" data-tt="sign_out">
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg></button>
       </div>
       <div class="muted small" id="side-version"></div>
@@ -264,7 +271,7 @@ tr:last-child td { border-bottom: 0; }
     <section id="page-overview">
       <div class="page-head">
         <div><h1 data-t="overview">Overview</h1><div class="sub" id="ov-sub"></div></div>
-        <span class="pill" id="ov-live"><span class="dot on"></span><span data-t="live">Live</span></span>
+        <span class="pill" id="ov-live" role="status"><span class="dot"></span><span id="ov-live-text"></span></span>
       </div>
       <div class="grid stats">
         <div class="card"><div class="stat-label"><span class="dot on"></span><span data-t="online_now">Online now</span></div>
@@ -309,7 +316,7 @@ tr:last-child td { border-bottom: 0; }
         </div>
       </div>
       <div class="toolbar">
-        <input class="input" id="user-search" placeholder="Search by name or key" data-tp="search" />
+        <input class="input" id="user-search" type="search" placeholder="Search by name or key" data-tp="search" data-tl="search" />
         <div class="seg" id="user-filter">
           <button class="on" data-f="all" data-t="all">All</button>
           <button data-f="online" data-t="online">Online</button>
@@ -320,11 +327,11 @@ tr:last-child td { border-bottom: 0; }
         <div class="table-wrap">
           <table>
             <thead><tr>
-              <th class="sortable" data-sort="name" data-t="user">User</th>
-              <th class="sortable hide-sm" data-sort="connections" data-t="sessions">Sessions</th>
-              <th class="sortable" data-sort="down" data-t="traffic">Traffic ↓ / ↑</th>
-              <th class="sortable usage" data-sort="usage" data-t="limit">Limit</th>
-              <th></th>
+              <th class="sortable" data-sort="name" tabindex="0" data-t="user">User</th>
+              <th class="sortable hide-sm" data-sort="connections" tabindex="0" data-t="sessions">Sessions</th>
+              <th class="sortable" data-sort="down" tabindex="0" data-t="traffic">Traffic ↓ / ↑</th>
+              <th class="sortable usage" data-sort="usage" tabindex="0" data-t="limit">Limit</th>
+              <th><span class="sr" data-t="actions">Actions</span></th>
             </tr></thead>
             <tbody id="users-body"></tbody>
           </table>
@@ -339,9 +346,9 @@ tr:last-child td { border-bottom: 0; }
         <button class="btn primary" id="btn-save-rules" data-t="save">Save</button>
       </div>
       <div class="card">
-        <p class="muted small" data-t="routing_help">A list of rules; each has domain_suffix and/or ip_cidr lists and an action ("proxy" or "direct"). Applied immediately.</p>
-        <textarea class="input" id="rules" rows="18" spellcheck="false"></textarea>
-        <p id="rules-note" class="note"></p>
+        <p class="muted small" data-t="routing_help">A list of rules; each has domain_suffix and/or ip_cidr lists and an action ("proxy", "direct" or "block"). Applied immediately and saved to config.json.</p>
+        <textarea class="input" id="rules" rows="18" spellcheck="false" data-tl="routing"></textarea>
+        <p id="rules-note" class="note" role="status"></p>
       </div>
     </section>
 
@@ -355,8 +362,8 @@ tr:last-child td { border-bottom: 0; }
         </div>
       </div>
       <div class="card">
-        <textarea class="input" id="config" rows="28" spellcheck="false"></textarea>
-        <p id="config-note" class="note"></p>
+        <textarea class="input" id="config" rows="28" spellcheck="false" data-tl="config"></textarea>
+        <p id="config-note" class="note" role="status"></p>
       </div>
     </section>
 
@@ -365,7 +372,7 @@ tr:last-child td { border-bottom: 0; }
       <div class="page-head">
         <div><h1>DNS</h1><div class="sub" data-t="dns_sub">Filtering resolver for connected clients: ads and trackers blocked, your own names answered. Not reachable from the internet.</div></div>
         <div class="row">
-          <span class="pill" id="dns-state"></span>
+          <span class="pill" id="dns-state" role="status"></span>
           <button class="btn" id="btn-dns-toggle"></button>
           <button class="btn" id="btn-dns-update" data-t="dns_update">Update lists</button>
         </div>
@@ -382,13 +389,13 @@ tr:last-child td { border-bottom: 0; }
       </div>
       <div class="card" style="margin-top:14px">
         <h3 data-t="dns_test">Check a domain</h3>
-        <div class="row"><input class="input grow" id="dns-test-name" placeholder="ads.example.com" /><button class="btn" id="btn-dns-test" data-t="dns_check">Check</button></div>
-        <p class="note" id="dns-test-result"></p>
+        <div class="row"><input class="input grow" id="dns-test-name" placeholder="ads.example.com" data-tl="dns_test" /><button class="btn" id="btn-dns-test" data-t="dns_check">Check</button></div>
+        <p class="note" id="dns-test-result" role="status"></p>
       </div>
       <div class="card" style="margin-top:14px">
         <div class="row" style="justify-content:space-between;margin-bottom:10px">
           <h3 style="margin:0" data-t="dns_log">Query log</h3>
-          <div class="row"><input class="input" id="dns-log-q" style="max-width:220px" data-tp="dns_filter" placeholder="domain or client" /><button class="btn danger sm" id="btn-dns-clear" data-t="clear">Clear</button></div>
+          <div class="row"><input class="input" id="dns-log-q" type="search" style="max-width:220px" data-tp="dns_filter" data-tl="dns_filter" placeholder="domain or client" /><button class="btn danger sm" id="btn-dns-clear" data-t="clear">Clear</button></div>
         </div>
         <div class="table-wrap"><table><thead><tr><th data-t="dns_time">Time</th><th data-t="dns_client">Client</th><th data-t="dns_domain">Domain</th><th data-t="dns_result">Result</th><th></th></tr></thead><tbody id="dns-log"></tbody></table></div>
         <div class="row" id="dns-log-more-row" style="justify-content:center;margin-top:10px;display:none"><button class="btn sm" id="btn-dns-more" data-t="dns_more">Show more</button></div>
@@ -396,28 +403,28 @@ tr:last-child td { border-bottom: 0; }
       <div class="grid two" style="margin-top:14px">
         <div class="card">
           <h3 data-t="dns_upstreams">Upstream resolvers</h3>
-          <textarea class="input" id="dns-upstreams-edit" rows="4" spellcheck="false"></textarea>
+          <textarea class="input" id="dns-upstreams-edit" rows="4" spellcheck="false" data-tl="dns_upstreams"></textarea>
           <p class="mini" data-t="dns_upstreams_help">One per line: https://…/dns-query, tls://host, tcp://ip, udp://ip or an IP.</p>
-          <div class="row"><label class="lbl" style="margin:0" data-t="dns_mode">Mode</label>
+          <div class="row"><label class="lbl" style="margin:0" for="dns-upstream-mode" data-t="dns_mode">Mode</label>
             <select class="input" id="dns-upstream-mode" style="max-width:220px"><option value="fallback" data-t="dns_fallback">In order</option><option value="parallel" data-t="dns_parallel">Parallel, fastest wins</option></select></div>
         </div>
         <div class="card">
           <h3 data-t="dns_options">Options</h3>
           <label class="chk"><input type="checkbox" id="dns-safe"> <span data-t="dns_safe">Safe search (Google, YouTube, Bing, DuckDuckGo, Yandex)</span></label>
           <label class="chk" style="margin-top:8px"><input type="checkbox" id="dns-doh"> <span data-t="dns_doh">Stop browsers' own DNS over HTTPS/TLS</span></label>
-          <div class="row" style="margin-top:10px"><label class="lbl" style="margin:0;min-width:140px" data-t="dns_blocking">Blocked names get</label>
+          <div class="row" style="margin-top:10px"><label class="lbl" style="margin:0;min-width:140px" for="dns-blocking" data-t="dns_blocking">Blocked names get</label>
             <select class="input" id="dns-blocking" style="max-width:220px"><option value="nxdomain">NXDOMAIN</option><option value="null_ip">0.0.0.0 / ::</option><option value="refused">REFUSED</option></select></div>
-          <div class="row" style="margin-top:8px"><label class="lbl" style="margin:0;min-width:140px" data-t="dns_interval">Update lists every, h</label><input class="input" id="dns-interval" type="number" min="1" style="max-width:120px"></div>
-          <div class="row" style="margin-top:8px"><label class="lbl" style="margin:0;min-width:140px" data-t="dns_cache">Cache entries</label><input class="input" id="dns-cache" type="number" min="0" style="max-width:120px"></div>
+          <div class="row" style="margin-top:8px"><label class="lbl" style="margin:0;min-width:140px" for="dns-interval" data-t="dns_interval">Update lists every, h</label><input class="input" id="dns-interval" type="number" min="1" max="8760" style="max-width:120px"></div>
+          <div class="row" style="margin-top:8px"><label class="lbl" style="margin:0;min-width:140px" for="dns-cache" data-t="dns_cache">Cache entries</label><input class="input" id="dns-cache" type="number" min="0" style="max-width:120px"></div>
         </div>
       </div>
       <div class="card" style="margin-top:14px">
         <h3 data-t="dns_lists">Block lists</h3>
         <div id="dns-lists"></div>
         <div class="row" style="margin-top:10px">
-          <select class="input" id="dns-preset" style="max-width:260px"></select>
+          <select class="input" id="dns-preset" style="max-width:260px" data-tl="dns_preset"></select>
           <button class="btn sm" id="btn-dns-preset" data-t="dns_add">Add</button>
-          <input class="input grow" id="dns-list-url" placeholder="https://…/list.txt" />
+          <input class="input grow" id="dns-list-url" placeholder="https://…/list.txt" data-tl="dns_list_url" />
           <label class="chk"><input type="checkbox" id="dns-list-allow"> <span data-t="dns_allowlist">allow list</span></label>
           <button class="btn sm" id="btn-dns-list-add" data-t="dns_add">Add</button>
         </div>
@@ -425,13 +432,13 @@ tr:last-child td { border-bottom: 0; }
       <div class="grid two" style="margin-top:14px">
         <div class="card">
           <h3 data-t="dns_rules_own">Your rules</h3>
-          <textarea class="input" id="dns-rules-edit" rows="8" spellcheck="false" placeholder="||ads.example.com^&#10;@@||good.example.com^&#10;0.0.0.0 tracker.example.net"></textarea>
+          <textarea class="input" id="dns-rules-edit" rows="8" spellcheck="false" data-tl="dns_rules_own" placeholder="||ads.example.com^&#10;@@||good.example.com^&#10;0.0.0.0 tracker.example.net"></textarea>
           <p class="mini" data-t="dns_rules_help">||domain^ blocks it with subdomains, @@ allows, $important wins over exceptions, * is a wildcard, hosts lines work.</p>
         </div>
         <div class="card">
           <h3 data-t="dns_rewrites">Your names</h3>
           <div id="dns-rewrites"></div>
-          <div class="row" style="margin-top:8px"><input class="input" id="dns-rw-domain" placeholder="panel.ostp"><input class="input" id="dns-rw-answer" placeholder="10.1.0.1"><button class="btn sm" id="btn-dns-rw-add" data-t="dns_add">Add</button></div>
+          <div class="row" style="margin-top:8px"><input class="input" id="dns-rw-domain" placeholder="panel.ostp" data-tl="dns_rw_domain"><input class="input" id="dns-rw-answer" placeholder="10.1.0.1" data-tl="dns_rw_answer"><button class="btn sm" id="btn-dns-rw-add" data-t="dns_add">Add</button></div>
           <p class="mini" data-t="dns_rewrites_help">10.1.0.1 is this server as clients see it through the tunnel: panel.ostp → 10.1.0.1 opens the panel by name. *.lan covers every subdomain.</p>
         </div>
       </div>
@@ -439,14 +446,14 @@ tr:last-child td { border-bottom: 0; }
         <h3 data-t="dns_services">Block services</h3>
         <div class="dns-grid" id="dns-services"></div>
       </div>
-      <div class="row" style="justify-content:flex-end;margin-top:14px"><span class="note" id="dns-save-note"></span><button class="btn primary" id="btn-dns-save" data-t="save">Save</button></div>
+      <div class="row" style="justify-content:flex-end;margin-top:14px"><span class="note" id="dns-save-note" role="status"></span><button class="btn primary" id="btn-dns-save" data-t="save">Save</button></div>
     </section>
 
     <!-- overnet -->
     <section id="page-overnet" class="hidden">
       <div class="page-head">
-        <div><h1>overnet</h1><div class="sub" data-t="ov_sub">.ov sites for this server's clients in any browser, through the overnet gateway on this machine. Off unless you turn it on.</div></div>
-        <div class="row"><span class="pill" id="ov-state"></span></div>
+        <div><h1 data-t="overnet">overnet</h1><div class="sub" data-t="ovn_sub">.ov sites for this server's clients in any browser, through the overnet gateway on this machine. Off unless you turn it on.</div></div>
+        <div class="row"><span class="pill" id="ov-state" role="status"></span></div>
       </div>
       <div class="dns-grid" style="grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:14px">
         <div class="card"><div class="stat-label" data-t="ov_entry">.ov for clients</div><div class="stat-value" id="ov-entry-v">–</div><div class="stat-sub" id="ov-entry-sub"></div></div>
@@ -457,11 +464,11 @@ tr:last-child td { border-bottom: 0; }
         <h3 data-t="ov_settings">Settings</h3>
         <label class="chk"><input type="checkbox" id="ov-enabled"> <span data-t="ov_enabled">overnet on this server</span></label>
         <label class="chk" style="margin-top:8px"><input type="checkbox" id="ov-entry"> <span data-t="ov_entry_chk">Serve .ov to clients</span></label>
-        <div class="row" style="margin-top:8px"><label class="lbl" style="margin:0;min-width:180px" data-t="ov_gateway_addr">Gateway (SOCKS5)</label><input class="input" id="ov-gateway" placeholder="127.0.0.1:9150" style="max-width:220px"></div>
+        <div class="row" style="margin-top:8px"><label class="lbl" style="margin:0;min-width:180px" for="ov-gateway" data-t="ov_gateway_addr">Gateway (SOCKS5)</label><input class="input" id="ov-gateway" placeholder="127.0.0.1:9150" style="max-width:220px" autocomplete="off" spellcheck="false"></div>
         <label class="chk" style="margin-top:12px"><input type="checkbox" id="ov-exit"> <span data-t="ov_exit_chk">Exit: overnet users reach the internet through this server</span></label>
-        <div class="row" style="margin-top:8px"><label class="lbl" style="margin:0;min-width:180px" data-t="ov_exit_addr">Exit listens on</label><input class="input" id="ov-exit-listen" placeholder="127.0.0.1:9151" style="max-width:220px"></div>
+        <div class="row" style="margin-top:8px"><label class="lbl" style="margin:0;min-width:180px" for="ov-exit-listen" data-t="ov_exit_addr">Exit listens on</label><input class="input" id="ov-exit-listen" placeholder="127.0.0.1:9151" style="max-width:220px" autocomplete="off" spellcheck="false"></div>
         <p class="mini" data-t="ov_help">The gateway is overnet's own program: on the server run ostp overnet install. While .ov is served, browsers' encrypted DNS to public resolvers is refused so they ask the server, which answers .ov. An exit answers for what leaves it: overnet users' traffic goes out from this server's IP.</p>
-        <div class="row" style="justify-content:flex-end;margin-top:10px"><span class="note" id="ov-save-note"></span><button class="btn primary" id="btn-ov-save" data-t="save">Save</button></div>
+        <div class="row" style="justify-content:flex-end;margin-top:10px"><span class="note" id="ov-save-note" role="status"></span><button class="btn primary" id="btn-ov-save" data-t="save">Save</button></div>
       </div>
     </section>
 
@@ -478,65 +485,64 @@ tr:last-child td { border-bottom: 0; }
 
 <!-- ── Modals ────────────────────────────────────────────────────────── -->
 <div id="m-user" class="overlay hidden">
-  <form class="modal" id="f-user">
+  <form class="modal" id="f-user" role="dialog" aria-modal="true" aria-labelledby="mu-title">
     <h2 id="mu-title" data-t="add_user">Add user</h2>
     <p class="desc" id="mu-desc" data-t="add_user_desc">A random access key is generated unless you paste one.</p>
     <div class="field"><label class="lbl" for="mu-name" data-t="name">Name</label><input class="input" id="mu-name" placeholder="alice" /></div>
     <div class="field" id="mu-key-field"><label class="lbl" for="mu-key" data-t="access_key_opt">Access key (optional)</label>
-      <div class="row"><input class="input mono grow" id="mu-key" spellcheck="false" /><button type="button" class="btn" id="mu-gen" data-t="generate">Generate</button></div></div>
-    <div class="field"><label class="lbl" for="mu-limit" data-t="limit_gb">Traffic limit, GB (empty = unlimited)</label><input class="input" id="mu-limit" type="number" min="0" step="0.1" /></div>
+      <div class="row"><input class="input mono grow" id="mu-key" spellcheck="false" autocomplete="off" /><button type="button" class="btn" id="mu-gen" data-t="generate">Generate</button></div></div>
+    <div class="field"><label class="lbl" for="mu-limit" data-t="limit_gb">Traffic limit, GB (empty = unlimited)</label><input class="input" id="mu-limit" type="number" min="0.01" step="any" /></div>
     <div class="modal-actions"><button type="button" class="btn" data-close data-t="cancel">Cancel</button><button class="btn primary" data-t="save">Save</button></div>
   </form>
 </div>
 
 <div id="m-bulk" class="overlay hidden">
-  <form class="modal" id="f-bulk">
-    <h2 data-t="bulk_create">Bulk create</h2>
+  <form class="modal" id="f-bulk" role="dialog" aria-modal="true" aria-labelledby="mb-title">
+    <h2 id="mb-title" data-t="bulk_create">Bulk create</h2>
     <p class="desc" data-t="bulk_desc">Creates many unnamed keys at once, e.g. for a batch of devices.</p>
     <div class="field"><label class="lbl" for="mb-count" data-t="count">Count</label><input class="input" id="mb-count" type="number" min="1" max="1000" value="10" required /></div>
-    <div class="field"><label class="lbl" for="mb-limit" data-t="limit_gb">Traffic limit, GB (empty = unlimited)</label><input class="input" id="mb-limit" type="number" min="0" step="0.1" /></div>
+    <div class="field"><label class="lbl" for="mb-limit" data-t="limit_gb">Traffic limit, GB (empty = unlimited)</label><input class="input" id="mb-limit" type="number" min="0.01" step="any" /></div>
     <div class="modal-actions"><button type="button" class="btn" data-close data-t="cancel">Cancel</button><button class="btn primary" data-t="create">Create</button></div>
   </form>
 </div>
 
 <div id="m-share" class="overlay hidden">
-  <div class="modal wide">
+  <div class="modal wide" role="dialog" aria-modal="true" aria-labelledby="ms-title">
     <h2 id="ms-title">Share</h2>
     <p class="desc" data-t="share_desc">Scan with the OSTP app, or copy the link. A subscription keeps the app up to date when the server changes.</p>
     <div class="seg" id="ms-kinds"></div>
     <div class="qr" id="ms-qr"></div>
-    <div class="copy-box"><input class="input" id="ms-text" readonly /><button class="btn" id="ms-copy" data-t="copy">Copy</button></div>
-    <p class="note" id="ms-note"></p>
+    <div class="copy-box"><input class="input" id="ms-text" readonly data-tl="share_link" /><button class="btn" id="ms-copy" data-t="copy">Copy</button></div>
+    <p class="note" id="ms-note" role="status"></p>
     <div class="modal-actions"><button class="btn" data-close data-t="close">Close</button></div>
   </div>
 </div>
 
 <div id="m-confirm" class="overlay hidden">
-  <div class="modal">
+  <div class="modal" role="alertdialog" aria-modal="true" aria-labelledby="mc-title" aria-describedby="mc-text">
     <h2 id="mc-title"></h2>
     <p class="desc" id="mc-text"></p>
     <div class="modal-actions"><button class="btn" data-close data-t="cancel">Cancel</button><button class="btn danger" id="mc-ok"></button></div>
   </div>
 </div>
 
-<div class="toasts" id="toasts"></div>
+<div class="toasts" id="toasts" role="status" aria-live="polite"></div>
 
 <script>
 'use strict';
 // ── i18n ──────────────────────────────────────────────────────────────
 const I18N = {
   en: {
-    username: 'Username', password: 'Password', sign_in: 'Sign in', bad_login: 'Wrong username or password',
-    too_many_logins: 'Too many sign-in attempts. Wait a minute and try again.',
-    overview: 'Overview', users: 'Users', routing: 'Routing', config: 'Configuration', activity: 'Activity',
-    live: 'Live', online_now: 'Online now', download: 'Download', upload: 'Upload', uptime: 'Uptime',
+    username: 'Username', password: 'Password', sign_in: 'Sign in', bad_login: 'Wrong username or password.',
+    overview: 'Overview', users: 'Users', routing: 'Routing', config: 'Configuration', dns: 'DNS', activity: 'Activity',
+    online_now: 'Online now', download: 'Download', upload: 'Upload', uptime: 'Uptime',
     throughput: 'Throughput', last_minutes: 'last 5 minutes', endpoints: 'How clients connect',
     top_users: 'Top users by traffic', recent_activity: 'Recent activity', no_activity: 'Nothing yet.',
     bulk_create: 'Bulk create', add_user: 'Add user', edit_user: 'Edit user', search: 'Search by name or key',
-    all: 'All', online: 'Online', near_limit: 'Near limit', user: 'User', sessions: 'Sessions',
+    all: 'All', online: 'Online', near_limit: '80% of limit or more', user: 'User', sessions: 'Sessions',
     traffic: 'Traffic ↓ / ↑', limit: 'Limit', unlimited: 'unlimited', save: 'Save', reload: 'Reload', clear: 'Clear',
     routing_sub: 'Outbound rules: which destinations go direct and which through the upstream proxy.',
-    routing_help: 'A list of rules; each has domain_suffix and/or ip_cidr lists and an action ("proxy" or "direct"). Applied immediately.',
+    routing_help: 'A list of rules; each has domain_suffix and/or ip_cidr lists and an action ("proxy", "direct" or "block"). Applied immediately and saved to config.json.',
     config_sub: "The server's config.json. Access keys reload on their own; other changes need a restart.",
     activity_sub: 'Changes made from this panel since the server started.',
     add_user_desc: 'A random access key is generated unless you paste one.', edit_user_desc: 'The access key stays the same.',
@@ -545,8 +551,8 @@ const I18N = {
     bulk_desc: 'Creates many unnamed keys at once, e.g. for a batch of devices.', count: 'Count',
     share_desc: 'Scan with the OSTP app, or copy the link. A subscription keeps the app up to date when the server changes.',
     share: 'Share', edit: 'Edit', reset: 'Reset traffic', delete: 'Delete',
-    confirm_delete: 'Delete user?', confirm_delete_text: 'Clients using this key are cut off. This cannot be undone.',
-    confirm_reset: 'Reset traffic?', confirm_reset_text: 'The traffic counters of this user start from zero.',
+    confirm_delete: 'Delete user {x}?', confirm_delete_text: 'Clients using this key are cut off. This cannot be undone.',
+    confirm_reset: 'Reset traffic of {x}?', confirm_reset_text: 'The traffic counters of this user start from zero. This cannot be undone.',
     confirm_clear: 'Clear activity?', confirm_clear_text: 'The activity list is emptied.',
     no_users: 'No users yet. Add one to get a link.', no_match: 'Nobody matches.',
     users_sub: '{total} users · {online} online', ov_sub: 'OSTP {version} · {host}',
@@ -556,13 +562,46 @@ const I18N = {
     online_sub: '{active} used the server · {total} total', rate: '{rate}/s now',
     saved: 'Saved', created: 'Created', deleted: 'Deleted', reset_done: 'Traffic reset',
     invalid_json: 'Not valid JSON: {err}', restart_note: 'Saved. Restart the server (systemctl restart ostp) to apply non-key changes.',
-    rules_saved: 'Rules applied', err: 'Error: {err}', copied_key: 'Key copied',
+    rules_saved: 'Rules applied', copied_key: 'Key copied',
     sub_note: 'The subscription URL is a credential: share it only with this user.',
     link_note: 'This link holds the access key: share it only with this user.',
     qr_failed: 'QR code unavailable', created_n: '{n} keys created',
     ev_add: 'Added user {x}', ev_edit: 'Edited user {x}', ev_del: 'Deleted user {x}', ev_reset: 'Reset traffic of {x}',
     ev_bulk: 'Created {x} keys', ev_config: 'Saved configuration', ev_rules: 'Saved routing rules',
     days: 'd', hours: 'h', minutes: 'm',
+    language: 'Language', theme: 'Theme', sign_out: 'Sign out', actions: 'Actions',
+    conn_ok: 'Connected', conn_lost: 'No connection, data may be out of date',
+    session_ended: 'The session has ended. Sign in again.',
+    too_many_logins: 'Too many sign-in attempts. Wait a minute and try again.',
+    net_error: 'The server did not answer. Check the connection and try again.',
+    server_error: 'The server failed (HTTP {code}). Look at its log: journalctl -u ostp.',
+    copy_failed: 'Could not copy. Select the text and copy it by hand.',
+    key_bad: 'The access key must be 8 to 128 characters with no spaces, slashes, ? or #.',
+    key_exists: 'A user with this access key already exists. Saving would overwrite it.',
+    rule_list: 'The rules must be a JSON list: [ { ... }, { ... } ].',
+    rule_bad: 'Rule {n} is not an object.',
+    rule_action: 'Rule {n}: action must be "proxy", "direct" or "block".',
+    config_obj: 'The configuration must be a JSON object.',
+    config_mode: 'The configuration has no "mode" field. The server would refuse to start with it.',
+    confirm_config: 'Overwrite config.json?', confirm_config_text: 'The file is replaced with this text. A mistake can stop the server at the next restart. Users added in the meantime are overwritten if this text is older.',
+    overwrite: 'Overwrite', discard: 'Discard', confirm_discard: 'Discard your edits?', confirm_discard_text: 'The text is reloaded from the server and your changes are lost.',
+    confirm_dns_clear: 'Clear the query log?', confirm_dns_clear_text: 'All logged DNS queries are removed. The statistics stay.', dns_cleared: 'Query log cleared',
+    url_bad: 'The list address must start with http:// or https://.',
+    interval_bad: 'Update interval: enter a whole number of hours, 1 or more.',
+    cache_bad: 'Cache entries: enter a whole number, 0 or more.',
+    rw_empty: 'Enter both the name and the answer.',
+    dns_not_loaded: 'DNS settings are not loaded yet. Wait a moment and try again.',
+    dns_test_empty: 'Enter a domain to check.',
+    dns_preset: 'Ready-made list', dns_list_url: 'List address', dns_rw_domain: 'Name', dns_rw_answer: 'Answer (IP address or name)', share_link: 'Link',
+    err_no_outbound: 'Outbound routing is off in config.json. Add an "outbound" section to the configuration, restart the server, then edit the rules here.',
+    err_no_config_path: 'The server was started without a config file, so nothing can be saved.',
+    err_user_gone: 'This user no longer exists. The list is refreshed.',
+    err_save_cfg: 'The server could not write config.json. Check the file permissions.',
+    f_load: 'Could not load data: {err}', f_user: 'Could not save the user: {err}', f_delete: 'Could not delete the user: {err}',
+    f_reset: 'Could not reset the traffic: {err}', f_bulk: 'Could not create the keys: {err}', f_share: 'Could not get the links: {err}',
+    f_rules: 'Rules not saved: {err}', f_config: 'Configuration not saved: {err}', f_dns: 'DNS settings not saved: {err}',
+    f_dns_update: 'Could not update the lists: {err}', f_dns_test: 'Could not check the domain: {err}',
+    f_dns_clear: 'Could not clear the log: {err}', f_log: 'Could not load the activity list: {err}', f_log_clear: 'Could not clear the activity list: {err}',
     dns_sub: 'Filtering resolver for connected clients: ads and trackers blocked, your own names answered. Not reachable from the internet.',
     dns_update: 'Update lists', dns_queries: 'Queries', dns_blocked: 'Blocked', dns_rules: 'Rules', dns_upstream: 'Upstream',
     dns_top_blocked: 'Most blocked', dns_top_domains: 'Most queried', dns_test: 'Check a domain', dns_check: 'Check',
@@ -574,12 +613,16 @@ const I18N = {
     dns_add: 'Add', dns_allowlist: 'allow list', dns_rules_own: 'Your rules',
     dns_rules_help: '||domain^ blocks it with subdomains, @@ allows, $important wins over exceptions, * is a wildcard, hosts lines work.',
     dns_rewrites: 'Your names', dns_rewrites_help: '10.1.0.1 is this server as clients see it through the tunnel: panel.ostp → 10.1.0.1 opens the panel by name. *.lan covers every subdomain.',
-    ov_sub: ".ov sites for this server's clients in any browser, through the overnet gateway on this machine. Off unless you turn it on.",
+    overnet: 'overnet',
+    ovn_sub: ".ov sites for this server's clients in any browser, through the overnet gateway on this machine. Off unless you turn it on.",
     ov_entry: '.ov for clients', ov_gateway: 'Gateway', ov_exit: 'Exit', ov_settings: 'Settings', ov_enabled: 'overnet on this server',
     ov_entry_chk: 'Serve .ov to clients', ov_gateway_addr: 'Gateway (SOCKS5)', ov_exit_chk: 'Exit: overnet users reach the internet through this server',
     ov_exit_addr: 'Exit listens on', ov_help: "The gateway is overnet's own program: on the server run ostp overnet install. While .ov is served, browsers' encrypted DNS to public resolvers is refused so they ask the server, which answers .ov. An exit answers for what leaves it: overnet users' traffic goes out from this server's IP.",
     ov_serving: 'Serving .ov', ov_off: 'Off', ov_down: 'Gateway not answering', ov_on: 'on', ov_no: 'off', ov_up: 'answers', ov_not_up: 'not answering',
     ov_unprobed: 'not checked (.ov off)', ov_listening: 'listening on {a}', ov_saved: 'Applied without a restart and saved',
+    ov_addr_bad: 'Address {a}: use host:port, for example 127.0.0.1:9150 (port 1 to 65535).',
+    ov_exit_confirm: 'Turn on the exit?', ov_exit_confirm_text: "Traffic of overnet users will leave from this server's IP, and you answer for it. Turn it on only if you accept that.", ov_exit_on: 'Turn on',
+    ev_overnet: 'Saved overnet settings', f_overnet: 'overnet settings not saved: {err}',
     dns_services: 'Block services', dns_on: 'Filtering on', dns_off: 'Filtering off', dns_turn_on: 'Turn on', dns_turn_off: 'Turn off',
     dns_block: 'Block', dns_allow: 'Allow', dns_cached_n: '{n} from cache', dns_pct: '{p}% of queries', dns_lists_n: '{n} lists',
     dns_saved: 'Applied without a restart and saved', dns_updated: 'Lists updated: {ok} of {n}', dns_rules_count: '{n} rules', dns_unsupported: '{n} unsupported',
@@ -587,17 +630,16 @@ const I18N = {
     o_allowed: 'allowed', o_cached: 'cached', o_blocked: 'blocked', o_blocked_service: 'service', o_safe_search: 'safe search', o_rewritten: 'your name', o_forwarded: 'forwarded', o_failed: 'failed',
   },
   ru: {
-    username: 'Логин', password: 'Пароль', sign_in: 'Войти', bad_login: 'Неверный логин или пароль',
-    too_many_logins: 'Слишком много попыток входа. Подождите минуту и попробуйте снова.',
-    overview: 'Обзор', users: 'Пользователи', routing: 'Маршрутизация', config: 'Конфигурация', activity: 'Журнал',
-    live: 'Онлайн', online_now: 'Сейчас онлайн', download: 'Загрузка', upload: 'Отдача', uptime: 'Аптайм',
+    username: 'Логин', password: 'Пароль', sign_in: 'Войти', bad_login: 'Неверный логин или пароль.',
+    overview: 'Обзор', users: 'Пользователи', routing: 'Маршрутизация', config: 'Конфигурация', dns: 'DNS', activity: 'Журнал',
+    online_now: 'Сейчас онлайн', download: 'Загрузка', upload: 'Отдача', uptime: 'Аптайм',
     throughput: 'Скорость', last_minutes: 'последние 5 минут', endpoints: 'Как подключаются клиенты',
     top_users: 'Больше всего трафика', recent_activity: 'Последние действия', no_activity: 'Пока ничего.',
     bulk_create: 'Создать пачкой', add_user: 'Добавить', edit_user: 'Изменить пользователя', search: 'Поиск по имени или ключу',
-    all: 'Все', online: 'Онлайн', near_limit: 'У лимита', user: 'Пользователь', sessions: 'Сессии',
+    all: 'Все', online: 'Онлайн', near_limit: '80% лимита и больше', user: 'Пользователь', sessions: 'Сессии',
     traffic: 'Трафик ↓ / ↑', limit: 'Лимит', unlimited: 'без лимита', save: 'Сохранить', reload: 'Перечитать', clear: 'Очистить',
     routing_sub: 'Правила выхода: какие адреса идут напрямую, а какие через вышестоящий прокси.',
-    routing_help: 'Список правил: у каждого списки domain_suffix и/или ip_cidr и action ("proxy" или "direct"). Применяется сразу.',
+    routing_help: 'Список правил: у каждого списки domain_suffix и/или ip_cidr и action ("proxy", "direct" или "block"). Применяется сразу и сохраняется в config.json.',
     config_sub: 'config.json сервера. Ключи доступа подхватываются сами, остальное — после перезапуска.',
     activity_sub: 'Изменения из этой панели с момента запуска сервера.',
     add_user_desc: 'Ключ доступа сгенерируется сам, если не вставить свой.', edit_user_desc: 'Ключ доступа не меняется.',
@@ -606,8 +648,8 @@ const I18N = {
     bulk_desc: 'Создаёт сразу много безымянных ключей, например для партии устройств.', count: 'Количество',
     share_desc: 'Отсканируйте в приложении OSTP или скопируйте ссылку. Подписка сама обновит приложение при изменениях на сервере.',
     share: 'Поделиться', edit: 'Изменить', reset: 'Сбросить трафик', delete: 'Удалить',
-    confirm_delete: 'Удалить пользователя?', confirm_delete_text: 'Клиенты с этим ключом отключатся. Отменить нельзя.',
-    confirm_reset: 'Сбросить трафик?', confirm_reset_text: 'Счётчики трафика пользователя начнутся с нуля.',
+    confirm_delete: 'Удалить пользователя {x}?', confirm_delete_text: 'Клиенты с этим ключом отключатся. Отменить нельзя.',
+    confirm_reset: 'Сбросить трафик {x}?', confirm_reset_text: 'Счётчики трафика пользователя начнутся с нуля. Отменить нельзя.',
     confirm_clear: 'Очистить журнал?', confirm_clear_text: 'Список действий будет очищен.',
     no_users: 'Пользователей пока нет. Добавьте, чтобы получить ссылку.', no_match: 'Никого не найдено.',
     users_sub: 'Всего {total} · онлайн {online}', ov_sub: 'OSTP {version} · {host}',
@@ -617,13 +659,46 @@ const I18N = {
     online_sub: 'пользовались: {active} · всего {total}', rate: 'сейчас {rate}/с',
     saved: 'Сохранено', created: 'Создано', deleted: 'Удалено', reset_done: 'Трафик сброшен',
     invalid_json: 'Некорректный JSON: {err}', restart_note: 'Сохранено. Перезапустите сервер (systemctl restart ostp), чтобы применить изменения кроме ключей.',
-    rules_saved: 'Правила применены', err: 'Ошибка: {err}', copied_key: 'Ключ скопирован',
+    rules_saved: 'Правила применены', copied_key: 'Ключ скопирован',
     sub_note: 'Ссылка подписки — это пароль: передавайте её только этому пользователю.',
     link_note: 'В ссылке ключ доступа: передавайте её только этому пользователю.',
     qr_failed: 'QR-код недоступен', created_n: 'Создано ключей: {n}',
     ev_add: 'Добавлен пользователь {x}', ev_edit: 'Изменён пользователь {x}', ev_del: 'Удалён пользователь {x}', ev_reset: 'Сброшен трафик {x}',
     ev_bulk: 'Создано ключей: {x}', ev_config: 'Сохранена конфигурация', ev_rules: 'Сохранены правила маршрутизации',
     days: 'д', hours: 'ч', minutes: 'м',
+    language: 'Язык', theme: 'Тема', sign_out: 'Выйти', actions: 'Действия',
+    conn_ok: 'Подключено', conn_lost: 'Нет связи, данные могли устареть',
+    session_ended: 'Сеанс завершён. Войдите снова.',
+    too_many_logins: 'Слишком много попыток входа. Подождите минуту и попробуйте снова.',
+    net_error: 'Сервер не отвечает. Проверьте соединение и повторите.',
+    server_error: 'Ошибка на сервере (HTTP {code}). Посмотрите его журнал: journalctl -u ostp.',
+    copy_failed: 'Не удалось скопировать. Выделите текст и скопируйте вручную.',
+    key_bad: 'Ключ доступа: от 8 до 128 символов, без пробелов, слэшей, ? и #.',
+    key_exists: 'Пользователь с таким ключом уже есть. Сохранение перезапишет его.',
+    rule_list: 'Правила должны быть списком JSON: [ { ... }, { ... } ].',
+    rule_bad: 'Правило {n}: это не объект.',
+    rule_action: 'Правило {n}: action должен быть "proxy", "direct" или "block".',
+    config_obj: 'Конфигурация должна быть объектом JSON.',
+    config_mode: 'В конфигурации нет поля "mode". С ней сервер не запустится.',
+    confirm_config: 'Перезаписать config.json?', confirm_config_text: 'Файл будет заменён этим текстом. Ошибка может остановить сервер при следующем перезапуске. Если текст старый, пользователи, добавленные за это время, будут затёрты.',
+    overwrite: 'Перезаписать', discard: 'Отбросить', confirm_discard: 'Отбросить ваши правки?', confirm_discard_text: 'Текст загрузится с сервера заново, изменения пропадут.',
+    confirm_dns_clear: 'Очистить журнал запросов?', confirm_dns_clear_text: 'Все записанные DNS-запросы будут удалены. Статистика останется.', dns_cleared: 'Журнал запросов очищен',
+    url_bad: 'Адрес списка должен начинаться с http:// или https://.',
+    interval_bad: 'Обновление списков: введите целое число часов, 1 или больше.',
+    cache_bad: 'Размер кэша: введите целое число, 0 или больше.',
+    rw_empty: 'Введите и имя, и ответ.',
+    dns_not_loaded: 'Настройки DNS ещё не загружены. Подождите и повторите.',
+    dns_test_empty: 'Введите домен для проверки.',
+    dns_preset: 'Готовый список', dns_list_url: 'Адрес списка', dns_rw_domain: 'Имя', dns_rw_answer: 'Ответ (IP-адрес или имя)', share_link: 'Ссылка',
+    err_no_outbound: 'Маршрутизация выхода выключена в config.json. Добавьте в конфигурацию раздел "outbound", перезапустите сервер и после этого правьте правила здесь.',
+    err_no_config_path: 'Сервер запущен без файла конфигурации, сохранять некуда.',
+    err_user_gone: 'Такого пользователя уже нет. Список обновлён.',
+    err_save_cfg: 'Сервер не смог записать config.json. Проверьте права на файл.',
+    f_load: 'Не удалось загрузить данные: {err}', f_user: 'Не удалось сохранить пользователя: {err}', f_delete: 'Не удалось удалить пользователя: {err}',
+    f_reset: 'Не удалось сбросить трафик: {err}', f_bulk: 'Не удалось создать ключи: {err}', f_share: 'Не удалось получить ссылки: {err}',
+    f_rules: 'Правила не сохранены: {err}', f_config: 'Конфигурация не сохранена: {err}', f_dns: 'Настройки DNS не сохранены: {err}',
+    f_dns_update: 'Не удалось обновить списки: {err}', f_dns_test: 'Не удалось проверить домен: {err}',
+    f_dns_clear: 'Не удалось очистить журнал запросов: {err}', f_log: 'Не удалось загрузить журнал: {err}', f_log_clear: 'Не удалось очистить журнал: {err}',
     dns_sub: 'Фильтрующий резолвер для подключённых клиентов: блокирует рекламу и трекеры, отвечает вашими именами. Из интернета недоступен.',
     dns_update: 'Обновить списки', dns_queries: 'Запросов', dns_blocked: 'Заблокировано', dns_rules: 'Правил', dns_upstream: 'Вышестоящий',
     dns_top_blocked: 'Чаще всего блокируется', dns_top_domains: 'Чаще всего запрашивается', dns_test: 'Проверить домен', dns_check: 'Проверить',
@@ -635,14 +710,18 @@ const I18N = {
     dns_add: 'Добавить', dns_allowlist: 'список разрешений', dns_rules_own: 'Свои правила',
     dns_rules_help: '||домен^ блокирует его с поддоменами, @@ разрешает, $important сильнее исключений, * — шаблон, строки hosts тоже работают.',
     dns_rewrites: 'Свои имена', dns_rewrites_help: '10.1.0.1 — это сервер, каким его видят клиенты через туннель: panel.ostp → 10.1.0.1 открывает панель по имени. *.lan — все поддомены.',
-    ov_sub: '.ov-сайты для клиентов этого сервера в любом браузере, через шлюз overnet на этой машине. Выключено, пока вы сами не включите.',
+    overnet: 'overnet',
+    ovn_sub: '.ov-сайты для клиентов этого сервера в любом браузере, через шлюз overnet на этой машине. Выключено, пока вы сами не включите.',
     ov_entry: '.ov для клиентов', ov_gateway: 'Шлюз', ov_exit: 'Выход', ov_settings: 'Настройки', ov_enabled: 'overnet на этом сервере',
     ov_entry_chk: 'Раздавать .ov клиентам', ov_gateway_addr: 'Шлюз (SOCKS5)', ov_exit_chk: 'Выход: пользователи overnet выходят в интернет через этот сервер',
     ov_exit_addr: 'Адрес выхода', ov_help: 'Шлюз — отдельная программа overnet: на сервере выполните ostp overnet install. Пока .ov раздаётся, шифрованный DNS браузеров к публичным резолверам отклоняется: они спрашивают сервер, а он отвечает за .ov. За выход отвечает его владелец: трафик пользователей overnet уходит с IP этого сервера.',
     ov_serving: '.ov раздаётся', ov_off: 'Выключено', ov_down: 'Шлюз не отвечает', ov_on: 'вкл', ov_no: 'выкл', ov_up: 'отвечает', ov_not_up: 'не отвечает',
     ov_unprobed: 'не проверяется (.ov выкл)', ov_listening: 'слушает {a}', ov_saved: 'Применено без перезапуска и сохранено',
+    ov_addr_bad: 'Адрес {a}: нужен вид хост:порт, например 127.0.0.1:9150 (порт от 1 до 65535).',
+    ov_exit_confirm: 'Включить выход?', ov_exit_confirm_text: 'Трафик пользователей overnet будет уходить с IP этого сервера, и отвечаете за него вы. Включайте, только если вы с этим согласны.', ov_exit_on: 'Включить',
+    ev_overnet: 'Сохранены настройки overnet', f_overnet: 'Настройки overnet не сохранены: {err}',
     dns_services: 'Блокировать сервисы', dns_on: 'Фильтрация включена', dns_off: 'Фильтрация выключена', dns_turn_on: 'Включить', dns_turn_off: 'Выключить',
-    dns_block: 'Блок', dns_allow: 'Разрешить', dns_cached_n: 'из кэша: {n}', dns_pct: '{p}% запросов', dns_lists_n: 'списков: {n}',
+    dns_block: 'Заблокировать', dns_allow: 'Разрешить', dns_cached_n: 'из кэша: {n}', dns_pct: '{p}% запросов', dns_lists_n: 'списков: {n}',
     dns_saved: 'Применено без перезапуска и сохранено', dns_updated: 'Списки обновлены: {ok} из {n}', dns_rules_count: 'правил: {n}', dns_unsupported: 'не поддерживается: {n}',
     dns_never: 'ещё не скачан', dns_empty: 'Запросов пока нет. Подключите клиента к этому серверу.', dns_remove: 'Удалить',
     o_allowed: 'пропущен', o_cached: 'из кэша', o_blocked: 'заблокирован', o_blocked_service: 'сервис', o_safe_search: 'безопасный поиск', o_rewritten: 'своё имя', o_forwarded: 'переслан', o_failed: 'ошибка',
@@ -658,7 +737,10 @@ function applyLang() {
   document.documentElement.lang = lang;
   document.querySelectorAll('[data-t]').forEach(el => { el.textContent = t(el.dataset.t); });
   document.querySelectorAll('[data-tp]').forEach(el => { el.placeholder = t(el.dataset.tp); });
-  document.getElementById('lang-label').textContent = lang === 'ru' ? 'EN' : 'RU';
+  document.querySelectorAll('[data-tl]').forEach(el => el.setAttribute('aria-label', t(el.dataset.tl)));
+  // Icon-only buttons: the same text is the tooltip and the accessible name.
+  document.querySelectorAll('[data-tt]').forEach(el => { el.title = t(el.dataset.tt); el.setAttribute('aria-label', t(el.dataset.tt)); });
+  $('lang-label').textContent = lang === 'ru' ? 'EN' : 'RU';
 }
 
 // ── helpers ───────────────────────────────────────────────────────────
@@ -680,29 +762,56 @@ function toast(msg, err = false) {
   el.className = 'toast' + (err ? ' err' : '');
   el.textContent = msg;
   $('toasts').appendChild(el);
-  setTimeout(() => el.remove(), 3500);
+  setTimeout(() => el.remove(), err ? 7000 : 3500);
 }
 async function copy(text) {
-  try { await navigator.clipboard.writeText(text); }
+  try { await navigator.clipboard.writeText(text); return true; }
   catch {
     const ta = document.createElement('textarea'); ta.value = text; document.body.appendChild(ta);
-    ta.select(); document.execCommand('copy'); ta.remove();
+    ta.select();
+    let ok = false;
+    try { ok = document.execCommand('copy'); } catch { /* falls through */ }
+    ta.remove();
+    return ok;
   }
 }
-function openModal(id) { $(id).classList.remove('hidden'); }
-function closeModals() { document.querySelectorAll('.overlay').forEach(o => o.classList.add('hidden')); }
+const copyToast = async text => (await copy(text)) ? true : (toast(t('copy_failed'), true), false);
+// Disables a button while its request runs, so a double click cannot send it twice.
+async function busy(btn, fn) {
+  btn.disabled = true;
+  try { return await fn(); } finally { btn.disabled = false; }
+}
+const fail = (key, err) => toast(t(key, { err: err.message }), true);
+
+let lastFocus = null, confirmDone = null;
+function openModal(id) { lastFocus = document.activeElement; $(id).classList.remove('hidden'); }
+function closeModals() {
+  document.querySelectorAll('.overlay').forEach(o => o.classList.add('hidden'));
+  if (confirmDone) { const d = confirmDone; confirmDone = null; d(false); }
+  if (lastFocus && lastFocus.focus) lastFocus.focus();
+  lastFocus = null;
+}
+// A form may hold typed text, so only the read-only dialogs close on a click outside.
 document.addEventListener('click', e => {
-  if (e.target.matches('[data-close]') || e.target.classList.contains('overlay')) closeModals();
+  if (e.target.matches('[data-close]') || (e.target.classList.contains('overlay') && (e.target.id === 'm-share' || e.target.id === 'm-confirm'))) closeModals();
 });
-document.addEventListener('keydown', e => { if (e.key === 'Escape') closeModals(); });
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') closeModals();
+  if (e.key !== 'Tab') return;
+  const o = document.querySelector('.overlay:not(.hidden)'); if (!o) return;
+  const f = [...o.querySelectorAll('button, input, select, textarea')].filter(x => !x.disabled && !x.closest('.hidden'));
+  if (!f.length) return;
+  if (e.shiftKey && document.activeElement === f[0]) { e.preventDefault(); f[f.length - 1].focus(); }
+  else if (!e.shiftKey && document.activeElement === f[f.length - 1]) { e.preventDefault(); f[0].focus(); }
+});
+// Cancel has the focus, so Enter does not confirm a destructive action by accident.
 function confirmBox(title, text, okLabel) {
   return new Promise(resolve => {
     $('mc-title').textContent = title; $('mc-text').textContent = text; $('mc-ok').textContent = okLabel;
     openModal('m-confirm');
-    const ok = $('mc-ok');
-    const done = v => { ok.onclick = null; closeModals(); resolve(v); };
-    ok.onclick = () => done(true);
-    $('m-confirm').querySelector('[data-close]').onclick = () => done(false);
+    $('m-confirm').querySelector('[data-close]').focus();
+    confirmDone = resolve;
+    $('mc-ok').onclick = () => { confirmDone = null; closeModals(); resolve(true); };
   });
 }
 
@@ -710,64 +819,97 @@ function confirmBox(title, text, okLabel) {
 // The panel lives at /<webpath>/ and the API at /<webpath>/api/.
 let token = sessionStorage.getItem('ostp_panel_token') || '';
 class Unauthorized extends Error {}
-class TooMany extends Error {}
+// The server's English error strings that need a "what to do" next to them.
+const KNOWN_ERRORS = [
+  [/outbound routing is not enabled/i, 'err_no_outbound'],
+  [/no config path/i, 'err_no_config_path'],
+  [/user not found/i, 'err_user_gone'],
+  [/failed to save configuration/i, 'err_save_cfg'],
+];
+function apiText(msg) { const k = KNOWN_ERRORS.find(([re]) => re.test(msg)); return k ? t(k[1]) : msg; }
 async function api(path, opts = {}) {
   const headers = { 'Content-Type': 'application/json' };
   if (token) headers.Authorization = 'Bearer ' + token;
-  const res = await fetch('api/' + path, { ...opts, headers, body: opts.body !== undefined ? JSON.stringify(opts.body) : undefined });
-  if (res.status === 401) throw new Unauthorized();
-  if (res.status === 429) throw new TooMany();
+  let res;
+  try { res = await fetch('api/' + path, { ...opts, headers, body: opts.body !== undefined ? JSON.stringify(opts.body) : undefined }); }
+  catch { throw new Error(t('net_error')); }
+  if (res.status === 401) {
+    if (path === 'login') throw new Unauthorized(t('bad_login'));
+    showLogin(token ? t('session_ended') : '');
+    throw new Unauthorized(t('session_ended'));
+  }
+  if (res.status === 429) throw new Error(t('too_many_logins'));
   let json;
-  try { json = await res.json(); } catch { throw new Error('HTTP ' + res.status); }
-  if (!json.ok) throw new Error(json.error || 'HTTP ' + res.status);
+  try { json = await res.json(); } catch { throw new Error(res.status >= 500 ? t('server_error', { code: res.status }) : 'HTTP ' + res.status); }
+  if (!json.ok) throw new Error(apiText(json.error || '') || 'HTTP ' + res.status);
   return json.data;
 }
 function audit(key, x) {
-  api('audit', { method: 'POST', body: { eventEn: I18N.en[key].replace('{x}', x), eventRu: I18N.ru[key].replace('{x}', x), success: true } }).catch(() => {});
+  const fill = d => d[key].split('{x}').join(x);
+  api('audit', { method: 'POST', body: { eventEn: fill(I18N.en), eventRu: fill(I18N.ru), success: true } }).catch(() => {});
 }
 
 // ── state ─────────────────────────────────────────────────────────────
-let status = null, users = [], page = 'overview';
+let status = null, users = [], page = 'overview', timer = null, live = null;
 const samples = []; // [{t, up, down}] totals over time
 let sortKey = 'down', sortDir = -1, filter = 'all';
+const PAGES = ['overview', 'users', 'routing', 'config', 'dns', 'overnet', 'activity'];
 
 // ── login ─────────────────────────────────────────────────────────────
-function showLogin() {
+function showLogin(msg) {
+  clearInterval(timer);
+  token = ''; sessionStorage.removeItem('ostp_panel_token');
+  closeModals();
+  const shown = !$('login').classList.contains('hidden');
   $('app').classList.add('hidden'); $('login').classList.remove('hidden');
-  setTimeout(() => $('lg-user').focus(), 50);
+  $('lg-err').textContent = msg || ''; $('lg-err').classList.toggle('hidden', !msg);
+  if (!shown) setTimeout(() => $('lg-user').focus(), 50);
 }
 $('login-form').addEventListener('submit', async e => {
   e.preventDefault();
   $('lg-err').classList.add('hidden');
-  try {
-    const d = await api('login', { method: 'POST', body: { username: $('lg-user').value, password: $('lg-pass').value } });
-    token = d.token; sessionStorage.setItem('ostp_panel_token', token);
-    $('login').classList.add('hidden'); start();
-  } catch (err) {
-    $('lg-err').textContent = err instanceof Unauthorized ? t('bad_login') : err instanceof TooMany ? t('too_many_logins') : String(err.message || err);
-    $('lg-err').classList.remove('hidden');
-  }
+  await busy($('lg-btn'), async () => {
+    try {
+      const d = await api('login', { method: 'POST', body: { username: $('lg-user').value, password: $('lg-pass').value } });
+      token = d.token; sessionStorage.setItem('ostp_panel_token', token);
+      $('lg-pass').value = '';
+      $('login').classList.add('hidden'); start();
+    } catch (err) {
+      $('lg-err').textContent = err.message; $('lg-err').classList.remove('hidden');
+      $('lg-pass').select();
+    }
+  });
 });
 $('btn-logout').addEventListener('click', () => { token = ''; sessionStorage.removeItem('ostp_panel_token'); location.reload(); });
 
 // ── navigation ────────────────────────────────────────────────────────
 function go(p) {
   page = p;
-  document.querySelectorAll('.nav').forEach(n => n.classList.toggle('active', n.dataset.page === p));
+  document.querySelectorAll('.nav').forEach(n => {
+    const on = n.dataset.page === p;
+    n.classList.toggle('active', on);
+    if (on) n.setAttribute('aria-current', 'page'); else n.removeAttribute('aria-current');
+  });
   document.querySelectorAll('main > section').forEach(s => s.classList.toggle('hidden', s.id !== 'page-' + p));
-  if (p === 'config') loadConfig();
-  if (p === 'routing') loadRules();
+  // Pages with an editor reload only when there are no unsaved edits in it.
+  if (p === 'config') loadConfig(false);
+  if (p === 'routing') loadRules(false);
   if (p === 'activity') loadLog();
-  if (p === 'dns') loadDns(true);
-  if (p === 'overnet') loadOvernet(true);
+  if (p === 'dns') loadDns(!dnsDirty);
+  if (p === 'overnet') loadOvernet(!ovDirty);
   if (p === 'overview') drawChart();
   location.hash = p;
 }
 document.querySelectorAll('.nav').forEach(n => n.addEventListener('click', () => go(n.dataset.page)));
-
+window.addEventListener('hashchange', () => {
+  const p = location.hash.slice(1);
+  if (PAGES.includes(p) && p !== page && !$('app').classList.contains('hidden')) go(p);
+});
 
 // ── overnet ───────────────────────────────────────────────────────────
+let ovStatus = null, ovDirty = false;
 function renderOvernet(st, withForm) {
+  ovStatus = st;
   const c = st.config;
   const wanted = c.enabled && c.entry;
   $('ov-state').className = 'pill ' + (st.serving ? 'ok' : (wanted ? 'bad' : ''));
@@ -784,34 +926,51 @@ function renderOvernet(st, withForm) {
     $('ov-gateway').value = c.gateway;
     $('ov-exit').checked = c.exit;
     $('ov-exit-listen').value = c.exit_listen;
+    ovDirty = false;
   }
 }
+// The form is overwritten from the server only while it has no unsaved edits.
 async function loadOvernet(withForm) {
   try { renderOvernet(await api('overnet'), withForm); }
-  catch (err) { if (withForm) toast(t('err', { err: err.message }), true); }
+  catch (err) { if (withForm && !(err instanceof Unauthorized)) fail('f_load', err); }
 }
-$('btn-ov-save').addEventListener('click', async () => {
+$('page-overnet').addEventListener('input', e => { if (e.target.closest('.card input')) ovDirty = true; });
+$('page-overnet').addEventListener('change', e => { if (e.target.closest('.card input')) ovDirty = true; });
+const hostPort = a => { const m = /^(?:\[[0-9a-f:.]+\]|[^\s:\[\]]+):(\d{1,5})$/i.exec(a); return !!m && +m[1] >= 1 && +m[1] <= 65535; };
+$('btn-ov-save').addEventListener('click', e => busy(e.currentTarget, async () => {
   const body = {
     enabled: $('ov-enabled').checked, entry: $('ov-entry').checked, gateway: $('ov-gateway').value.trim() || '127.0.0.1:9150',
     exit: $('ov-exit').checked, exit_listen: $('ov-exit-listen').value.trim() || '127.0.0.1:9151',
   };
+  for (const [id, a] of [['ov-gateway', body.gateway], ['ov-exit-listen', body.exit_listen]]) {
+    if (!hostPort(a)) { setNote('ov-save-note', t('ov_addr_bad', { a }), true); $(id).focus(); return; }
+  }
+  // Opening an exit puts other people's traffic on this server's IP: ask first.
+  if (body.exit && !(ovStatus && ovStatus.config.exit) && !await confirmBox(t('ov_exit_confirm'), t('ov_exit_confirm_text'), t('ov_exit_on'))) return;
   try {
     renderOvernet(await api('overnet', { method: 'PUT', body }), true);
-    $('ov-save-note').textContent = '';
+    audit('ev_overnet', '');
+    setNote('ov-save-note', '');
     toast(t('ov_saved'));
-  } catch (err) { $('ov-save-note').textContent = t('err', { err: err.message }); toast(t('err', { err: err.message }), true); }
-});
+  } catch (err) { setNote('ov-save-note', t('f_overnet', { err: err.message }), true); fail('f_overnet', err); }
+}));
 
 // ── polling ───────────────────────────────────────────────────────────
+function setLive(ok) {
+  live = ok;
+  $('ov-live').className = 'pill ' + (ok ? 'ok' : 'bad');
+  $('ov-live').firstElementChild.className = 'dot' + (ok ? ' on' : '');
+  $('ov-live-text').textContent = t(ok ? 'conn_ok' : 'conn_lost');
+}
 async function refresh() {
   try {
     [status, users] = await Promise.all([api('server/status'), api('users')]);
   } catch (err) {
-    if (err instanceof Unauthorized) { showLogin(); return false; }
-    $('ov-live').className = 'pill bad';
+    if (err instanceof Unauthorized) return false;
+    setLive(false); // the old numbers stay on screen, marked as possibly stale
     return true;
   }
-  $('ov-live').className = 'pill ok';
+  setLive(true);
   samples.push({ t: Date.now(), up: status.bytes_up || 0, down: status.bytes_down || 0 });
   while (samples.length > 61) samples.shift();
   renderOverview();
@@ -911,11 +1070,16 @@ const ICON = {
   edit: '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/></svg>',
   reset: '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="1 4 1 10 7 10"/><path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"/></svg>',
   del: '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6M14 11v6"/></svg>',
+  x: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>',
 };
+const iconBtn = (act, icon, label, who, cls = '') =>
+  `<button class="icon-btn ${cls}" data-act="${act}" title="${esc(label)}" aria-label="${esc(label + ': ' + who)}">${icon}</button>`;
 const usage = u => u.limit_bytes ? (u.bytes_down + u.bytes_up) / u.limit_bytes : null;
 
 function renderUsers() {
   $('users-sub').textContent = t('users_sub', { total: users.length, online: users.filter(u => u.online).length });
+  document.querySelectorAll('th.sortable').forEach(th =>
+    th.setAttribute('aria-sort', th.dataset.sort === sortKey ? (sortDir > 0 ? 'ascending' : 'descending') : 'none'));
   const q = $('user-search').value.trim().toLowerCase();
   let list = users.filter(u => !q || (u.name || '').toLowerCase().includes(q) || u.access_key.toLowerCase().includes(q));
   if (filter === 'online') list = list.filter(u => u.online);
@@ -924,61 +1088,81 @@ function renderUsers() {
   list.sort((a, b) => (val(a) > val(b) ? 1 : val(a) < val(b) ? -1 : 0) * sortDir);
 
   const body = $('users-body');
+  // The table is redrawn every few seconds: keep the keyboard focus on the same button.
+  const af = document.activeElement;
+  const focused = af && body.contains(af) && af.closest('tr') ? [af.closest('tr').dataset.key, af.dataset.act] : null;
   if (!list.length) {
     body.innerHTML = `<tr><td colspan="5" class="empty">${esc(users.length ? t('no_match') : t('no_users'))}</td></tr>`;
     return;
   }
   body.innerHTML = list.map(u => {
     const r = usage(u);
+    const who = u.name || u.access_key.slice(0, 8);
     const bar = r == null ? `<span class="muted small">${esc(t('unlimited'))}</span>`
       : `<span class="small">${fmtBytes(u.bytes_down + u.bytes_up)} / ${fmtBytes(u.limit_bytes)}</span>
          <div class="bar ${r >= 1 ? 'full' : r >= .8 ? 'warn' : ''}"><div style="width:${Math.min(100, r * 100).toFixed(1)}%"></div></div>`;
     return `<tr data-key="${esc(u.access_key)}">
-      <td><div class="row"><span class="dot ${u.online ? 'on' : ''}"></span><div>
+      <td><div class="row"><span class="dot ${u.online ? 'on' : ''}" title="${u.online ? esc(t('online')) : ''}"></span><div>
         <div class="user-name">${esc(u.name || '—')}</div>
-        <div class="key" data-act="copykey" title="${esc(t('copy'))}">${esc(u.access_key.slice(0, 6))}…${esc(u.access_key.slice(-4))}</div></div></div></td>
+        <button class="key" data-act="copykey" title="${esc(t('copy'))}" aria-label="${esc(t('copy') + ': ' + who)}">${esc(u.access_key.slice(0, 6))}…${esc(u.access_key.slice(-4))}</button></div></div></td>
       <td class="hide-sm">${u.connections}</td>
       <td class="small">↓ ${fmtBytes(u.bytes_down)}<br><span class="muted">↑ ${fmtBytes(u.bytes_up)}</span></td>
       <td class="usage">${bar}</td>
       <td><div class="actions">
-        <button class="icon-btn" data-act="share" title="${esc(t('share'))}">${ICON.share}</button>
-        <button class="icon-btn" data-act="edit" title="${esc(t('edit'))}">${ICON.edit}</button>
-        <button class="icon-btn" data-act="reset" title="${esc(t('reset'))}">${ICON.reset}</button>
-        <button class="icon-btn danger" data-act="del" title="${esc(t('delete'))}">${ICON.del}</button>
+        ${iconBtn('share', ICON.share, t('share'), who)}
+        ${iconBtn('edit', ICON.edit, t('edit'), who)}
+        ${iconBtn('reset', ICON.reset, t('reset'), who)}
+        ${iconBtn('del', ICON.del, t('delete'), who, 'danger')}
       </div></td></tr>`;
   }).join('');
+  if (focused) {
+    const row = [...body.querySelectorAll('tr')].find(r => r.dataset.key === focused[0]);
+    const el = row && [...row.querySelectorAll('[data-act]')].find(b => b.dataset.act === focused[1]);
+    if (el) el.focus();
+  }
 }
 $('user-search').addEventListener('input', renderUsers);
 $('user-filter').addEventListener('click', e => {
   const b = e.target.closest('button'); if (!b) return;
   filter = b.dataset.f;
-  $('user-filter').querySelectorAll('button').forEach(x => x.classList.toggle('on', x === b));
+  $('user-filter').querySelectorAll('button').forEach(x => { x.classList.toggle('on', x === b); x.setAttribute('aria-pressed', x === b); });
   renderUsers();
 });
-document.querySelectorAll('th.sortable').forEach(th => th.addEventListener('click', () => {
+function sortBy(th) {
   const k = th.dataset.sort;
   sortDir = sortKey === k ? -sortDir : (k === 'name' ? 1 : -1);
   sortKey = k; renderUsers();
-}));
+}
+document.querySelectorAll('th.sortable').forEach(th => {
+  th.addEventListener('click', () => sortBy(th));
+  th.addEventListener('keydown', e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); sortBy(th); } });
+});
 
 $('users-body').addEventListener('click', async e => {
   const btn = e.target.closest('[data-act]'); if (!btn) return;
   const key = btn.closest('tr').dataset.key;
   const u = users.find(x => x.access_key === key); if (!u) return;
   const label = u.name || key.slice(0, 8);
-  try {
-    if (btn.dataset.act === 'copykey') { await copy(key); toast(t('copied_key')); }
-    if (btn.dataset.act === 'share') openShare(u);
-    if (btn.dataset.act === 'edit') openUserModal(u);
-    if (btn.dataset.act === 'reset' && await confirmBox(t('confirm_reset'), t('confirm_reset_text'), t('reset'))) {
+  const act = btn.dataset.act;
+  if (act === 'copykey') { if (await copyToast(key)) toast(t('copied_key')); return; }
+  if (act === 'share') return openShare(u);
+  if (act === 'edit') return openUserModal(u);
+  if (act === 'reset') {
+    if (!await confirmBox(t('confirm_reset', { x: label }), t('confirm_reset_text'), t('reset'))) return;
+    try {
       await api(`users/${encodeURIComponent(key)}/reset`, { method: 'POST' });
-      audit('ev_reset', label); toast(t('reset_done')); refresh();
-    }
-    if (btn.dataset.act === 'del' && await confirmBox(t('confirm_delete'), t('confirm_delete_text'), t('delete'))) {
+      audit('ev_reset', label); toast(t('reset_done'));
+    } catch (err) { fail('f_reset', err); }
+    refresh();
+  }
+  if (act === 'del') {
+    if (!await confirmBox(t('confirm_delete', { x: label }), t('confirm_delete_text'), t('delete'))) return;
+    try {
       await api(`users/${encodeURIComponent(key)}`, { method: 'DELETE' });
-      audit('ev_del', label); toast(t('deleted')); refresh();
-    }
-  } catch (err) { toast(t('err', { err: err.message }), true); }
+      audit('ev_del', label); toast(t('deleted'));
+    } catch (err) { fail('f_delete', err); }
+    refresh();
+  }
 });
 
 // add / edit
@@ -990,7 +1174,7 @@ function openUserModal(u) {
   $('mu-key-field').classList.toggle('hidden', !!u);
   $('mu-name').value = u?.name || '';
   $('mu-key').value = '';
-  $('mu-limit').value = u?.limit_bytes ? +(u.limit_bytes / GB).toFixed(2) : '';
+  $('mu-limit').value = u?.limit_bytes ? +(u.limit_bytes / GB).toPrecision(4) : '';
   openModal('m-user');
   setTimeout(() => $('mu-name').focus(), 50);
 }
@@ -1006,96 +1190,133 @@ $('f-user').addEventListener('submit', async e => {
   const name = $('mu-name').value.trim() || null;
   const lim = parseFloat($('mu-limit').value);
   const limit_bytes = lim > 0 ? Math.round(lim * GB) : null;
-  try {
-    if (editing) {
-      await api(`users/${encodeURIComponent(editing.access_key)}`, { method: 'PUT', body: { name, limit_bytes } });
-      audit('ev_edit', name || editing.access_key.slice(0, 8)); toast(t('saved'));
-    } else {
-      const key = $('mu-key').value.trim() || null;
-      const created = await api('users', { method: 'POST', body: { access_key: key, name, limit_bytes } });
-      audit('ev_add', name || String(created).slice(0, 8)); toast(t('created'));
-      closeModals(); await refresh();
-      const u = users.find(x => x.access_key === created);
-      if (u) openShare(u);
-      return;
-    }
-    closeModals(); refresh();
-  } catch (err) { toast(t('err', { err: err.message }), true); }
+  // The server accepts any key and overwrites an existing one, so check here.
+  const key = editing ? null : ($('mu-key').value.trim() || null);
+  if (key && !/^[^\s\/?#%\\]{8,128}$/.test(key)) { toast(t('key_bad'), true); $('mu-key').focus(); return; }
+  if (key && users.some(x => x.access_key === key)) { toast(t('key_exists'), true); $('mu-key').focus(); return; }
+  await busy($('f-user').querySelector('.btn.primary'), async () => {
+    try {
+      if (editing) {
+        await api(`users/${encodeURIComponent(editing.access_key)}`, { method: 'PUT', body: { name, limit_bytes } });
+        audit('ev_edit', name || editing.access_key.slice(0, 8)); toast(t('saved'));
+        closeModals(); refresh();
+      } else {
+        const created = await api('users', { method: 'POST', body: { access_key: key, name, limit_bytes } });
+        audit('ev_add', name || String(created).slice(0, 8)); toast(t('created'));
+        closeModals(); await refresh();
+        const u = users.find(x => x.access_key === created);
+        if (u) openShare(u);
+      }
+    } catch (err) { fail('f_user', err); }
+  });
 });
 
 // bulk
-$('btn-bulk').addEventListener('click', () => openModal('m-bulk'));
+$('btn-bulk').addEventListener('click', () => { openModal('m-bulk'); setTimeout(() => $('mb-count').focus(), 50); });
 $('f-bulk').addEventListener('submit', async e => {
   e.preventDefault();
   const count = parseInt($('mb-count').value, 10);
   const lim = parseFloat($('mb-limit').value);
-  try {
-    const keys = await api('users/bulk', { method: 'POST', body: { count, limit_bytes: lim > 0 ? Math.round(lim * GB) : null } });
-    audit('ev_bulk', String(keys.length)); toast(t('created_n', { n: keys.length }));
-    closeModals(); refresh();
-  } catch (err) { toast(t('err', { err: err.message }), true); }
+  await busy($('f-bulk').querySelector('.btn.primary'), async () => {
+    try {
+      const keys = await api('users/bulk', { method: 'POST', body: { count, limit_bytes: lim > 0 ? Math.round(lim * GB) : null } });
+      audit('ev_bulk', String(keys.length)); toast(t('created_n', { n: keys.length }));
+      closeModals(); refresh();
+    } catch (err) { fail('f_bulk', err); }
+  });
 });
 
 // share
+let shareSeq = 0;
 async function openShare(u) {
+  const seq = ++shareSeq;
   $('ms-title').textContent = `${t('share')}: ${u.name || u.access_key.slice(0, 8) + '…'}`;
-  $('ms-qr').innerHTML = '';
+  $('ms-qr').innerHTML = ''; $('ms-kinds').innerHTML = ''; $('ms-text').value = '';
+  $('ms-note').className = 'note'; $('ms-note').textContent = '';
   openModal('m-share');
+  $('m-share').querySelector('[data-close]').focus();
   let share;
   try { share = await api(`users/${encodeURIComponent(u.access_key)}/share`); }
-  catch (err) { $('ms-note').textContent = t('err', { err: err.message }); return; }
+  catch (err) { if (seq === shareSeq) { $('ms-note').className = 'note warn'; $('ms-note').textContent = t('f_share', { err: err.message }); } return; }
+  if (seq !== shareSeq) return;
   const kinds = [];
   if (share.subscription) kinds.push(['subscription', t('sub_tab'), share.subscription]);
   if (share.tls) kinds.push(['tls', 'TLS', share.tls]);
   kinds.push(['udp', 'UDP', share.udp]);
   const seg = $('ms-kinds');
-  seg.innerHTML = kinds.map(([k, label], i) => `<button data-k="${k}" class="${i ? '' : 'on'}">${esc(label)}</button>`).join('');
+  seg.innerHTML = kinds.map(([k, label], i) => `<button type="button" data-k="${k}" class="${i ? '' : 'on'}" aria-pressed="${!i}">${esc(label)}</button>`).join('');
   const show = async k => {
     const [, , text] = kinds.find(x => x[0] === k);
-    seg.querySelectorAll('button').forEach(b => b.classList.toggle('on', b.dataset.k === k));
+    seg.querySelectorAll('button').forEach(b => { b.classList.toggle('on', b.dataset.k === k); b.setAttribute('aria-pressed', b.dataset.k === k); });
     $('ms-text').value = text;
     $('ms-note').textContent = t(k === 'subscription' ? 'sub_note' : 'link_note');
     $('ms-qr').innerHTML = '';
-    try { $('ms-qr').innerHTML = await api('qr', { method: 'POST', body: { text } }); }
-    catch { $('ms-qr').innerHTML = `<span class="muted">${esc(t('qr_failed'))}</span>`; }
+    let svg;
+    try { svg = await api('qr', { method: 'POST', body: { text } }); }
+    catch { svg = `<span class="muted">${esc(t('qr_failed'))}</span>`; }
+    if (seq === shareSeq && $('ms-text').value === text) $('ms-qr').innerHTML = svg;
   };
   seg.onclick = e => { const b = e.target.closest('button'); if (b) show(b.dataset.k); };
   show(kinds[0][0]);
 }
-$('ms-copy').addEventListener('click', async () => { await copy($('ms-text').value); toast(t('copied')); });
+$('ms-copy').addEventListener('click', async () => { if (await copyToast($('ms-text').value)) toast(t('copied')); });
 
-// ── routing ───────────────────────────────────────────────────────────
-async function loadRules() {
-  $('rules-note').textContent = '';
-  try { $('rules').value = JSON.stringify(await api('router/rules'), null, 2); }
-  catch (err) { $('rules-note').textContent = t('err', { err: err.message }); }
+// ── routing and config editors ────────────────────────────────────────
+// What the editor held right after loading; a difference means unsaved edits.
+let rulesSnap = null, configSnap = null;
+const edited = (id, snap) => snap !== null && $(id).value !== snap;
+function setNote(id, msg, warn) { const el = $(id); el.textContent = msg; el.className = 'note' + (warn ? ' warn' : ''); }
+
+function checkRules(r) {
+  if (!Array.isArray(r)) return t('rule_list');
+  for (let i = 0; i < r.length; i++) {
+    if (!r[i] || typeof r[i] !== 'object' || Array.isArray(r[i])) return t('rule_bad', { n: i + 1 });
+    if (!['proxy', 'direct', 'block'].includes(r[i].action)) return t('rule_action', { n: i + 1 });
+  }
+  return '';
 }
-$('btn-save-rules').addEventListener('click', async () => {
+async function loadRules(force) {
+  if (!force && edited('rules', rulesSnap)) return;
+  setNote('rules-note', '');
+  try { $('rules').value = JSON.stringify(await api('router/rules'), null, 2); rulesSnap = $('rules').value; }
+  catch (err) { rulesSnap = null; setNote('rules-note', t('f_load', { err: err.message }), true); }
+}
+$('btn-save-rules').addEventListener('click', e => busy(e.currentTarget, async () => {
   let rules;
-  try { rules = JSON.parse($('rules').value); } catch (err) { $('rules-note').textContent = t('invalid_json', { err: err.message }); return; }
-  try { await api('router/rules', { method: 'PUT', body: rules }); audit('ev_rules', ''); toast(t('rules_saved')); $('rules-note').textContent = ''; }
-  catch (err) { $('rules-note').textContent = t('err', { err: err.message }); }
-});
+  try { rules = JSON.parse($('rules').value); } catch (err) { setNote('rules-note', t('invalid_json', { err: err.message }), true); return; }
+  const bad = checkRules(rules);
+  if (bad) { setNote('rules-note', bad, true); return; }
+  try {
+    await api('router/rules', { method: 'PUT', body: rules });
+    audit('ev_rules', ''); rulesSnap = $('rules').value; toast(t('rules_saved')); setNote('rules-note', '');
+  } catch (err) { setNote('rules-note', t('f_rules', { err: err.message }), true); }
+}));
 
-// ── config ────────────────────────────────────────────────────────────
-async function loadConfig() {
-  $('config-note').textContent = '';
-  try { $('config').value = JSON.stringify(await api('server/config'), null, 2); }
-  catch (err) { $('config-note').textContent = t('err', { err: err.message }); }
+async function loadConfig(force) {
+  if (!force && edited('config', configSnap)) return;
+  setNote('config-note', '');
+  try { $('config').value = JSON.stringify(await api('server/config'), null, 2); configSnap = $('config').value; }
+  catch (err) { configSnap = null; setNote('config-note', t('f_load', { err: err.message }), true); }
 }
-$('btn-reload-config').addEventListener('click', loadConfig);
-$('btn-save-config').addEventListener('click', async () => {
+$('btn-reload-config').addEventListener('click', async () => {
+  if (edited('config', configSnap) && !await confirmBox(t('confirm_discard'), t('confirm_discard_text'), t('discard'))) return;
+  loadConfig(true);
+});
+$('btn-save-config').addEventListener('click', e => busy(e.currentTarget, async () => {
   let cfg;
-  try { cfg = JSON.parse($('config').value); } catch (err) { $('config-note').className = 'note warn'; $('config-note').textContent = t('invalid_json', { err: err.message }); return; }
+  try { cfg = JSON.parse($('config').value); } catch (err) { setNote('config-note', t('invalid_json', { err: err.message }), true); return; }
+  if (!cfg || typeof cfg !== 'object' || Array.isArray(cfg)) { setNote('config-note', t('config_obj'), true); return; }
+  if (!('mode' in cfg)) { setNote('config-note', t('config_mode'), true); return; }
+  if (!await confirmBox(t('confirm_config'), t('confirm_config_text'), t('overwrite'))) return;
   try {
     await api('server/config', { method: 'PUT', body: cfg });
-    audit('ev_config', ''); toast(t('saved'));
-    $('config-note').className = 'note warn'; $('config-note').textContent = t('restart_note');
-  } catch (err) { $('config-note').className = 'note warn'; $('config-note').textContent = t('err', { err: err.message }); }
-});
+    audit('ev_config', ''); configSnap = $('config').value; toast(t('saved'));
+    setNote('config-note', t('restart_note'), true);
+  } catch (err) { setNote('config-note', t('f_config', { err: err.message }), true); }
+}));
 
 // ── DNS ───────────────────────────────────────────────────────────────
-let dnsSettings = null, dnsMeta = null;
+let dnsSettings = null, dnsMeta = null, dnsListStats = [], dnsDirty = false, dnsSaving = false;
 
 function renderDnsStats(st) {
   $('dns-state').className = 'pill ' + (st.enabled ? 'ok' : '');
@@ -1118,7 +1339,6 @@ function renderDnsStats(st) {
   tops(st.top_domains, 'dns-top-domains');
   dnsListStats = st.lists;
 }
-let dnsListStats = [];
 
 // The query log shows the newest few; "Show more" asks the server for more.
 const DNS_LOG_STEP = 25;
@@ -1136,7 +1356,7 @@ function renderDnsLog(entries) {
     return `<tr><td class="small">${esc(time)}</td><td class="mono small">${esc(e.client)}</td>
       <td><span class="mono small">${esc(e.name)}</span> <span class="mini">${esc(e.qtype)} · ${e.elapsed_ms} ms</span>${why}</td>
       <td><span class="pill ${esc(e.outcome)}">${esc(t('o_' + e.outcome))}</span></td>
-      <td><div class="actions"><button class="btn sm" data-dns-act="${blocked ? 'allow' : 'block'}" data-name="${esc(e.name)}">${esc(t(blocked ? 'dns_allow' : 'dns_block'))}</button></div></td></tr>`;
+      <td><div class="actions"><button class="btn sm" data-dns-act="${blocked ? 'allow' : 'block'}" data-name="${esc(e.name)}" aria-label="${esc(t(blocked ? 'dns_allow' : 'dns_block') + ': ' + e.name)}">${esc(t(blocked ? 'dns_allow' : 'dns_block'))}</button></div></td></tr>`;
   }).join('');
 }
 
@@ -1153,38 +1373,57 @@ function renderDnsSettings() {
   const row = (l, kind, i) => {
     const st = dnsListStats.find(x => x.name === l.name);
     const info = st ? (st.rules ? t('dns_rules_count', { n: st.rules.toLocaleString() }) + (st.unsupported ? ' · ' + t('dns_unsupported', { n: st.unsupported }) : '') : t('dns_never')) : '';
-    return `<div class="top-user"><label class="chk"><input type="checkbox" data-list="${kind}" data-i="${i}" ${l.enabled ? 'checked' : ''}></label>
-      <div class="grow">${esc(l.name)}${kind === 'allow' ? ' <span class="pill ok">allow</span>' : ''}<div class="mini">${esc(l.url)}</div></div>
-      <span class="mini">${esc(info)}</span><button class="icon-btn danger" title="${esc(t('dns_remove'))}" data-list-rm="${kind}" data-i="${i}">✕</button></div>`;
+    return `<div class="top-user"><label class="chk"><input type="checkbox" data-list="${kind}" data-i="${i}" aria-label="${esc(l.name)}" ${l.enabled ? 'checked' : ''}></label>
+      <div class="grow">${esc(l.name)}${kind === 'allow' ? ` <span class="pill ok">${esc(t('dns_allowlist'))}</span>` : ''}<div class="mini">${esc(l.url)}</div></div>
+      <span class="mini">${esc(info)}</span><button class="icon-btn danger" title="${esc(t('dns_remove'))}" aria-label="${esc(t('dns_remove') + ': ' + l.name)}" data-list-rm="${kind}" data-i="${i}">${ICON.x}</button></div>`;
   };
   $('dns-lists').innerHTML = s.lists.map((l, i) => row(l, 'block', i)).join('') + s.allowlists.map((l, i) => row(l, 'allow', i)).join('');
-  $('dns-preset').innerHTML = dnsMeta.presets.filter(([, , url]) => !s.lists.some(l => l.url === url)).map(([id, name]) => `<option value="${esc(id)}">${esc(name)}</option>`).join('');
-  $('dns-rewrites').innerHTML = s.rewrites.map((r, i) => `<div class="top-user"><div class="grow mono small">${esc(r.domain)} → ${esc(r.answer)}</div><button class="icon-btn danger" data-rw-rm="${i}">✕</button></div>`).join('');
+  const presets = dnsMeta.presets.filter(([, , url]) => !s.lists.some(l => l.url === url));
+  $('dns-preset').innerHTML = presets.map(([id, name]) => `<option value="${esc(id)}">${esc(name)}</option>`).join('');
+  $('btn-dns-preset').disabled = !presets.length;
+  $('dns-rewrites').innerHTML = s.rewrites.map((r, i) => `<div class="top-user"><div class="grow mono small">${esc(r.domain)} → ${esc(r.answer)}</div><button class="icon-btn danger" title="${esc(t('dns_remove'))}" aria-label="${esc(t('dns_remove') + ': ' + r.domain)}" data-rw-rm="${i}">${ICON.x}</button></div>`).join('');
   $('dns-services').innerHTML = dnsMeta.services.map(([id, name]) => `<label class="chk"><input type="checkbox" data-svc="${esc(id)}" ${s.blocked_services.includes(id) ? 'checked' : ''}> ${esc(name)}</label>`).join('');
+  dnsDirty = false;
 }
 
-/// The form into dnsSettings (what Save sends).
+// Typing in the settings form marks it as edited, so a reload does not wipe it.
+const dnsMark = e => { if (e.target.closest('#dns-upstreams-edit, #dns-upstream-mode, #dns-safe, #dns-doh, #dns-blocking, #dns-interval, #dns-cache, #dns-rules-edit, #dns-lists, #dns-services')) dnsDirty = true; };
+$('page-dns').addEventListener('input', dnsMark);
+$('page-dns').addEventListener('change', dnsMark);
+
+/// The form into dnsSettings (what Save sends). False, with a message, when it cannot be sent.
 function collectDns() {
   const s = dnsSettings;
+  if (!s) { toast(t('dns_not_loaded'), true); return false; }
+  const interval = Number($('dns-interval').value), cache = Number($('dns-cache').value);
+  if (!Number.isInteger(interval) || interval < 1) { toast(t('interval_bad'), true); $('dns-interval').focus(); return false; }
+  if ($('dns-cache').value.trim() === '' || !Number.isInteger(cache) || cache < 0) { toast(t('cache_bad'), true); $('dns-cache').focus(); return false; }
   s.upstreams = $('dns-upstreams-edit').value.split('\n').map(x => x.trim()).filter(Boolean);
   s.upstream_mode = $('dns-upstream-mode').value;
   s.safe_search = $('dns-safe').checked;
   s.block_doh_bypass = $('dns-doh').checked;
   s.blocking_mode = $('dns-blocking').value;
-  s.update_interval_hours = Math.max(1, parseInt($('dns-interval').value, 10) || 24);
-  s.cache_size = Math.max(0, parseInt($('dns-cache').value, 10) || 0);
+  s.update_interval_hours = interval;
+  s.cache_size = cache;
   s.user_rules = $('dns-rules-edit').value.split('\n').map(x => x.trim()).filter(Boolean);
   document.querySelectorAll('[data-list]').forEach(c => { (c.dataset.list === 'allow' ? s.allowlists : s.lists)[+c.dataset.i].enabled = c.checked; });
   s.blocked_services = [...document.querySelectorAll('[data-svc]')].filter(c => c.checked).map(c => c.dataset.svc);
+  return true;
 }
 
-async function saveDns(note = true) {
+async function saveDns() {
+  if (dnsSaving) return;
+  dnsSaving = true; $('btn-dns-save').disabled = true;
   try {
     await api('dns/settings', { method: 'PUT', body: dnsSettings });
-    if (note) toast(t('dns_saved'));
-    $('dns-save-note').textContent = '';
-    loadDns(true);
-  } catch (err) { $('dns-save-note').textContent = t('err', { err: err.message }); toast(t('err', { err: err.message }), true); }
+    toast(t('dns_saved'));
+    setNote('dns-save-note', '');
+    await loadDns(true);
+  } catch (err) {
+    setNote('dns-save-note', t('f_dns', { err: err.message }), true); fail('f_dns', err);
+    // Show what was attempted, so the form and dnsSettings agree and the user can correct it.
+    renderDnsSettings(); dnsDirty = true;
+  } finally { dnsSaving = false; $('btn-dns-save').disabled = false; }
 }
 
 async function loadDns(withSettings) {
@@ -1196,60 +1435,70 @@ async function loadDns(withSettings) {
       [dnsSettings, dnsMeta] = await Promise.all([api('dns/settings'), dnsMeta ? Promise.resolve(dnsMeta) : api('dns/meta')]);
       renderDnsSettings();
     }
-  } catch (err) { if (withSettings) toast(t('err', { err: err.message }), true); }
+  } catch (err) { if (withSettings && !(err instanceof Unauthorized)) fail('f_load', err); }
 }
 
-$('btn-dns-save').addEventListener('click', () => { collectDns(); saveDns(); });
-$('btn-dns-toggle').addEventListener('click', () => { collectDns(); dnsSettings.enabled = !dnsSettings.enabled; saveDns(); });
-$('btn-dns-update').addEventListener('click', async () => {
-  const b = $('btn-dns-update'); b.disabled = true;
+$('btn-dns-save').addEventListener('click', () => { if (collectDns()) saveDns(); });
+$('btn-dns-toggle').addEventListener('click', () => { if (!collectDns()) return; dnsSettings.enabled = !dnsSettings.enabled; saveDns(); });
+$('btn-dns-update').addEventListener('click', e => busy(e.currentTarget, async () => {
   try {
     const r = await api('dns/update', { method: 'POST' });
     toast(t('dns_updated', { ok: r.filter(x => x.ok).length, n: r.length }), r.some(x => !x.ok));
-    loadDns(true);
-  } catch (err) { toast(t('err', { err: err.message }), true); }
-  finally { b.disabled = false; }
-});
-$('btn-dns-test').addEventListener('click', async () => {
-  const name = $('dns-test-name').value.trim(); if (!name) return;
+    loadDns(!dnsDirty);
+  } catch (err) { fail('f_dns_update', err); }
+}));
+$('btn-dns-test').addEventListener('click', e => busy(e.currentTarget, async () => {
+  const name = $('dns-test-name').value.trim();
+  if (!name) { setNote('dns-test-result', t('dns_test_empty'), true); return; }
   try {
-    const e = await api('dns/test', { method: 'POST', body: { domain: name } });
-    $('dns-test-result').innerHTML = `<span class="pill ${esc(e.outcome)}">${esc(t('o_' + e.outcome))}</span> ${esc(e.detail)}${e.rule ? ' · <span class="mono">' + esc(e.rule) + '</span>' : ''}${e.source ? ' · ' + esc(e.source) : ''}`;
-  } catch (err) { $('dns-test-result').textContent = t('err', { err: err.message }); }
-});
+    const r = await api('dns/test', { method: 'POST', body: { domain: name } });
+    $('dns-test-result').className = 'note';
+    $('dns-test-result').innerHTML = `<span class="pill ${esc(r.outcome)}">${esc(t('o_' + r.outcome))}</span> ${esc(r.detail)}${r.rule ? ' · <span class="mono">' + esc(r.rule) + '</span>' : ''}${r.source ? ' · ' + esc(r.source) : ''}`;
+  } catch (err) { setNote('dns-test-result', t('f_dns_test', { err: err.message }), true); }
+}));
 $('dns-test-name').addEventListener('keydown', e => { if (e.key === 'Enter') $('btn-dns-test').click(); });
-$('dns-log-q').addEventListener('input', () => { dnsLogLimit = DNS_LOG_STEP; loadDns(false); });
+let dnsFilterTimer = null;
+$('dns-log-q').addEventListener('input', () => {
+  clearTimeout(dnsFilterTimer);
+  dnsFilterTimer = setTimeout(() => { dnsLogLimit = DNS_LOG_STEP; loadDns(false); }, 250);
+});
 $('btn-dns-more').addEventListener('click', () => { dnsLogLimit = Math.min(2000, dnsLogLimit + 50); loadDns(false); });
-$('btn-dns-clear').addEventListener('click', async () => { try { await api('dns/log', { method: 'DELETE' }); loadDns(false); } catch (err) { toast(t('err', { err: err.message }), true); } });
+$('btn-dns-clear').addEventListener('click', async () => {
+  if (!await confirmBox(t('confirm_dns_clear'), t('confirm_dns_clear_text'), t('clear'))) return;
+  try { await api('dns/log', { method: 'DELETE' }); toast(t('dns_cleared')); loadDns(false); } catch (err) { fail('f_dns_clear', err); }
+});
 $('dns-log').addEventListener('click', e => {
-  const b = e.target.closest('[data-dns-act]'); if (!b || !dnsSettings) return;
-  collectDns();
+  const b = e.target.closest('[data-dns-act]'); if (!b || !collectDns()) return;
   const d = b.dataset.name, block = `||${d}^`, allow = `@@||${d}^`;
   dnsSettings.user_rules = dnsSettings.user_rules.filter(r => r !== block && r !== allow);
   dnsSettings.user_rules.push(b.dataset.dnsAct === 'block' ? block : allow);
   saveDns();
 });
 $('btn-dns-preset').addEventListener('click', () => {
-  const id = $('dns-preset').value; const p = dnsMeta.presets.find(x => x[0] === id); if (!p) return;
-  collectDns(); dnsSettings.lists.push({ name: p[1], url: p[2], enabled: true }); saveDns();
+  const p = dnsMeta && dnsMeta.presets.find(x => x[0] === $('dns-preset').value); if (!p || !collectDns()) return;
+  dnsSettings.lists.push({ name: p[1], url: p[2], enabled: true }); saveDns();
 });
 $('btn-dns-list-add').addEventListener('click', () => {
-  const url = $('dns-list-url').value.trim(); if (!/^https?:\/\//.test(url)) return;
-  collectDns();
-  (($('dns-list-allow').checked) ? dnsSettings.allowlists : dnsSettings.lists).push({ name: url.split('/').filter(Boolean).pop() || url, url, enabled: true });
+  const url = $('dns-list-url').value.trim();
+  if (!/^https?:\/\/\S+$/i.test(url)) { toast(t('url_bad'), true); $('dns-list-url').focus(); return; }
+  if (!collectDns()) return;
+  ($('dns-list-allow').checked ? dnsSettings.allowlists : dnsSettings.lists).push({ name: url.split('/').filter(Boolean).pop() || url, url, enabled: true });
   $('dns-list-url').value = ''; saveDns();
 });
 $('dns-lists').addEventListener('click', e => {
-  const b = e.target.closest('[data-list-rm]'); if (!b) return;
-  collectDns(); (b.dataset.listRm === 'allow' ? dnsSettings.allowlists : dnsSettings.lists).splice(+b.dataset.i, 1); saveDns();
+  const b = e.target.closest('[data-list-rm]'); if (!b || !collectDns()) return;
+  (b.dataset.listRm === 'allow' ? dnsSettings.allowlists : dnsSettings.lists).splice(+b.dataset.i, 1); saveDns();
 });
 $('btn-dns-rw-add').addEventListener('click', () => {
-  const domain = $('dns-rw-domain').value.trim(), answer = $('dns-rw-answer').value.trim(); if (!domain || !answer) return;
-  collectDns(); dnsSettings.rewrites.push({ domain, answer }); $('dns-rw-domain').value = ''; $('dns-rw-answer').value = ''; saveDns();
+  const domain = $('dns-rw-domain').value.trim(), answer = $('dns-rw-answer').value.trim();
+  if (!domain || !answer) { toast(t('rw_empty'), true); return; }
+  if (!collectDns()) return;
+  dnsSettings.rewrites = dnsSettings.rewrites.filter(r => r.domain !== domain);
+  dnsSettings.rewrites.push({ domain, answer }); $('dns-rw-domain').value = ''; $('dns-rw-answer').value = ''; saveDns();
 });
 $('dns-rewrites').addEventListener('click', e => {
-  const b = e.target.closest('[data-rw-rm]'); if (!b) return;
-  collectDns(); dnsSettings.rewrites.splice(+b.dataset.rwRm, 1); saveDns();
+  const b = e.target.closest('[data-rw-rm]'); if (!b || !collectDns()) return;
+  dnsSettings.rewrites.splice(+b.dataset.rwRm, 1); saveDns();
 });
 
 // ── activity ──────────────────────────────────────────────────────────
@@ -1259,11 +1508,16 @@ function logHtml(items, limit) {
     <span class="dot ${l.success ? 'on' : ''}"></span><span>${esc(lang === 'ru' ? l.eventRu : l.eventEn)}</span></div>`).join('');
 }
 async function loadLog() {
-  try { const items = await api('audit'); $('log').innerHTML = logHtml(items, 100); $('ov-log').innerHTML = logHtml(items, 6); } catch { /* shown elsewhere */ }
+  try { const items = await api('audit'); $('log').innerHTML = logHtml(items, 100); $('ov-log').innerHTML = logHtml(items, 6); }
+  catch (err) {
+    if (err instanceof Unauthorized) return;
+    const msg = `<div class="empty">${esc(t('f_log', { err: err.message }))}</div>`;
+    $('log').innerHTML = msg; $('ov-log').innerHTML = msg;
+  }
 }
 $('btn-clear-log').addEventListener('click', async () => {
   if (!await confirmBox(t('confirm_clear'), t('confirm_clear_text'), t('clear'))) return;
-  try { await api('audit', { method: 'DELETE' }); loadLog(); } catch (err) { toast(t('err', { err: err.message }), true); }
+  try { await api('audit', { method: 'DELETE' }); loadLog(); } catch (err) { fail('f_log_clear', err); }
 });
 
 // ── theme / language ──────────────────────────────────────────────────
@@ -1277,16 +1531,19 @@ $('btn-lang').addEventListener('click', () => {
   lang = lang === 'ru' ? 'en' : 'ru';
   localStorage.setItem('ostp_panel_lang', lang);
   applyLang();
-  if (status) { renderOverview(); renderUsers(); loadLog(); }
+  if (live !== null) setLive(live);
+  if (status) { renderOverview(); renderUsers(); }
+  loadLog();
+  if (ovStatus) renderOvernet(ovStatus, false);
+  if (dnsSettings) loadDns(!dnsDirty); // rebuilds the DNS texts; kept as is while the form has edits
 });
 
 // ── start ─────────────────────────────────────────────────────────────
-let timer = null;
 async function start() {
   if (!await refresh()) return;
   $('app').classList.remove('hidden');
   const p = location.hash.slice(1);
-  go(['overview', 'users', 'routing', 'config', 'activity', 'dns', 'overnet'].includes(p) ? p : 'overview');
+  go(PAGES.includes(p) ? p : 'overview');
   loadLog();
   clearInterval(timer);
   timer = setInterval(async () => {
