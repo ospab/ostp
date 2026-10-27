@@ -85,6 +85,12 @@ struct Counters {
 
 const TOP_CAP: usize = 5000;
 
+/// Queries waiting on an upstream at once. Each one holds a socket for up to
+/// the upstream timeout, so a client sending unique names faster than they
+/// are answered could use up the process's file descriptors for everyone.
+/// Past the cap a query is answered with SERVFAIL at once.
+const MAX_UPSTREAM_QUERIES: usize = 256;
+
 /// The counters and the query log, kept next to the config so a restart or
 /// an update does not wipe them. Holds clients' addresses and the names they
 /// looked up, so it is written readable by root only; "Clear" empties it.
@@ -167,6 +173,8 @@ pub struct Dns {
     since: Mutex<u64>,
     /// Something changed since the activity file was last written.
     dirty: AtomicBool,
+    /// Free slots for queries going to an upstream (`MAX_UPSTREAM_QUERIES`).
+    upstream_slots: tokio::sync::Semaphore,
 }
 
 fn qtype_code(q: QTYPE) -> u16 {
@@ -306,6 +314,7 @@ impl Dns {
             proxy: RwLock::new(None),
             since: Mutex::new(since),
             dirty: AtomicBool::new(false),
+            upstream_slots: tokio::sync::Semaphore::new(MAX_UPSTREAM_QUERIES),
         })
     }
 
@@ -578,6 +587,9 @@ impl Dns {
         }
         let started = Instant::now();
         let ups = self.upstreams.read().unwrap_or_else(|e| e.into_inner()).clone();
+        let Ok(_slot) = self.upstream_slots.try_acquire() else {
+            anyhow::bail!("too many queries waiting for the upstream resolvers");
+        };
         let (answer, label) = ups.query(query).await?;
         let ms = started.elapsed().as_millis() as u64;
         if s.cache_size > 0 {

@@ -18,6 +18,14 @@ const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(8);
 /// frame length of at most 1535), which is how the server tells raw UoT
 /// apart from TLS and HTTP on the same port.
 const MAX_JUNK_LEN: usize = 1400;
+/// Config values beyond this many junk frames only delay the handshake.
+const MAX_JUNK_COUNT: usize = 64;
+/// A write that makes no progress this long means the connection is dead (a
+/// closed window, a path that swallows segments). The writer then gives up and
+/// drops the connection: `Transport::send` waits on the writer's queue from the
+/// bridge loop, which also runs the stall detection, so an endless write would
+/// freeze the recovery that is meant to replace this connection.
+const WRITE_STALL: Duration = Duration::from_secs(10);
 /// How much of the first frame TCP fragmentation splits into small segments.
 const FRAG_HEAD_BYTES: usize = 32;
 
@@ -131,7 +139,7 @@ where
             let mut rng = rand::thread_rng();
             let min_c = junk_pc_min;
             let max_c = junk_pc_max.max(min_c);
-            let num_junk = rng.gen_range(min_c..=max_c);
+            let num_junk = rng.gen_range(min_c..=max_c).min(MAX_JUNK_COUNT);
             (0..num_junk)
                 .map(|_| {
                     let min_s = junk_ps_min.clamp(1, MAX_JUNK_LEN);
@@ -191,9 +199,9 @@ where
                 let mut frame = Vec::with_capacity(2 + data.len());
                 frame.extend_from_slice(&len_buf);
                 frame.extend_from_slice(&data);
-                if write_half.write_all(&frame).await.is_err() { break; }
+                if !matches!(tokio::time::timeout(WRITE_STALL, write_half.write_all(&frame)).await, Ok(Ok(_))) { break; }
             }
-            if write_half.flush().await.is_err() { break; }
+            if !matches!(tokio::time::timeout(WRITE_STALL, write_half.flush()).await, Ok(Ok(_))) { break; }
         }
         // The transport was dropped (or the stream failed): close our side.
         // Dropping a plain TCP write half already sends FIN, but a write half
@@ -202,7 +210,7 @@ where
         // shutdown() sends close_notify and FIN, so the server (or the web
         // server in front of it) closes the connection instead of keeping it
         // open forever.
-        let _ = write_half.shutdown().await;
+        let _ = tokio::time::timeout(Duration::from_secs(2), write_half.shutdown()).await;
     });
 
     // Reader: reads whatever is available and only pulls a frame out once the

@@ -31,6 +31,27 @@ const STALL_AFTER: Duration = Duration::from_secs(10);
 /// How long a moved session gets to show a sign of life on its new path.
 const MIGRATION_TIMEOUT_MIN: Duration = Duration::from_secs(4);
 
+/// Parallel sessions the multiplexer opens at most; the config value is the
+/// user's, and each session is a socket, a task and a handshake in sequence.
+const MAX_MUX_SESSIONS: usize = 32;
+
+/// Minimum gap between log lines about packets that fail to authenticate.
+const INBOUND_ERROR_LOG_EVERY: Duration = Duration::from_secs(5);
+
+/// A ping answered later than this is not an RTT sample: the clock moved.
+const MAX_PLAUSIBLE_RTT_MS: u64 = 60_000;
+
+/// Ceiling on the wait for a moved session to show life, whatever the RTT.
+const MIGRATION_TIMEOUT_MAX: Duration = Duration::from_secs(30);
+
+/// Resolving the server's name must not hold the bridge loop (and with it
+/// the stop button) for as long as a dead resolver likes.
+const RESOLVE_TIMEOUT: Duration = Duration::from_secs(8);
+
+/// All sockets of a move, or the move is given up for a full handshake,
+/// which can be interrupted; the move itself runs on the bridge loop.
+const MIGRATION_CONNECT_BUDGET: Duration = Duration::from_secs(20);
+
 /// Pause after a failed full-handshake attempt, by attempt number; the last
 /// value repeats until the user stops the tunnel.
 const RETRY_BACKOFF_SECS: [u64; 6] = [1, 2, 5, 10, 20, 30];
@@ -248,6 +269,8 @@ pub struct Bridge {
     last_rtt_ms: f64,
     last_sample_at: Instant,
 
+    last_inbound_error_log: Option<Instant>,
+
     link: Link,
     sessions: Vec<SessionState>,
     udp_rx: Option<mpsc::Receiver<(usize, Bytes)>>,
@@ -273,7 +296,7 @@ impl Bridge {
             keepalive_interval_sec: config.ostp.keepalive_interval_sec,
             mode: config.mode.clone(),
             mux_enabled: config.multiplex.enabled,
-            mux_sessions: config.multiplex.sessions.max(1),
+            mux_sessions: config.multiplex.sessions.clamp(1, MAX_MUX_SESSIONS),
 
             transport_mode: config.transport.mode.clone(),
             tcp_fragmentation: config.transport.tcp_fragmentation,
@@ -300,6 +323,8 @@ impl Bridge {
             last_rtt_ms: 0.0,
             last_sample_at: Instant::now(),
 
+            last_inbound_error_log: None,
+
             link: Link::Idle,
             sessions: Vec::new(),
             udp_rx: None,
@@ -318,7 +343,7 @@ impl Bridge {
         proxy_tx: mpsc::UnboundedSender<(u16, ProxyToClientMsg)>,
     ) -> Result<()> {
         let mut metrics_tick = interval(Duration::from_millis(500));
-        let mut keepalive_tick = interval(Duration::from_secs(self.keepalive_interval_sec.max(1)));
+        let mut keepalive_tick = interval(Duration::from_secs(self.keepalive_interval_sec.clamp(1, 3600)));
         let mut retransmit_tick = interval(Duration::from_millis(10));
         // The default `Burst` replays every tick missed during a suspend, which
         // for the 10 ms retransmit tick is a CPU storm right after waking.
@@ -352,8 +377,10 @@ impl Bridge {
             tokio::select! {
                 biased;
                 _ = tokio::time::sleep(pace_wait.unwrap_or_default()), if pace_wait.is_some() => {}
-                _ = shutdown.changed() => {
-                    if *shutdown.borrow() {
+                changed = shutdown.changed() => {
+                    // A dropped sender is a shutdown too: `changed()` would
+                    // otherwise return an error at once, on every pass.
+                    if changed.is_err() || *shutdown.borrow() {
                         break;
                     }
                 }
@@ -441,8 +468,16 @@ impl Bridge {
         let initial_action = match session.machine.on_event(OstpEvent::Inbound(inbound)) {
             Ok(a) => a,
             Err(e) => {
-                let _ = tx.send(UiEvent::Log(format!("Protocol decrypt error: {e}"))).await;
-                tracing::warn!("Inbound protocol error (session {}): {}", session_index, e);
+                // Anyone who can send to this socket can make this happen once
+                // per packet; one line every few seconds is enough to see it,
+                // and a full UI channel must not hold the loop for each one.
+                if self.last_inbound_error_log.map_or(true, |t| t.elapsed() >= INBOUND_ERROR_LOG_EVERY) {
+                    self.last_inbound_error_log = Some(Instant::now());
+                    let _ = tx.send(UiEvent::Log(format!("Protocol decrypt error: {e}"))).await;
+                    tracing::warn!("Inbound protocol error (session {}): {}", session_index, e);
+                } else {
+                    tracing::trace!("Inbound protocol error (session {}): {}", session_index, e);
+                }
                 return;
             }
         };
@@ -485,9 +520,15 @@ impl Bridge {
                                     let _ = proxy_tx.send((stream_id, ProxyToClientMsg::Error(msg)));
                                 }
                                 RelayMessage::Pong(ts) => {
-                                    let now = SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
-                                    self.last_rtt_ms = now.saturating_sub(ts) as f64;
-                                    self.metrics.rtt_ms.store(self.last_rtt_ms as u32, Ordering::Relaxed);
+                                    let now = SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
+                                    // The ping carries the wall clock, so a clock step
+                                    // between ping and pong reads as an RTT of hours
+                                    // (and stretches the move deadline with it).
+                                    let rtt = now.saturating_sub(ts);
+                                    if rtt <= MAX_PLAUSIBLE_RTT_MS {
+                                        self.last_rtt_ms = rtt as f64;
+                                        self.metrics.rtt_ms.store(rtt as u32, Ordering::Relaxed);
+                                    }
                                 }
                                 RelayMessage::UdpAssociate => {}
                                 RelayMessage::UdpData(target, data) => {
@@ -617,7 +658,7 @@ impl Bridge {
     /// tick and are answered within an RTT, so two ticks of silence mean the
     /// path is gone or blocked.
     fn stall_after(&self) -> Duration {
-        STALL_AFTER.max(Duration::from_secs(self.keepalive_interval_sec.saturating_mul(2)))
+        STALL_AFTER.max(Duration::from_secs(self.keepalive_interval_sec.clamp(1, 3600) * 2))
     }
 
     /// Silence of the quietest session. A session that stopped answering must
@@ -651,7 +692,9 @@ impl Bridge {
                     ))).await.ok();
                     return;
                 }
-                let deadline = MIGRATION_TIMEOUT_MIN.max(Duration::from_millis((self.last_rtt_ms * 4.0) as u64));
+                let deadline = MIGRATION_TIMEOUT_MIN
+                    .max(Duration::from_millis((self.last_rtt_ms * 4.0) as u64))
+                    .min(MIGRATION_TIMEOUT_MAX);
                 if started.elapsed() >= deadline {
                     // The server stays silent to unknown sessions on purpose, so
                     // "session expired" and "path blocked" look the same here.
@@ -744,8 +787,8 @@ impl Bridge {
             loop {
                 tokio::select! {
                     result = &mut establish => break Ok(result),
-                    _ = shutdown.changed() => {
-                        if *shutdown.borrow() {
+                    changed = shutdown.changed() => {
+                        if changed.is_err() || *shutdown.borrow() {
                             break Err(Interrupt::Shutdown);
                         }
                     }
@@ -1088,9 +1131,10 @@ impl Bridge {
 
         let secrets = ostp_core::crypto::derive_all_secrets(&self.access_key);
 
-        let mut resolved_addrs: Vec<std::net::SocketAddr> = match tokio::net::lookup_host(&self.server_addr).await {
-            Ok(addrs) => addrs.collect(),
-            Err(e) => return Err(anyhow::anyhow!("failed to resolve server address {}: {}", self.server_addr, e)),
+        let mut resolved_addrs: Vec<std::net::SocketAddr> = match timeout(RESOLVE_TIMEOUT, tokio::net::lookup_host(&self.server_addr)).await {
+            Ok(Ok(addrs)) => addrs.collect(),
+            Ok(Err(e)) => return Err(anyhow::anyhow!("failed to resolve server address {}: {}", self.server_addr, e)),
+            Err(_) => return Err(anyhow::anyhow!("resolving server address {} timed out", self.server_addr)),
         };
         // IPv4 first. Addresses are tried strictly in order, each burning its
         // full retry budget before the next is touched, so this ordering decides
@@ -1347,8 +1391,9 @@ impl Bridge {
     /// trying the resolved addresses IPv4-first and NAT64 once, as the
     /// handshake path does.
     async fn connect_server(&self, tx: &mpsc::Sender<UiEvent>) -> Result<crate::transport::Transport> {
-        let mut addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host(&self.server_addr)
+        let mut addrs: Vec<std::net::SocketAddr> = timeout(RESOLVE_TIMEOUT, tokio::net::lookup_host(&self.server_addr))
             .await
+            .map_err(|_| anyhow::anyhow!("resolving server address {} timed out", self.server_addr))?
             .with_context(|| format!("failed to resolve server address {}", self.server_addr))?
             .collect();
         addrs.sort_by_key(|addr| addr.is_ipv6());
@@ -1394,9 +1439,15 @@ impl Bridge {
         // Connect everything before touching the sessions, so a failure leaves
         // them as they were.
         let mut sockets = Vec::with_capacity(count);
-        for _ in 0..count {
-            sockets.push(self.connect_server(tx).await?);
-        }
+        let connect_all = async {
+            for _ in 0..count {
+                sockets.push(self.connect_server(tx).await?);
+            }
+            Ok::<_, anyhow::Error>(())
+        };
+        timeout(MIGRATION_CONNECT_BUDGET, connect_all)
+            .await
+            .map_err(|_| anyhow::anyhow!("no connection to the server within {} s", MIGRATION_CONNECT_BUDGET.as_secs()))??;
 
         let (udp_tx, udp_rx) = mpsc::channel(1024);
         for (index, (session, socket)) in self.sessions.iter_mut().zip(sockets).enumerate() {
@@ -1454,7 +1505,7 @@ impl Bridge {
         self.io_timeout_ms = cfg.ostp.io_timeout_ms;
         self.mode = cfg.mode.clone(); // Bug fix: mode was never updated on hot-reload
         self.mux_enabled = cfg.multiplex.enabled;
-        self.mux_sessions = cfg.multiplex.sessions.max(1);
+        self.mux_sessions = cfg.multiplex.sessions.clamp(1, MAX_MUX_SESSIONS);
         self.transport_mode = cfg.transport.mode.clone();
         self.tcp_fragmentation = cfg.transport.tcp_fragmentation;
         self.frag_chunk = cfg.transport.frag_chunk.max(1);
@@ -1621,7 +1672,8 @@ pub(crate) fn server_host(server_addr: &str) -> String {
 /// Why a UDP handshake got no answer, told apart by a TCP connect to the
 /// same port (the server takes both on it) made around the tunnel.
 async fn udp_failure_diagnosis(server_addr: &str) -> String {
-    let addr = match tokio::net::lookup_host(server_addr).await.ok().and_then(|mut a| a.next()) {
+    let lookup = tokio::time::timeout(RESOLVE_TIMEOUT, tokio::net::lookup_host(server_addr)).await;
+    let addr = match lookup.ok().and_then(|r| r.ok()).and_then(|mut a| a.next()) {
         Some(a) => a,
         None => return format!("{server_addr} does not resolve"),
     };

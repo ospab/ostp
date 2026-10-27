@@ -289,7 +289,28 @@ where
     Ok(())
 }
 
+/// Longest an upstream proxy gets for a whole handshake. A proxy that accepts
+/// the connection and then never answers would otherwise hold the client's
+/// connection slot (and its task) for good.
+const PROXY_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
+
+async fn within_proxy_timeout<T>(what: &str, fut: impl std::future::Future<Output = Result<T>>) -> Result<T> {
+    tokio::time::timeout(PROXY_HANDSHAKE_TIMEOUT, fut)
+        .await
+        .map_err(|_| anyhow::anyhow!("{what}: no answer from the proxy in {}s", PROXY_HANDSHAKE_TIMEOUT.as_secs()))?
+}
+
 pub(crate) async fn connect_via_socks5(
+    proxy_addr: &str,
+    target: &str,
+    bind_ip: Option<&str>,
+    username: &str,
+    password: &str,
+) -> Result<TcpStream> {
+    within_proxy_timeout("SOCKS5 connect", connect_via_socks5_inner(proxy_addr, target, bind_ip, username, password)).await
+}
+
+async fn connect_via_socks5_inner(
     proxy_addr: &str,
     target: &str,
     bind_ip: Option<&str>,
@@ -365,6 +386,10 @@ fn check_wire_host(host: &str) -> Result<()> {
 }
 
 async fn connect_via_http(proxy_addr: &str, target: &str, bind_ip: Option<&str>) -> Result<TcpStream> {
+    within_proxy_timeout("HTTP CONNECT", connect_via_http_inner(proxy_addr, target, bind_ip)).await
+}
+
+async fn connect_via_http_inner(proxy_addr: &str, target: &str, bind_ip: Option<&str>) -> Result<TcpStream> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let (host, _) = split_host_port(target).ok_or_else(|| anyhow::anyhow!("invalid target"))?;
@@ -531,6 +556,16 @@ pub async fn connect_udp_target(
 }
 
 pub async fn connect_udp_via_socks5(
+    proxy_addr: &str,
+    server_udp: std::sync::Arc<tokio::net::UdpSocket>,
+    bind_ip: Option<&str>,
+    username: &str,
+    password: &str,
+) -> Result<UdpProxySocket> {
+    within_proxy_timeout("SOCKS5 UDP ASSOCIATE", connect_udp_via_socks5_inner(proxy_addr, server_udp, bind_ip, username, password)).await
+}
+
+async fn connect_udp_via_socks5_inner(
     proxy_addr: &str,
     server_udp: std::sync::Arc<tokio::net::UdpSocket>,
     bind_ip: Option<&str>,

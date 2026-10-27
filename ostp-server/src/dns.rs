@@ -26,7 +26,11 @@ pub async fn spawn_tcp_listener(
     let addr = listener.local_addr()?;
     tokio::spawn(async move {
         loop {
-            let Ok((mut s, peer)) = listener.accept().await else { continue };
+            let Ok((mut s, peer)) = listener.accept().await else {
+                // Out of descriptors, say: retrying at once is a busy loop.
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                continue;
+            };
             let dns = dns.clone();
             let overnet = overnet.clone();
             tokio::spawn(async move {
@@ -38,7 +42,7 @@ pub async fn spawn_tcp_listener(
                         break;
                     }
                     let mut q = vec![0u8; u16::from_be_bytes(len) as usize];
-                    if s.read_exact(&mut q).await.is_err() {
+                    if !matches!(tokio::time::timeout(std::time::Duration::from_secs(30), s.read_exact(&mut q)).await, Ok(Ok(_))) {
                         break;
                     }
                     let ov = overnet.read().unwrap().answer_dns(&q);

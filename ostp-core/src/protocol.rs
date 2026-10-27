@@ -189,6 +189,12 @@ impl ProtocolMachine {
             config.role,
             &config.psk,
         )?;
+        // The MTU comes from user config. Zero divides by zero in the
+        // congestion controller and anything under the padder's 64-byte
+        // bucket panics in `clamp`, so a nonsense value is raised to the
+        // smallest one the framing can use.
+        let mtu = config.mtu.max(crate::framing::DATAGRAM_OVERHEAD + 64);
+        let now = Instant::now();
 
         Ok(Self {
             role: config.role,
@@ -202,7 +208,7 @@ impl ProtocolMachine {
             sent_history: VecDeque::with_capacity(config.max_sent_history.max(1)),
             session_id: config.session_id,
             handshake_payload: config.handshake_payload,
-            padder: AdaptivePadder::new(config.mtu, config.max_padding, config.padding_strategy),
+            padder: AdaptivePadder::new(mtu, config.max_padding, config.padding_strategy),
             obfuscation_key: config.obfuscation_key,
             max_reorder: config.max_reorder.max(1),
             // A sender never has more than MAX_CWND_PACKETS frames in flight,
@@ -218,7 +224,7 @@ impl ProtocolMachine {
             max_sent_history: config.max_sent_history.max(1),
             ack_pending: false,
             last_ack_sent: Instant::now(),
-            last_nack_sent: Instant::now() - Duration::from_secs(1),
+            last_nack_sent: now.checked_sub(Duration::from_secs(1)).unwrap_or(now),
             gap_since: None,
             gap_nacked: false,
             nacked_nonce: None,
@@ -227,13 +233,13 @@ impl ProtocolMachine {
             last_recv_advance: Instant::now(),
             highest_authenticated_recv_nonce: None,
             authenticated_recv_count: 0,
-            cc: CongestionController::new(config.mtu as u64),
+            cc: CongestionController::new(mtu as u64),
             reliable_carrier: false,
             path_changed_at: None,
             last_nacked_nonce: None,
             handshake_pad_min: config.handshake_pad_min.max(8),
             handshake_pad_max: config.handshake_pad_max.max(config.handshake_pad_min + 16),
-            _mtu: config.mtu,
+            _mtu: mtu,
         })
     }
 
@@ -716,7 +722,7 @@ impl ProtocolMachine {
                 if self.reorder_buffer.len() < self.max_reorder_buffer {
                     self.reorder_buffer.insert(nonce, action);
                 } else {
-                    tracing::warn!("Reorder buffer still full after gap recovery, dropping frame nonce={}", nonce);
+                    tracing::debug!("Reorder buffer full, dropping frame nonce={}", nonce);
                 }
             } else {
                 tracing::debug!("Frame nonce={} arrived too late after gap recovery, dropping", nonce);
@@ -1300,6 +1306,41 @@ mod tests {
         assert_eq!(server.state(), OstpState::Established);
 
         (client, server)
+    }
+
+    /// The MTU is user config: zero used to divide by zero in the congestion
+    /// controller and one under 64 panicked the padder's `clamp`.
+    #[test]
+    fn a_nonsense_mtu_is_raised_not_a_panic() {
+        for mtu in [0usize, 1, 63] {
+            let mut ccfg = make_config(NoiseRole::Initiator);
+            ccfg.mtu = mtu;
+            let mut scfg = make_config(NoiseRole::Responder);
+            scfg.mtu = mtu;
+            let mut client = ProtocolMachine::new(ccfg).unwrap();
+            let mut server = ProtocolMachine::new(scfg).unwrap();
+            let ProtocolAction::SendDatagram(msg1) = client.on_event(OstpEvent::Start).unwrap() else {
+                panic!("expected the handshake datagram")
+            };
+            server.on_event(OstpEvent::Start).unwrap();
+            let reply = match server.on_event(OstpEvent::Inbound(msg1)).unwrap() {
+                ProtocolAction::HandshakePayload(_, Some(d)) => d,
+                ProtocolAction::Multiple(list) => list
+                    .into_iter()
+                    .find_map(|a| match a {
+                        ProtocolAction::HandshakePayload(_, Some(d)) => Some(d),
+                        ProtocolAction::SendDatagram(d) => Some(d),
+                        _ => None,
+                    })
+                    .expect("a handshake reply"),
+                _ => panic!("unexpected server action"),
+            };
+            client.on_event(OstpEvent::Inbound(reply)).unwrap();
+            assert!(client.max_payload() >= 64);
+            assert!(client.cwnd_packets() > 0);
+            client.on_event(OstpEvent::Outbound(1, Bytes::from_static(b"x"))).unwrap();
+            client.on_event(OstpEvent::Tick).unwrap();
+        }
     }
 
     #[test]

@@ -250,7 +250,12 @@ impl UdpSessionRouter {
         let addr = match target.parse::<std::net::SocketAddr>() {
             Ok(a) => a,
             Err(_) => {
-                let mut addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host(target).await?.collect();
+                // getaddrinfo has no timeout of its own; the sends of one
+                // association are sequential, so a hung lookup holds them all.
+                let mut addrs: Vec<std::net::SocketAddr> = tokio::time::timeout(std::time::Duration::from_secs(5), tokio::net::lookup_host(target))
+                    .await
+                    .map_err(|_| anyhow::anyhow!("resolving {target} timed out"))??
+                    .collect();
                 addrs.sort_by_key(|a| a.is_ipv6());
                 addrs.into_iter().next().ok_or_else(|| anyhow::anyhow!("no addresses for {target}"))?
             }
