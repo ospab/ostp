@@ -4,12 +4,10 @@
 
 ![GitHub Release](https://img.shields.io/github/v/release/ospab/ostp?style=for-the-badge&color=blue)
 ![License: AGPL v3](https://img.shields.io/badge/License-AGPL%20v3-blue.svg?style=for-the-badge)
-![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20Linux%20%7C%20macOS%20%7C%20Android%20%7C%20FreeBSD-green.svg?style=for-the-badge)
-![Crypto](https://img.shields.io/badge/Crypto-Noise__NNpsk0-blueviolet?style=for-the-badge)
 
-**OSTP** is an encrypted tunnel written in Rust for networks with active traffic filtering (DPI). A client on your computer or phone sends all
-of its traffic, or only the apps and sites you choose, through your own server. The protocol, the server, the command-line tool, the desktop
-and Android apps are all in this repository.
+OSTP is an encrypted tunnel written in Rust, for networks that filter traffic (DPI). A client on your computer or phone sends all of its
+traffic, or only the apps and sites you choose, through your own server. The protocol, the server, the command-line tool and the desktop and
+Android apps are in this repository.
 
 What it looks like on the wire depends on the transport you pick:
 
@@ -74,24 +72,19 @@ Details: [Domains and TLS](docs/en/tls.md), [Server](docs/en/server.md), [Client
 
 ---
 
-## Features
+## What is in it
 
-| | |
-|---|---|
-| **Three transports** | UDP, UoT (UDP over TCP) and TLS on 443 with a real certificate, directly or behind a web server on a secret path. |
-| **No fingerprint of its own** | Headers are masked per packet, handshake sizes vary per key, junk packets and TCP fragmentation are available; nothing on the wire is constant. |
-| **Probe resistance** | Anything that is not a valid client gets the fallback website or a decoy answer. |
-| **Seamless roaming** | On a network change or a stalled path the session moves to a new socket without a new handshake; open connections stay up. |
-| **Proxy and TUN** | A local SOCKS5/HTTP proxy (and the Windows system proxy), or a full-system VPN through a TUN adapter with a kill switch. |
-| **Split tunneling** | Exclude domains, IP ranges and, on Windows, processes from the tunnel. |
-| **Subscriptions** | Per-user subscription URLs with a page for browsers; the apps import and refresh them. |
-| **Web panel and API** | Users, keys, traffic limits, statistics, DNS settings; a REST API for your own tools. |
-| **Filtering DNS** | Block lists, custom rules, local names and safe search for connected clients. |
-| **Network prober** | Tries every transport against your server and locates filtering equipment by TTL. |
-| **Outbound routing** | Send the server's outgoing traffic through a SOCKS5 proxy by rule, or from a chosen source address. |
+- Three transports: UDP, UoT (UDP over TCP) and TLS on 443 with a real certificate, directly or behind a web server.
+- Anything that is not a valid client gets the fallback website or a decoy answer.
+- Local SOCKS5/HTTP proxy (and the Windows system proxy), or a TUN adapter with a kill switch.
+- Domains, IP ranges and, on Windows and Linux, processes can be excluded from the tunnel.
+- When the network changes or a path stalls, the session moves to a new socket without a new handshake.
+- Per-user subscription links, a web panel with a REST API, and a filtering DNS for connected clients.
+- A network prober that tries every transport against your server and locates filtering equipment by TTL.
+- The server's outgoing traffic can go through a SOCKS5 proxy by rule or leave from a chosen address.
+- Optional `.ov` sites through [overnet](https://github.com/ospab/overnet), off by default.
 
-The protocol itself, `Noise_NNpsk0_25519_ChaChaPoly_BLAKE2s` with ChaCha20-Poly1305 per packet and HMAC-derived header masks, is described in the
-[specification](docs/en/specification.md).
+The cipher suite is `Noise_NNpsk0_25519_ChaChaPoly_BLAKE2s` with ChaCha20-Poly1305 per packet; see the [specification](docs/en/specification.md).
 
 ---
 
@@ -143,6 +136,7 @@ ostp [--config PATH] [COMMAND]
 | `sub status\|enable\|disable\|set\|urls` | Subscription links (server) |
 | `panel status\|enable\|disable\|set\|passwd\|token` | Web panel and management API (server) |
 | `dns status\|enable\|disable\|...` | Filtering DNS for clients (server) |
+| `overnet status\|install\|enable\|disable\|exit` | `.ov` sites for clients through overnet (server) |
 | `hash-password` | Hash a password for the panel config |
 | `migrate [--dry-run]` | Upgrade the config to the current format; never done automatically |
 | `update [-b stable\|beta\|alpha] [-v VERSION]` | Install another release |
@@ -156,7 +150,7 @@ The config is `/etc/ostp/config.json` on Linux and `config.json` in the current 
 
 ## Documentation
 
-The index is [docs/README.md](docs/README.md). Most used:
+Index: [docs/README.md](docs/README.md). Most used:
 
 - [Client](docs/en/client.md) and [Server](docs/en/server.md)
 - [Domains and TLS](docs/en/tls.md)
@@ -181,7 +175,7 @@ How the repository is organized and how to send changes: [CONTRIBUTING.md](CONTR
 
 ## Security
 
-Found a vulnerability? Please report it privately, not in a public issue: see [SECURITY.md](SECURITY.md).
+Report vulnerabilities privately, not in a public issue: see [SECURITY.md](SECURITY.md).
 
 ## License
 

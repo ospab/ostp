@@ -1,7 +1,7 @@
 # OSTP Traffic Obfuscation
 
-## Design Philosophy
-Traditional tunneling protocols (such as TLS, OpenVPN, and WireGuard) exhibit distinct, recognizable fingerprints during key exchanges or carry static protocol headers. The OSTP obfuscation engine is explicitly designed to achieve **maximum entropy from the first byte**, rendering the transport completely indistinguishable from random, high-entropy noise to Deep Packet Inspection (DPI) systems.
+## Goal
+OpenVPN and WireGuard have recognizable handshakes or fixed headers. OSTP masks every byte from the first one, so that DPI sees nothing but random-looking data. The limits of that claim are stated below.
 
 ---
 
@@ -32,7 +32,7 @@ Obscurity is used only on top of real security, never instead of it: the secret 
 
 ---
 
-## Secret Derivation
+## Secret derivation
 
 Every protocol secret — the obfuscation key, the Noise PSK, the handshake padding range, and the per-key junk marker (see below) — is derived from the shared `access_key` via a single HKDF-SHA256 pass, domain-separated by a trailing info byte per output:
 
@@ -50,7 +50,7 @@ Unlike the other three secrets, `junk_marker` is **not** a fixed per-key value �
 
 ---
 
-## Dynamic In-Place Masking Algorithm
+## Header masking
 
 OSTP datagrams are masked "in-place" immediately prior to transmission and right after arrival. The mask itself is **derived from the packet's own ciphertext**, not from a fixed keystream or a counter, so it changes with every packet automatically:
 
@@ -69,7 +69,7 @@ Because the mask is keyed on both the shared secret and the packet's own ciphert
 
 ---
 
-## Statistical Padding & Shaping
+## Padding
 
 In addition to header obfuscation, OSTP defends against Traffic Length Analysis (TLA). 
 The `AdaptivePadder` calculates dynamic dummy byte quantities to append to the packet payload before it enters the cryptographic step:
@@ -79,7 +79,7 @@ The `AdaptivePadder` calculates dynamic dummy byte quantities to append to the p
 
 ---
 
-## Junk Packets & TCP Fragmentation
+## Junk packets and TCP fragmentation
 
 OSTP does not try to impersonate a known protocol (TLS, HTTP, or otherwise) — a fingerprint-matching filter can always be updated to catch an impersonation attempt. Instead it follows a **zapret-like** approach: no recognizable header at all, plus active manipulation of packet boundaries, so there is nothing distinctive to fingerprint in the first place.
 

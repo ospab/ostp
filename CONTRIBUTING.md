@@ -1,21 +1,6 @@
 # Contributing to OSTP
 
-Thank you for your interest in contributing to **OSTP (Ospab Stealth Transport Protocol)**! We welcome contributions from developers, security researchers, testers, and documentation writers of all skill levels.
-
-By contributing to this project, you agree that your contribution is licensed under the project's license (AGPL-3.0).
-
----
-
-## Table of Contents
-
-1. [Development Setup](#development-setup)
-2. [Project Structure](#project-structure)
-3. [Branch Strategy](#branch-strategy)
-4. [Development Workflow](#development-workflow)
-5. [Commit Message Conventions](#commit-message-conventions)
-6. [Coding Guidelines](#coding-guidelines)
-7. [Submitting Pull Requests](#submitting-pull-requests)
-8. [Security Vulnerabilities](#security-vulnerabilities)
+Code, bug reports, tests, documentation and security review are all welcome. By contributing you agree that your contribution is licensed under the project's license (AGPL-3.0).
 
 ---
 
@@ -56,15 +41,16 @@ The repository is a Cargo workspace plus two app projects:
 
 | Path | What it is |
 |---|---|
-| [`ostp/`](ostp) | The `ostp` binary: CLI, setup wizard, `cert`/`sub`/`panel`/`dns` commands, runs client or server from the config. |
+| [`ostp/`](ostp) | The `ostp` binary: CLI, setup wizard, `cert`/`sub`/`panel`/`dns`/`overnet` commands, runs client or server from the config. |
 | [`ostp-core/`](ostp-core) | The protocol: Noise handshake, header obfuscation, framing and padding, ARQ, congestion control, relay messages, share links. |
 | [`ostp-client/`](ostp-client) | Client: local SOCKS5/HTTP proxy, TUN mode, exclusions, UDP/UoT/TLS transports, session roaming, network prober. |
 | [`ostp-server/`](ostp-server) | Server: session dispatcher, relay to the internet, TCP sniffing (UoT, TLS, HTTP upgrade, decoy), certificates, subscriptions, web panel and API. |
+| [`ostp-ssh/`](ostp-ssh) | SSH client used by the apps to install and manage a server, and the saved-servers store. |
 | [`ostp-dns/`](ostp-dns) | Filtering DNS resolver for the server: block lists, rules, rewrites, cache. |
 | [`ostp-tun/`](ostp-tun) | Platform TUN device and routing (Wintun on Windows). |
 | [`ostp-tun-helper/`](ostp-tun-helper) | Privileged helper that runs the tunnel for the desktop GUI on Windows. |
 | [`ostp-jni/`](ostp-jni) | JNI bindings used by the Android app. |
-| [`ostp-gui/`](ostp-gui) | Desktop client (Tauri) for Windows and Linux; not part of the Cargo workspace. |
+| [`ostp-gui/`](ostp-gui) | Desktop client (Tauri) for Windows, Linux and macOS; not part of the Cargo workspace. |
 | [`ostp-flutter/`](ostp-flutter) | Android client (Flutter). |
 | [`docs/`](docs) | Documentation in English and Russian, see [`docs/README.md`](docs/README.md). |
 
@@ -72,7 +58,7 @@ The repository is a Cargo workspace plus two app projects:
 
 ## Branch Strategy
 
-The repository runs three long-lived branches, in increasing order of stability:
+Three long-lived branches, from least to most stable:
 
 | Branch | Role |
 |---|---|
@@ -141,7 +127,7 @@ Multiple unrelated changes belong in separate commits, not one bundled commit - 
 *   **Safety**: Avoid using `unsafe` blocks unless absolutely necessary for low-level system bindings (e.g., FFI configurations like `setsockopt`). When using `unsafe`, add safety doc comments explaining why it is safe.
 *   **Documentation**: Document public modules, structs, and functions. Maintain comment integrity across codebase changes.
 *   **Logging**: Use the `tracing` framework for structured logging. Avoid `println!` for production logs.
-*   **Aesthetics**: When editing GUI or Web components, adhere to premium, modern web design aesthetics (vibrant color palettes, glassmorphism, responsive grids).
+*   **Interface**: In the GUI and the panel, keep to the existing look. No emoji, gradients or decorative effects; the layout has to work on a phone screen.
 
 ---
 

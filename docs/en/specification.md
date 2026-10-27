@@ -9,9 +9,9 @@
 
 ## 1. Introduction
 
-The **Ospab Stealth Transport Protocol (OSTP)** is a high-entropy, multiplexed transport pipeline developed to achieve secure, resilient data replication between distributed nodes across networks characterized by severe stochastic disturbance and hostile packet-level telemetry inspections (Deep Packet Inspection / DPI).
+The **Ospab Stealth Transport Protocol (OSTP)** is a multiplexed, encrypted transport for networks with lossy links and deep packet inspection (DPI).
 
-Standard tunneling protocols (e.g., OpenVPN, WireGuard) produce traffic patterns that are reliably identified by stateful DPI systems through static magic bytes, fixed handshake sizes, or predictable sequence patterns. OSTP addresses this threat model by employing key-derived per-packet masking and randomized frame-boundary injection prior to final serialization. The primary design goal is complete convergence toward **Maximum Uniform Entropy**, yielding datagrams statistically identical to pure line noise, with no plaintext version marker or magic byte anywhere on the wire.
+OpenVPN and WireGuard are identified by DPI through static magic bytes, fixed handshake sizes and predictable sequences. OSTP masks each packet with a key derived from the shared secret and randomizes frame boundaries, so datagrams look like random data and the wire carries no plaintext version marker or magic byte.
 
 OSTP is transport-agnostic at the datagram level: the same masked/encrypted datagram is carried either directly over UDP, or — for networks that block or throttle unrecognized UDP — inside a plain TCP byte stream (**UoT**, "UDP-over-TCP"; see §9). Neither transport adds any protocol-identifying header of its own.
 
