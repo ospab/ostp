@@ -1066,12 +1066,13 @@ impl ProtocolMachine {
     }
 
     fn lookup_sent_frame(&mut self, nonce: u64) -> Option<Bytes> {
-        if let Some(frame) = self.sent_history.iter_mut().rev().find(|f| f.nonce == nonce) {
-            frame.last_sent = Instant::now();
-            frame.retries = frame.retries.saturating_add(1);
-            return Some(frame.bytes.clone());
-        }
-        None
+        // The history is in nonce order, and a NACK for a nonce that is not in
+        // it must not cost a scan of the whole history.
+        let i = self.sent_history.partition_point(|f| f.nonce < nonce);
+        let frame = self.sent_history.get_mut(i).filter(|f| f.nonce == nonce)?;
+        frame.last_sent = Instant::now();
+        frame.retries = frame.retries.saturating_add(1);
+        Some(frame.bytes.clone())
     }
 
     fn push_sent_frame(&mut self, nonce: u64, bytes: Bytes, is_retransmittable: bool) {
@@ -1101,6 +1102,19 @@ impl ProtocolMachine {
     }
 
     fn drop_acked_frames(&mut self, ranges: &[(u64, u64)]) {
+        // An ACK carries up to 255 ranges and the history up to 32768 frames; a
+        // peer repeating one that matches nothing would make every packet cost
+        // their product on the server's single packet loop. Merged and sorted,
+        // a range check is a binary search, and an ACK outside the history
+        // costs nothing.
+        let ranges = merge_ranges(ranges);
+        let ranges = ranges.as_slice();
+        let (Some(oldest), Some(newest)) = (self.sent_history.front(), self.sent_history.back()) else {
+            return;
+        };
+        if !ranges.iter().any(|&(start, end)| end >= oldest.nonce && start <= newest.nonce) {
+            return;
+        }
         let now = Instant::now();
         let mut acked_bytes = 0u64;
         let mut min_rtt: Option<Duration> = None;
@@ -1177,13 +1191,41 @@ fn parse_ack_ranges(payload: &[u8]) -> Result<Vec<(u64, u64)>, ProtocolError> {
     Ok(ranges)
 }
 
+/// Sorted, non-overlapping ranges covering the same nonces (empty ones dropped).
+fn merge_ranges(ranges: &[(u64, u64)]) -> Vec<(u64, u64)> {
+    let mut sorted: Vec<(u64, u64)> = ranges.iter().copied().filter(|(start, end)| start <= end).collect();
+    sorted.sort_unstable();
+    let mut merged: Vec<(u64, u64)> = Vec::with_capacity(sorted.len());
+    for (start, end) in sorted {
+        match merged.last_mut() {
+            Some(last) if start <= last.1.saturating_add(1) => last.1 = last.1.max(end),
+            _ => merged.push((start, end)),
+        }
+    }
+    merged
+}
+
+/// Whether `nonce` is in one of `ranges`, which `merge_ranges` returned.
 fn nonce_in_ranges(nonce: u64, ranges: &[(u64, u64)]) -> bool {
-    ranges.iter().any(|(start, end)| nonce >= *start && nonce <= *end)
+    let after = ranges.partition_point(|&(start, _)| start <= nonce);
+    after > 0 && ranges[after - 1].1 >= nonce
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn merged_ack_ranges_cover_the_same_nonces() {
+        let raw = [(10, 12), (0, 3), (4, 4), (11, 20), (30, 29), (u64::MAX - 1, u64::MAX)];
+        let merged = merge_ranges(&raw);
+        assert_eq!(merged, vec![(0, 4), (10, 20), (u64::MAX - 1, u64::MAX)]);
+        for n in [0, 4, 5, 9, 10, 20, 21, 29, 30, u64::MAX - 2, u64::MAX] {
+            let expected = raw.iter().any(|&(s, e)| n >= s && n <= e);
+            assert_eq!(nonce_in_ranges(n, &merged), expected, "nonce {n}");
+        }
+        assert!(!nonce_in_ranges(5, &[]));
+    }
     use crate::framing::PaddingStrategy;
 
     fn test_psk() -> [u8; 32] {
