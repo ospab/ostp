@@ -46,6 +46,14 @@ const report = e => { if (!e?.cancelled) app.showToast(String(e?.message || e), 
 const esc = s => app.escHtml(s == null ? '' : String(s));
 
 // ── Small dialogs ──────────────────────────────────────────────────────
+// Each dialog remembers how to cancel itself. Opening it again while it is
+// still open (a double click, a tray command) answers the first caller with
+// "no" instead of leaving it waiting for ever.
+const cancelOpen = {};
+function superseding(name, cancel) {
+  cancelOpen[name]?.();
+  cancelOpen[name] = cancel;
+}
 // The app's own dialog: never window.confirm, whose native box is titled
 // "tauri.localhost".
 export function confirmBox(title, text, okLabel = 'OK', danger = true) {
@@ -56,6 +64,7 @@ export function confirmBox(title, text, okLabel = 'OK', danger = true) {
     ok.textContent = okLabel;
     ok.className = 'btn ' + (danger ? 'danger' : 'primary');
     const done = v => { $('confirm-modal').classList.add('hidden'); ok.onclick = null; $('btn-confirm-cancel').onclick = null; resolve(v); };
+    superseding('confirm', () => done(false));
     ok.onclick = () => done(true);
     $('btn-confirm-cancel').onclick = () => done(false);
     $('confirm-modal').classList.remove('hidden');
@@ -75,6 +84,7 @@ function choiceBox(title, text, options, cancelLabel = 'Cancel') {
           ${o.hint ? `<div class="choice-hint">${esc(o.hint)}</div>` : ''}</div>
       </button>`).join('');
     const done = v => { $('choice-modal').classList.add('hidden'); resolve(v); };
+    superseding('choice', () => done(null));
     box.querySelectorAll('[data-i]').forEach(b => { b.onclick = () => done(options[+b.dataset.i].value); });
     $('btn-choice-cancel').textContent = cancelLabel;
     $('btn-choice-cancel').onclick = () => done(null);
@@ -93,9 +103,10 @@ function promptBox(title, text, fields) {
       <div class="field-group">
         <label class="field-label" for="prompt-f-${esc(f.name)}">${esc(f.label)}</label>
         <input class="field-input" id="prompt-f-${esc(f.name)}" data-name="${esc(f.name)}" type="${f.type || 'text'}"
-               value="${esc(f.value || '')}" placeholder="${esc(f.placeholder || '')}" />
+               maxlength="256" value="${esc(f.value || '')}" placeholder="${esc(f.placeholder || '')}" />
       </div>`).join('');
     const done = v => { $('prompt-modal').classList.add('hidden'); resolve(v); };
+    superseding('prompt', () => done(null));
     $('btn-prompt-ok').onclick = () => {
       const out = {};
       box.querySelectorAll('input').forEach(i => { out[i.dataset.name] = i.value; });
@@ -106,6 +117,9 @@ function promptBox(title, text, fields) {
     $('prompt-modal').classList.remove('hidden');
   });
 }
+
+// A private key is a few kilobytes; more is a wrong file.
+const MAX_SECRET = 65536;
 
 function askSecret(server) {
   return new Promise(resolve => {
@@ -122,6 +136,8 @@ function askSecret(server) {
     $('secret-passphrase').style.display = isKey ? '' : 'none';
     $('secret-passphrase').value = '';
     const done = v => { $('secret-modal').classList.add('hidden'); resolve(v); };
+    superseding('secret', () => done(null));
+    input.maxLength = MAX_SECRET;
     $('btn-secret-ok').onclick = () => done(input.value ? {
       kind: isKey ? 'key' : 'password', secret: input.value, passphrase: $('secret-passphrase').value || null,
     } : null);
@@ -134,7 +150,21 @@ function askSecret(server) {
 // ── Calls with the secret asked for when it is not remembered ─────────
 let serversCache = [];
 
+// Reading is free; a change (install, action, user add/remove/rename) is one
+// at a time, because the progress lines of two jobs would mix.
+let changing = false;
+const isChange = (cmd, args) => cmd === 'server_install' || cmd === 'server_action'
+  || (cmd === 'server_manage' && !['status', 'users', 'logs'].includes(args.args?.[0]));
+
 async function call(cmd, args) {
+  if (!isChange(cmd, args)) return callOnce(cmd, args);
+  if (changing) throw new Error('Another change is still running on a server. Wait for it to finish.');
+  changing = true;
+  try { return await callOnce(cmd, args); }
+  finally { changing = false; }
+}
+
+async function callOnce(cmd, args) {
   const id = args.id;
   for (let attempt = 0; attempt < 3; attempt++) {
     try {
@@ -168,18 +198,18 @@ export async function mountSshForm(container, { onInstalled, submitLabel = 'Conn
     <div class="ssh-form">
       <div class="ssh-row">
         <div class="field-group"><label class="field-label">Server address</label>
-          <input class="field-input mono" aria-label="Server address" data-f="host" placeholder="203.0.113.10" autocomplete="off" spellcheck="false" /></div>
+          <input class="field-input mono" aria-label="Server address" data-f="host" maxlength="260" placeholder="203.0.113.10" autocomplete="off" spellcheck="false" /></div>
         <div class="field-group port"><label class="field-label">SSH port</label>
-          <input class="field-input mono" aria-label="SSH port" data-f="port" value="22" inputmode="numeric" /></div>
+          <input class="field-input mono" aria-label="SSH port" data-f="port" value="22" inputmode="numeric" maxlength="5" /></div>
       </div>
       <div class="field-group"><label class="field-label">Login</label>
-        <input class="field-input mono" aria-label="Login" data-f="user" value="root" autocomplete="off" spellcheck="false" /></div>
+        <input class="field-input mono" aria-label="Login" data-f="user" value="root" maxlength="65" autocomplete="off" spellcheck="false" /></div>
       <div class="segmented" data-f="kind" role="group" aria-label="Sign-in method">
         <button type="button" class="active" aria-pressed="true" data-kind="password">Password</button>
         <button type="button" aria-pressed="false" data-kind="key">Private key</button>
       </div>
       <div data-part="password" class="field-group">
-        <input class="field-input" data-f="password" type="password" aria-label="SSH password" placeholder="SSH password" autocomplete="off" />
+        <input class="field-input" data-f="password" type="password" maxlength="1024" aria-label="SSH password" placeholder="SSH password" autocomplete="off" />
       </div>
       <div data-part="key" style="display:none;">
         <div class="field-group">
@@ -212,7 +242,12 @@ export async function mountSshForm(container, { onInstalled, submitLabel = 'Conn
   f('keyfile-btn').addEventListener('click', () => f('keyfile').click());
   f('keyfile').addEventListener('change', async () => {
     const file = f('keyfile').files[0];
-    if (file) f('key').value = (await file.text()).trim();
+    f('keyfile').value = '';
+    if (!file) return;
+    if (file.size > MAX_SECRET) { f('error').textContent = 'That file is too large to be a private key'; return; }
+    f('error').textContent = '';
+    try { f('key').value = (await file.text()).trim(); }
+    catch { f('error').textContent = 'The file could not be read'; }
   });
 
   f('submit').addEventListener('click', async () => {
@@ -224,8 +259,13 @@ export async function mountSshForm(container, { onInstalled, submitLabel = 'Conn
     if (m && !host.includes('::')) { host = m[1]; port = parseInt(m[2], 10); }
     const secret = kind === 'password' ? f('password').value : f('key').value.trim();
     if (!host) { f('error').textContent = 'Enter the server address'; return; }
+    if (host.length > 253 || /\s/.test(host)) { f('error').textContent = 'The server address is not valid'; return; }
+    if (!(port >= 1 && port <= 65535)) { f('error').textContent = 'The SSH port must be a number from 1 to 65535'; return; }
+    if (f('user').value.trim().length > 64) { f('error').textContent = 'The login is too long'; return; }
+    if (secret.length > MAX_SECRET) { f('error').textContent = kind === 'password' ? 'The password is too long' : 'The key is too large'; return; }
     if (!secret) { f('error').textContent = kind === 'password' ? 'Enter the password' : 'Paste the private key or choose its file'; return; }
     const auth = { kind, secret, passphrase: kind === 'key' ? (f('passphrase').value || null) : null };
+    if (f('submit').disabled) return;
     f('submit').disabled = true;
     try {
       const result = await addAndInstall({
@@ -251,6 +291,8 @@ function steps(list) {
   };
 }
 
+const MAX_LOG_CHARS = 200000;
+
 function openInstallModal(title) {
   $('install-title').textContent = title;
   $('install-log').textContent = '';
@@ -258,7 +300,12 @@ function openInstallModal(title) {
   $('btn-install-close').disabled = true;
   $('install-modal').classList.remove('hidden');
   const log = $('install-log');
-  return line => { log.textContent += line + '\n'; log.scrollTop = log.scrollHeight; };
+  // The newest part is kept: a chatty installer must not grow the page.
+  return line => {
+    log.textContent += String(line).slice(0, 2000) + '\n';
+    if (log.textContent.length > MAX_LOG_CHARS) log.textContent = log.textContent.slice(-MAX_LOG_CHARS / 2);
+    log.scrollTop = log.scrollHeight;
+  };
 }
 
 async function addAndInstall({ host, port, user, auth, remember }) {
@@ -419,27 +466,33 @@ function fmtDuration(sec) {
 }
 const kv = (k, v, cls = '') => `<div class="kv-row"><span class="k">${esc(k)}</span><span class="v ${cls}">${v}</span></div>`;
 
+// Switching tabs or pressing refresh quickly starts several requests; only
+// the newest may draw, or an old answer would overwrite the tab on screen.
+let tabSeq = 0;
+const stale = (id, seq) => id !== currentId || seq !== tabSeq;
+
 async function renderTab() {
   const id = currentId;
   if (!id) return;
+  const seq = ++tabSeq;
   const body = $('server-body');
   body.innerHTML = '<div class="loading-note">Talking to the server…</div>';
   try {
-    if (currentTab === 'status') await renderStatus(body, id);
-    else if (currentTab === 'users') await renderUsers(body, id);
-    else if (currentTab === 'connection') await renderConnection(body, id);
-    else await renderManage(body, id);
+    if (currentTab === 'status') await renderStatus(body, id, seq);
+    else if (currentTab === 'users') await renderUsers(body, id, seq);
+    else if (currentTab === 'connection') await renderConnection(body, id, seq);
+    else await renderManage(body, id, seq);
   } catch (e) {
-    if (id !== currentId) return;
+    if (stale(id, seq)) return;
     body.innerHTML = `<div class="empty-note">${esc(e?.message || e)}</div>
       <div class="btn-row"><button class="btn secondary" id="btn-tab-retry">Try again</button></div>`;
     $('btn-tab-retry').onclick = () => renderTab();
   }
 }
 
-async function renderStatus(body, id) {
+async function renderStatus(body, id, seq) {
   const s = await call('server_manage', { id, args: ['status'] });
-  if (id !== currentId) return;
+  if (stale(id, seq)) return;
   const sys = s.system || {};
   const now = Date.now() / 1000;
   const memUsed = sys.mem_total && sys.mem_available != null ? sys.mem_total - sys.mem_available : null;
@@ -471,10 +524,12 @@ async function renderStatus(body, id) {
   $('btn-srv-update').onclick = () => runAction(id, 'update', 'Update OSTP?', 'The newest release of this app\'s channel is installed and the service restarts. The config is kept.');
 }
 
-async function renderUsers(body, id) {
+const MAX_USERS_SHOWN = 500;
+
+async function renderUsers(body, id, seq) {
   const r = await call('server_manage', { id, args: ['users'] });
-  if (id !== currentId) return;
-  const users = r.users || [];
+  if (stale(id, seq)) return;
+  const users = (r.users || []).slice(0, MAX_USERS_SHOWN);
   const server = serversCache.find(s => s.id === id);
   body.innerHTML = `
     <div class="inline-add">
@@ -510,6 +565,7 @@ async function renderUsers(body, id) {
     card.querySelector('[data-a="rename"]').onclick = async () => {
       const v = await promptBox('Rename user', '', [{ name: 'name', label: 'Name', value: u.name }]);
       if (!v || !v.name.trim()) return;
+      if (v.name.trim().length > 64) { app.showToast('The name is longer than 64 characters', 'error'); return; }
       try { await call('server_manage', { id, args: ['user-rename', who, v.name.trim()] }); renderTab(); }
       catch (e) { report(e); }
     };
@@ -523,6 +579,7 @@ async function renderUsers(body, id) {
   $('btn-user-add').onclick = async () => {
     const name = $('new-user-name').value.trim();
     if (!name) { $('new-user-name').focus(); return; }
+    if (name.length > 64) { app.showToast('The name is longer than 64 characters', 'error'); return; }
     $('btn-user-add').disabled = true;
     try {
       const r = await call('server_manage', { id, args: ['user-add', name] });
@@ -540,9 +597,9 @@ async function renderUsers(body, id) {
   };
 }
 
-async function renderConnection(body, id) {
+async function renderConnection(body, id, seq) {
   const s = await call('server_manage', { id, args: ['status'] });
-  if (id !== currentId) return;
+  if (stale(id, seq)) return;
   const tls = s.tls || {};
   const days = tls.cert_days_left;
   const certPill = !tls.enabled ? '<span class="pill warn">not set up</span>'
@@ -569,7 +626,16 @@ async function renderConnection(body, id) {
       { name: 'email', label: 'Email for expiry notices (optional)', type: 'email' },
     ]);
     if (!v || !v.domain.trim()) return;
-    runAction(id, 'cert-issue', null, null, { domain: v.domain.trim(), email: v.email.trim() });
+    const domain = v.domain.trim();
+    if (domain.length > 253 || !/^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$/.test(domain) || !domain.includes('.')) {
+      app.showToast('Enter a domain name such as vpn.example.com', 'error');
+      return;
+    }
+    if (v.email.trim() && !/^[^\s@]+@[^\s@]+$/.test(v.email.trim())) {
+      app.showToast('The email address is not valid', 'error');
+      return;
+    }
+    runAction(id, 'cert-issue', null, null, { domain, email: v.email.trim() });
   };
   $('btn-sub').onclick = () => runAction(id, s.subscription ? 'sub-disable' : 'sub-enable',
     s.subscription ? 'Turn subscriptions off?' : null, s.subscription ? 'Subscription links stop updating in the apps.' : null);
@@ -615,9 +681,9 @@ function bindOvernet(id, ov) {
     ov.exit ? 'The OSTP service restarts.' : 'overnet users\' internet traffic will leave from this server\'s IP, and you answer for it. The OSTP service restarts.');
 }
 
-async function renderManage(body, id) {
+async function renderManage(body, id, seq) {
   const s = await call('server_manage', { id, args: ['status'] });
-  if (id !== currentId) return;
+  if (stale(id, seq)) return;
   const server = serversCache.find(x => x.id === id);
   const panel = s.panel || {};
   body.innerHTML = `
@@ -686,6 +752,7 @@ async function renderManage(body, id) {
   $('btn-srv-rename').onclick = async () => {
     const v = await promptBox('Rename server', '', [{ name: 'name', label: 'Name', value: server?.name }]);
     if (!v || !v.name.trim()) return;
+    if (v.name.trim().length > 64) { app.showToast('The name is longer than 64 characters', 'error'); return; }
     try {
       await app.invoke('server_rename', { id, name: v.name.trim() });
       await loadServers();
@@ -725,6 +792,7 @@ const CONFIRM_LABEL = {
 };
 
 async function runAction(id, action, confirmTitle, confirmText, params = null) {
+  if (changing) { app.showToast('Another change is still running on a server. Wait for it to finish.', 'error'); return; }
   const server = serversCache.find(s => s.id === id);
   const disruptive = ['restart', 'update', 'reboot', 'uninstall', 'panel-enable', 'panel-disable', 'cert-issue',
     'overnet-enable', 'overnet-disable', 'overnet-exit-on', 'overnet-exit-off'].includes(action);

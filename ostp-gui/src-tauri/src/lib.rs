@@ -497,14 +497,43 @@ async fn get_config() -> Result<String, String> {
         .map_err(|e| format!("Failed to read config: {}", e))
 }
 
+/// A real configuration is a few kilobytes; this only stops a runaway paste
+/// from being written to disk and parsed at every connect.
+const MAX_CONFIG_BYTES: usize = 2 * 1024 * 1024;
+
+/// Writes through a temporary file and a rename, so a crash or a power cut
+/// leaves the old file whole instead of a truncated one. When the rename is
+/// refused (another program holds the file open) it falls back to writing in
+/// place, which is what this did before.
+fn write_config_file(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, data)?;
+    match std::fs::rename(&tmp, path) {
+        Ok(()) => Ok(()),
+        Err(first) => {
+            let _ = std::fs::remove_file(&tmp);
+            std::fs::write(path, data).map_err(|_| first)
+        }
+    }
+}
+
 #[tauri::command]
 async fn save_config(json_content: String) -> Result<bool, String> {
+    if json_content.len() > MAX_CONFIG_BYTES {
+        return Err("The configuration is too large".into());
+    }
     // Strip JSONC comments before validation
     let mut stripped = json_comments::StripComments::new(json_content.as_bytes());
     let _parsed: UnifiedConfig = serde_json::from_reader(&mut stripped)
         .map_err(|e| format!("Invalid configuration: {}", e))?;
     let path = get_config_path();
-    std::fs::write(path, json_content).map_err(|e| format!("Failed to write config: {}", e))?;
+    write_config_file(&path, json_content.as_bytes()).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::PermissionDenied {
+            format!("Access to {} was denied. Move the app to a folder you can write to.", path.display())
+        } else {
+            format!("Failed to write config: {}", e)
+        }
+    })?;
     Ok(true)
 }
 
@@ -590,7 +619,7 @@ async fn reload_tunnel(state: tauri::State<'_, AppState>) -> Result<bool, String
                 serde_json::to_string(&config_str).unwrap(),
                 h.token
             );
-            let _ = h.cmd_tx.send(cmd).await;
+            send_to_helper(&h.cmd_tx, cmd).await?;
         }
         Some(TunnelHandle::InProcess(s)) => {
             // Hot-reload exclusions by pushing new config into the watch channel.
@@ -606,10 +635,20 @@ async fn reload_tunnel(state: tauri::State<'_, AppState>) -> Result<bool, String
     Ok(true)
 }
 
-#[tauri::command]
-async fn stop_tunnel(state: tauri::State<'_, AppState>) -> Result<bool, String> {
-    let mut guard = state.0.lock().await;
-    match guard.tunnel.take() {
+/// Hands one command line to the helper's writer task. The channel is small
+/// and the helper may be gone or stuck; waiting for ever would freeze the
+/// caller, so the wait is short.
+async fn send_to_helper(tx: &tokio::sync::mpsc::Sender<String>, line: String) -> Result<(), String> {
+    match tokio::time::timeout(std::time::Duration::from_secs(3), tx.send(line)).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(_)) => Err("The TUN helper is no longer running".into()),
+        Err(_) => Err("The TUN helper did not accept the command".into()),
+    }
+}
+
+/// Stops a tunnel that has already been taken out of the state.
+async fn stop_taken(tunnel: Option<TunnelHandle>) {
+    match tunnel {
         None => {}
         Some(TunnelHandle::InProcess(mut s)) => {
             if let Some(tx) = s.shutdown_tx.take() { let _ = tx.send(true); }
@@ -625,16 +664,39 @@ async fn stop_tunnel(state: tauri::State<'_, AppState>) -> Result<bool, String> 
                 "cmd": "stop",
                 "token": h.token
             }).to_string();
-            let _ = h.cmd_tx.send(format!("{}\n", stop_cmd)).await;
+            let _ = send_to_helper(&h.cmd_tx, format!("{}\n", stop_cmd)).await;
         }
     }
+}
+
+#[tauri::command]
+async fn stop_tunnel(state: tauri::State<'_, AppState>) -> Result<bool, String> {
+    let mut guard = state.0.lock().await;
+    stop_taken(guard.tunnel.take()).await;
     Ok(true)
+}
+
+/// Leaving the app from the tray: the tunnel is stopped first, so quitting
+/// does not leave an elevated helper holding the adapter (and the kill switch)
+/// behind. Bounded: a start that is still waiting for the administrator prompt
+/// must not keep the app from closing.
+async fn shutdown_tunnel(state: &AppState) {
+    let Ok(mut guard) = tokio::time::timeout(std::time::Duration::from_secs(3), state.0.lock()).await else { return };
+    let helper = matches!(guard.tunnel, Some(TunnelHandle::Helper(_)));
+    stop_taken(guard.tunnel.take()).await;
+    if helper {
+        // The stop line is written by the helper's own task; let it go out.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
 }
 
 /// Render a share link to an SVG QR code locally. The access key never leaves
 /// the device — unlike an online QR service. (Ported from the current ostp-gui.)
 #[tauri::command]
 fn generate_qr(text: String) -> Result<String, String> {
+    if text.len() > 2000 {
+        return Err("the text is too long for a QR code".into());
+    }
     let code = qrcode::QrCode::new(text.as_bytes()).map_err(|e| e.to_string())?;
     let svg = code
         .render::<qrcode::render::svg::Color>()
@@ -650,10 +712,25 @@ fn generate_qr(text: String) -> Result<String, String> {
 #[tauri::command]
 async fn decode_qr(image_base64: String) -> Result<String, String> {
     use base64::Engine;
+    // About 10 MB of picture. A larger one is not a screenshot of a code.
+    const MAX_BASE64: usize = 14_000_000;
+    // A decompression bomb is small on disk and enormous in memory: the size
+    // is read from the header before the pixels are unpacked.
+    const MAX_PIXELS: u64 = 40_000_000;
+    if image_base64.len() > MAX_BASE64 {
+        return Err("the picture is too large".into());
+    }
     tauri::async_runtime::spawn_blocking(move || {
         let bytes = base64::engine::general_purpose::STANDARD
             .decode(image_base64.trim())
             .map_err(|_| "this is not an image".to_string())?;
+        let (w, h) = image::ImageReader::new(std::io::Cursor::new(&bytes[..]))
+            .with_guessed_format()
+            .and_then(|r| r.into_dimensions().map_err(std::io::Error::other))
+            .map_err(|e| format!("cannot read the image: {e}"))?;
+        if (w as u64) * (h as u64) > MAX_PIXELS {
+            return Err("the picture has too many pixels".to_string());
+        }
         let img = image::load_from_memory(&bytes).map_err(|e| format!("cannot read the image: {e}"))?.to_luma8();
         let (w, h) = img.dimensions();
         let mut prepared = rqrr::PreparedImage::prepare_from_greyscale(w as usize, h as usize, |x, y| img.get_pixel(x as u32, y as u32).0[0]);
@@ -669,7 +746,10 @@ async fn decode_qr(image_base64: String) -> Result<String, String> {
 
 /// Runs a network job on its own thread and runtime (as the Android bridge
 /// does), so the probes never need to be `Send` or share the UI runtime.
-async fn off_thread<F, Fut>(job: F) -> Result<serde_json::Value, String>
+///
+/// `limit` ends a job that waits on a network that never answers; without it
+/// the thread, and the button waiting for the result, would be stuck.
+async fn off_thread<F, Fut>(limit: std::time::Duration, job: F) -> Result<serde_json::Value, String>
 where
     F: FnOnce() -> Fut + Send + 'static,
     Fut: std::future::Future<Output = Result<serde_json::Value, String>>,
@@ -679,7 +759,11 @@ where
             .enable_all()
             .build()
             .map_err(|e| format!("failed to create tokio runtime: {e}"))?;
-        rt.block_on(job())
+        let out = rt.block_on(tokio::time::timeout(limit, job()))
+            .unwrap_or_else(|_| Err(format!("it did not finish in {} seconds and was stopped", limit.as_secs())));
+        // A name lookup stuck in a worker thread must not hold this one back.
+        rt.shutdown_timeout(std::time::Duration::from_secs(2));
+        out
     })
     .await
     .map_err(|e| e.to_string())?
@@ -689,7 +773,10 @@ where
 /// code as the CLI and Android: verified TLS, JSON or plain link lists.
 #[tauri::command]
 async fn fetch_subscription(url: String) -> Result<serde_json::Value, String> {
-    off_thread(move || async move {
+    if url.len() > 2048 || !url.trim().to_ascii_lowercase().starts_with("https://") {
+        return Err("a subscription URL must be an https:// address of at most 2048 characters".into());
+    }
+    off_thread(std::time::Duration::from_secs(30), move || async move {
         let doc = ostp_client::subscription::fetch(&url).await.map_err(|e| e.to_string())?;
         serde_json::to_value(doc).map_err(|e| e.to_string())
     })
@@ -705,7 +792,7 @@ fn app_build_tag() -> String {
 /// Newer stable and beta releases on GitHub, if any.
 #[tauri::command]
 async fn check_updates() -> Result<serde_json::Value, String> {
-    off_thread(|| async {
+    off_thread(std::time::Duration::from_secs(30), || async {
         let r = ostp_client::updates::check().await.map_err(|e| format!("{e:#}"))?;
         serde_json::to_value(r).map_err(|e| e.to_string())
     })
@@ -726,8 +813,11 @@ struct ProberRequest {
 /// for a TLS profile).
 #[tauri::command]
 async fn run_prober_matrix(request: ProberRequest) -> Result<serde_json::Value, String> {
-    off_thread(move || async move {
-        let timeout = std::time::Duration::from_millis(request.timeout_ms.unwrap_or(3000));
+    if request.server.len() > 255 || request.key.len() > 512 {
+        return Err("the server address or the key is too long".into());
+    }
+    off_thread(std::time::Duration::from_secs(60), move || async move {
+        let timeout = std::time::Duration::from_millis(request.timeout_ms.unwrap_or(3000).clamp(300, 10_000));
         let entries = ostp_client::prober::run_matrix(&request.server, request.key.as_bytes(), timeout, request.tls)
             .await
             .map_err(|e| e.to_string())?;
@@ -754,7 +844,7 @@ async fn run_prober_ttl(request: TtlRequest) -> Result<serde_json::Value, String
     let ip: std::net::IpAddr = request.address.parse().map_err(|e| format!("invalid address: {e}"))?;
     let transport = ostp_client::prober::TransportKind::parse(&request.transport)
         .ok_or_else(|| format!("unknown transport: {}", request.transport))?;
-    off_thread(move || async move {
+    off_thread(std::time::Duration::from_secs(60), move || async move {
         let report = ostp_client::prober::run_ttl_scan(
             ip,
             request.port,
@@ -773,7 +863,7 @@ async fn run_prober_ttl(request: TtlRequest) -> Result<serde_json::Value, String
 /// What this network filters in general (well-known public targets, ~10 s).
 #[tauri::command]
 async fn run_dpi_battery() -> Result<serde_json::Value, String> {
-    off_thread(|| async {
+    off_thread(std::time::Duration::from_secs(120), || async {
         let report = ostp_client::dpi_probes::run_dpi_battery().await;
         serde_json::to_value(report).map_err(|e| e.to_string())
     })
@@ -790,14 +880,9 @@ async fn start_tunnel(state: tauri::State<'_, AppState>, app: tauri::AppHandle) 
     // This implements the plan's "server change = full stop+start, not hot-reload".
     match guard.tunnel.take() {
         None => {}
-        Some(TunnelHandle::InProcess(mut s)) => {
-            if let Some(tx) = s.shutdown_tx.take() { let _ = tx.send(true); }
-            s.handle.abort();
-            let _ = tokio::time::timeout(std::time::Duration::from_secs(2), s.handle).await;
-        }
-        Some(TunnelHandle::Helper(h)) => {
-            let stop_cmd = serde_json::json!({ "cmd": "stop", "token": h.token }).to_string();
-            let _ = h.cmd_tx.send(format!("{}\n", stop_cmd)).await;
+        old @ Some(TunnelHandle::InProcess(_)) => stop_taken(old).await,
+        old @ Some(TunnelHandle::Helper(_)) => {
+            stop_taken(old).await;
             // Let the elevated helper stop the tunnel and release the ostp_tun
             // adapter before a new helper tries to create it (avoids name clashes).
             tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
@@ -809,10 +894,11 @@ async fn start_tunnel(state: tauri::State<'_, AppState>, app: tauri::AppHandle) 
     ostp_client::logging::begin_connection();
 
     let path = get_config_path();
-    let content = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
+    let content = std::fs::read_to_string(&path)
+        .map_err(|e| format!("Cannot read the configuration {}: {}", path.display(), e))?;
     let mut stripped = json_comments::StripComments::new(content.as_bytes());
     let unified: UnifiedConfig = serde_json::from_reader(&mut stripped)
-        .map_err(|e| format!("Config parse error: {}", e))?;
+        .map_err(|e| format!("The configuration file is damaged ({}). Change a setting or pick a profile again to rewrite it.", e))?;
 
     let client_cfg = match unified.mode {
         AppMode::Client(c) => c,
@@ -976,7 +1062,14 @@ async fn start_tun_via_helper(
                 }
             }
         }
-        state_for_task.lock().await.connection_state = 0;
+        // The pipe closed. If the helper never said why it stopped, the next
+        // status read still has to report that it did (no event: after a stop
+        // the user asked for, nobody is listening to this state).
+        let mut s = state_for_task.lock().await;
+        if s.connection_state != 0 && s.error_msg.is_none() {
+            s.error_msg = Some("The TUN helper stopped without a message. The file ostp.log next to the app may have details.".into());
+        }
+        s.connection_state = 0;
     });
 
     guard.tunnel = Some(TunnelHandle::Helper(HelperState { pipe_state, cmd_tx, token: auth_token, port }));
@@ -1405,7 +1498,21 @@ pub fn run() {
                             }
                         }
                         "exit" => {
-                            app.exit(0);
+                            // Not while a server is being installed or changed:
+                            // half an install leaves the server broken.
+                            if servers::jobs_running() > 0 {
+                                if let Some(window) = app.get_webview_window("main") {
+                                    let _ = window.show();
+                                    let _ = window.set_focus();
+                                }
+                                let _ = app.emit("exit-blocked", ());
+                                return;
+                            }
+                            let handle = app.clone();
+                            tauri::async_runtime::spawn(async move {
+                                shutdown_tunnel(&handle.state::<AppState>()).await;
+                                handle.exit(0);
+                            });
                         }
                         _ => {}
                     }
