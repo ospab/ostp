@@ -168,10 +168,16 @@ async fn run_udp_relay(cfg: RelayConfig) -> Result<()> {
                     continue;
                 }
 
-                let upstream = match new_upstream_socket(&upstream_addr).await {
-                    Ok(s) => s,
-                    Err(e) => {
+                // This loop serves every client; a resolver that hangs must not
+                // hold them all.
+                let upstream = match tokio::time::timeout(Duration::from_secs(5), new_upstream_socket(&upstream_addr)).await {
+                    Ok(Ok(s)) => s,
+                    Ok(Err(e)) => {
                         tracing::warn!("Relay UDP: cannot reach upstream {upstream_addr}: {e}");
+                        continue;
+                    }
+                    Err(_) => {
+                        tracing::warn!("Relay UDP: resolving upstream {upstream_addr} timed out");
                         continue;
                     }
                 };
@@ -191,27 +197,45 @@ async fn run_udp_relay(cfg: RelayConfig) -> Result<()> {
                 let sessions_rx = sessions.clone();
                 tokio::spawn(async move {
                     let mut rbuf = vec![0u8; 65535];
+                    // This task holds the socket too, so reclaiming the entry
+                    // alone does not close it: the task has to notice, or each
+                    // idle session would leak a task and a descriptor outside
+                    // the MAX_UDP_SESSIONS count.
+                    let ours = |map: &HashMap<SocketAddr, UdpSession>| {
+                        map.get(&peer).is_some_and(|s| Arc::ptr_eq(&s.upstream, &upstream))
+                    };
                     loop {
-                        match upstream.recv(&mut rbuf).await {
-                            Ok(n) => {
+                        match tokio::time::timeout(Duration::from_secs(30), upstream.recv(&mut rbuf)).await {
+                            Ok(Ok(n)) => {
                                 if back_sock.send_to(&rbuf[..n], peer).await.is_err() {
                                     break;
                                 }
                                 if let Some(s) = sessions_rx.lock().await.get_mut(&peer) {
-                                    s.last_seen = Instant::now();
+                                    if Arc::ptr_eq(&s.upstream, &upstream) {
+                                        s.last_seen = Instant::now();
+                                    }
                                 }
                             }
-                            Err(_) => break,
+                            Ok(Err(_)) => break,
+                            Err(_) => {
+                                if !ours(&*sessions_rx.lock().await) {
+                                    break;
+                                }
+                            }
                         }
                     }
-                    sessions_rx.lock().await.remove(&peer);
+                    // Only our own entry: the client may have a newer session.
+                    let mut map = sessions_rx.lock().await;
+                    if ours(&map) {
+                        map.remove(&peer);
+                    }
                 });
             }
         });
     }
 
-    // Reclaim idle sessions. Dropping the entry closes the upstream socket,
-    // which ends that session's reader task.
+    // Reclaim idle sessions. The reader task of a reclaimed one notices at its
+    // next 30 s check and drops the upstream socket.
     loop {
         tokio::time::sleep(Duration::from_secs(30)).await;
         let now = Instant::now();

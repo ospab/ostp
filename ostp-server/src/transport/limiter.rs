@@ -13,6 +13,11 @@ const MAX_CONNS: u32 = 60;
 /// How often stale windows are swept, so a scan from many addresses cannot
 /// grow the map without bound.
 const PRUNE_EVERY: Duration = Duration::from_secs(60);
+/// Sources tracked at once. A client holds a whole IPv6 /64 and can pick any
+/// address in it, so between sweeps the map could otherwise grow with the
+/// connection rate. Past the cap an unknown source is admitted untracked: the
+/// pending-connection limit still bounds what that costs.
+const MAX_TRACKED: usize = 100_000;
 
 pub struct ConnLimiter {
     inner: Mutex<Inner>,
@@ -42,10 +47,21 @@ impl ConnLimiter {
     }
 
     fn check_at(&self, ip: IpAddr, now: Instant) -> bool {
+        // An IPv6 subscriber holds a /64: counted as one source.
+        let ip = match ip {
+            IpAddr::V6(v6) if v6.to_ipv4_mapped().is_none() => {
+                let s = v6.segments();
+                IpAddr::V6(std::net::Ipv6Addr::new(s[0], s[1], s[2], s[3], 0, 0, 0, 0))
+            }
+            other => other,
+        };
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         if now.duration_since(inner.last_prune) >= PRUNE_EVERY {
             inner.windows.retain(|_, (_, start)| now.duration_since(*start) < WINDOW);
             inner.last_prune = now;
+        }
+        if inner.windows.len() >= MAX_TRACKED && !inner.windows.contains_key(&ip) {
+            return true;
         }
         let entry = inner.windows.entry(ip).or_insert((0, now));
         if now.duration_since(entry.1) >= WINDOW {
@@ -108,6 +124,17 @@ mod tests {
             assert!(l.check(ip("203.0.113.9")));
         }
         assert!(!l.check(ip("::ffff:203.0.113.9")));
+    }
+
+    #[test]
+    fn an_ipv6_slash64_shares_one_window() {
+        let l = ConnLimiter::new();
+        let t0 = Instant::now();
+        for i in 0..MAX_CONNS {
+            assert!(l.check_at(ip(&format!("2001:db8:1:2::{:x}", i + 1)), t0));
+        }
+        assert!(!l.check_at(ip("2001:db8:1:2::ffff"), t0), "another address of the same /64 is the same source");
+        assert!(l.check_at(ip("2001:db8:1:3::1"), t0), "a different /64 is not");
     }
 
     #[test]

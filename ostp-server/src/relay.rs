@@ -383,7 +383,9 @@ async fn send_one(
             }
         }
         if !sent_tcp {
-            let _ = socket.send_to(&frame, peer_addr).await?;
+            if let Err(e) = socket.send_to(&frame, peer_addr).await {
+                tracing::debug!("send to {peer_addr} failed: {e}");
+            }
         }
     }
     Ok(())

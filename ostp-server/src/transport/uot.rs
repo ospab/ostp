@@ -41,6 +41,9 @@ where
 
     // Register this connection in the map
     let (tx, mut rx) = mpsc::channel::<Bytes>(16384);
+    // Weak: a strong sender kept here would stop a replaced connection from
+    // ending (its writer waits for every sender to go away).
+    let me = tx.downgrade();
     {
         tcp_map.write().await.insert(peer_addr, tx);
     }
@@ -94,7 +97,14 @@ where
         _ = reader => {},
     }
 
-    tcp_map.write().await.remove(&peer_addr);
+    // A newer connection from the same address (a local web server reuses
+    // ports) has its own entry by now; it is not ours to remove.
+    {
+        let mut map = tcp_map.write().await;
+        if map.get(&peer_addr).zip(me.upgrade()).is_some_and(|(m, t)| m.same_channel(&t)) {
+            map.remove(&peer_addr);
+        }
+    }
     tracing::debug!("UoT client disconnected: {}", peer_addr);
     Ok(())
 }
@@ -168,6 +178,28 @@ mod tests {
         drop(client);
         let _ = handle.await;
         assert!(!tcp_map.read().await.contains_key(&peer()), "tcp_map entry must be removed on close");
+    }
+
+    /// A local web server reuses ports: when an old connection from an address
+    /// ends after a newer one from the same address registered, the newer
+    /// one's entry must stay.
+    #[tokio::test]
+    async fn a_closing_connection_leaves_a_newer_one_registered() {
+        let tcp_map: Arc<RwLock<HashMap<SocketAddr, mpsc::Sender<Bytes>>>> =
+            Arc::new(RwLock::new(HashMap::new()));
+        let (udp_tx, _udp_rx) = mpsc::channel(16);
+
+        let (client_a, server_a) = tokio::io::duplex(1024);
+        let handle_a = tokio::spawn(handle_tcp_connection(server_a, peer(), tcp_map.clone(), udp_tx.clone()));
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let (_client_b, server_b) = tokio::io::duplex(1024);
+        let _handle_b = tokio::spawn(handle_tcp_connection(server_b, peer(), tcp_map.clone(), udp_tx));
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        drop(client_a);
+        let _ = handle_a.await;
+        assert!(tcp_map.read().await.contains_key(&peer()), "the newer connection was unregistered");
     }
 
     /// A connection that goes quiet is closed and unregistered, while one

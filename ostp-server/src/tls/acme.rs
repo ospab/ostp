@@ -426,6 +426,15 @@ pub async fn renewal_task(t: TlsSettings, store: Arc<ChallengeStore>, resolver: 
                 if let Some(cmd) = &t.reload_command {
                     run_reload_command(cmd).await;
                 }
+                // A certificate that is due again the moment it is issued
+                // (renew_days_before beyond its lifetime, a CA that answers
+                // with other names) must not be requested in a loop: the CA's
+                // rate limits would lock the domain out.
+                let due_again = renew_at(cert_info(&t.cert_path).ok().as_ref(), &domain, t.acme.staging, t.acme.renew_days_before) <= unix_now();
+                if due_again {
+                    tracing::warn!("The new certificate for {domain} is already due for renewal; waiting {}h before asking again", MAX_BACKOFF.as_secs() / 3600);
+                    tokio::time::sleep(MAX_BACKOFF).await;
+                }
             }
             Err(e) => {
                 let left = info.as_ref().filter(|i| !i.self_signed).map(|i| i.days_left(now));

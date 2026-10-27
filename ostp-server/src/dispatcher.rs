@@ -371,7 +371,9 @@ impl Dispatcher {
                 let action = match peer_state.machine.on_event(OstpEvent::Inbound(packet)) {
                     Ok(a) => a,
                     Err(e) => {
-                        tracing::warn!("Protocol error for session {}: {}", session_id, e);
+                        // Per packet, and anyone who can spoof the client's address
+                        // can send packets that get this far: not a warning.
+                        tracing::debug!("Protocol error for session {}: {}", session_id, e);
                         return Ok(DispatchOutcome::Unauthorized);
                     }
                 };
@@ -517,7 +519,9 @@ impl Dispatcher {
                             .unwrap_or_default()
                             .as_secs();
 
-                        let drift = (now as i64 - ts as i64).abs();
+                        // ts is attacker-chosen: a signed subtraction overflows for
+                        // far-off values and the wrapped result can look small.
+                        let drift = now.abs_diff(ts);
                         if drift > 300 {
                             tracing::warn!("Handshake rejected: timestamp drift {}s exceeds 300s limit (peer={})", drift, peer);
                             continue;
@@ -536,7 +540,7 @@ impl Dispatcher {
                                 // one evicted before the cache genuinely holds
                                 // 50k sub-300s handshakes.
                                 self.replay_cache.retain(|_, &mut cached_ts| {
-                                    (now as i64 - cached_ts as i64).abs() <= 300
+                                    now.abs_diff(cached_ts) <= 300
                                 });
                                 if self.replay_cache.len() >= REPLAY_CACHE_MAX {
                                     if let Some(oldest) = self.replay_cache
@@ -650,7 +654,7 @@ impl Dispatcher {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        self.replay_cache.retain(|_, &mut ts| (current_sys_time as i64 - ts as i64).abs() <= 300);
+        self.replay_cache.retain(|_, &mut ts| current_sys_time.abs_diff(ts) <= 300);
 
         // Drop cached secrets/junk-markers for keys that have been deleted, so the
         // caches can't grow without bound as keys churn.

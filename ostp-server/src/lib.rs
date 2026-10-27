@@ -737,7 +737,7 @@ async fn run_server_loop(
     }
 
     let mut retransmit_tick = interval(Duration::from_millis(10));
-    let mut last_empty_app_log = Instant::now() - Duration::from_secs(10);
+    let mut last_empty_app_log = Instant::now();
     let mut peer_last_seen: HashMap<IpAddr, Instant> = HashMap::new();
     let mut peer_available: HashMap<IpAddr, bool> = HashMap::new();
     let session_backpressure: SessionBackpressure = Arc::new(RwLock::new(HashMap::new()));
@@ -994,8 +994,13 @@ async fn handle_udp_packet(
                         sent_tcp = true;
                     }
                 }
+                // A send error (an unreachable address, say) must not drop the
+                // payloads this datagram delivered: the core has already
+                // consumed them, nobody would send them again.
                 if !sent_tcp {
-                    let _ = socket.send_to(&resp, peer_addr).await?;
+                    if let Err(e) = socket.send_to(&resp, peer_addr).await {
+                        tracing::debug!("send to {peer_addr} failed: {e}");
+                    }
                 }
             }
 
@@ -1009,7 +1014,9 @@ async fn handle_udp_packet(
                         payload.len()
                     )));
                 }
-                relay::handle_relay_message(
+                // One bad message must not discard the rest of the datagram's
+                // payloads (see above).
+                if let Err(e) = relay::handle_relay_message(
                     peer_addr,
                     session_id,
                     stream_id,
@@ -1024,7 +1031,9 @@ async fn handle_udp_packet(
                     router.clone(),
                     tcp_map,
                     session_backpressure,
-                ).await?;
+                ).await {
+                    tracing::debug!("relay message [{session_id}:{stream_id}] rejected: {e:#}");
+                }
             }
         }
         Err(err) => {
@@ -1053,6 +1062,10 @@ async fn handle_tick(
             let _ = ui_event_tx.send(UiEvent::Log(format!("Client {peer_ip} disconnected (timeout)")));
         }
     }
+    // Addresses of clients that came and went (mobile clients change theirs
+    // all the time) are forgotten after a day instead of kept for good.
+    peer_last_seen.retain(|_, seen| now.duration_since(*seen) < Duration::from_secs(24 * 3600));
+    peer_available.retain(|ip, _| peer_last_seen.contains_key(ip));
     // Publish each active session's current download-direction headroom so
     // relay reader tasks (running on other tasks, no access to `dispatcher`)
     // can throttle without touching a lock on every read. New sessions get an
@@ -1079,8 +1092,12 @@ async fn handle_tick(
                 sent_tcp = true;
             }
         }
+        // Not `?`: one unreachable client would skip the other clients' frames
+        // and the cleanup of the dropped sessions below, leaking their streams.
         if !sent_tcp {
-            let _ = socket.send_to(&frame, peer_addr).await?;
+            if let Err(e) = socket.send_to(&frame, peer_addr).await {
+                tracing::debug!("send to {peer_addr} failed: {e}");
+            }
         }
     }
     if !dropped_sessions.is_empty() {
