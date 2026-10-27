@@ -513,6 +513,7 @@ fn generate_secure_key(format_type: &str) -> String {
 fn parse_outbound_action(value: Option<String>) -> ostp_server::OutboundAction {
     match value.as_deref() {
         Some("direct") => ostp_server::OutboundAction::Direct,
+        Some("block") => ostp_server::OutboundAction::Block,
         _ => ostp_server::OutboundAction::Proxy,
     }
 }

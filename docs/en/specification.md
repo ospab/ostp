@@ -218,12 +218,13 @@ Because delivery is strictly gated on the next expected nonce, a single frame th
 
 ### 9.5 Congestion Control
 
-A simplified BBR-inspired controller (per-session, independent of TCP-level congestion control on any carrier transport) governs how much data may be in flight:
+A per-session controller, independent of TCP congestion control on any carrier transport, limits the data in flight:
 
-* **Slow start:** begins at an initial window of 32 MTU-sized packets and grows exponentially per ACKed byte. An isolated loss during slow start (a single dropped frame — Wi-Fi noise, an LTE handover blip) takes a mild window haircut (×0.8) but **stays** in slow start; only 3+ losses within a rolling 500ms window are treated as sustained congestion, which exits slow start and halves the window (`ssthresh = cwnd / 2`).
-* **Probe-bandwidth phase:** additive increase (~1 MTU/RTT); loss triggers a multiplicative decrease to 70% of `cwnd` (gentler than TCP Cubic's 50%).
-* **RTT/RTO estimation:** RFC 6298 `SRTT`/`RTTVAR`, clamped `RTO ∈ [50ms, 16s]`. RTT samples are taken only from frames that were never retransmitted (Karn's algorithm), so a retransmit never spuriously drags the estimate down.
-* **Retransmit budget:** each tick may resend up to `max(2, cwnd_packets / 4)` frames, capped at 64, keeping retransmission bandwidth-aware rather than a flat per-tick constant.
+* **Slow start:** starts at 32 MTU-sized packets and grows exponentially per ACKed byte. One isolated loss (Wi-Fi noise, an LTE handover blip) cuts the window by 20% and stays in slow start. Slow start ends on 3 or more losses within a rolling 500 ms, or when the smoothed RTT reaches twice the minimum RTT.
+* **Congestion avoidance:** CUBIC (RFC 9438, multiplicative decrease 0.7, scaling constant 0.4). A smoothed RTT of four times the minimum RTT is treated as a standing queue and the window is reduced to drain it.
+* **Pacing and ceiling:** sending is paced at `cwnd / min_rtt` with a burst allowance of about 10 ms; the window is capped at 8,192 packets.
+* **RTT/RTO estimation:** RFC 6298 `SRTT`/`RTTVAR`, clamped `RTO ∈ [50ms, 16s]`. RTT samples are taken only from frames that were never retransmitted (Karn's algorithm).
+* **Retransmit budget:** each tick may resend up to `max(2, cwnd_packets / 4)` frames, capped at 64.
 
 ### 9.6 Roaming and Session Migration
 

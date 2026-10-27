@@ -1,28 +1,24 @@
-# OSTP System Architecture
+# Architecture
 
-## Overview
-OSTP (Ospab Stealth Transport Protocol) is a high-performance, asynchronous network tunneling framework designed to provide secure, resilient, and indistinguishable data transport over untrusted networks. It is built entirely in Rust to guarantee memory safety, concurrency, and minimal overhead.
+OSTP (Ospab Stealth Transport Protocol) is an encrypted tunnel written in Rust on Tokio. This page shows how the crates fit together and how a packet is framed.
 
----
+## Crates
 
-## Workspace Structure
-The Cargo workspace is modularized into the following crates:
-
-1. **ostp-core**: The protocol engine. Contains the `ProtocolMachine` state machine, Noise handshake driving, AEAD framing, header obfuscation, adaptive padding, the `RelayMessage` application-multiplexing layer, and the BBR-inspired congestion controller. Fully `sans-io` — no networking of its own.
+1. **ostp-core**: The protocol engine. Contains the `ProtocolMachine` state machine, Noise handshake driving, AEAD framing, header obfuscation, adaptive padding, the `RelayMessage` application-multiplexing layer, and the congestion controller (slow start, then CUBIC). Fully `sans-io` — no networking of its own.
 2. **ostp-client**: The client daemon. Runs a dual-mode SOCKS5/HTTP inbound proxy and/or a TUN virtual adapter, drives NAT/exclusion logic, and maintains the encrypted session to the remote server, moving it to a new socket of the same transport when the network changes (roaming).
-3. **ostp-server**: The high-concurrency dispatcher. Demultiplexes inbound datagrams by session ID, terminates sessions, handles IP roaming, proxies decrypted traffic to the open internet, and hosts the optional Management API, built-in DNS resolver, and TCP fallback listener.
+3. **ostp-server**: The high-concurrency dispatcher. Demultiplexes inbound datagrams by session ID, terminates sessions, handles IP roaming, proxies decrypted traffic to the open internet, and hosts the optional Management API, built-in DNS resolver, TCP fallback listener and the overnet bridge.
 4. **ostp-tun**: Platform TUN-adapter bindings (Windows/Wintun, Linux, macOS) shared by the client and the GUI helper.
 5. **ostp-tun-helper**: A small, separately-privileged process the desktop GUI launches to create/own the TUN adapter, so the GUI itself doesn't need to run elevated.
 6. **ostp-jni**: Android JNI bindings (`OstpClientSdk` native methods: start/stop client, metrics, logs, prober, subscriptions, server management) that embed the client engine inside the Flutter/Android app via isolated Tokio runtimes.
 7. **ostp-dns**: The filtering DNS resolver the server runs for its clients (block lists, rules, rewrites, cache).
 8. **ostp-ssh**: The SSH client both apps use to install OSTP on a server and manage it: password or key sign-in, a pinned host key, commands as root, a local port forward to the web panel, and the saved-servers list with sealed secrets (see [`integrations.md`](integrations.md#your-own-server-from-the-apps)).
-9. **ostp**: The unified CLI binary — runs the engine in server, client, or relay mode, and hosts the `setup`/`init`/`gk`/`links`/`connect`/`migrate`/`update`/`cert`/`sub`/`panel`/`dns`/`manage`/`changelog` subcommands (see [`client.md`](client.md) / [`server.md`](server.md)).
+9. **ostp**: The unified CLI binary — runs the engine in server, client, or relay mode, and hosts the `setup`/`init`/`gk`/`links`/`connect`/`import`/`migrate`/`update`/`cert`/`sub`/`panel`/`dns`/`overnet`/`manage`/`changelog` subcommands (see [`client.md`](client.md) / [`server.md`](server.md)).
 
 Two further application shells consume these crates but live outside the Cargo workspace: **ostp-gui** (a Tauri desktop app for Windows and Linux) and **ostp-flutter** (the cross-platform mobile app, Android via `ostp-jni`). See [`integrations.md`](integrations.md).
 
 ---
 
-## Outer Envelope vs. Inner Frame
+## Outer envelope and inner frame
 
 OSTP has two distinct framing layers (full byte layout in [`specification.md`](specification.md)):
 
@@ -50,13 +46,13 @@ A complete inner record (`FramedPacket`) is `[12-byte FrameHeader] + [N-byte Pay
 
 ---
 
-## Application Multiplexing (`RelayMessage`)
+## Multiplexing: `RelayMessage`
 
 A `Data` frame's payload is a tag-length-value `RelayMessage`: `Connect(addr)`, `Data(bytes)`, `Close`, `ConnectOk`, `Error(msg)`, `Ping`/`Pong(ts)`, `UdpAssociate`, `UdpData(addr, bytes)`, `KeepAlive`. This is the layer that actually multiplexes many proxied TCP connections and UDP flows over one encrypted session — `stream_id` in the inner `FrameHeader` is not yet used to demultiplex; sequencing of a given proxied connection is implicit in the order of its `Connect`/`Data`/`Close` messages.
 
 ---
 
-## Reliable ARQ System (Automatic Repeat reQuest)
+## ARQ
 
 `ostp-core` implements a custom Selective-Repeat ARQ over the unreliable datagram substrate:
 
@@ -69,13 +65,13 @@ A `Data` frame's payload is a tag-length-value `RelayMessage`: `Connect(addr)`, 
 
 ---
 
-## Congestion Control
+## Congestion control
 
-A BBR-inspired controller (`ostp-core::congestion`) tracks `cwnd`/RTT per session: exponential slow start from a 32-packet initial window, tolerant of isolated loss (only 3+ losses inside a 500ms window count as sustained congestion and exit slow start), additive-increase/multiplicative-decrease (×0.7) in the probe-bandwidth phase, and RFC 6298 SRTT/RTTVAR-based RTO with Karn's-algorithm RTT sampling (never sampled from a retransmitted frame).
+`ostp-core::congestion` keeps a window and an RTT estimate per session. Slow start begins at 32 packets. A single loss there costs a mild cut and slow start goes on; 3 or more losses inside 500 ms, or a smoothed RTT of twice the minimum, end it. After that the window follows CUBIC (RFC 9438). A smoothed RTT of four times the minimum counts as a standing queue and the window is reduced to drain it. Sending is paced at `cwnd / min_rtt`, and the window is capped at 8,192 packets. RTO follows RFC 6298 (SRTT/RTTVAR) with Karn's rule: a retransmitted frame is never used as an RTT sample.
 
 ---
 
-## Dynamic Roaming
+## Roaming
 
 Session mappings are bound to the cryptographic `session_id`, not the network address. When a client switches networks (e.g., LTE to Wi-Fi) or the current path stops answering:
 1. The client opens a new connection over the same transport and moves the same session onto it, with no new handshake.
@@ -87,7 +83,7 @@ Details in the [specification, §9.6](specification.md). Looking a session up fo
 
 ---
 
-## Server-Side Subsystems
+## Server subsystems
 
 Beyond the dispatcher/ARQ core, `ostp-server` hosts several optional subsystems, each independently configurable — see [`server.md`](server.md) for details:
 
@@ -95,5 +91,6 @@ Beyond the dispatcher/ARQ core, `ostp-server` hosts several optional subsystems,
 - **Traffic statistics file**: per-user traffic written next to the config every 30 seconds, read by `ostp manage` (what the apps run over SSH).
 - **DNS resolver** (`dns.rs`): AdBlock-list filtering and DNS-over-HTTPS forwarding for tunneled clients, with a rate-limited reply path.
 - **Fallback listener** (`fallback.rs`): pipes unauthenticated TCP connections (DPI probes, scanners) through to a real backend (e.g. local nginx), so an active probe sees an ordinary website instead of a closed or anomalous port.
-- **Outbound chaining** (`outbound.rs`): optional egress through an upstream SOCKS5/HTTP proxy, with per-rule (domain suffix / CIDR / protocol) routing to proxy, direct, or block.
-- **Relay-node federation** (`relay_node.rs`): a lightweight relay mode that accepts client connections (UDP or UoT), authenticates them against access keys synced from an upstream server's Management API, and blindly forwards authorized traffic on — letting a chain of relays front one target server without each hop knowing traffic contents.
+- **Outbound proxy** (`outbound.rs`): optional egress through an upstream SOCKS5/HTTP proxy, with per-rule (domain suffix / CIDR / protocol) routing to proxy, direct, or block.
+- **Relay node** (`relay_node.rs`): the `relay` mode. It forwards client UDP and UoT traffic to one fixed upstream server and authenticates nothing; the target server does that end to end.
+- **overnet bridge**: optional. Sends `.ov` names to a local overnet gateway and can open an exit for overnet users (see [`server.md`](server.md)).
