@@ -775,10 +775,19 @@ impl Bridge {
                 if attempt == 0 && self.transport_mode == "udp" {
                     tx.send(UiEvent::Log(udp_failure_diagnosis(&self.server_addr).await)).await.ok();
                 }
+                // A first connection that fails is most often a wrong key,
+                // address or transport: retrying would not fix it, so stop and
+                // let the user decide. Only a link that once worked is retried.
+                if !self.established_once {
+                    tx.send(UiEvent::Log(format!("Connection failed: {err}"))).await.ok();
+                    self.close_sessions().await;
+                    self.reset_proxy_streams(tx, proxy_tx, "connection failed");
+                    tx.send(UiEvent::TunnelStopped).await.ok();
+                    return true;
+                }
                 let wait = RETRY_BACKOFF_SECS[(attempt as usize).min(RETRY_BACKOFF_SECS.len() - 1)];
-                let what = if self.established_once { "Reconnect attempt" } else { "Connection attempt" };
                 tx.send(UiEvent::Log(format!(
-                    "{what} {} failed: {err}. Next try in {wait}s", attempt + 1
+                    "Reconnect attempt {} failed: {err}. Next try in {wait}s", attempt + 1
                 ))).await.ok();
                 self.link = Link::Down {
                     since,
