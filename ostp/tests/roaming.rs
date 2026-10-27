@@ -111,6 +111,8 @@ struct Relay {
     addr: SocketAddr,
     upstream: Arc<Mutex<SocketAddr>>,
     tcp_conns: Arc<Mutex<Vec<tokio::task::AbortHandle>>>,
+    /// While set, UDP is dropped in both directions (a path that went silent).
+    blackhole: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Relay {
@@ -127,17 +129,22 @@ async fn start_relay(upstream: SocketAddr) -> Relay {
     let port = free_port();
     let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
     let upstream = Arc::new(Mutex::new(upstream));
+    let blackhole = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     // UDP: one upstream socket per (client address, upstream).
     let front = Arc::new(UdpSocket::bind(addr).await.unwrap());
     {
         let front = front.clone();
         let upstream = upstream.clone();
+        let blackhole = blackhole.clone();
         tokio::spawn(async move {
             let flows: UdpFlows = Default::default();
             let mut buf = vec![0u8; 65535];
             loop {
                 let (n, client) = front.recv_from(&mut buf).await.unwrap();
+                if blackhole.load(std::sync::atomic::Ordering::Relaxed) {
+                    continue;
+                }
                 let target = *upstream.lock().unwrap();
                 let existing = flows.lock().unwrap().get(&(client, target)).cloned();
                 let back = match existing {
@@ -147,9 +154,13 @@ async fn start_relay(upstream: SocketAddr) -> Relay {
                         sock.connect(target).await.unwrap();
                         flows.lock().unwrap().insert((client, target), sock.clone());
                         let (sock2, front2) = (sock.clone(), front.clone());
+                        let blackhole2 = blackhole.clone();
                         tokio::spawn(async move {
                             let mut b = vec![0u8; 65535];
                             while let Ok(n) = sock2.recv(&mut b).await {
+                                if blackhole2.load(std::sync::atomic::Ordering::Relaxed) {
+                                    continue;
+                                }
                                 let _ = front2.send_to(&b[..n], client).await;
                             }
                         });
@@ -185,6 +196,7 @@ async fn start_relay(upstream: SocketAddr) -> Relay {
         addr,
         upstream,
         tcp_conns,
+        blackhole,
     }
 }
 
@@ -368,8 +380,22 @@ async fn uot_session_moves_to_a_new_connection_and_keeps_its_streams() {
     roams_on_network_change("uot").await;
 }
 
+/// Waits for the apps' side to be told that every stream is gone.
+async fn expect_streams_reset(client: &mut Client) {
+    match timeout(Duration::from_secs(5), client.to_app.recv()).await {
+        Ok(Some((_, ProxyToClientMsg::Close))) => {}
+        other => panic!(
+            "expected a stream reset, got {:?}; log:\n{}",
+            other.map(|o| o.map(|(id, m)| (id, describe(&m)))),
+            client.logs.lock().unwrap().join("\n")
+        ),
+    }
+}
+
+/// A move that gets no answer ends in a full reconnect to the same server
+/// address and transport; the old streams are reset, new ones work.
 #[tokio::test(flavor = "multi_thread")]
-async fn unanswered_move_is_reported_and_starts_nothing_else() {
+async fn unanswered_move_ends_in_a_reconnect_to_the_same_address() {
     let first = start_server().await;
     let second = start_server().await;
     let relay = start_relay(first).await;
@@ -389,22 +415,66 @@ async fn unanswered_move_is_reported_and_starts_nothing_else() {
     client
         .wait_log("did not answer on the new path", Duration::from_secs(10))
         .await;
+    client
+        .wait_log("reconnecting to the server", Duration::from_secs(1))
+        .await;
 
-    // No automatic transport switch or reconnect follows the failed move.
-    tokio::time::sleep(Duration::from_secs(3)).await;
-    assert!(
-        !client.has_log("reconnect successful"),
-        "a reconnect was started automatically"
-    );
-    assert_eq!(
-        client_handshakes(&client),
-        before,
-        "a handshake was started automatically"
-    );
-    assert!(
-        client.to_app.try_recv().is_err(),
-        "the apps' streams were touched"
-    );
+    expect_streams_reset(&mut client).await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    while client_handshakes(&client) == before && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(client_handshakes(&client) > before, "no new handshake followed");
+
+    // Same relay address, so the same server address and transport.
+    client.open_stream(echo).await;
+    client
+        .echo(b"after the reconnect", Duration::from_secs(5))
+        .await;
+}
+
+/// A tunnel that is up but hears nothing is detected without any signal from
+/// the OS and recovers on its own once the path works again.
+#[tokio::test(flavor = "multi_thread")]
+async fn silent_path_is_detected_and_recovered() {
+    let server = start_server().await;
+    let relay = start_relay(server).await;
+    let echo = start_echo().await;
+    let mut client = Client::start(relay.addr, "udp").await;
+    client.open_stream(echo).await;
+    client.echo(b"before", Duration::from_secs(5)).await;
+
+    relay
+        .blackhole
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    client
+        .wait_log("No answer from the server", Duration::from_secs(20))
+        .await;
+    relay
+        .blackhole
+        .store(false, std::sync::atomic::Ordering::Relaxed);
+
+    // The path is back: either the move or the reconnect that follows it
+    // restores the tunnel.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(40);
+    loop {
+        if client.has_log("Session moved to the new path") {
+            client.echo(b"after the move", Duration::from_secs(5)).await;
+            break;
+        }
+        if client.logs.lock().unwrap().iter().filter(|l| l.as_str() == "Connection established").count() >= 2 {
+            expect_streams_reset(&mut client).await;
+            client.open_stream(echo).await;
+            client.echo(b"after the reconnect", Duration::from_secs(5)).await;
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the tunnel did not recover; log:\n{}",
+            client.logs.lock().unwrap().join("\n")
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
