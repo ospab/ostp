@@ -14,7 +14,7 @@ mod manage_cmd;
 mod webserver;
 
 #[derive(Parser, Debug)]
-#[command(author, version, about = "OSTP Core - Ospab Stealth Transport Protocol", long_about = None)]
+#[command(author, version, about = "OSTP: encrypted tunnel for filtered networks", long_about = None)]
 struct Args {
     /// Path to the JSON configuration file
     #[cfg_attr(unix, arg(short, long, default_value = "/etc/ostp/config.json", global = true))]
@@ -50,10 +50,7 @@ enum Commands {
         #[arg(long, default_value = "hex")]
         format: String,
         /// Number of keys to generate
-        // NOT short='c' - `--config` is a global arg (propagated into every
-        // subcommand's scope), so a local '-c' here would collide with it.
-        // Clap validates the whole command tree on the first parse() and
-        // panics on a duplicate short flag, breaking the ENTIRE CLI.
+        // No short `-c`: the global `--config` already owns it and clap panics on a duplicate.
         #[arg(short = 'n', long, default_value_t = 1)]
         count: usize,
     },
@@ -139,10 +136,7 @@ enum Commands {
         #[arg(short, long)]
         lang: Option<String>,
     },
-    /// Upgrade the configuration file to the current schema. This is the
-    /// ONLY place config migration ever runs - never automatically at
-    /// startup or during install/update, so a config never changes shape
-    /// without you asking it to.
+    /// Upgrade the configuration file to the current schema (only when you run this command)
     Migrate {
         /// Show what would change without writing anything
         #[arg(long)]
@@ -150,9 +144,7 @@ enum Commands {
     },
 }
 
-/// Bridges the new subcommand-based CLI onto the original flat-flag dispatch
-/// below, so the ~500 lines of existing command logic don't need to change -
-/// only how they get populated does.
+/// Flat view of the parsed subcommand that `run_app` dispatches on.
 struct LegacyArgs {
     config: PathBuf,
     init: Option<String>,
@@ -174,16 +166,12 @@ struct LegacyArgs {
     migrate_dry_run: bool,
 }
 
-/// Asks the same TUN/mux/debug questions regardless of how a share link
-/// reached this config - connecting directly (`ostp connect <url>`) or
-/// importing it to disk (`ostp import <url>`). Previously only the connect
-/// path asked; `import` just wrote flat defaults with no way to turn any of
-/// this on short of hand-editing the resulting config.json.
+/// TUN and mux questions for a link given to `ostp connect` or `ostp import`.
 fn prompt_client_options(client_cfg: &mut ClientConfig) {
     use std::io::Write;
     let mut input = String::new();
 
-    print!("{} Enable TUN (VPN) mode? [y/N]: ", "?".blue().bold());
+    print!("{} Route all traffic through the tunnel (TUN)? [y/N]: ", "?".blue().bold());
     std::io::stdout().flush().unwrap();
     std::io::stdin().read_line(&mut input).unwrap();
     if input.trim().eq_ignore_ascii_case("y") {
@@ -192,12 +180,12 @@ fn prompt_client_options(client_cfg: &mut ClientConfig) {
         }
     }
 
-    print!("{} Enable connection multiplexing (mux)? [y/N]: ", "?".blue().bold());
+    print!("{} Use several parallel sessions (mux)? [y/N]: ", "?".blue().bold());
     std::io::stdout().flush().unwrap();
     input.clear();
     std::io::stdin().read_line(&mut input).unwrap();
     if input.trim().eq_ignore_ascii_case("y") {
-        print!("How many sessions? [5]: ");
+        print!("{} Sessions [5]: ", "?".blue().bold());
         std::io::stdout().flush().unwrap();
         input.clear();
         std::io::stdin().read_line(&mut input).unwrap();
@@ -216,14 +204,6 @@ fn prompt_client_options(client_cfg: &mut ClientConfig) {
             mux.enabled = Some(true);
             mux.sessions = Some(sessions);
         }
-    }
-
-    print!("Enable debug mode? [y/N]: ");
-    std::io::stdout().flush().unwrap();
-    input.clear();
-    std::io::stdin().read_line(&mut input).unwrap();
-    if input.trim().eq_ignore_ascii_case("y") {
-        client_cfg.debug = Some(true);
     }
 }
 
@@ -285,7 +265,6 @@ fn share_links_for(
     links
 }
 
-/// The `transport` section a share link describes.
 /// `https://<domain>[:port]<path>/<token>` when subscriptions are on.
 fn subscription_url_for(server_cfg: &ostp_client::config::ServerConfig, key: &str) -> Option<String> {
     let sub = server_cfg.subscription.as_ref().filter(|s| s.is_enabled())?;
@@ -581,15 +560,7 @@ fn resolve_tls_settings(
     }
 }
 
-// The on-disk config.json shapes (client/server/relay + all nested types)
-// live in ostp_client::config now - this used to be ~220 lines of struct
-// definitions duplicated here with no other consumer able to see them,
-// which is exactly why ostp_client::migrate had to work against loosely
-// typed JSON instead of a real schema. `ClientFileConfig` is aliased back to
-// the bare `ClientConfig` name used throughout the rest of this file, so it
-// doesn't collide with `ostp_client::config::ClientConfig` (the RUNTIME
-// shape the engine actually uses - a different thing on purpose; see the
-// doc comment on that struct).
+// `ClientConfig` here is the on-disk shape; `ostp_client::config::ClientConfig` is the runtime one.
 use ostp_client::config::{
     AppMode, ClientFileConfig as ClientConfig, MuxConfig, TransportConfigRaw, TunConfig,
     UnifiedConfig,
@@ -597,26 +568,20 @@ use ostp_client::config::{
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Raise the open-file-descriptor limit to avoid EMFILE under many concurrent
-    // connections (ported from 0.3.x fix 922cf0b). No-op / best-effort on platforms
-    // where it does not apply.
+    // Many concurrent connections otherwise hit EMFILE.
     let _ = rlimit::increase_nofile_limit(1048576);
     ostp_client::logging::setup_panic_hook();
-    // Clear the shared log at startup only when THIS invocation is the daemon —
-    // a one-shot command (`ostp gk`, `ostp check`, ...) must not wipe a running
-    // daemon's log. (Truncation itself is additionally Windows-only.)
+    // One-shot commands (`ostp gk`, `ostp check`) must not truncate a running daemon's log.
     let is_daemon = ostp_client::logging::invocation_is_daemon(std::env::args());
     let _log_guard = ostp_client::logging::init_tracing("info", "ostp-cli", env!("CARGO_PKG_VERSION"), is_daemon);
 
     let res = run_app().await;
     if let Err(e) = res {
-        eprintln!();
-        eprintln!("{} {}", "[FATAL ERROR]".red().bold(), e);
-        eprintln!();
-        
+        eprintln!("{} {:#}", "[error]".red().bold(), e);
+
         #[cfg(target_os = "windows")]
         {
-            println!("\nPress ENTER key to close this window...");
+            println!("Press Enter to close this window.");
             let mut dummy = String::new();
             let _ = std::io::stdin().read_line(&mut dummy);
         }
@@ -625,66 +590,31 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-#[allow(dead_code)]
+#[cfg(not(target_os = "windows"))]
 fn is_private_ip(ip: &str) -> bool {
-    ip.starts_with("10.") 
-    || ip.starts_with("192.168.") 
-    || ip.starts_with("127.")
-    || (ip.starts_with("172.") && {
-        let parts: Vec<&str> = ip.split('.').collect();
-        if parts.len() >= 2 {
-            if let Ok(second) = parts[1].parse::<u8>() {
-                (16..=31).contains(&second)
-            } else { false }
-        } else { false }
-    })
+    let mut parts = ip.split('.');
+    let first = parts.next().and_then(|p| p.parse::<u8>().ok());
+    let second = parts.next().and_then(|p| p.parse::<u8>().ok());
+    match (first, second) {
+        (Some(10 | 127), _) => true,
+        (Some(192), Some(168)) => true,
+        (Some(172), Some(16..=31)) => true,
+        _ => false,
+    }
 }
 
-fn detect_local_public_ip() -> Option<String> {
-    #[cfg(not(target_os = "windows"))]
-    {
-        let out = std::process::Command::new("ip")
-            .args(["-4", "addr", "show", "scope", "global"])
-            .output()
-            .ok()?;
-        
+/// Global IPv4 addresses of this machine (Linux only; empty elsewhere). More than one
+/// means multi-address egress (`bind_ip` / `send_from`) is possible.
+#[cfg(not(target_os = "windows"))]
+fn detect_all_public_ipv4() -> Vec<String> {
+    let mut ips = Vec::new();
+    if let Ok(out) = std::process::Command::new("ip").args(["-4", "addr", "show", "scope", "global"]).output() {
         let text = String::from_utf8_lossy(&out.stdout);
         for line in text.lines() {
             if let Some(idx) = line.find("inet ") {
-                let substr = &line[idx + 5..];
-                let ip = substr.split(|c: char| c == '/' || c.is_whitespace()).next().unwrap_or("");
-                if !ip.is_empty() && !is_private_ip(ip) {
-                    return Some(ip.to_string());
-                }
-            }
-        }
-    }
-    None
-}
-
-/// All global (non-private) IPv4 addresses the machine holds. A VPS with a
-/// second address — bought to escape a burned IP — shows up here as more than
-/// one entry, which is what the multi-address egress feature (bind_ip /
-/// send_from) routes over.
-fn detect_all_public_ipv4() -> Vec<String> {
-    let mut ips = Vec::new();
-    #[cfg(not(target_os = "windows"))]
-    {
-        if let Ok(out) = std::process::Command::new("ip")
-            .args(["-4", "addr", "show", "scope", "global"])
-            .output()
-        {
-            let text = String::from_utf8_lossy(&out.stdout);
-            for line in text.lines() {
-                if let Some(idx) = line.find("inet ") {
-                    let substr = &line[idx + 5..];
-                    let ip = substr
-                        .split(|c: char| c == '/' || c.is_whitespace())
-                        .next()
-                        .unwrap_or("");
-                    if !ip.is_empty() && !is_private_ip(ip) && !ips.contains(&ip.to_string()) {
-                        ips.push(ip.to_string());
-                    }
+                let ip = line[idx + 5..].split(|c: char| c == '/' || c.is_whitespace()).next().unwrap_or("");
+                if !ip.is_empty() && !is_private_ip(ip) && !ips.contains(&ip.to_string()) {
+                    ips.push(ip.to_string());
                 }
             }
         }
@@ -692,14 +622,14 @@ fn detect_all_public_ipv4() -> Vec<String> {
     ips
 }
 
-/// Detect the machine's public IPv4 address(es), record them one per line in
-/// `.ostp_public_ip`, and — when there is more than one — offer to set up
-/// multi-address egress. Called from the server setup wizard.
-///
-/// Returns `Some(primary_ip)` to be used as the config's global `bind_ip` when
-/// the operator opts into multi-address egress; `None` when there is a single
-/// address or they decline (leave egress on the OS default). The file is always
-/// written regardless, so the addresses are on hand for editing send_from later.
+#[cfg(target_os = "windows")]
+fn detect_all_public_ipv4() -> Vec<String> {
+    Vec::new()
+}
+
+/// Records the public IPv4 addresses in `.ostp_public_ip` (one per line) and, when there
+/// are several, offers multi-address egress. Returns the primary address for `bind_ip`
+/// if the operator accepts.
 fn setup_public_ips(config_dir: &std::path::Path) -> Option<String> {
     let cache_path = config_dir.join(".ostp_public_ip");
     let detected = detect_all_public_ipv4();
@@ -707,28 +637,23 @@ fn setup_public_ips(config_dir: &std::path::Path) -> Option<String> {
         return None;
     }
 
-    // Record every detected address, one per line, so it is available later for
-    // configuring bind_ip / send_from. The first line stays the primary.
     let _ = std::fs::write(&cache_path, detected.join("\n") + "\n");
 
     if detected.len() == 1 {
-        println!("  {} Detected public IP: {}", "[ostp]".green().bold(), detected[0].cyan());
+        println!("  {} Public IP: {}", "[ostp]".green().bold(), detected[0].cyan());
         return None;
     }
 
-    println!("  {} Detected {} public IPs (saved to {}):", "[ostp]".green().bold(), detected.len(), cache_path.display());
+    println!("  {} {} public IPs (saved to {}):", "[ostp]".green().bold(), detected.len(), cache_path.display());
     for ip in &detected {
-        println!("      • {}", ip.cyan());
+        println!("      {}", ip.cyan());
     }
-    let multi = wizard_yn(
-        "Set up multi-address egress (route different destinations out of different IPs)?",
-        true,
-    );
+    let multi = wizard_yn("Send outgoing traffic from different IPs by rule?", true);
     if !multi {
         return None;
     }
     println!(
-        "      Global source set to {}. Per-destination sources go in outbound rules, e.g.\n      \
+        "      bind_ip is {}. Per-rule sources go in outbound rules, e.g.\n      \
          {{ \"domain_suffix\": [\"youtube.com\"], \"action\": \"direct\", \"send_from\": \"{}\" }}",
         detected[0].cyan(),
         detected.last().unwrap()
@@ -742,22 +667,20 @@ fn get_or_ask_public_ip(config_path: &std::path::Path) -> String {
 
     if cache_path.exists() {
         if let Ok(cached) = std::fs::read_to_string(&cache_path) {
-            // The file may hold several addresses (one per line); the first
-            // non-empty line is the primary that links advertise.
+            // The first line is the primary address links advertise.
             if let Some(ip) = cached.lines().map(|l| l.trim()).find(|l| !l.is_empty()) {
                 return ip.to_string();
             }
         }
     }
 
-    if let Some(detected) = detect_local_public_ip() {
-        println!("[ostp] Detected public IP: {}", detected);
+    if let Some(detected) = detect_all_public_ipv4().into_iter().next() {
+        println!("[ostp] Public IP: {}", detected);
         let _ = std::fs::write(&cache_path, &detected);
         return detected;
     }
 
-    print!("\n[ostp] Could not detect the server public IP automatically.\n");
-    print!("  Enter your public IP or domain: ");
+    print!("[ostp] Cannot detect the public IP. Enter the server's IP or domain: ");
     use std::io::Write;
     let _ = std::io::stdout().flush();
 
@@ -772,10 +695,6 @@ fn get_or_ask_public_ip(config_path: &std::path::Path) -> String {
 
     "<YOUR_SERVER_PUBLIC_IP>".to_string()
 }
-
-// ---------------------------------------------------------------------------
-// Setup Wizard
-// ---------------------------------------------------------------------------
 
 fn wizard_prompt(prompt: &str, default: &str) -> String {
     use std::io::Write;
@@ -817,14 +736,10 @@ fn wizard_step(n: usize, total: usize, title: &str) {
     println!("  {}", "-".repeat(50).dimmed());
 }
 
-fn wizard_box(lines: &[&str]) {
-    let width = lines.iter().map(|l| l.len()).max().unwrap_or(0).max(40);
-    println!("  ╔{}╗", "═".repeat(width + 2));
+fn wizard_summary(lines: &[&str]) {
     for line in lines {
-        let padding = width - line.len();
-        println!("  ║ {}{} ║", line, " ".repeat(padding));
+        println!("  {line}");
     }
-    println!("  ╚{}╝", "═".repeat(width + 2));
 }
 
 fn wizard_ok(msg: &str) {
@@ -842,7 +757,6 @@ fn wizard_section(title: &str) {
 fn wizard_save_config(config_path: &std::path::Path, json_value: &serde_json::Value) -> Result<std::path::PathBuf> {
     let current_path = config_path.to_path_buf();
     
-    // Attempt 1: write to requested path
     if let Some(parent) = current_path.parent() {
         if !parent.as_os_str().is_empty() {
             let _ = fs::create_dir_all(parent);
@@ -851,23 +765,21 @@ fn wizard_save_config(config_path: &std::path::Path, json_value: &serde_json::Va
     
     match fs::write(&current_path, serde_json::to_string_pretty(json_value)?) {
         Ok(_) => {
-            wizard_ok(&format!("Configuration saved to {:?}", current_path));
+            wizard_ok(&format!("Saved {:?}", current_path));
             return Ok(current_path);
         }
         Err(e) => {
-            wizard_warn(&format!("Could not write to {:?}: {}", current_path, e));
-            // Attempt 2: fallback to current directory
+            wizard_warn(&format!("Cannot write {:?}: {}", current_path, e));
             let fallback = std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")).join("config.json");
-            wizard_warn(&format!("Falling back to {:?}", fallback));
+            wizard_warn(&format!("Trying {:?} instead", fallback));
             
             match fs::write(&fallback, serde_json::to_string_pretty(json_value)?) {
                 Ok(_) => {
-                    wizard_ok(&format!("Configuration saved to {:?}", fallback));
+                    wizard_ok(&format!("Saved {:?}", fallback));
                     return Ok(fallback);
                 }
                 Err(e2) => {
-                    wizard_warn(&format!("Could not write to fallback {:?}: {}", fallback, e2));
-                    anyhow::bail!("Failed to save configuration to any location.");
+                    anyhow::bail!("cannot write {:?} either: {}", fallback, e2);
                 }
             }
         }
@@ -881,12 +793,9 @@ fn run_setup_wizard(config_path: &std::path::Path) -> Result<Option<PathBuf>> {
     use std::io::Write;
 
     println!();
-    wizard_box(&[
-        "OSTP Setup Wizard",
-        concat!("Version ", env!("CARGO_PKG_VERSION")),
-        "",
-        "This wizard will create your configuration file.",
-        "Press Enter to accept the value shown in [brackets].",
+    wizard_summary(&[
+        concat!("OSTP ", env!("CARGO_PKG_VERSION"), " setup"),
+        "Press Enter to accept the value in [brackets].",
     ]);
 
     // -- Mode selection ------------------------------------------------
@@ -919,7 +828,7 @@ fn run_setup_wizard(config_path: &std::path::Path) -> Result<Option<PathBuf>> {
     let valid_choices = ["1", "2"];
 
     if !valid_choices.contains(&mode_choice) {
-        anyhow::bail!("Invalid selection '{}'", mode_choice);
+        anyhow::bail!("'{}' is not an option", mode_choice);
     }
 
     match mode_choice {
@@ -949,24 +858,8 @@ fn run_setup_wizard(config_path: &std::path::Path) -> Result<Option<PathBuf>> {
 
             wizard_step(3, TOTAL, "VPN (TUN) mode");
 
-            // SSH warning on Linux - always
             #[cfg(unix)]
-            {
-                println!();
-                println!("  ┌{}", "-".repeat(60));
-                println!("  │ {} {}",
-                    "WARNING:".red().bold(),
-                    "TUN mode captures ALL network traffic.".yellow());
-                println!("  │");
-                println!("  │  {} If you are connected via SSH to a headless server,",
-                    "▶".red());
-                println!("  │    enabling TUN mode will route the SSH connection");
-                println!("  │    through the VPN tunnel.");
-                println!("  │");
-                println!("  │    Make sure the VPN server is reachable before");
-                println!("  │    enabling TUN, or your SSH session may be lost!");
-                println!("  └{}", "-".repeat(60));
-            }
+            wizard_warn("TUN routes all traffic, SSH included. Make sure the server is reachable before enabling it over SSH.");
 
             let tun_enable = wizard_yn("Enable TUN (full VPN) mode?", false);
 
@@ -984,16 +877,6 @@ fn run_setup_wizard(config_path: &std::path::Path) -> Result<Option<PathBuf>> {
                 let s = wizard_prompt("Number of parallel sessions", "5");
                 s.parse::<usize>().unwrap_or(5)
             } else { 1 };
-
-            // Daemon step - Linux only
-            #[cfg(unix)]
-            {
-                wizard_step(5, TOTAL, "Auto-start (systemd)");
-            }
-
-            // Build and save config
-            let key_for_gen = generate_secure_key("hex");
-            let _ = key_for_gen;
 
             let client_json = serde_json::json!({
                 "mode": "client",
@@ -1025,25 +908,23 @@ fn run_setup_wizard(config_path: &std::path::Path) -> Result<Option<PathBuf>> {
             let actual_path = wizard_save_config(config_path, &client_json)?;
             println!();
 
-            // Daemon registration
             #[cfg(unix)]
-            wizard_register_systemd(&actual_path)?;
+            {
+                wizard_step(5, TOTAL, "Auto-start (systemd)");
+                wizard_register_systemd(&actual_path)?;
+            }
             #[cfg(windows)]
             wizard_register_windows_service(&actual_path)?;
 
             // Summary
             println!();
-            wizard_box(&[
-                "Setup complete!",
-                "",
+            wizard_summary(&[
+                "Done.",
                 &format!("Config:       {:?}", config_path),
                 &format!("Server:       {}", server),
                 &format!("SOCKS5 proxy: {}", socks_bind),
                 &format!("TUN mode:     {}", if tun_enable { "enabled" } else { "disabled" }),
-                "",
-                "To start:  ostp",
-                "To check:  ostp check",
-                "Proxy env: eval $(ostp proxy-env)",
+                "Start: ostp    Check: ostp check    Proxy env: eval $(ostp proxy-env)",
             ]);
         }
 
@@ -1064,13 +945,9 @@ fn run_setup_wizard(config_path: &std::path::Path) -> Result<Option<PathBuf>> {
             }
             wizard_ok(&format!("Generated {} key(s)", key_count));
 
-            // Auto-detect the machine's public IPs and, when there is more than
-            // one, offer multi-address egress (records them in .ostp_public_ip).
             let config_dir = config_path.parent().unwrap_or_else(|| std::path::Path::new("."));
             let bind_ip = setup_public_ips(config_dir);
 
-            wizard_step(3, TOTAL, "Service registration");
-            // intentional: step text then daemon call below
             let mut server_json = serde_json::json!({
                 "mode": "server",
                 "config_version": ostp_client::migrate::CURRENT_VERSION,
@@ -1104,12 +981,12 @@ fn run_setup_wizard(config_path: &std::path::Path) -> Result<Option<PathBuf>> {
 
             let actual_path = wizard_save_config(config_path, &server_json)?;
 
+            wizard_step(3, TOTAL, "Service registration");
             #[cfg(unix)]
             wizard_register_systemd(&actual_path)?;
             #[cfg(windows)]
             wizard_register_windows_service(&actual_path)?;
 
-            // Print share links
             let host = get_or_ask_public_ip(config_path);
             let port = listen.split(':').last().unwrap_or("50000");
             println!();
@@ -1119,16 +996,12 @@ fn run_setup_wizard(config_path: &std::path::Path) -> Result<Option<PathBuf>> {
             }
 
             println!();
-            wizard_box(&[
-                "Setup complete!",
-                "",
+            wizard_summary(&[
+                "Done.",
                 &format!("Config:  {:?}", config_path),
                 &format!("Listen:  {}", listen),
                 &format!("Keys:    {}", key_count),
-                "",
-                "To start:  ostp",
-                "To check:  ostp check",
-                "Share links: ostp links",
+                "Start: ostp    Check: ostp check    Links: ostp links",
             ]);
             println!();
             if wizard_yn("Bind a domain name and serve OSTP over HTTPS on 443 (Let's Encrypt)?", false) {
@@ -1172,7 +1045,6 @@ fn run_setup_wizard(config_path: &std::path::Path) -> Result<Option<PathBuf>> {
             // The same format api.rs checks at sign-in.
             let pass_hash = ostp_server::password::hash(&password);
 
-            // Auto-detect public IPs and offer multi-address egress.
             let config_dir = config_path.parent().unwrap_or_else(|| std::path::Path::new("."));
             let bind_ip = setup_public_ips(config_dir);
 
@@ -1226,9 +1098,8 @@ fn run_setup_wizard(config_path: &std::path::Path) -> Result<Option<PathBuf>> {
             }
 
             println!();
-            wizard_box(&[
-                "Setup complete!",
-                "",
+            wizard_summary(&[
+                "Done.",
                 &format!("Config:   {:?}", config_path),
                 &format!("Listen:   {}", listen),
                 &format!("Panel:    http://10.1.0.1:{}/{}/ (through the VPN)", panel_port, webpath),
@@ -1250,12 +1121,10 @@ fn run_setup_wizard(config_path: &std::path::Path) -> Result<Option<PathBuf>> {
             wizard_step(1, TOTAL, "Listen & upstream");
             let listen   = wizard_prompt("Listen address (host:port)", "0.0.0.0:50000");
             let upstream = wizard_prompt("Upstream server address (host:port)", "");
-            if upstream.is_empty() { anyhow::bail!("Upstream address cannot be empty."); }
+            if upstream.is_empty() { anyhow::bail!("the upstream address is required"); }
 
             wizard_step(2, TOTAL, "Saving configuration");
-            // No credentials are collected: the relay forwards transparently and
-            // authenticates nothing, so it needs neither the target's API nor a
-            // copy of the access keys.
+            // The relay authenticates nothing, so it needs no keys.
             let relay_json = serde_json::json!({
                 "mode": "relay",
                 "config_version": ostp_client::migrate::CURRENT_VERSION,
@@ -1271,14 +1140,12 @@ fn run_setup_wizard(config_path: &std::path::Path) -> Result<Option<PathBuf>> {
             wizard_register_systemd(&actual_path)?;
 
             println!();
-            wizard_box(&[
-                "Relay setup complete!",
-                "",
+            wizard_summary(&[
+                "Done.",
                 &format!("Config:    {:?}", config_path),
                 &format!("Listen:    {}", listen),
                 &format!("Upstream:  {}", upstream),
-                "",
-                "To start:  ostp",
+                "Start: ostp",
             ]);
         }
 
@@ -1310,13 +1177,10 @@ fn wizard_register_systemd(config_path: &std::path::Path) -> Result<()> {
         Ok(_) => {
             let _ = Command::new("systemctl").arg("daemon-reload").status();
             let _ = Command::new("systemctl").args(["enable", "ostp"]).status();
-            wizard_ok(&format!("Systemd service registered: {}", unit_path));
-            wizard_ok("Run:  systemctl start ostp");
-            wizard_ok("Logs: journalctl -u ostp -f");
+            wizard_ok(&format!("Wrote {}; start with `systemctl start ostp`, logs: `journalctl -u ostp -f`", unit_path));
         }
         Err(e) => {
-            wizard_warn(&format!("Could not write {}: {} (are you root?)", unit_path, e));
-            wizard_warn("Skipping service registration.");
+            wizard_warn(&format!("Cannot write {}: {} (run as root?). Service not registered.", unit_path, e));
         }
     }
     Ok(())
@@ -1339,13 +1203,10 @@ fn wizard_register_windows_service(config_path: &std::path::Path) -> Result<()> 
 
     match status {
         Ok(s) if s.success() => {
-            wizard_ok("Windows Service 'ostp' registered.");
-            wizard_ok("Run:  sc start ostp");
-            wizard_ok("Stop: sc stop ostp");
+            wizard_ok("Service 'ostp' created; start with `sc start ostp`, stop with `sc stop ostp`");
         }
         Ok(_) | Err(_) => {
-            wizard_warn("Could not register service (run as Administrator?).");
-            wizard_warn("Skipping service registration.");
+            wizard_warn("Cannot register the service (run as Administrator?). Service not registered.");
         }
     }
     Ok(())
@@ -1379,11 +1240,6 @@ async fn run_app() -> Result<()> {
             Commands::Setup { init } => { args.setup = true; args.init = init; }
             Commands::Init { mode } => { args.init = Some(mode); }
             Commands::HashPassword { password } => {
-                // The panel stores only a hash, and until now nothing in the CLI
-                // could produce one: `ostp init server` writes password_hash: ""
-                // and the only generator lived inside the Unix-only Server+Panel
-                // wizard branch, leaving no supported way to set up API auth on a
-                // plain server.
                 let password = match password {
                     Some(p) => p,
                     None => {
@@ -1442,14 +1298,13 @@ async fn run_app() -> Result<()> {
         return cmd_migrate(&args.config, args.migrate_dry_run);
     }
 
-    // -- Setup wizard: explicit flag or first-time (no config) --------
     if args.setup {
         if let Some(path) = run_setup_wizard(&args.config)? {
             cert_cmd::issue_interactive(&path, cert_cmd::IssueArgs::default()).await?;
         }
         return Ok(());
     }
-    // Auto-trigger wizard on first run (no config, no other flags)
+    // No config and no other command: start the wizard.
     if !args.config.exists()
         && !args.generate_key
         && args.init.is_none()
@@ -1503,7 +1358,7 @@ async fn run_app() -> Result<()> {
             new_keys.push(key);
         }
 
-        // Автоматическое добавление ключа в config.json если это сервер
+        // On a server config the new keys are appended to access_keys.
         if args.config.exists() {
             if let Ok(content) = fs::read_to_string(&args.config) {
                 let mut stripped = json_comments::StripComments::new(content.as_bytes());
@@ -1519,7 +1374,7 @@ async fn run_app() -> Result<()> {
                                     }
                                     if let Ok(new_content) = serde_json::to_string_pretty(&json_val) {
                                         let _ = fs::write(&args.config, new_content);
-                                        println!("[ostp] Key(s) automatically added to {:?}", args.config);
+                                        println!("[ostp] Added to access_keys in {:?}", args.config);
                                     }
                                 }
                             }
@@ -1533,7 +1388,7 @@ async fn run_app() -> Result<()> {
 
     if let Some(import_url) = args.import {
         let import_url = if import_url.trim().to_ascii_lowercase().starts_with("https://") {
-            println!("{} Fetching subscription...", "[ostp]".cyan().bold());
+            println!("{} Fetching subscription", "[ostp]".cyan().bold());
             let doc = ostp_client::subscription::fetch(&import_url)
                 .await
                 .map_err(|e| anyhow!("Subscription Error: {e}"))?;
@@ -1551,12 +1406,11 @@ async fn run_app() -> Result<()> {
             } else {
                 1
             };
-            println!("  Run `ostp import <url>` again to pick up server changes.");
             links[pick - 1].to_uri()
         } else {
             import_url
         };
-        println!("{} Importing configuration from share link...", "[ostp]".cyan().bold());
+        println!("{} Importing share link", "[ostp]".cyan().bold());
         let mut client_cfg = parse_ostp_link(&import_url)
             .map_err(|e| anyhow!("Share Link Error: {e}"))?;
         prompt_client_options(&mut client_cfg);
@@ -1572,12 +1426,12 @@ async fn run_app() -> Result<()> {
             }
         }
         fs::write(&args.config, content)?;
-        println!("{} Configuration successfully imported and saved to {:?}", "[ostp]".green().bold(), args.config);
+        println!("{} Saved to {:?}", "[ostp]".green().bold(), args.config);
         return Ok(());
     }
 
     if let Some(url) = args.url {
-        println!("{} Connecting via share link...", "[ostp]".cyan().bold());
+        println!("{} Connecting", "[ostp]".cyan().bold());
         let mut client_cfg = parse_ostp_link(&url)
             .map_err(|e| anyhow!("Share Link Error: {e}"))?;
         prompt_client_options(&mut client_cfg);
@@ -1585,10 +1439,9 @@ async fn run_app() -> Result<()> {
         return run_client_directly(client_cfg).await;
     }
 
-    // Handle --check: validate config and exit
     if args.check {
         if !args.config.exists() {
-            anyhow::bail!("Configuration file {:?} not found.", args.config);
+            anyhow::bail!("{:?} not found", args.config);
         }
         let content = fs::read_to_string(&args.config)?;
         let mut stripped = json_comments::StripComments::new(content.as_bytes());
@@ -1653,19 +1506,18 @@ async fn run_app() -> Result<()> {
                         println!("  Upstream TCP: {}", r.upstream_tcp.cyan());
                         println!("  Upstream UDP: {}", r.upstream_udp.cyan());
                         if !r.upstream_api_url.is_empty() {
-                            println!("  {}", "upstream_api_url is set but no longer used - safe to remove".yellow());
+                            println!("  {}", "upstream_api_url is ignored; remove it".yellow());
                         }
                     }
                 }
             }
             Err(e) => {
-                anyhow::bail!("Config parse error: {}", e);
+                anyhow::bail!("config parse error: {}", e);
             }
         }
         return Ok(());
     }
 
-    // Handle explicit configuration initialization
     if let Some(ref mode_str) = args.init {
         let is_server = mode_str == "server";
         let key = generate_secure_key("hex");
@@ -1844,16 +1696,9 @@ async fn run_app() -> Result<()> {
         return Ok(());
     }
 
-    // Validate config file existence
     if !args.config.exists() {
         anyhow::bail!(
-            "Configuration file {:?} not found.\n\n\
-             To generate a default configuration template, run:\n\
-             \t./ostp init server\n\
-             \tor\n\
-             \t./ostp init client\n\n\
-             Or specify a custom configuration file path using:\n\
-             \t./ostp --config /path/to/your_config.json",
+            "{:?} not found. Create one with `ostp setup` or `ostp init server|client`, or pass --config PATH",
             args.config
         );
     }
@@ -1861,7 +1706,7 @@ async fn run_app() -> Result<()> {
     let config_content = fs::read_to_string(&args.config)?;
     let mut stripped = json_comments::StripComments::new(config_content.as_bytes());
     let config: UnifiedConfig = serde_json::from_reader(&mut stripped)
-        .map_err(|e| anyhow!("Failed to parse config: {}", e))?;
+        .map_err(|e| anyhow!("config parse error: {}", e))?;
 
     config.validate()?;
     let current = ostp_client::migrate::CURRENT_VERSION;
@@ -1906,18 +1751,16 @@ async fn run_app() -> Result<()> {
                 return Ok(());
             }
             AppMode::Client(_) => {
-                anyhow::bail!("The configuration file is in Client mode. The --links flag can only extract keys from a Server configuration.");
+                anyhow::bail!("`ostp links` needs a server config; this one is a client config");
             }
             AppMode::Relay(_) => {
-                anyhow::bail!("The configuration file is in Relay mode. The --links flag only works with Server configuration.");
+                anyhow::bail!("`ostp links` needs a server config; this one is a relay config");
             }
         }
     }
 
     match config.mode {
         AppMode::Server(server_cfg) => {
-            println!("{}", include_str!("../../docs/banner.txt").blue().bold());
-            
             let listen_addrs = server_cfg.listen.addresses();
             println!("{} Starting server on {:?}", "[ostp]".cyan().bold(), listen_addrs);
             let debug = server_cfg.debug.unwrap_or(false);
@@ -1978,11 +1821,7 @@ async fn run_app() -> Result<()> {
                     include_udp: s.includes("udp"),
                 }
             });
-            // Build DNS config and set owndns flag in subscribe links if DNS enabled.
-            // Kept untyped (serde_json::Value) in the shared ServerConfig so
-            // ostp-client doesn't need a dependency on ostp-server just to
-            // name this type - deserialize it here instead, where both
-            // crates are already in scope.
+            // ServerConfig keeps `dns` untyped so ostp-client need not depend on ostp-server.
             let dns_cfg: Option<ostp_server::dns::DnsConfig> = server_cfg
                 .dns
                 .map(serde_json::from_value)
@@ -2012,23 +1851,13 @@ async fn run_app() -> Result<()> {
             .await?;
         }
         AppMode::Client(client_cfg) => {
-            println!("{}", include_str!("../../docs/banner.txt").blue().bold());
             run_client_directly(client_cfg).await?;
         }
         AppMode::Relay(relay_cfg) => {
-            println!("{}", include_str!("../../docs/banner.txt").blue().bold());
             let listen_addrs = relay_cfg.listen.addresses();
             println!("{} Starting relay node on {:?}", "[ostp]".cyan().bold(), listen_addrs);
             println!("{} Upstream TCP: {}", "[ostp]".cyan().bold(), relay_cfg.upstream_tcp);
             println!("{} Upstream UDP: {}", "[ostp]".cyan().bold(), relay_cfg.upstream_udp);
-            if !relay_cfg.upstream_api_url.is_empty() {
-                println!(
-                    "{} Note: upstream_api_url is no longer used and can be removed. The relay \
-                     forwards transparently; sessions are authenticated end-to-end by the target \
-                     server.",
-                    "[ostp]".yellow().bold()
-                );
-            }
             let relay_config = ostp_server::RelayConfig {
                 listen_addrs,
                 upstream_tcp: relay_cfg.upstream_tcp,
@@ -2041,14 +1870,11 @@ async fn run_app() -> Result<()> {
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// Uninstall command
-// ---------------------------------------------------------------------------
 #[cfg(unix)]
 fn cmd_uninstall() -> Result<()> {
     use std::process::Command;
 
-    println!("[ostp] Uninstalling OSTP...");
+    println!("[ostp] Uninstalling");
 
     // 1. Stop and disable systemd service (best-effort)
     for action in &["stop", "disable"] {
@@ -2091,23 +1917,20 @@ fn cmd_uninstall() -> Result<()> {
         println!("[ostp] Removed {}", config_dir.display());
     }
 
-    println!("[ostp] Uninstall complete.");
+    println!("[ostp] Done.");
     Ok(())
 }
 
 #[cfg(not(unix))]
 fn cmd_uninstall() -> Result<()> {
-    anyhow::bail!("The 'uninstall' command is only supported on Linux/Unix systems.");
+    anyhow::bail!("`ostp uninstall` works on Linux only");
 }
 
-// ---------------------------------------------------------------------------
-// Update command
-// ---------------------------------------------------------------------------
 #[cfg(unix)]
 fn cmd_update(branch: String, version: Option<String>) -> Result<()> {
     use std::process::Command;
 
-    println!("[ostp] Updating OSTP (branch={branch})...");
+    println!("[ostp] Updating (branch={branch})");
 
     let mut script_args = vec!["-c".to_string()];
     if let Some(v) = version {
@@ -2125,27 +1948,24 @@ fn cmd_update(branch: String, version: Option<String>) -> Result<()> {
     let status = Command::new("bash")
         .args(&script_args)
         .status()
-        .map_err(|e| anyhow!("Failed to run update: {e}"))?;
+        .map_err(|e| anyhow!("cannot run bash: {e}"))?;
 
     if !status.success() {
-        anyhow::bail!("Update script exited with status: {}", status);
+        anyhow::bail!("the install script failed ({status})");
     }
     Ok(())
 }
 
 #[cfg(not(unix))]
 fn cmd_update(_branch: String, _version: Option<String>) -> Result<()> {
-    anyhow::bail!("The 'update' command is only supported on Linux/Unix systems.");
+    anyhow::bail!("`ostp update` works on Linux only; download a release from GitHub");
 }
 
-/// The ONLY place config migration ever runs - see ostp_client::migrate for
-/// why (and for the actual field-by-field mapping). Never called
-/// automatically; only this explicit command touches an existing config's
-/// shape.
+/// `ostp migrate`; the field mapping lives in `ostp_client::migrate`.
 fn cmd_migrate(config_path: &std::path::Path, dry_run: bool) -> Result<()> {
     use ostp_client::migrate::{self, Change};
     if !config_path.exists() {
-        anyhow::bail!("Configuration file not found at {:?}", config_path);
+        anyhow::bail!("{:?} not found", config_path);
     }
 
     let raw = fs::read_to_string(config_path)?;
@@ -2157,7 +1977,7 @@ fn cmd_migrate(config_path: &std::path::Path, dry_run: bool) -> Result<()> {
     }
     let had_comments = content != raw;
     let parsed: serde_json::Value = serde_json::from_str(&content)
-        .map_err(|e| anyhow!("Failed to parse {:?} as JSON: {}", config_path, e))?;
+        .map_err(|e| anyhow!("{:?} is not valid JSON: {}", config_path, e))?;
 
     let m = migrate::migrate(parsed)?;
     let tag = "[ostp]".cyan().bold();
@@ -2206,7 +2026,7 @@ fn cmd_migrate(config_path: &std::path::Path, dry_run: bool) -> Result<()> {
     out.push('\n');
     fs::write(config_path, out)?;
     println!("\n{tag} Migrated {:?}; the original is in {:?}.", config_path, backup_path);
-    println!("{tag} Run 'ostp check' to validate it.");
+    println!("{tag} Check it with `ostp check`.");
     Ok(())
 }
 
@@ -2242,7 +2062,7 @@ fn ensure_elevated_for_tun() -> Result<()> {
     let cwd = std::env::current_dir()?;
     let cwd_wstr: Vec<u16> = cwd.as_os_str().encode_wide().chain(Some(0)).collect();
 
-    println!("{}", "[ostp] TUN mode requires administrator privileges. Requesting elevation...".yellow());
+    println!("{}", "[ostp] TUN needs administrator rights; asking for elevation".yellow());
 
     let ret = unsafe {
         ShellExecuteW(
@@ -2255,20 +2075,14 @@ fn ensure_elevated_for_tun() -> Result<()> {
         )
     };
 
-    // ShellExecuteW's return is a pseudo-HINSTANCE: > 32 means the call itself
-    // "succeeded" - but that range INCLUDES ERROR_CANCELLED (1223), which is
-    // exactly what Windows returns when the user clicks "No" on the UAC
-    // prompt. The old check (`ret <= 32` only) treated a user-denied prompt
-    // as success and silently exited without ever starting the tunnel.
+    // A declined UAC prompt returns 1223, which is above the usual "<= 32 is an error" range.
     if ret == 1223 {
-        anyhow::bail!("UAC elevation was denied. TUN mode requires administrator privileges.");
+        anyhow::bail!("elevation was declined; TUN needs administrator rights");
     }
     if ret <= 32 {
         let win_err = unsafe { GetLastError() };
         anyhow::bail!(
-            "Failed to request UAC elevation (ShellExecuteW ret={}, GetLastError={}). \
-             If this keeps happening, an unsigned binary can be silently blocked by \
-             SmartScreen/antivirus during elevation - try running this as Administrator manually.",
+            "cannot request elevation (ShellExecuteW ret={}, GetLastError={}); run ostp as Administrator instead",
             ret, win_err
         );
     }
@@ -2278,13 +2092,9 @@ fn ensure_elevated_for_tun() -> Result<()> {
 async fn run_client_directly(client_cfg: ClientConfig) -> Result<()> {
     let is_tun_enabled = client_cfg.tun.as_ref().map(|t| t.enable).unwrap_or(false);
     let mode_str = if is_tun_enabled { "tun" } else { "proxy" };
-    println!("{} Starting client (mode={}, server={})", "[ostp]".cyan().bold(), mode_str.yellow(), client_cfg.server.cyan());
+    println!("{} Client starting (mode={}, server={})", "[ostp]".cyan().bold(), mode_str.yellow(), client_cfg.server.cyan());
 
-    // TUN mode needs admin rights to create the WinTun adapter. This was
-    // missing entirely before - the CLI would just try to create the
-    // adapter unelevated and fail at the driver level with no UAC prompt
-    // ever shown, which is what "UAC denied regardless of GUI or TUI"
-    // actually was for this code path: TUI never asked for elevation at all.
+    // Creating the WinTun adapter needs administrator rights.
     #[cfg(target_os = "windows")]
     if is_tun_enabled {
         ensure_elevated_for_tun()?;
@@ -2322,7 +2132,6 @@ async fn run_client_directly(client_cfg: ClientConfig) -> Result<()> {
         gui: None,
     };
 
-    // Run the client implementation
     ostp_client::runner::run_client(client_conf).await?;
     Ok(())
 }
