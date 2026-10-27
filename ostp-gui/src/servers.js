@@ -26,11 +26,22 @@ export function initServers(helpers) {
   $('btn-install-close').addEventListener('click', () => $('install-modal').classList.add('hidden'));
   $('ssh-modal').addEventListener('click', e => { if (e.target.id === 'ssh-modal') $('ssh-modal').classList.add('hidden'); });
   document.querySelectorAll('#server-tabs .tab').forEach(t => t.addEventListener('click', () => {
-    currentTab = t.dataset.tab;
-    document.querySelectorAll('#server-tabs .tab').forEach(x => x.classList.toggle('active', x === t));
+    selectTab(t.dataset.tab);
     renderTab();
   }));
 }
+
+function selectTab(tab) {
+  currentTab = tab;
+  document.querySelectorAll('#server-tabs .tab').forEach(x => {
+    const on = x.dataset.tab === tab;
+    x.classList.toggle('active', on);
+    x.setAttribute('aria-selected', String(on));
+  });
+}
+
+// A cancelled sign-in prompt is the user's choice, not an error to show.
+const report = e => { if (!e?.cancelled) app.showToast(String(e?.message || e), 'error'); };
 
 const esc = s => app.escHtml(s == null ? '' : String(s));
 
@@ -80,8 +91,8 @@ function promptBox(title, text, fields) {
     const box = $('prompt-fields');
     box.innerHTML = fields.map(f => `
       <div class="field-group">
-        <label class="field-label">${esc(f.label)}</label>
-        <input class="field-input" data-name="${esc(f.name)}" type="${f.type || 'text'}"
+        <label class="field-label" for="prompt-f-${esc(f.name)}">${esc(f.label)}</label>
+        <input class="field-input" id="prompt-f-${esc(f.name)}" data-name="${esc(f.name)}" type="${f.type || 'text'}"
                value="${esc(f.value || '')}" placeholder="${esc(f.placeholder || '')}" />
       </div>`).join('');
     const done = v => { $('prompt-modal').classList.add('hidden'); resolve(v); };
@@ -91,8 +102,8 @@ function promptBox(title, text, fields) {
       done(out);
     };
     $('btn-prompt-cancel').onclick = () => done(null);
+    box.querySelectorAll('input').forEach(i => { i.onkeydown = e => { if (e.key === 'Enter') $('btn-prompt-ok').click(); }; });
     $('prompt-modal').classList.remove('hidden');
-    box.querySelector('input')?.focus();
   });
 }
 
@@ -106,6 +117,7 @@ function askSecret(server) {
     const input = $('secret-input');
     input.value = '';
     input.rows = isKey ? 5 : 1;
+    input.setAttribute('aria-label', isKey ? 'Private key' : 'Password');
     input.style.webkitTextSecurity = isKey ? 'none' : 'disc';
     $('secret-passphrase').style.display = isKey ? '' : 'none';
     $('secret-passphrase').value = '';
@@ -114,8 +126,8 @@ function askSecret(server) {
       kind: isKey ? 'key' : 'password', secret: input.value, passphrase: $('secret-passphrase').value || null,
     } : null);
     $('btn-secret-cancel').onclick = () => done(null);
+    input.onkeydown = e => { if (e.key === 'Enter' && !isKey) $('btn-secret-ok').click(); };
     $('secret-modal').classList.remove('hidden');
-    input.focus();
   });
 }
 
@@ -135,7 +147,7 @@ async function call(cmd, args) {
       typedAuth.delete(id);
       const server = serversCache.find(s => s.id === id);
       const auth = server && await askSecret(server);
-      if (!auth) throw new Error('Cancelled');
+      if (!auth) throw Object.assign(new Error('Cancelled'), { cancelled: true });
       typedAuth.set(id, auth);
     }
   }
@@ -150,47 +162,50 @@ async function loadServers() {
 
 // ── The SSH form (first-run screen and "Add server") ───────────────────
 // onInstalled(result) runs after OSTP is installed and profiles imported.
-export async function mountSshForm(container, { onInstalled, submitLabel = 'Connect' } = {}) {
+export async function mountSshForm(container, { onInstalled, submitLabel = 'Connect over SSH' } = {}) {
   const info = await loadServers().catch(() => ({ can_remember: false }));
   container.innerHTML = `
     <div class="ssh-form">
       <div class="ssh-row">
         <div class="field-group"><label class="field-label">Server address</label>
-          <input class="field-input mono" data-f="host" placeholder="203.0.113.10" autocomplete="off" spellcheck="false" /></div>
+          <input class="field-input mono" aria-label="Server address" data-f="host" placeholder="203.0.113.10" autocomplete="off" spellcheck="false" /></div>
         <div class="field-group port"><label class="field-label">SSH port</label>
-          <input class="field-input mono" data-f="port" value="22" inputmode="numeric" /></div>
+          <input class="field-input mono" aria-label="SSH port" data-f="port" value="22" inputmode="numeric" /></div>
       </div>
       <div class="field-group"><label class="field-label">Login</label>
-        <input class="field-input mono" data-f="user" value="root" autocomplete="off" spellcheck="false" /></div>
-      <div class="segmented" data-f="kind">
-        <button type="button" class="active" data-kind="password">Password</button>
-        <button type="button" data-kind="key">Private key</button>
+        <input class="field-input mono" aria-label="Login" data-f="user" value="root" autocomplete="off" spellcheck="false" /></div>
+      <div class="segmented" data-f="kind" role="group" aria-label="Sign-in method">
+        <button type="button" class="active" aria-pressed="true" data-kind="password">Password</button>
+        <button type="button" aria-pressed="false" data-kind="key">Private key</button>
       </div>
       <div data-part="password" class="field-group">
-        <input class="field-input" data-f="password" type="password" placeholder="SSH password" autocomplete="off" />
+        <input class="field-input" data-f="password" type="password" aria-label="SSH password" placeholder="SSH password" autocomplete="off" />
       </div>
       <div data-part="key" style="display:none;">
         <div class="field-group">
-          <textarea class="field-input mono" data-f="key" rows="4" placeholder="-----BEGIN OPENSSH PRIVATE KEY-----" spellcheck="false"></textarea>
+          <textarea class="field-input mono" aria-label="Private key" data-f="key" rows="4" placeholder="-----BEGIN OPENSSH PRIVATE KEY-----" spellcheck="false"></textarea>
           <div style="display:flex;justify-content:space-between;margin-top:6px;">
             <button type="button" class="link-btn" data-f="keyfile-btn">Choose a key file…</button>
             <span class="field-hint" style="margin:0;">OpenSSH, PEM or PuTTY (.ppk)</span>
           </div>
           <input type="file" data-f="keyfile" style="display:none;" />
         </div>
-        <div class="field-group"><input class="field-input" data-f="passphrase" type="password" placeholder="Key passphrase (if it has one)" /></div>
+        <div class="field-group"><input class="field-input" data-f="passphrase" type="password" aria-label="Key passphrase" placeholder="Key passphrase (if it has one)" /></div>
       </div>
       <label class="check-row"><input type="checkbox" data-f="remember" ${info.can_remember ? 'checked' : 'disabled'} />
         ${info.can_remember ? 'Remember the password or key (encrypted, in the system credential store)'
                             : 'This system has no credential store: the password or key is asked for each time'}</label>
-      <p class="field-hint is-error" data-f="error"></p>
+      <p class="field-hint is-error" data-f="error" role="alert"></p>
       <div class="choice-actions"><button type="button" class="btn primary" data-f="submit">${esc(submitLabel)}</button></div>
     </div>`;
   const f = name => container.querySelector(`[data-f="${name}"]`);
   let kind = 'password';
   container.querySelectorAll('.segmented button').forEach(b => b.addEventListener('click', () => {
     kind = b.dataset.kind;
-    container.querySelectorAll('.segmented button').forEach(x => x.classList.toggle('active', x === b));
+    container.querySelectorAll('.segmented button').forEach(x => {
+      x.classList.toggle('active', x === b);
+      x.setAttribute('aria-pressed', String(x === b));
+    });
     container.querySelector('[data-part="password"]').style.display = kind === 'password' ? '' : 'none';
     container.querySelector('[data-part="key"]').style.display = kind === 'key' ? '' : 'none';
   }));
@@ -218,7 +233,7 @@ export async function mountSshForm(container, { onInstalled, submitLabel = 'Conn
       });
       if (result) onInstalled?.(result);
     } catch (e) {
-      f('error').textContent = String(e?.message || e);
+      if (!e?.cancelled) f('error').textContent = String(e?.message || e);
     } finally {
       f('submit').disabled = false;
     }
@@ -247,7 +262,7 @@ function openInstallModal(title) {
 }
 
 async function addAndInstall({ host, port, user, auth, remember }) {
-  const appendLog = openInstallModal('Setting up your server');
+  const appendLog = openInstallModal('Setting up the server');
   const st = steps(['Connecting over SSH', 'Checking the system', 'Installing OSTP', 'Adding the connection to this app']);
   let step = 0;
   let server = null;
@@ -269,11 +284,11 @@ async function addAndInstall({ host, port, user, auth, remember }) {
     if (probe.installed) {
       mode = await choiceBox(`OSTP ${probe.version} is already on this server`,
         'Nothing on the server changes unless you choose to update it.', [
-          { value: 'keep', title: 'Add it as it is', hint: "OSTP is left untouched; the app takes the users' links from it" },
+          { value: 'keep', title: 'Add it as it is', hint: "OSTP is left untouched; the app reads the users' links from it" },
           { value: 'install', title: 'Update OSTP', hint: "The newest release of this app's channel; the config and users are kept, the service restarts" },
         ]);
       if (!mode) {
-        appendLog('Nothing was changed on the server. It stays in Settings → Servers.');
+        appendLog('Nothing was changed on the server. It stays in the list under More settings, Servers.');
         $('install-title').textContent = 'Server added';
         $('btn-install-close').disabled = false;
         return null;
@@ -297,8 +312,8 @@ async function addAndInstall({ host, port, user, auth, remember }) {
     const first = (result.users || [])[0];
     const imported = first ? await addUserToApp(server, first) : 0;
     st.done(3);
-    appendLog(imported == null ? 'No connection was added to this app.' : `Added ${imported} connection profile(s).`);
-    $('install-title').textContent = 'Your server is ready';
+    appendLog(imported == null ? 'No connection was added to this app.' : `Added ${imported} connection ${imported === 1 ? 'profile' : 'profiles'}.`);
+    $('install-title').textContent = 'The server is ready';
     $('btn-install-close').disabled = false;
     return { server, result };
   } catch (e) {
@@ -306,10 +321,11 @@ async function addAndInstall({ host, port, user, auth, remember }) {
     st.fail(step);
     const msg = String(e?.message || e);
     $('install-error').textContent = msg;
+    $('install-title').textContent += ': failed';
     $('btn-install-close').disabled = false;
     // A server that never connected is not kept.
     if (server && step === 0) app.invoke('server_remove', { id: server.id }).catch(() => {});
-    throw new Error(step === 0 ? msg : 'Installation did not finish; see the server output');
+    throw Object.assign(new Error(step === 0 ? msg : 'Installation did not finish. The server output in the dialog shows where it stopped.'), { cancelled: e?.cancelled });
   }
 }
 
@@ -340,15 +356,16 @@ function importUsers(server, users, limit = Infinity) {
 }
 
 // ── Servers list ───────────────────────────────────────────────────────
-function openAddModal() {
-  $('ssh-modal').classList.remove('hidden');
-  mountSshForm($('modal-ssh-form'), {
+async function openAddModal() {
+  // Mounted first, so the dialog opens with its first field in focus.
+  await mountSshForm($('modal-ssh-form'), {
     onInstalled: ({ server }) => {
       $('ssh-modal').classList.add('hidden');
       renderServers();
       openServer(server.id);
     },
   });
+  $('ssh-modal').classList.remove('hidden');
 }
 
 export async function renderServers() {
@@ -357,36 +374,38 @@ export async function renderServers() {
   let r;
   try { r = await loadServers(); } catch (e) { list.innerHTML = `<div class="empty-note">${esc(e?.message || e)}</div>`; return; }
   if (!r.servers.length) {
-    list.innerHTML = `<div class="profile-empty"><p>No servers yet.<br/>Tap <strong>+</strong> to install OSTP on your own VPS over SSH.</p></div>`;
+    list.innerHTML = `<div class="profile-empty"><p>No servers yet.<br/>Press <strong>+</strong> at the top to install OSTP on your own VPS over SSH.</p></div>`;
     return;
   }
   list.innerHTML = '';
   for (const s of r.servers) {
     const card = document.createElement('div');
     card.className = 'profile-card server-card';
+    card.tabIndex = 0;
+    card.setAttribute('role', 'button');
     card.innerHTML = `
       <div class="profile-info">
         <div class="profile-name">${esc(s.name)}</div>
         <div class="profile-server">${esc(s.user)}@${esc(s.host)}${s.port !== 22 ? ':' + s.port : ''}</div>
       </div>
-      <span class="profile-transport-badge">${s.remembered ? esc(s.auth) : 'ask'}</span>`;
+      <span class="profile-transport-badge" title="${s.remembered ? 'Remembered on this computer' : 'Asked each time'}">${s.remembered ? esc(s.auth) : 'ask'}</span>`;
     card.addEventListener('click', () => openServer(s.id));
+    card.addEventListener('keydown', e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); openServer(s.id); } });
     list.appendChild(card);
   }
 }
 
 export function openServer(id) {
   currentId = id;
-  currentTab = 'status';
   const s = serversCache.find(x => x.id === id);
   $('server-title').textContent = s ? s.name : 'Server';
-  document.querySelectorAll('#server-tabs .tab').forEach(x => x.classList.toggle('active', x.dataset.tab === 'status'));
+  selectTab('status');
   app.showScreen('server');
   renderTab();
 }
 
 // ── One server ─────────────────────────────────────────────────────────
-function fmtBytes(b) {
+export function fmtBytes(b) {
   if (b == null) return '—';
   const u = ['B', 'KB', 'MB', 'GB', 'TB'];
   let i = 0;
@@ -447,7 +466,7 @@ async function renderStatus(body, id) {
       <button class="btn secondary" id="btn-srv-restart">Restart OSTP</button>
       <button class="btn secondary" id="btn-srv-update">Update OSTP</button>
     </div>
-    <p class="card-note">Restarting or updating drops every active connection, this one too if it goes through this server.</p>`;
+    <p class="card-note">Restarting or updating drops every active connection, including this app's if it goes through this server.</p>`;
   $('btn-srv-restart').onclick = () => runAction(id, 'restart', 'Restart OSTP?', 'Every connected client is disconnected for a few seconds.');
   $('btn-srv-update').onclick = () => runAction(id, 'update', 'Update OSTP?', 'The newest release of this app\'s channel is installed and the service restarts. The config is kept.');
 }
@@ -459,8 +478,8 @@ async function renderUsers(body, id) {
   const server = serversCache.find(s => s.id === id);
   body.innerHTML = `
     <div class="inline-add">
-      <input class="field-input" id="new-user-name" placeholder="New user's name, e.g. phone" />
-      <button class="btn primary" id="btn-user-add">Add</button>
+      <input class="field-input" id="new-user-name" aria-label="Name of the new user" placeholder="Name of the new user, e.g. phone" />
+      <button class="btn primary" id="btn-user-add">Add user</button>
     </div>
     <div id="users-list"></div>
     <p class="card-note">Traffic is kept across restarts and updates${r.stats_at ? `, as of ${new Date(r.stats_at * 1000).toLocaleTimeString()}` : ''}.</p>`;
@@ -468,21 +487,21 @@ async function renderUsers(body, id) {
   users.forEach(u => {
     const card = document.createElement('div');
     card.className = 'user-card';
-    const traffic = u.bytes_down != null ? `↓ ${fmtBytes(u.bytes_down)} · ↑ ${fmtBytes(u.bytes_up)}` : 'no traffic yet';
+    const traffic = u.bytes_down != null ? `down ${fmtBytes(u.bytes_down)} · up ${fmtBytes(u.bytes_up)}` : 'no traffic yet';
     card.innerHTML = `
       <div class="user-head">
-        <span class="online-dot ${u.online ? 'on' : ''}" title="${u.online ? 'Online' : 'Offline'}"></span>
+        <span class="online-dot ${u.online ? 'on' : ''}" role="img" aria-label="${u.online ? 'Online' : 'Offline'}" title="${u.online ? 'Online' : 'Offline'}"></span>
         <span class="user-name">${esc(u.name || 'user ' + u.number)}</span>
         <button class="profile-action-btn" data-a="import" title="Add to this app"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg></button>
-        <button class="profile-action-btn" data-a="share" title="Share (QR)"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/><line x1="8.59" y1="13.51" x2="15.42" y2="17.49"/><line x1="15.41" y1="6.51" x2="8.59" y2="10.49"/></svg></button>
+        <button class="profile-action-btn" data-a="share" title="Share link or QR code"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/><line x1="8.59" y1="13.51" x2="15.42" y2="17.49"/><line x1="15.41" y1="6.51" x2="8.59" y2="10.49"/></svg></button>
         <button class="profile-action-btn" data-a="rename" title="Rename"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg></button>
-        <button class="profile-action-btn" data-a="remove" title="Revoke"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/></svg></button>
+        <button class="profile-action-btn" data-a="remove" title="Revoke access"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/></svg></button>
       </div>
       <div class="user-meta">${traffic}${u.limit_bytes ? ` · limit ${fmtBytes(u.limit_bytes)}` : ''}</div>`;
     const who = String(u.number);
     card.querySelector('[data-a="import"]').onclick = async () => {
       const n = await addUserToApp(server, u);
-      if (n != null) app.showToast(n ? `Added ${n} profile(s)` : 'Already in the app', 'ok');
+      if (n != null) app.showToast(n ? `Added ${n} ${n === 1 ? 'profile' : 'profiles'}` : 'Already in the app', 'ok');
     };
     card.querySelector('[data-a="share"]').onclick = () => {
       const best = u.subscription || u.links?.[0]?.uri;
@@ -492,12 +511,12 @@ async function renderUsers(body, id) {
       const v = await promptBox('Rename user', '', [{ name: 'name', label: 'Name', value: u.name }]);
       if (!v || !v.name.trim()) return;
       try { await call('server_manage', { id, args: ['user-rename', who, v.name.trim()] }); renderTab(); }
-      catch (e) { app.showToast(String(e.message || e), 'error'); }
+      catch (e) { report(e); }
     };
     card.querySelector('[data-a="remove"]').onclick = async () => {
-      if (!await confirmBox(`Revoke ${u.name || 'user ' + u.number}?`, 'Their key stops working at once. Profiles made from it stop connecting.', 'Revoke')) return;
+      if (!await confirmBox(`Revoke ${u.name || 'user ' + u.number}?`, 'Their key stops working at once. Profiles made from it stop connecting.', 'Revoke access')) return;
       try { await call('server_manage', { id, args: ['user-remove', u.key] }); renderTab(); }
-      catch (e) { app.showToast(String(e.message || e), 'error'); }
+      catch (e) { report(e); }
     };
     list.appendChild(card);
   });
@@ -507,15 +526,15 @@ async function renderUsers(body, id) {
     $('btn-user-add').disabled = true;
     try {
       const r = await call('server_manage', { id, args: ['user-add', name] });
-      app.showToast(`User ${name} added`, 'ok');
+      app.showToast(`User "${name}" added`, 'ok');
       // The new user may be for someone else: "Not now" leaves the app as is.
       if (r?.user) {
         const n = await addUserToApp(server, r.user, { cancelLabel: 'Not now' });
-        if (n) app.showToast(`Added ${n} profile(s)`, 'ok');
+        if (n) app.showToast(`Added ${n} ${n === 1 ? 'profile' : 'profiles'}`, 'ok');
       }
       renderTab();
     } catch (e) {
-      app.showToast(String(e.message || e), 'error');
+      report(e);
       $('btn-user-add').disabled = false;
     }
   };
@@ -638,7 +657,7 @@ async function renderManage(body, id) {
   if (panel.enabled) {
     $('btn-panel-open').onclick = async () => {
       try { await call('server_open_panel', { id }); }
-      catch (e) { app.showToast(String(e.message || e), 'error'); }
+      catch (e) { report(e); }
     };
     $('btn-panel-off').onclick = () => runAction(id, 'panel-disable', 'Turn off the panel?', 'The OSTP service restarts; connected clients drop for a few seconds.');
   } else {
@@ -648,7 +667,9 @@ async function renderManage(body, id) {
         { name: 'password', label: 'Password (8+ characters)', type: 'password' },
       ]);
       if (!v) return;
-      runAction(id, 'panel-enable', null, null, { user: v.user, password: v.password });
+      if (!v.user.trim()) { app.showToast('Enter a sign-in name for the panel', 'error'); return; }
+      if (v.password.length < 8) { app.showToast('The panel password needs 8 or more characters', 'error'); return; }
+      runAction(id, 'panel-enable', null, null, { user: v.user.trim(), password: v.password });
     };
   }
   bindOvernet(id, s.overnet);
@@ -660,25 +681,29 @@ async function renderManage(body, id) {
       const r = await call('server_manage', { id, args: ['logs', '-n', '300'] });
       pre.textContent = (r.lines || []).join('\n') || '(empty)';
       pre.scrollTop = pre.scrollHeight;
-    } catch (e) { pre.textContent = String(e.message || e); }
+    } catch (e) { pre.textContent = e?.cancelled ? '' : String(e.message || e); if (e?.cancelled) pre.style.display = 'none'; }
   };
   $('btn-srv-rename').onclick = async () => {
     const v = await promptBox('Rename server', '', [{ name: 'name', label: 'Name', value: server?.name }]);
     if (!v || !v.name.trim()) return;
-    await app.invoke('server_rename', { id, name: v.name.trim() });
-    await loadServers();
-    $('server-title').textContent = v.name.trim();
-    renderTab();
+    try {
+      await app.invoke('server_rename', { id, name: v.name.trim() });
+      await loadServers();
+      $('server-title').textContent = v.name.trim();
+      renderTab();
+    } catch (e) { report(e); }
   };
   $('btn-srv-reboot').onclick = () => runAction(id, 'reboot', 'Reboot the server?', 'It is back in about a minute. Every connection drops until then.');
-  $('btn-srv-uninstall').onclick = () => runAction(id, 'uninstall', 'Remove OSTP from the server?',
+  $('btn-srv-uninstall').onclick = () => runAction(id, 'uninstall', 'Uninstall OSTP?',
     'The service, the config and every user key are deleted. Nobody can connect to this server afterwards.');
   $('btn-srv-forget').onclick = async () => {
-    if (!await confirmBox('Remove from the app?', 'Only this app forgets the server and its saved password or key. OSTP keeps running on it.', 'Remove')) return;
-    await app.invoke('server_remove', { id });
-    typedAuth.delete(id);
-    currentId = null;
-    app.showScreen('servers');
+    if (!await confirmBox('Forget this server?', 'Only this app forgets the server and its saved password or key. OSTP keeps running on it.', 'Forget server')) return;
+    try {
+      await app.invoke('server_remove', { id });
+      typedAuth.delete(id);
+      currentId = null;
+      app.showScreen('servers');
+    } catch (e) { report(e); }
   };
 }
 
@@ -692,34 +717,53 @@ function vpnPanelUrl(panel) {
 
 // Actions that restart or remove things are refused while this app is
 // connected through the same server: the answer would never arrive.
+const CONFIRM_LABEL = {
+  restart: 'Restart OSTP', update: 'Update OSTP', reboot: 'Reboot server', uninstall: 'Uninstall OSTP',
+  'panel-disable': 'Turn off the panel', 'sub-disable': 'Turn subscriptions off',
+  'overnet-install': 'Install gateway', 'overnet-enable': 'Turn .ov on', 'overnet-disable': 'Turn .ov off',
+  'overnet-exit-on': 'Open the exit', 'overnet-exit-off': 'Close the exit',
+};
+
 async function runAction(id, action, confirmTitle, confirmText, params = null) {
   const server = serversCache.find(s => s.id === id);
   const disruptive = ['restart', 'update', 'reboot', 'uninstall', 'panel-enable', 'panel-disable', 'cert-issue',
     'overnet-enable', 'overnet-disable', 'overnet-exit-on', 'overnet-exit-off'].includes(action);
   if (disruptive && server && app.connectedThrough(server.host)) {
-    await confirmBox('Disconnect first', 'This app is connected through this server, and this change interrupts that connection. Disconnect, then try again.', 'OK', false);
+    await confirmBox('Disconnect first', 'This app is connected through this server, and this change would cut that connection. Disconnect, then try again.', 'OK', false);
     return;
   }
-  if (confirmTitle && !await confirmBox(confirmTitle, confirmText || '', 'Continue')) return;
+  if (confirmTitle && !await confirmBox(confirmTitle, confirmText || '', CONFIRM_LABEL[action] || 'Continue')) return;
   const appendLog = openInstallModal({
     update: 'Updating OSTP', restart: 'Restarting OSTP', reboot: 'Rebooting', uninstall: 'Removing OSTP',
     'panel-enable': 'Turning on the panel', 'panel-disable': 'Turning off the panel', 'cert-issue': 'Getting a certificate',
     'sub-enable': 'Turning on subscriptions', 'sub-disable': 'Turning off subscriptions',
+    'overnet-install': 'Installing the overnet gateway', 'overnet-enable': 'Turning .ov on', 'overnet-disable': 'Turning .ov off',
+    'overnet-exit-on': 'Opening the overnet exit', 'overnet-exit-off': 'Closing the overnet exit',
   }[action] || action);
   const st = steps(['Running on the server']);
   st.run(0);
   lineSink = { id, fn: appendLog };
+  let ok = false;
   try {
     await call('server_action', { id, action, params });
+    ok = true;
     st.done(0);
     $('install-title').textContent += ': done';
   } catch (e) {
     st.fail(0);
-    $('install-error').textContent = String(e?.message || e);
+    $('install-title').textContent += ': failed';
+    $('install-error').textContent = e?.cancelled ? 'Cancelled: no password or key was entered.' : String(e?.message || e);
   } finally {
     lineSink = null;
     $('btn-install-close').disabled = false;
-    if (action === 'uninstall' || action === 'reboot') return;
-    renderTab();
   }
+  // After these two the old status would be wrong, and asking the server for a
+  // new one would fail or hang: say what happened instead.
+  if (ok && (action === 'uninstall' || action === 'reboot')) {
+    $('server-body').innerHTML = `<div class="empty-note">${action === 'uninstall'
+      ? 'OSTP was removed from this server. Use Forget server (Manage tab) to remove it from the app too.'
+      : 'The server is restarting. Reload this tab in about a minute.'}</div>`;
+    return;
+  }
+  renderTab();
 }

@@ -4,15 +4,12 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>OSTP</title>
-  <link rel="preconnect" href="https://fonts.googleapis.com" />
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" />
   <link rel="stylesheet" href="styles.css" />
 </head>
 <body>
   <div class="app-root">
 
-    <!-- Eagle watermark — behind everything, every screen -->
+    <!-- Eagle watermark, behind every screen -->
     <div class="watermark" aria-hidden="true">
       <img src="assets/logo.png" alt="" />
     </div>
@@ -31,7 +28,7 @@
               <polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/>
             </svg>
           </button>
-          <button id="btn-go-settings" class="icon-btn" aria-label="Settings">
+          <button id="btn-go-settings" class="icon-btn" aria-label="Settings" title="Settings">
             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
               <circle cx="12" cy="12" r="3"/>
               <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>
@@ -43,14 +40,8 @@
       <!-- Center stage -->
       <main class="stage">
 
-        <!-- Orbit rings (animated when connecting/connected) -->
-        <div class="orbit-wrap" id="orbit-wrap">
-          <div class="orbit orbit-1"></div>
-          <div class="orbit orbit-2"></div>
-          <div class="orbit orbit-3"></div>
-
-          <!-- Power button -->
-          <button id="btn-connect" class="power-btn" aria-label="Connect / Disconnect">
+        <div class="orbit-wrap">
+          <button id="btn-connect" class="power-btn" aria-label="Connect">
             <div class="power-icon">
               <svg width="46" height="46" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
                 <path d="M18.36 6.64a9 9 0 1 1-12.73 0"/>
@@ -62,12 +53,12 @@
 
         <!-- Status text -->
         <div class="status-block">
-          <div id="status-text" class="status-label">Disconnected</div>
-          <div id="uptime-text" class="status-sub">Tap to protect your traffic</div>
+          <div id="status-text" class="status-label" role="status">Disconnected</div>
+          <div id="uptime-text" class="status-sub">Press the button to connect</div>
         </div>
 
         <!-- Error banner -->
-        <div id="error-banner" class="error-banner hidden"></div>
+        <div id="error-banner" class="error-banner hidden" role="alert"></div>
 
         <!-- Connection info (visible when connected) -->
         <div id="connection-info" class="connection-info hidden">
@@ -89,12 +80,12 @@
             </div>
             <div class="live-stat-sep" id="stat-sep-1"></div>
             <div class="live-stat" id="stat-down-box">
-              <span class="live-stat-label">↓</span>
+              <span class="live-stat-label">Down</span>
               <span id="live-down-speed" class="live-stat-value">0 B/s</span>
             </div>
             <div class="live-stat-sep" id="stat-sep-2"></div>
             <div class="live-stat" id="stat-up-box">
-              <span class="live-stat-label">↑</span>
+              <span class="live-stat-label">Up</span>
               <span id="live-up-speed" class="live-stat-value">0 B/s</span>
             </div>
           </div>
@@ -111,7 +102,7 @@
             </svg>
           </div>
           <div class="metric-body">
-            <span class="metric-label">Download</span>
+            <span class="metric-label">Received</span>
             <span id="metric-down" class="metric-value">0 B</span>
           </div>
         </div>
@@ -123,7 +114,7 @@
             </svg>
           </div>
           <div class="metric-body">
-            <span class="metric-label">Upload</span>
+            <span class="metric-label">Sent</span>
             <span id="metric-up" class="metric-value">0 B</span>
           </div>
         </div>
@@ -134,13 +125,13 @@
     <div id="settings-screen" class="screen">
 
       <header class="topbar">
-        <button id="btn-back" class="icon-btn" aria-label="Back">
+        <button id="btn-back" class="icon-btn" aria-label="Back" title="Back">
           <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
             <path d="M19 12H5M12 19l-7-7 7-7"/>
           </svg>
         </button>
-        <span class="topbar-title">Profiles</span>
-        <button id="btn-add-profile" class="icon-btn add-btn" aria-label="Add profile">
+        <span class="topbar-title">Settings</span>
+        <button id="btn-add-profile" class="icon-btn add-btn" aria-label="Add profile" title="Add profile" aria-haspopup="menu">
           <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
             <line x1="12" y1="5" x2="12" y2="19"/>
             <line x1="5" y1="12" x2="19" y2="12"/>
@@ -165,7 +156,7 @@
               <line x1="12" y1="8" x2="12" y2="16"/>
               <line x1="8" y1="12" x2="16" y2="12"/>
             </svg>
-            <p>No profiles yet.<br/>Tap <strong>+</strong> to add one.</p>
+            <p>No profiles yet.<br/>Press <strong>+</strong> at the top to add one.</p>
           </div>
         </div>
 
@@ -176,8 +167,8 @@
 
           <div class="toggle-row">
             <div class="toggle-text">
-              <span class="toggle-name">TUN Mode</span>
-              <span class="toggle-hint">Route all system traffic</span>
+              <span class="toggle-name">TUN mode</span>
+              <span class="toggle-hint">Route all system traffic; asks for administrator rights</span>
             </div>
             <label class="toggle">
               <input type="checkbox" id="in-tun-mode" />
@@ -187,8 +178,8 @@
 
           <div class="toggle-row sub-row" id="group-kill-switch" style="display:none;">
             <div class="toggle-text">
-              <span class="toggle-name">Kill Switch</span>
-              <span class="toggle-hint">Block traffic if VPN drops</span>
+              <span class="toggle-name">Kill switch</span>
+              <span class="toggle-hint">Block all traffic if the VPN drops</span>
             </div>
             <label class="toggle">
               <input type="checkbox" id="in-kill-switch" />
@@ -199,7 +190,7 @@
           <div class="toggle-row">
             <div class="toggle-text">
               <span class="toggle-name">Multiplexing</span>
-              <span class="toggle-hint">Multiple streams over one connection</span>
+              <span class="toggle-hint">Several streams over one connection</span>
             </div>
             <label class="toggle">
               <input type="checkbox" id="in-mux-mode" />
@@ -208,27 +199,27 @@
           </div>
 
           <div class="inline-field sub-row" id="group-mux-sessions" style="display:none;">
-            <span class="field-label">Sessions</span>
+            <label class="field-label" for="in-mux-sessions">Sessions</label>
             <input id="in-mux-sessions" class="field-input compact" type="number" placeholder="2" min="1" max="8" />
           </div>
 
           <div class="inline-field">
-            <span class="field-label">MTU</span>
+            <label class="field-label" for="in-mtu">MTU</label>
             <input id="in-mtu" class="field-input compact" type="number" placeholder="1350" />
           </div>
 
           <div class="inline-field">
-            <span class="field-label">DNS</span>
+            <label class="field-label" for="in-dns">DNS server</label>
             <input id="in-dns" class="field-input compact" type="text" placeholder="1.1.1.1" />
           </div>
 
           <div class="inline-field">
-            <span class="field-label">Local Proxy</span>
+            <label class="field-label" for="in-socks">Local proxy</label>
             <input id="in-socks" class="field-input compact" type="text" placeholder="127.0.0.1:1088" />
           </div>
 
         </div> <!-- client-settings-card -->
-        
+
         <button id="btn-go-more" class="wide-btn" type="button">
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="4" y1="21" x2="4" y2="14"/><line x1="4" y1="10" x2="4" y2="3"/><line x1="12" y1="21" x2="12" y2="12"/><line x1="12" y1="8" x2="12" y2="3"/><line x1="20" y1="21" x2="20" y2="16"/><line x1="20" y1="12" x2="20" y2="3"/><line x1="1" y1="14" x2="7" y2="14"/><line x1="9" y1="8" x2="15" y2="8"/><line x1="17" y1="16" x2="23" y2="16"/></svg>
           More settings
@@ -237,38 +228,39 @@
     </div> <!-- settings-screen -->
 
     <!-- ── MORE SETTINGS SCREEN ─────────────────────────────── -->
-    <!-- Everything that is not profiles, subscriptions or the connection. -->
+    <!-- Everything that is not profiles, subscriptions or the connection. Toggle inputs get their accessible name from the row text in main.js. -->
     <div id="more-screen" class="screen">
       <header class="topbar">
-        <button id="btn-more-back" class="icon-btn" aria-label="Back">
+        <button id="btn-more-back" class="icon-btn" aria-label="Back" title="Back">
           <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
             <path d="M19 12H5M12 19l-7-7 7-7"/>
           </svg>
         </button>
         <span class="topbar-title">More settings</span>
-        <span style="width:32px;"></span>
+        <span class="topbar-spacer"></span>
       </header>
       <div class="settings-body">
         <button id="btn-go-servers" class="wide-btn" type="button">
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="20" height="7" rx="2"/><rect x="2" y="14" width="20" height="7" rx="2"/><line x1="6" y1="6.5" x2="6.01" y2="6.5"/><line x1="6" y1="17.5" x2="6.01" y2="17.5"/></svg>
-          Server management
+          Servers
         </button>
 
         <div class="client-settings-card">
-          <div class="section-divider-mini"><span>Exceptions / Routing</span></div>
+          <div class="section-divider-mini"><span>Exclusions</span></div>
+          <p class="field-hint" style="margin: 0 14px 4px;">Traffic to these goes outside the VPN. Separate entries with commas or new lines.</p>
 
           <div class="field-group" style="padding: 10px 14px; margin-bottom: 0;">
-            <label class="field-label" for="in-ex-domains">Excluded Domains</label>
+            <label class="field-label" for="in-ex-domains">Excluded domains</label>
             <textarea id="in-ex-domains" class="field-input mono" placeholder="google.com, mycompany.internal" rows="2" spellcheck="false"></textarea>
           </div>
 
           <div class="field-group" style="padding: 0 14px 10px; margin-bottom: 0;">
-            <label class="field-label" for="in-ex-ips">Excluded IPs / Subnets</label>
+            <label class="field-label" for="in-ex-ips">Excluded IPs and subnets</label>
             <textarea id="in-ex-ips" class="field-input mono" placeholder="192.168.1.0/24, 10.0.0.1" rows="2" spellcheck="false"></textarea>
           </div>
 
-          <div class="field-group" style="padding: 0 14px 10px; margin-bottom: 0; border-bottom: 1px solid rgba(255,255,255,0.04);">
-            <label class="field-label" for="in-ex-procs">Excluded Processes</label>
+          <div class="field-group" style="padding: 0 14px 10px; margin-bottom: 0;">
+            <label class="field-label" for="in-ex-procs">Excluded processes</label>
             <textarea id="in-ex-procs" class="field-input mono" placeholder="chrome.exe, spotify.exe" rows="2" spellcheck="false"></textarea>
           </div>
 
@@ -276,8 +268,8 @@
 
           <div class="toggle-row" style="border-top:none;">
             <div class="toggle-text">
-              <span class="toggle-name">Auto-connect</span>
-              <span class="toggle-hint">Connect on startup</span>
+              <span class="toggle-name">Connect at start</span>
+              <span class="toggle-hint">Connect with the active profile when the app opens</span>
             </div>
             <label class="toggle">
               <input type="checkbox" id="in-autoconnect" />
@@ -287,8 +279,8 @@
 
           <div class="toggle-row" style="border-top:none;">
             <div class="toggle-text">
-              <span class="toggle-name">Launch at Startup</span>
-              <span class="toggle-hint">Start with Windows</span>
+              <span class="toggle-name">Start with the system</span>
+              <span class="toggle-hint">Open OSTP when you sign in</span>
             </div>
             <label class="toggle">
               <input type="checkbox" id="in-launch-startup" />
@@ -298,8 +290,8 @@
 
           <div class="toggle-row" style="border-top:none;">
             <div class="toggle-text">
-              <span class="toggle-name">Check for updates</span>
-              <span class="toggle-hint">When the app opens: stable and beta releases</span>
+              <span class="toggle-name">Check for updates at start</span>
+              <span class="toggle-hint">Looks for stable and beta releases when the app opens</span>
             </div>
             <label class="toggle">
               <input type="checkbox" id="in-update-check" checked />
@@ -309,8 +301,8 @@
 
           <div class="toggle-row" style="border-top:none;">
             <div class="toggle-text">
-              <span class="toggle-name">Debug Logs</span>
-              <span class="toggle-hint">Verbose output to .log file</span>
+              <span class="toggle-name">Debug log</span>
+              <span class="toggle-hint">Write detailed output to ostp.log</span>
             </div>
             <label class="toggle">
               <input type="checkbox" id="in-debug" />
@@ -320,8 +312,8 @@
 
           <div class="toggle-row" style="border-top:none;">
             <div class="toggle-text">
-              <span class="toggle-name">Show RTT</span>
-              <span class="toggle-hint">Display live ping on dashboard</span>
+              <span class="toggle-name">Show round-trip time</span>
+              <span class="toggle-hint">On the main screen while connected</span>
             </div>
             <label class="toggle">
               <input type="checkbox" id="in-show-rtt" checked />
@@ -331,8 +323,8 @@
 
           <div class="toggle-row" style="border-top:none;">
             <div class="toggle-text">
-              <span class="toggle-name">Show Speed</span>
-              <span class="toggle-hint">Display traffic speed on dashboard</span>
+              <span class="toggle-name">Show speed</span>
+              <span class="toggle-hint">On the main screen while connected</span>
             </div>
             <label class="toggle">
               <input type="checkbox" id="in-show-speed" checked />
@@ -344,15 +336,15 @@
 
           <div class="toggle-row" style="border-top:none;">
             <div class="toggle-text">
-              <span class="toggle-name">Junk Packets</span>
-              <span class="toggle-hint">Random noise before connection (UoT only)</span>
+              <span class="toggle-name">Junk packets</span>
+              <span class="toggle-hint">Random data before the handshake (TCP only)</span>
             </div>
             <div class="toggle-with-gear">
               <label class="toggle">
                 <input type="checkbox" id="cs-junk-enabled" />
                 <span class="toggle-track"><span class="toggle-thumb"></span></span>
               </label>
-              <button id="btn-junk-settings" class="gear-btn" title="Configure junk packets">
+              <button id="btn-junk-settings" class="gear-btn" title="Junk packet options" aria-label="Junk packet options">
                 <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
               </button>
             </div>
@@ -360,15 +352,15 @@
 
           <div class="toggle-row" style="border-top:none;">
             <div class="toggle-text">
-              <span class="toggle-name">TCP Fragmentation</span>
-              <span class="toggle-hint">Split handshake into segments (UoT only)</span>
+              <span class="toggle-name">TCP fragmentation</span>
+              <span class="toggle-hint">Split the handshake into small segments (TCP only)</span>
             </div>
             <div class="toggle-with-gear">
               <label class="toggle">
                 <input type="checkbox" id="cs-tcp-frag" />
                 <span class="toggle-track"><span class="toggle-thumb"></span></span>
               </label>
-              <button id="btn-frag-settings" class="gear-btn" title="Configure fragmentation">
+              <button id="btn-frag-settings" class="gear-btn" title="Fragmentation options" aria-label="Fragmentation options">
                 <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
               </button>
             </div>
@@ -376,8 +368,8 @@
 
           <div class="toggle-row" style="border-top:none;">
             <div class="toggle-text">
-              <span class="toggle-name" data-i18n="label_ttl_desync">TTL Desync</span>
-              <span class="toggle-hint" data-i18n="hint_ttl_desync">Decoy packets that die before the server (UDP, auto-tuned)</span>
+              <span class="toggle-name">TTL desync</span>
+              <span class="toggle-hint">Decoy packets that expire before the server (UDP only)</span>
             </div>
             <label class="toggle">
               <input type="checkbox" id="cs-ttl-desync" />
@@ -388,7 +380,7 @@
 
         <div class="app-version">
           <span id="app-version">OSTP GUI</span>
-          <button id="btn-check-updates" class="btn secondary compact-btn" type="button">Check for updates</button>
+          <button id="btn-check-updates" class="btn secondary compact-btn" type="button">Check for updates now</button>
         </div>
       </div>
     </div>
@@ -396,27 +388,26 @@
     <!-- ── PROBER SCREEN ────────────────────────────────────── -->
     <div id="prober-screen" class="screen">
       <header class="topbar">
-        <button id="btn-prober-back" class="icon-btn" aria-label="Back">
+        <button id="btn-prober-back" class="icon-btn" aria-label="Back" title="Back">
           <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
             <path d="M19 12H5M12 19l-7-7 7-7"/>
           </svg>
         </button>
         <span class="topbar-title">Network check</span>
-        <span style="width:32px;"></span>
+        <span class="topbar-spacer"></span>
       </header>
       <div class="settings-body">
-        <p class="prober-intro">Real OSTP handshakes against your server, a hop-by-hop scan for in-path
-          interference, and a general test of what this network filters. Nothing leaves this device except the probes themselves.</p>
+        <p class="prober-intro">Tries real OSTP handshakes against your server, scans the path hop by hop for interference, and tests what this network filters. Nothing leaves this device except the probes themselves.</p>
         <div class="field-group">
           <label class="field-label" for="pr-profile">Profile</label>
           <select id="pr-profile" class="field-input"></select>
         </div>
         <div class="prober-actions">
           <button id="btn-pr-matrix" class="btn primary">Check server</button>
-          <button id="btn-pr-ttl" class="btn secondary" disabled title="Run “Check server” first">Path scan (TTL)</button>
-          <button id="btn-pr-dpi" class="btn secondary">Network DPI test</button>
+          <button id="btn-pr-ttl" class="btn secondary" disabled title="Run “Check server” first">Scan the path</button>
+          <button id="btn-pr-dpi" class="btn secondary">Test the network</button>
         </div>
-        <div id="pr-status" class="prober-status"></div>
+        <div id="pr-status" class="prober-status" role="status"></div>
         <div id="pr-results" class="prober-results"></div>
       </div>
     </div>
@@ -425,34 +416,30 @@
     <!-- ── WELCOME (first run) ──────────────────────────────── -->
     <div id="welcome-screen" class="screen">
       <header class="topbar">
-        <button id="btn-welcome-back" class="icon-btn" aria-label="Back" style="visibility:hidden;"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M19 12H5M12 19l-7-7 7-7"/></svg></button>
+        <button id="btn-welcome-back" class="icon-btn" aria-label="Back" title="Back" style="visibility:hidden;"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M19 12H5M12 19l-7-7 7-7"/></svg></button>
         <div class="brand"><div class="brand-dot"></div><span class="brand-name">OSTP</span></div>
         <button id="btn-welcome-skip" class="btn secondary compact-btn" type="button">Skip</button>
       </header>
       <div class="settings-body">
         <!-- Step 1: what the user has -->
         <div data-welcome="choose">
-          <h1 class="welcome-title">Let's get started</h1>
-          <p class="welcome-sub">How will you connect?</p>
+          <h1 class="welcome-title">Add a connection</h1>
+          <p class="welcome-sub">What do you have?</p>
           <button type="button" class="choice-card choice-pick" data-go="link">
             <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg>
             <div class="choice-body"><div class="choice-title">I have a link</div><div class="choice-hint">Someone gave me an ostp:// link or a subscription URL</div></div>
-            <svg class="choice-chevron" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"/></svg>
           </button>
           <button type="button" class="choice-card choice-pick" data-go="qr">
             <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/><path d="M14 14h3v3h-3zM20 14v.01M14 20h.01M17 20h4v-3"/></svg>
-            <div class="choice-body"><div class="choice-title">I have a QR code</div><div class="choice-hint">A picture or a screenshot of the code of a link or a subscription</div></div>
-            <svg class="choice-chevron" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"/></svg>
+            <div class="choice-body"><div class="choice-title">I have a QR code</div><div class="choice-hint">A picture or screenshot of a QR code that holds a link or a subscription</div></div>
           </button>
           <button type="button" class="choice-card choice-pick" data-go="server">
             <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="20" height="7" rx="2"/><rect x="2" y="14" width="20" height="7" rx="2"/><line x1="6" y1="6.5" x2="6.01" y2="6.5"/><line x1="6" y1="17.5" x2="6.01" y2="17.5"/></svg>
-            <div class="choice-body"><div class="choice-title">I have a server</div><div class="choice-hint">A VPS and its SSH login; OSTP is set up for me</div></div>
-            <svg class="choice-chevron" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"/></svg>
+            <div class="choice-body"><div class="choice-title">I have a server</div><div class="choice-hint">A VPS and its SSH login; the app installs OSTP on it</div></div>
           </button>
           <button type="button" class="choice-card choice-pick" id="btn-welcome-repo">
             <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></svg>
-            <div class="choice-body"><div class="choice-title">The project on GitHub</div><div class="choice-hint">Source code, documentation, releases</div></div>
-            <svg class="choice-chevron" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"/></svg>
+            <div class="choice-body"><div class="choice-title">Open the project on GitHub</div><div class="choice-hint">Source code, documentation, releases</div></div>
           </button>
         </div>
 
@@ -460,7 +447,7 @@
         <div data-welcome="link" style="display:none;">
           <h1 class="welcome-title">Add a link</h1>
           <p class="welcome-sub">Paste the ostp:// link or the subscription URL (https://…/sub/…) you were given.</p>
-          <textarea id="welcome-link" class="field-input mono" rows="4" placeholder="ostp://… or https://…/sub/…"></textarea>
+          <textarea id="welcome-link" class="field-input mono" rows="4" aria-label="Link or subscription URL" placeholder="ostp://… or https://…/sub/…"></textarea>
           <div class="choice-actions">
             <button id="btn-welcome-paste" class="btn secondary" type="button">Paste</button>
             <button id="btn-welcome-link" class="btn primary" type="button">Add</button>
@@ -471,11 +458,11 @@
         <div data-welcome="qr" style="display:none;">
           <h1 class="welcome-title">Add from a QR code</h1>
           <p class="welcome-sub">Choose a picture with the code, or copy a screenshot of it and press Ctrl+V here.</p>
-          <div class="qr-drop" id="welcome-qr-drop">
+          <div class="qr-drop" id="welcome-qr-drop" role="status">
             <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></svg>
             <span id="welcome-qr-status">Drop a picture here</span>
           </div>
-          <input type="file" id="welcome-qr-file" accept="image/png,image/jpeg,image/bmp,image/webp" style="display:none;" />
+          <input type="file" id="welcome-qr-file" accept="image/png,image/jpeg,image/bmp,image/webp" style="display:none;" tabindex="-1" />
           <div class="choice-actions">
             <button id="btn-welcome-qr-file" class="btn primary" type="button">Choose a picture</button>
           </div>
@@ -484,7 +471,7 @@
         <!-- Step 2c: a server -->
         <div data-welcome="server" style="display:none;">
           <h1 class="welcome-title">Your server</h1>
-          <p class="welcome-sub">The app signs in over SSH and installs OSTP; no Linux knowledge needed. If OSTP is already there, you choose whether to update it.</p>
+          <p class="welcome-sub">The app signs in over SSH and installs OSTP for you. If OSTP is already on the server, you choose whether to update it.</p>
           <div id="welcome-ssh-form"></div>
         </div>
       </div>
@@ -493,9 +480,9 @@
     <!-- ── SERVERS ──────────────────────────────────────────── -->
     <div id="servers-screen" class="screen">
       <header class="topbar">
-        <button id="btn-servers-back" class="icon-btn" aria-label="Back"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M19 12H5M12 19l-7-7 7-7"/></svg></button>
+        <button id="btn-servers-back" class="icon-btn" aria-label="Back" title="Back"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M19 12H5M12 19l-7-7 7-7"/></svg></button>
         <span class="topbar-title">Servers</span>
-        <button id="btn-servers-add" class="icon-btn add-btn" aria-label="Add server">
+        <button id="btn-servers-add" class="icon-btn add-btn" aria-label="Add server" title="Add server">
           <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
         </button>
       </header>
@@ -507,48 +494,48 @@
     <!-- ── ONE SERVER ───────────────────────────────────────── -->
     <div id="server-screen" class="screen">
       <header class="topbar">
-        <button id="btn-server-back" class="icon-btn" aria-label="Back"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M19 12H5M12 19l-7-7 7-7"/></svg></button>
+        <button id="btn-server-back" class="icon-btn" aria-label="Back" title="Back"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M19 12H5M12 19l-7-7 7-7"/></svg></button>
         <span class="topbar-title" id="server-title">Server</span>
-        <button id="btn-server-refresh" class="icon-btn" aria-label="Refresh" title="Refresh">
+        <button id="btn-server-refresh" class="icon-btn" aria-label="Reload this tab" title="Reload this tab">
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>
         </button>
       </header>
-      <div class="tabs" id="server-tabs">
-        <button class="tab active" data-tab="status">Status</button>
-        <button class="tab" data-tab="users">Users</button>
-        <button class="tab" data-tab="connection">Connection</button>
-        <button class="tab" data-tab="manage">Management</button>
+      <div class="tabs" id="server-tabs" role="tablist">
+        <button class="tab active" role="tab" aria-selected="true" data-tab="status">Status</button>
+        <button class="tab" role="tab" aria-selected="false" data-tab="users">Users</button>
+        <button class="tab" role="tab" aria-selected="false" data-tab="connection">Connection</button>
+        <button class="tab" role="tab" aria-selected="false" data-tab="manage">Manage</button>
       </div>
       <div class="settings-body" id="server-body"></div>
     </div>
 
     <!-- ── ADD PROFILE DROPDOWN ─────────────────────────────── -->
-    <div id="add-menu" class="add-menu hidden">
-      <button id="add-from-link" class="add-menu-item">
+    <div id="add-menu" class="add-menu hidden" role="menu">
+      <button id="add-from-link" class="add-menu-item" role="menuitem">
         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg>
         Link or subscription
       </button>
-      <button id="add-from-clipboard" class="add-menu-item">
+      <button id="add-from-clipboard" class="add-menu-item" role="menuitem">
         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
-        From clipboard
+        Paste from clipboard
       </button>
-      <button id="add-manually" class="add-menu-item">
+      <button id="add-manually" class="add-menu-item" role="menuitem">
         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>
-        Manually
+        Enter by hand
       </button>
     </div>
 
     <!-- ── LINK INPUT MODAL ─────────────────────────────────── -->
     <div id="link-modal" class="modal-overlay hidden">
       <div class="modal-content compact">
-        <h3 class="modal-title">Paste link</h3>
+        <h3 class="modal-title">Add a link</h3>
         <div class="field-group">
-          <input id="link-input" class="field-input mono" type="text" placeholder="ostp://key@host:port  or  https://domain/sub/…" spellcheck="false" />
+          <input id="link-input" class="field-input mono" type="text" aria-label="Link or subscription URL" placeholder="ostp://key@host:port  or  https://domain/sub/…" spellcheck="false" />
           <p class="field-hint">A subscription (https://) keeps its profiles in sync with the server.</p>
         </div>
         <div class="modal-actions">
-          <button id="btn-link-cancel" class="btn secondary">Cancel</button>
-          <button id="btn-link-import" class="btn primary">Import</button>
+          <button id="btn-link-cancel" class="btn secondary" data-dismiss>Cancel</button>
+          <button id="btn-link-import" class="btn primary">Add</button>
         </div>
       </div>
     </div>
@@ -556,7 +543,7 @@
     <!-- ── PROFILE EDITOR MODAL ─────────────────────────────── -->
     <div id="profile-modal" class="modal-overlay hidden">
       <div class="modal-content">
-        <h3 class="modal-title" id="profile-modal-title">New Profile</h3>
+        <h3 class="modal-title" id="profile-modal-title">New profile</h3>
 
         <div class="field-group">
           <label class="field-label" for="pm-name">Name</label>
@@ -567,10 +554,10 @@
           <input id="pm-server" class="field-input mono" type="text" placeholder="host:port" spellcheck="false" />
         </div>
         <div class="field-group">
-          <label class="field-label" for="pm-key">Access Key</label>
+          <label class="field-label" for="pm-key">Access key</label>
           <div class="input-wrap">
-            <input id="pm-key" class="field-input mono has-icon" type="password" placeholder="Secure access key" spellcheck="false" />
-            <button class="peek-btn" id="btn-peek-pm" tabindex="-1" aria-label="Show key">
+            <input id="pm-key" class="field-input mono has-icon" type="password" placeholder="Access key" spellcheck="false" />
+            <button class="peek-btn" id="btn-peek-pm" type="button" aria-label="Show key" title="Show key">
               <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>
             </button>
           </div>
@@ -578,7 +565,7 @@
         <div class="field-group">
           <label class="field-label" for="pm-transport">Transport</label>
           <select id="pm-transport" class="field-input">
-            <option value="udp">UDP (Default)</option>
+            <option value="udp">UDP (default)</option>
             <option value="uot">TCP (UoT)</option>
           </select>
         </div>
@@ -603,10 +590,10 @@
               <label class="field-label" for="pm-ws-path">Upgrade path</label>
               <input id="pm-ws-path" class="field-input mono" type="text" placeholder="only through nginx / apache / caddy" spellcheck="false" />
             </div>
-            <div class="toggle-row">
+            <div class="toggle-row is-danger">
               <div class="toggle-text">
-                <span class="toggle-name" style="color:#f87171;">Don't verify certificate</span>
-                <span class="toggle-hint" style="color:#f87171;">Insecure: anyone on the path can impersonate the server. Testing only.</span>
+                <span class="toggle-name">Don't verify the certificate</span>
+                <span class="toggle-hint">Insecure: anyone on the path can impersonate the server. For testing only.</span>
               </div>
               <label class="toggle">
                 <input type="checkbox" id="pm-tls-insecure" />
@@ -617,8 +604,8 @@
         </div>
 
         <div class="modal-actions">
-          <button id="btn-profile-cancel" class="btn secondary">Cancel</button>
-          <button id="btn-profile-delete" class="btn danger" style="display:none;">Delete</button>
+          <button id="btn-profile-cancel" class="btn secondary" data-dismiss>Cancel</button>
+          <button id="btn-profile-delete" class="btn danger" style="display:none;">Delete profile</button>
           <button id="btn-profile-save" class="btn primary">Save</button>
         </div>
       </div>
@@ -627,13 +614,13 @@
     <!-- ── SHARE MODAL ──────────────────────────────────────── -->
     <div id="share-modal" class="modal-overlay hidden">
       <div class="modal-content">
-        <h3 class="modal-title" id="share-title">Share Profile</h3>
-        <p class="modal-text">Scan with the OSTP app. The QR is generated locally — the key never leaves this device.</p>
-        <div id="share-qr" class="share-qr"></div>
+        <h3 class="modal-title" id="share-title">Share profile</h3>
+        <p class="modal-text">Scan with the OSTP app. The QR code is made on this device; the key is not sent anywhere.</p>
+        <div id="share-qr" class="share-qr" role="img" aria-label="QR code with the link"></div>
         <p id="share-qr-error" class="field-hint is-error" style="display:none;"></p>
-        <input id="share-link" class="field-input mono" type="text" readonly />
+        <input id="share-link" class="field-input mono" type="text" readonly aria-label="Link" />
         <div class="modal-actions">
-          <button id="btn-share-close" class="btn secondary">Close</button>
+          <button id="btn-share-close" class="btn secondary" data-dismiss>Close</button>
           <button id="btn-share-copy" class="btn primary">Copy link</button>
         </div>
       </div>
@@ -647,8 +634,8 @@
         <p class="modal-text update-warning hidden" id="update-warning">This is a beta: new features that are still being tested. It can be less stable than the release you have; keep the previous installer in case you need to go back.</p>
         <div class="modal-actions">
           <button id="btn-update-skip" class="btn secondary">Skip this version</button>
-          <button id="btn-update-later" class="btn secondary">Later</button>
-          <button id="btn-update-download" class="btn primary">Download</button>
+          <button id="btn-update-later" class="btn secondary" data-dismiss>Later</button>
+          <button id="btn-update-download" class="btn primary">Open download page</button>
         </div>
       </div>
     </div>
@@ -656,17 +643,17 @@
     <!-- ── WINTUN MODAL ─────────────────────────────────────── -->
     <div id="wintun-modal" class="modal-overlay hidden">
       <div class="modal-content">
-        <h3 class="modal-title">Wintun Driver Missing</h3>
-        <p class="modal-text">TUN mode requires the Wintun network driver.</p>
+        <h3 class="modal-title">Wintun driver is missing</h3>
+        <p class="modal-text">TUN mode needs the Wintun network driver (wintun.dll). Add it, then connect again.</p>
         <ol class="modal-steps">
           <li>Download <strong>wintun.zip</strong> from wintun.net</li>
           <li>Extract <code>amd64\wintun.dll</code></li>
           <li>Place it here: <code id="wintun-install-path">...</code></li>
-          <li>Restart the connection</li>
+          <li>Press connect again</li>
         </ol>
         <div class="modal-actions">
-          <button id="btn-wintun-cancel" class="btn secondary">Cancel</button>
-          <a id="btn-wintun-open" href="https://www.wintun.net" target="_blank" class="btn primary">Open wintun.net ↗</a>
+          <button id="btn-wintun-cancel" class="btn secondary" data-dismiss>Close</button>
+          <a id="btn-wintun-open" href="https://www.wintun.net" target="_blank" rel="noopener" class="btn primary">Open wintun.net</a>
         </div>
       </div>
     </div>
@@ -674,8 +661,8 @@
     <!-- ── JUNK PACKETS MODAL ──────────────────────────────────── -->
     <div id="junk-modal" class="modal-overlay hidden">
       <div class="modal-content compact">
-        <h3 class="modal-title">Junk Packets</h3>
-        <p class="modal-text">Sends random garbage frames before the Noise handshake to confuse DPI pattern matching. Active in UoT/TCP mode only.</p>
+        <h3 class="modal-title">Junk packets</h3>
+        <p class="modal-text">Sends random frames before the handshake so that DPI cannot match a fixed pattern. Works on TCP (UoT) only.</p>
         <div class="modal-row-2">
           <div class="field-group">
             <label class="field-label" for="cs-junk-pc-min">Count min</label>
@@ -697,7 +684,7 @@
           </div>
         </div>
         <div class="modal-actions">
-          <button id="btn-junk-done" class="btn primary">Done</button>
+          <button id="btn-junk-done" class="btn primary" data-dismiss>Done</button>
         </div>
       </div>
     </div>
@@ -705,8 +692,8 @@
     <!-- ── TCP FRAGMENTATION MODAL ──────────────────────────────── -->
     <div id="frag-modal" class="modal-overlay hidden">
       <div class="modal-content compact">
-        <h3 class="modal-title">TCP Fragmentation</h3>
-        <p class="modal-text">Splits the initial handshake into tiny TCP segments with delays between them. Prevents DPI from reading the full handshake signature. Active in UoT/TCP mode only.</p>
+        <h3 class="modal-title">TCP fragmentation</h3>
+        <p class="modal-text">Splits the first handshake into tiny TCP segments with a pause between them, so DPI does not see the whole signature at once. Works on TCP (UoT) only.</p>
         <div class="modal-row-2">
           <div class="field-group">
             <label class="field-label" for="cs-frag-chunk">Chunk size (bytes)</label>
@@ -718,7 +705,7 @@
           </div>
         </div>
         <div class="modal-actions">
-          <button id="btn-frag-done" class="btn primary">Done</button>
+          <button id="btn-frag-done" class="btn primary" data-dismiss>Done</button>
         </div>
       </div>
     </div>
@@ -733,29 +720,30 @@
       <div class="modal-content">
         <h3 class="modal-title">Add a server</h3>
         <div id="modal-ssh-form"></div>
+        <div class="modal-actions"><button id="btn-ssh-cancel" class="btn secondary" data-dismiss>Cancel</button></div>
       </div>
     </div>
 
     <div id="install-modal" class="modal-overlay hidden">
       <div class="modal-content wide">
-        <h3 class="modal-title" id="install-title">Installing OSTP</h3>
+        <h3 class="modal-title" id="install-title">Working on the server</h3>
         <ol class="step-list" id="install-steps"></ol>
         <details class="install-log"><summary>Server output</summary><pre id="install-log"></pre></details>
         <p class="field-hint is-error" id="install-error"></p>
         <div class="modal-actions">
-          <button id="btn-install-close" class="btn secondary" disabled>Close</button>
+          <button id="btn-install-close" class="btn secondary" data-dismiss disabled>Close</button>
         </div>
       </div>
     </div>
 
     <div id="secret-modal" class="modal-overlay hidden">
       <div class="modal-content compact">
-        <h3 class="modal-title" id="secret-title">Sign in</h3>
+        <h3 class="modal-title" id="secret-title">Sign in over SSH</h3>
         <p class="modal-text" id="secret-text"></p>
-        <textarea id="secret-input" class="field-input mono" rows="1"></textarea>
-        <input id="secret-passphrase" class="field-input" type="password" placeholder="Key passphrase (if any)" style="margin-top:8px;display:none;" />
+        <textarea id="secret-input" class="field-input mono" rows="1" aria-label="Password or private key" spellcheck="false"></textarea>
+        <input id="secret-passphrase" class="field-input" type="password" aria-label="Key passphrase" placeholder="Key passphrase (if it has one)" style="margin-top:8px;display:none;" />
         <div class="modal-actions">
-          <button id="btn-secret-cancel" class="btn secondary">Cancel</button>
+          <button id="btn-secret-cancel" class="btn secondary" data-dismiss>Cancel</button>
           <button id="btn-secret-ok" class="btn primary">Sign in</button>
         </div>
       </div>
@@ -766,7 +754,7 @@
         <h3 class="modal-title" id="confirm-title"></h3>
         <p class="modal-text" id="confirm-text"></p>
         <div class="modal-actions">
-          <button id="btn-confirm-cancel" class="btn secondary">Cancel</button>
+          <button id="btn-confirm-cancel" class="btn secondary" data-dismiss>Cancel</button>
           <button id="btn-confirm-ok" class="btn danger">OK</button>
         </div>
       </div>
@@ -778,7 +766,7 @@
         <p class="modal-text" id="choice-text"></p>
         <div class="choice-options" id="choice-options"></div>
         <div class="modal-actions">
-          <button id="btn-choice-cancel" class="btn secondary">Cancel</button>
+          <button id="btn-choice-cancel" class="btn secondary" data-dismiss>Cancel</button>
         </div>
       </div>
     </div>
@@ -789,7 +777,7 @@
         <p class="modal-text" id="prompt-text"></p>
         <div id="prompt-fields"></div>
         <div class="modal-actions">
-          <button id="btn-prompt-cancel" class="btn secondary">Cancel</button>
+          <button id="btn-prompt-cancel" class="btn secondary" data-dismiss>Cancel</button>
           <button id="btn-prompt-ok" class="btn primary">OK</button>
         </div>
       </div>

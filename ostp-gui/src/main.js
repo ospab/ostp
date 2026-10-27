@@ -1,4 +1,4 @@
-import { initServers, renderServers, mountSshForm, confirmBox } from './servers.js';
+import { initServers, renderServers, mountSshForm, confirmBox, fmtBytes } from './servers.js';
 
 // ── Tauri invoke shim ─────────────────────────────────────────────────
 let invoke = () => Promise.resolve(null);
@@ -71,7 +71,6 @@ const $ = id => document.getElementById(id);
 const homeScreen     = $('home-screen');
 const settingsScreen = $('settings-screen');
 const brandDot       = $('brand-dot');
-const orbitWrap      = $('orbit-wrap');
 const btnConnect     = $('btn-connect');
 const statusText     = $('status-text');
 const uptimeText     = $('uptime-text');
@@ -207,13 +206,6 @@ const inFragSleep     = $('cs-frag-sleep');
 const btnFragDone     = $('btn-frag-done');
 
 // ── UTILITIES ─────────────────────────────────────────────────────────
-function fmtBytes(b) {
-  if (!b || b === 0) return '0 B';
-  const units = ['B', 'KB', 'MB', 'GB'];
-  const i = Math.min(Math.floor(Math.log2(b) / 10), 3);
-  return (b / Math.pow(1024, i)).toFixed(i === 0 ? 0 : 1) + ' ' + units[i];
-}
-
 function fmtTime(s) {
   const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = s % 60;
   const p = n => String(n).padStart(2, '0');
@@ -225,17 +217,38 @@ function showToast(msg, variant = '') {
   toast.textContent = msg;
   toast.className = 'toast show' + (variant ? ' is-' + variant : '');
   clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => toast.classList.remove('show'), 2600);
+  // An error needs time to be read; a confirmation does not.
+  toastTimer = setTimeout(() => toast.classList.remove('show'), variant === 'error' ? 7000 : 2600);
 }
 
+// The banner stays until the next connection attempt: a failure that
+// disappears after a few seconds is easy to miss and impossible to copy.
 function showError(msg) {
   errorBanner.textContent = msg;
   errorBanner.classList.remove('hidden');
   btnConnect.classList.add('error');
-  setTimeout(() => {
-    errorBanner.classList.add('hidden');
-    btnConnect.classList.remove('error');
-  }, 5000);
+}
+
+function clearError() {
+  errorBanner.classList.add('hidden');
+  btnConnect.classList.remove('error');
+}
+
+// The core reads its settings from the config file, so every change to the
+// active profile or the settings is written there. Resolves to false when the
+// write failed (the user has been told).
+function persistConfig() {
+  const cfg = buildConfig();
+  if (!cfg) return Promise.resolve(false);
+  return invoke('save_config', { jsonContent: JSON.stringify(cfg, null, 2) })
+    .then(() => true)
+    .catch(err => { showToast('Could not save the configuration: ' + err, 'error'); return false; });
+}
+
+// The tunnel stopped on its own: say so, with the reason.
+function onTunnelError(msg) {
+  setState('disconnected');
+  showError('The connection stopped: ' + msg);
 }
 
 // ── STATE MACHINE ─────────────────────────────────────────────────────
@@ -244,13 +257,14 @@ function setState(next) {
   appState = next;
 
   btnConnect.className = 'power-btn';
-  orbitWrap.className  = 'orbit-wrap';
   brandDot.className   = 'brand-dot';
   statusText.className = 'status-label';
+  btnConnect.setAttribute('aria-label',
+    next === 'disconnected' ? 'Connect' : next === 'connecting' ? 'Cancel connecting' : 'Disconnect');
 
   if (next === 'disconnected') {
     statusText.textContent = 'Disconnected';
-    uptimeText.textContent  = 'Tap to protect your traffic';
+    uptimeText.textContent  = 'Press the button to connect';
     connInfo.classList.add('hidden');
     metricDown.textContent = liveDown.textContent = '0 B';
     metricUp.textContent   = liveUp.textContent   = '0 B';
@@ -262,19 +276,19 @@ function setState(next) {
     uptimeSecs = 0;
 
   } else if (next === 'connecting') {
+    clearError();
     btnConnect.classList.add('connecting');
-    orbitWrap.classList.add('connecting');
     brandDot.classList.add('connecting');
     statusText.classList.add('is-connecting');
     statusText.textContent = 'Connecting…';
-    uptimeText.textContent  = 'Establishing secure tunnel';
+    uptimeText.textContent  = 'Press the button to cancel';
     connInfo.classList.add('hidden');
     clearInterval(uptimeTimer); uptimeTimer = null;
     uptimeSecs = 0;
 
   } else if (next === 'connected') {
+    clearError();
     btnConnect.classList.add('connected');
-    orbitWrap.classList.add('connected');
     brandDot.classList.add('connected');
     statusText.classList.add('is-connected');
     statusText.textContent = 'Connected';
@@ -286,10 +300,10 @@ function setState(next) {
     }
 
     uptimeSecs = 0;
-    statusText.textContent = 'Connected';
+    uptimeText.textContent = 'Connected for ' + fmtTime(0);
     uptimeTimer = setInterval(() => {
       uptimeSecs++;
-      uptimeText.textContent = fmtTime(uptimeSecs);
+      uptimeText.textContent = 'Connected for ' + fmtTime(uptimeSecs);
     }, 1000);
   }
 }
@@ -329,8 +343,8 @@ async function poll() {
       }
     }
   } catch (err) {
-    console.error('[OSTP] poll error:', err);
-    if (pollTimer) setState('disconnected');
+    // get_tunnel_status reports the reason the tunnel ended as an error.
+    if (pollTimer) onTunnelError(String(err));
   }
 }
 
@@ -391,43 +405,55 @@ function buildConfig() {
 }
 
 // ── CONNECT / DISCONNECT ──────────────────────────────────────────────
+// The button is disabled while start_tunnel / stop_tunnel are running (a TUN
+// start can wait for the administrator prompt), so a click is never ignored
+// without a sign that it is.
+let toggleBusy = false;
+
 async function handleToggle() {
-  if (appState !== 'disconnected') {
-    setState('disconnected');
-    try { await invoke('stop_tunnel'); } catch { /* ignore */ }
-    showToast('Disconnected');
-    return;
-  }
-
-  if (!activeId || !profiles.find(p => p.id === activeId)) {
-    showToast('Select a profile first', 'error');
-    return;
-  }
-
-  const cfg = buildConfig();
-  if (!cfg) { showToast('Active profile invalid', 'error'); return; }
-
-  setState('connecting');
-  errorBanner.classList.add('hidden');
-
+  if (toggleBusy) return;
+  toggleBusy = true;
+  btnConnect.disabled = true;
   try {
-    await invoke('save_config', { jsonContent: JSON.stringify(cfg, null, 2) });
-    const ok = await invoke('start_tunnel');
-    if (ok) {
-      startPolling();
-    } else {
+    if (appState !== 'disconnected') {
+      // Show "disconnected" only once the core has really stopped.
+      try {
+        await invoke('stop_tunnel');
+        setState('disconnected');
+        showToast('Disconnected');
+      } catch (err) {
+        showError('Could not stop the connection: ' + err);
+      }
+      return;
+    }
+
+    clearError();
+    if (!profiles.some(p => p.id === activeId)) {
+      showError('No profile is selected. Open Settings and add or choose one.');
+      return;
+    }
+    const cfg = buildConfig();
+    if (!cfg) { showError('The selected profile is not valid. Open Settings and check it.'); return; }
+
+    setState('connecting');
+    try {
+      await invoke('save_config', { jsonContent: JSON.stringify(cfg, null, 2) });
+      const ok = await invoke('start_tunnel');
+      if (ok) {
+        startPolling();
+      } else {
+        setState('disconnected');
+        showError('The connection did not start. The file ostp.log next to the app has details.');
+      }
+    } catch (err) {
       setState('disconnected');
-      showError('Failed to start tunnel. Check the log file.');
+      const msg = String(err);
+      if (msg.includes('WINTUN_MISSING')) wintunModal.classList.remove('hidden');
+      else showError('Could not connect: ' + msg);
     }
-  } catch (err) {
-    setState('disconnected');
-    const msg = String(err);
-    if (msg.includes('WINTUN_MISSING')) {
-      wintunModal.classList.remove('hidden');
-    } else {
-      showError(msg);
-      showToast(msg, 'error');
-    }
+  } finally {
+    toggleBusy = false;
+    btnConnect.disabled = false;
   }
 }
 
@@ -448,7 +474,10 @@ function showScreen(name) {
   } else if (name === 'servers') {
     renderServers();
   }
-  (screens[name] || homeScreen).classList.add('active');
+  const target = screens[name] || homeScreen;
+  target.classList.add('active');
+  // The screen the focus was on is gone; start from this one.
+  (target === homeScreen ? btnConnect : target.querySelector('button'))?.focus({ preventScroll: true });
 }
 
 // ── FIRST RUN ─────────────────────────────────────────────────────────
@@ -460,7 +489,7 @@ function finishWelcome() {
   showScreen('home');
 }
 
-// Step 1 picks "link" or "server"; step 2 is that page alone.
+// Step 1 picks how the user gets a connection; step 2 is that page alone.
 function welcomeStep(step) {
   document.querySelectorAll('#welcome-screen [data-welcome]').forEach(el => {
     el.style.display = el.dataset.welcome === step ? '' : 'none';
@@ -483,7 +512,7 @@ async function welcomeAdd(raw) {
   }
   try {
     parseOstpLink(raw);
-    importLinks([raw], {});
+    if (!importLinks([raw], {})) { showToast('This profile is already in the app', 'error'); return false; }
     showToast('Profile added', 'ok');
     finishWelcome();
     return true;
@@ -496,7 +525,7 @@ async function welcomeAdd(raw) {
 // Reads the QR code in a picture (a File or Blob) on the Rust side.
 async function welcomeQrFrom(blob) {
   const status = $('welcome-qr-status');
-  if (!blob || !/^image\//.test(blob.type || '')) { status.textContent = 'That is not a picture'; return; }
+  if (!blob || !/^image\//.test(blob.type || '')) { status.textContent = 'That file is not a picture'; return; }
   status.textContent = 'Reading the code…';
   try {
     const b64 = await new Promise((resolve, reject) => {
@@ -508,7 +537,7 @@ async function welcomeQrFrom(blob) {
     const text = await invoke('decode_qr', { imageBase64: b64 });
     if (!text) throw new Error('QR codes can be read only in the desktop app');
     status.textContent = 'Found a code';
-    if (!await welcomeAdd(text)) status.textContent = 'The code does not hold an ostp:// link or a subscription URL';
+    if (!await welcomeAdd(text)) status.textContent = 'The code was read, but it is not an ostp:// link or a subscription URL';
   } catch (e) {
     status.textContent = String(e?.message || e);
   }
@@ -521,7 +550,7 @@ function setupWelcome() {
     b.addEventListener('click', () => welcomeStep(b.dataset.go)));
   $('btn-welcome-paste').addEventListener('click', async () => {
     try { $('welcome-link').value = (await navigator.clipboard.readText()).trim(); }
-    catch { showToast('Clipboard is not available; paste with Ctrl+V', 'error'); }
+    catch { showToast('The clipboard cannot be read here. Click the field and press Ctrl+V.', 'error'); }
   });
   $('btn-welcome-link').addEventListener('click', () => {
     if (!$('welcome-link').value.trim()) { $('welcome-link').focus(); return; }
@@ -576,8 +605,7 @@ function importLinks(links, { baseName = '', serverId = null } = {}) {
     saveProfiles(profiles);
     saveActiveId(activeId);
     renderProfiles();
-    const cfg = buildConfig();
-    if (cfg) invoke('save_config', { jsonContent: JSON.stringify(cfg, null, 2) }).catch(() => {});
+    persistConfig();
   }
   return added;
 }
@@ -608,6 +636,9 @@ function profileCard(p) {
     const card = document.createElement('div');
     card.className = 'profile-card' + (p.id === activeId ? ' active' : '');
     card.dataset.id = p.id;
+    card.tabIndex = 0;
+    card.setAttribute('role', 'radio');
+    card.setAttribute('aria-checked', String(p.id === activeId));
     card.innerHTML = `
       <div class="profile-radio">
         <div class="profile-radio-dot"></div>
@@ -618,24 +649,32 @@ function profileCard(p) {
       </div>
       <span class="profile-transport-badge">${escHtml(p.transport === 'uot' && p.tls ? 'tls' : (p.transport || 'udp'))}</span>
       <div class="profile-actions">
-        <button class="profile-action-btn btn-share-profile" title="Share" data-id="${p.id}">
+        <button class="profile-action-btn btn-share-profile" title="Share profile" data-id="${p.id}">
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/><line x1="8.59" y1="13.51" x2="15.42" y2="17.49"/><line x1="15.41" y1="6.51" x2="8.59" y2="10.49"/></svg>
         </button>
-        <button class="profile-action-btn btn-edit-profile" title="Edit" data-id="${p.id}">
+        <button class="profile-action-btn btn-edit-profile" title="Edit profile" data-id="${p.id}">
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>
         </button>
       </div>
     `;
 
-    // Select profile on card click (not on action buttons)
-    card.addEventListener('click', e => {
-      if (e.target.closest('.profile-action-btn')) return;
+    // Select the profile on a click or Enter/Space (not on the action buttons)
+    const select = () => {
       activeId = p.id;
       saveActiveId(activeId);
       renderProfiles();
-      // Auto-save into config
-      const cfg = buildConfig();
-      if (cfg) invoke('save_config', { jsonContent: JSON.stringify(cfg, null, 2) }).catch(() => {});
+      persistConfig();
+      if (appState !== 'disconnected') showToast('The connection keeps using the previous profile until you reconnect');
+    };
+    card.addEventListener('click', e => {
+      if (e.target.closest('.profile-action-btn')) return;
+      select();
+    });
+    card.addEventListener('keydown', e => {
+      if (e.target !== card || (e.key !== 'Enter' && e.key !== ' ')) return;
+      e.preventDefault();
+      select();
+      document.querySelector(`.profile-card[data-id="${p.id}"]`)?.focus();
     });
 
     card.querySelector('.btn-edit-profile').addEventListener('click', e => {
@@ -660,7 +699,7 @@ function openProfileEditor(id) {
   if (id) {
     const p = profiles.find(p => p.id === id);
     if (!p) return;
-    profileModalTitle.textContent = 'Edit Profile';
+    profileModalTitle.textContent = 'Edit profile';
     pmName.value = p.name || '';
     pmServer.value = p.server || '';
     pmKey.value = p.key || '';
@@ -668,7 +707,7 @@ function openProfileEditor(id) {
     setTlsFields(p);
     btnProfileDelete.style.display = '';
   } else {
-    profileModalTitle.textContent = 'New Profile';
+    profileModalTitle.textContent = 'New profile';
     pmName.value = pmServer.value = pmKey.value = '';
     pmTransport.value = 'udp';
     setTlsFields({});
@@ -676,14 +715,15 @@ function openProfileEditor(id) {
   }
   pmKey.type = 'password';
   profileModal.classList.remove('hidden');
-  setTimeout(() => pmName.focus(), 80);
 }
 
 function saveProfileFromEditor() {
   const server = pmServer.value.trim();
   const key    = pmKey.value.trim();
-  if (!server) { showToast('Server address required', 'error'); return; }
-  if (!key)    { showToast('Access key required', 'error'); return; }
+  if (!server) { showToast('Enter the server address', 'error'); pmServer.focus(); return; }
+  try { splitHostPort(server); }
+  catch { showToast('The server must be written as host:port, for example 203.0.113.10:50000', 'error'); pmServer.focus(); return; }
+  if (!key)    { showToast('Enter the access key', 'error'); pmKey.focus(); return; }
 
   if (editingProfileId) {
     const idx = profiles.findIndex(p => p.id === editingProfileId);
@@ -714,13 +754,17 @@ function saveProfileFromEditor() {
   renderProfiles();
   showToast('Profile saved', 'ok');
 
-  // Persist config if this is the active profile
-  const cfg = buildConfig();
-  if (cfg) invoke('save_config', { jsonContent: JSON.stringify(cfg, null, 2) }).catch(() => {});
+  persistConfig();
 }
 
-function deleteEditingProfile() {
-  if (!editingProfileId) return;
+async function deleteEditingProfile() {
+  const doomed = profiles.find(p => p.id === editingProfileId);
+  if (!doomed) return;
+  const inUse = doomed.id === activeId && appState !== 'disconnected';
+  if (!await confirmBox(`Delete "${doomed.name || doomed.server}"?`,
+    'The profile and its access key are removed from this app.'
+      + (doomed.sub_id ? ' Its subscription brings it back on the next update.' : '')
+      + (inUse ? ' The connection stays up until you disconnect.' : ''), 'Delete profile')) return;
   profiles = profiles.filter(p => p.id !== editingProfileId);
   if (activeId === editingProfileId) {
     activeId = profiles[0]?.id || null;
@@ -729,6 +773,7 @@ function deleteEditingProfile() {
   saveProfiles(profiles);
   profileModal.classList.add('hidden');
   renderProfiles();
+  persistConfig();
   showToast('Profile deleted');
 }
 
@@ -788,13 +833,14 @@ function parseOstpLink(raw) {
   return out;
 }
 
+// Returns false when the text is not a usable link (the user has been told).
 function importFromLink(raw) {
-  if (isSubscriptionUrl(raw)) { addSubscription(raw.trim()); return; }
+  if (isSubscriptionUrl(raw)) { addSubscription(raw.trim()); return true; }
   try {
     const parsed = parseOstpLink(raw);
     // Pre-fill editor
     editingProfileId = null;
-    profileModalTitle.textContent = 'New Profile';
+    profileModalTitle.textContent = 'New profile';
     pmName.value = parsed.name;
     pmServer.value = parsed.server;
     pmKey.value = parsed.key;
@@ -802,9 +848,11 @@ function importFromLink(raw) {
     setTlsFields(parsed);
     btnProfileDelete.style.display = 'none';
     profileModal.classList.remove('hidden');
-    showToast('Link imported — tap Save', 'ok');
+    showToast('Check the details, then press Save', 'ok');
+    return true;
   } catch (err) {
     showToast(err.message, 'error');
+    return false;
   }
 }
 
@@ -824,7 +872,7 @@ function buildShareLink(p) {
 async function openShare(id) {
   const p = profiles.find(p => p.id === id);
   if (!p) return;
-  showShare('Share Profile', buildShareLink(p));
+  showShare('Share profile', buildShareLink(p));
 }
 
 async function showShare(title, text) {
@@ -839,7 +887,7 @@ async function showShare(title, text) {
     if (svg) shareQr.innerHTML = svg;
     else throw new Error('QR codes need the desktop app');
   } catch (e) {
-    err.textContent = 'QR code unavailable: ' + (e?.message || e);
+    err.textContent = 'The QR code could not be made: ' + (e?.message || e) + '. The link below still works.';
     err.style.display = '';
   }
 }
@@ -925,17 +973,16 @@ async function refreshSubscription(id, { quiet = false } = {}) {
     const doc = await invoke('fetch_subscription', { url: sub.url });
     if (!doc) throw new Error('subscriptions need the desktop app');
     const n = applySubscription(sub, doc);
-    if (!quiet) showToast(`Updated: ${n} profile(s)`, 'ok');
+    if (!quiet) showToast(`Subscription updated: ${n} ${n === 1 ? 'profile' : 'profiles'}`, 'ok');
   } catch (e) {
     sub.lastError = String(e?.message || e);
-    if (!quiet) showToast('Update failed: ' + sub.lastError, 'error');
+    if (!quiet) showToast('Could not update the subscription: ' + sub.lastError, 'error');
   } finally {
     refreshing.delete(id);
     saveSubs(subs);
     renderSubs();
     renderProfiles();
-    const cfg = buildConfig();
-    if (cfg) invoke('save_config', { jsonContent: JSON.stringify(cfg, null, 2) }).catch(() => {});
+    persistConfig();
   }
 }
 
@@ -947,7 +994,7 @@ async function addSubscription(url) {
     subs.push(sub);
     saveSubs(subs);
   }
-  showToast('Fetching subscription…');
+  showToast('Fetching the subscription…');
   await refreshSubscription(sub.id);
   const saved = loadSubs().find(s => s.id === sub.id);
   // A URL that never worked is not worth keeping.
@@ -959,7 +1006,7 @@ async function addSubscription(url) {
 
 async function removeSubscription(id) {
   const sub = loadSubs().find(s => s.id === id);
-  if (!sub || !await confirmBox(`Remove "${sub.name || sub.url}"?`, 'The subscription and its profiles are removed from this app.', 'Remove')) return;
+  if (!sub || !await confirmBox(`Remove "${sub.name || sub.url}"?`, 'The subscription and its profiles are removed from this app.', 'Remove subscription')) return;
   saveSubs(loadSubs().filter(s => s.id !== id));
   profiles = profiles.filter(p => p.sub_id !== id);
   if (!profiles.some(p => p.id === activeId)) { activeId = profiles[0]?.id || null; saveActiveId(activeId); }
@@ -988,13 +1035,13 @@ function renderSubs() {
       <div class="sub-head">
         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 11a9 9 0 0 1 9 9"/><path d="M4 4a16 16 0 0 1 16 16"/><circle cx="5" cy="19" r="1"/></svg>
         <div class="sub-name">${escHtml(s.name || s.url)}</div>
-        <button class="profile-action-btn sub-refresh${refreshing.has(s.id) ? ' spinning' : ''}" title="Update now">
+        <button class="profile-action-btn sub-refresh${refreshing.has(s.id) ? ' spinning' : ''}" title="Update subscription now">
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
         </button>
         <button class="profile-action-btn sub-share" title="Share subscription (QR)">
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/><path d="M14 14h3v3h-3zM18 18h3v3h-3z"/></svg>
         </button>
-        <button class="profile-action-btn sub-remove" title="Remove">
+        <button class="profile-action-btn sub-remove" title="Remove subscription">
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/></svg>
         </button>
       </div>
@@ -1006,7 +1053,7 @@ function renderSubs() {
     const own = card.querySelector('.sub-profiles');
     profiles.filter(p => p.sub_id === s.id).forEach(p => own.appendChild(profileCard(p)));
     card.querySelector('.sub-refresh').addEventListener('click', () => refreshSubscription(s.id));
-    card.querySelector('.sub-share').addEventListener('click', () => showShare('Share Subscription', s.url));
+    card.querySelector('.sub-share').addEventListener('click', () => showShare('Share subscription', s.url));
     card.querySelector('.sub-remove').addEventListener('click', () => removeSubscription(s.id));
     list.appendChild(card);
   }
@@ -1029,10 +1076,10 @@ function fillProberProfiles() {
       (p.name || '').toUpperCase().includes(carrierOf(p).toUpperCase()) ? '' : ' — ' + escHtml(carrierOf(p).toUpperCase())}</option>`).join('');
 }
 
-function prStatus(msg, busy = false) {
+function prStatus(msg, state = '') {
   const el = $('pr-status');
   el.textContent = msg;
-  el.className = 'prober-status' + (busy ? ' busy' : '');
+  el.className = 'prober-status' + (state ? ' ' + state : '');
 }
 
 function prCard(title, html) {
@@ -1045,13 +1092,14 @@ function prCard(title, html) {
 function setProberBusy(busy) {
   ['btn-pr-matrix', 'btn-pr-dpi'].forEach(id => { $(id).disabled = busy; });
   $('btn-pr-ttl').disabled = busy || !lastMatrix;
+  $('btn-pr-ttl').title = lastMatrix ? '' : 'Run “Check server” first';
 }
 
 async function runMatrix() {
   const p = profiles.find(x => x.id === $('pr-profile').value);
   if (!p) { showToast('Add a profile first', 'error'); return; }
   setProberBusy(true);
-  prStatus(`Handshaking with ${p.server} over every address and carrier…`, true);
+  prStatus(`Trying a handshake with ${p.server} on every address and carrier…`, 'busy');
   try {
     const rows = await invoke('run_prober_matrix', { request: { server: p.server, key: p.key, tls: proberTls(p) } });
     if (!rows) throw new Error('the prober needs the desktop app');
@@ -1069,10 +1117,10 @@ async function runMatrix() {
       <td>${r.outcome.success
         ? `<span class="pr-ok">✓ ${r.outcome.rtt_ms != null ? Math.round(r.outcome.rtt_ms) + ' ms' : 'ok'}</span>`
         : `<span class="${r.outcome.foreign_bytes ? 'pr-warn' : 'pr-bad'}">✕ ${escHtml(r.outcome.error || 'failed')}</span>`}</td></tr>`).join('')}</table>`;
-    prCard(`Server check — ${p.name || p.server}`, verdict + table);
+    prCard(`Server check: ${p.name || p.server}`, verdict + table);
     prStatus('Done.');
   } catch (e) {
-    prStatus('Check failed: ' + (e?.message || e));
+    prStatus('Could not run the check: ' + (e?.message || e), 'is-error');
   } finally {
     setProberBusy(false);
   }
@@ -1084,10 +1132,11 @@ async function runTtl() {
   // Scan the combination that failed with a foreign answer, else the first that worked.
   const target = rows.find(r => r.outcome.foreign_bytes) || rows.find(r => r.outcome.success) || rows[0];
   setProberBusy(true);
-  prStatus(`Scanning ${target.address} hop by hop (${carrierName(target.transport)}); up to 20 steps…`, true);
+  prStatus(`Scanning the path to ${target.address} (${carrierName(target.transport)}), up to 20 hops…`, 'busy');
   try {
     const rep = await invoke('run_prober_ttl', { request: {
       address: target.address, port: target.port, transport: target.transport, key: p.key, tls: proberTls(p), max_ttl: 20 } });
+    if (!rep) throw new Error('the prober needs the desktop app');
     const cells = rep.steps.map(s => `<span class="pr-ttl ${s.outcome}" title="${escHtml(s.preview || s.outcome)}">${s.ttl}</span>`).join('');
     let verdict;
     if (rep.first_foreign_ttl != null && (rep.first_genuine_ttl == null || rep.first_foreign_ttl < rep.first_genuine_ttl)) {
@@ -1097,11 +1146,11 @@ async function runTtl() {
     } else {
       verdict = '<div class="pr-verdict warn">No answer at any hop count.</div>';
     }
-    prCard(`Path scan — ${target.address}`, verdict + `<div class="pr-ttl-row">${cells}</div>
+    prCard(`Path scan: ${target.address}`, verdict + `<div class="pr-ttl-row">${cells}</div>
       <p class="field-hint">Green: the server. Red: someone else answered. Grey: no answer. Routing noise can blur this; read it as an estimate.</p>`);
     prStatus('Done.');
   } catch (e) {
-    prStatus('Path scan failed: ' + (e?.message || e));
+    prStatus('Could not run the path scan: ' + (e?.message || e), 'is-error');
   } finally {
     setProberBusy(false);
   }
@@ -1109,7 +1158,7 @@ async function runTtl() {
 
 async function runDpi() {
   setProberBusy(true);
-  prStatus('Testing what this network filters, around the VPN tunnel (10–30 s)…', true);
+  prStatus('Testing what this network filters, outside the VPN tunnel. This takes 10 to 30 seconds…', 'busy');
   try {
     const r = await invoke('run_dpi_battery');
     if (!r) throw new Error('the prober needs the desktop app');
@@ -1149,10 +1198,10 @@ async function runDpi() {
          ${r.path_summary ? `<p class="field-hint">${escHtml(r.path_summary.charAt(0).toUpperCase() + r.path_summary.slice(1))}.</p>` : ''}
          <table class="pr-table"><tr><th>Hop</th><th>Router</th><th>Network</th></tr>${path}</table>
          <p class="field-hint">A censor that resets or answers is placed by TTL; one that drops silently can only be narrowed to the hops before the destination network.</p>` : '';
-    prCard('Network DPI test', verdict + `<table class="pr-table">${checks}${rows}</table>` + tip + pathBlock);
+    prCard('Network test', verdict + `<table class="pr-table">${checks}${rows}</table>` + tip + pathBlock);
     prStatus('Done.');
   } catch (e) {
-    prStatus('DPI test failed: ' + (e?.message || e));
+    prStatus('Could not run the network test: ' + (e?.message || e), 'is-error');
   } finally {
     setProberBusy(false);
   }
@@ -1190,14 +1239,14 @@ async function checkUpdates({ manual }) {
     pendingUpdate = offer;
     const isBeta = offer.channel === 'beta';
     $('update-title').textContent = isBeta ? 'Beta version available' : 'Update available';
-    $('update-text').textContent = `${offer.tag} is out. You have ${r.current}.` +
+    $('update-text').textContent = `Version ${offer.tag} is available. You have ${r.current}.` +
       (isBeta && r.stable ? ` The newest stable release is ${r.stable.tag}.` : '');
     $('update-warning').classList.toggle('hidden', !isBeta);
     $('update-modal').classList.remove('hidden');
   } catch (e) {
-    if (manual) showToast('Update check failed: ' + (e?.message || e), 'error');
+    if (manual) showToast('Could not check for updates: ' + (e?.message || e), 'error');
   } finally {
-    if (manual) { btn.disabled = false; btn.textContent = 'Check for updates'; }
+    if (manual) { btn.disabled = false; btn.textContent = 'Check for updates now'; }
   }
 }
 
@@ -1279,7 +1328,13 @@ function collectAndSaveSettings() {
   // Only touch autostart when it actually changed — this is a registry write.
   if (s.launchStartup !== lastAppliedAutostart) {
     lastAppliedAutostart = s.launchStartup;
-    invoke('set_autostart', { enable: s.launchStartup }).catch(() => {});
+    invoke('set_autostart', { enable: s.launchStartup }).catch(err => {
+      // Put the switch back: it must not claim something the system refused.
+      lastAppliedAutostart = !s.launchStartup;
+      inLaunchStartup.checked = !s.launchStartup;
+      saveClientSettings({ ...loadClientSettings(), launchStartup: !s.launchStartup });
+      showToast('Could not change start with the system: ' + err, 'error');
+    });
   }
 
   // Hot-reload the tunnel only when something it actually reads has changed,
@@ -1293,13 +1348,14 @@ function collectAndSaveSettings() {
     ]);
     if (tunnelRelevant !== lastAppliedTunnelConfig) {
       clearTimeout(hotReloadTimer);
-      hotReloadTimer = setTimeout(() => {
+      hotReloadTimer = setTimeout(async () => {
         lastAppliedTunnelConfig = tunnelRelevant;
-        const cfg = buildConfig();
-        if (cfg) {
-          invoke('save_config', { jsonContent: JSON.stringify(cfg, null, 2) })
-            .then(() => invoke('reload_tunnel'))
-            .catch(() => {});
+        if (!await persistConfig()) return;
+        try {
+          const applied = await invoke('reload_tunnel');
+          showToast(applied ? 'Settings applied. TUN mode changes need a reconnect.' : 'Settings saved. Reconnect to apply them.', applied ? 'ok' : '');
+        } catch (err) {
+          showToast('Could not apply the settings to the running connection: ' + err, 'error');
         }
       }, 1500);
     }
@@ -1356,10 +1412,7 @@ window.addEventListener('DOMContentLoaded', async () => {
   // Tauri events
   if (window.__TAURI__?.event) {
     const { listen } = window.__TAURI__.event;
-    listen('tunnel-error', evt => {
-      setState('disconnected');
-      showError(String(evt.payload));
-    });
+    listen('tunnel-error', evt => onTunnelError(String(evt.payload)));
     listen('tray_connect', () => { if (appState === 'disconnected') handleToggle(); });
     listen('tray_disconnect', () => { if (appState !== 'disconnected') handleToggle(); });
   }
@@ -1397,7 +1450,7 @@ window.addEventListener('DOMContentLoaded', async () => {
   $('btn-pr-dpi').addEventListener('click', runDpi);
   $('pr-profile').addEventListener('change', () => { lastMatrix = null; setProberBusy(false); });
 
-  // GUI version shown at the bottom of Settings
+  // GUI version shown at the bottom of More settings
   const appVersionEl = $('app-version');
   if (appVersionEl) {
     const setV = v => { appVersionEl.textContent = 'OSTP GUI ' + v; };
@@ -1420,9 +1473,8 @@ window.addEventListener('DOMContentLoaded', async () => {
 
   addFromLink.addEventListener('click', () => {
     addMenu.classList.add('hidden');
-    linkModal.classList.remove('hidden');
-    setTimeout(() => linkInput.focus(), 80);
     linkInput.value = '';
+    linkModal.classList.remove('hidden');
   });
 
   addFromClipboard.addEventListener('click', async () => {
@@ -1432,10 +1484,10 @@ window.addEventListener('DOMContentLoaded', async () => {
       if (text.trim().startsWith('ostp://') || isSubscriptionUrl(text)) {
         importFromLink(text.trim());
       } else {
-        showToast('No ostp:// link or subscription URL in clipboard', 'error');
+        showToast('The clipboard has no ostp:// link or subscription URL', 'error');
       }
     } catch {
-      showToast('Cannot read clipboard', 'error');
+      showToast('The clipboard cannot be read here. Use "Add a link" and press Ctrl+V.', 'error');
     }
   });
 
@@ -1447,8 +1499,9 @@ window.addEventListener('DOMContentLoaded', async () => {
   // Link modal
   btnLinkCancel.addEventListener('click', () => linkModal.classList.add('hidden'));
   btnLinkImport.addEventListener('click', () => {
-    importFromLink(linkInput.value);
-    linkModal.classList.add('hidden');
+    const raw = linkInput.value.trim();
+    if (!raw) { linkInput.focus(); return; }
+    if (importFromLink(raw)) linkModal.classList.add('hidden');
   });
   linkInput.addEventListener('keydown', e => { if (e.key === 'Enter') btnLinkImport.click(); });
   linkModal.addEventListener('click', e => { if (e.target === linkModal) linkModal.classList.add('hidden'); });
@@ -1456,9 +1509,15 @@ window.addEventListener('DOMContentLoaded', async () => {
   // Profile editor modal
   btnProfileCancel.addEventListener('click', () => profileModal.classList.add('hidden'));
   btnProfileSave.addEventListener('click', saveProfileFromEditor);
+  profileModal.addEventListener('keydown', e => {
+    if (e.key === 'Enter' && e.target.tagName === 'INPUT' && e.target.type !== 'checkbox') btnProfileSave.click();
+  });
   btnProfileDelete.addEventListener('click', deleteEditingProfile);
   btnPeekPm.addEventListener('click', () => {
-    pmKey.type = pmKey.type === 'password' ? 'text' : 'password';
+    const show = pmKey.type === 'password';
+    pmKey.type = show ? 'text' : 'password';
+    btnPeekPm.setAttribute('aria-label', show ? 'Hide key' : 'Show key');
+    btnPeekPm.title = show ? 'Hide key' : 'Show key';
   });
   profileModal.addEventListener('click', e => { if (e.target === profileModal) profileModal.classList.add('hidden'); });
 
@@ -1491,14 +1550,10 @@ window.addEventListener('DOMContentLoaded', async () => {
 
   // Wintun modal
   btnWintunCancel.addEventListener('click', () => wintunModal.classList.add('hidden'));
-  if (btnWintunOpen && window.__TAURI__) {
-    btnWintunOpen.addEventListener('click', e => {
-      e.preventDefault();
-      const opener = window.__TAURI__?.opener || window.__TAURI__?.shell;
-      if (opener?.open) opener.open('https://www.wintun.net');
-      else window.open('https://www.wintun.net', '_blank');
-    });
-  }
+  btnWintunOpen.addEventListener('click', e => {
+    e.preventDefault();
+    openUrl('https://www.wintun.net');
+  });
   wintunModal.addEventListener('click', e => { if (e.target === wintunModal) wintunModal.classList.add('hidden'); });
 
   // Client settings — wire all inputs
@@ -1528,46 +1583,65 @@ window.addEventListener('DOMContentLoaded', async () => {
   });
   fragModal.addEventListener('click', e => { if (e.target === fragModal) fragModal.classList.add('hidden'); });
 
-  // ── Global Keyboard Shortcuts (TUI emulation) ─────────────────────
-  window.addEventListener('keydown', async e => {
-    // Ignore if typing in an input or textarea
-    if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA' || e.target.tagName === 'SELECT') return;
-
-    if (e.code === 'Space') {
-      e.preventDefault();
-      handleToggle();
-    } else if (e.code === 'Tab') {
-      e.preventDefault();
-      if (profiles.length > 0) {
-        let idx = profiles.findIndex(p => p.id === activeId);
-        idx = (idx + 1) % profiles.length;
-        activeId = profiles[idx].id;
-        saveActiveId(activeId);
-        renderProfiles();
-        const cfg = buildConfig();
-        if (cfg) invoke('save_config', { jsonContent: JSON.stringify(cfg, null, 2) }).catch(() => {});
-        showToast('Profile: ' + profiles[idx].name);
-      }
-    } else if (e.key === 'b' || e.key === 'B') {
-      // Hide to tray (background)
-      try { invoke('hide_window'); } catch { window.close(); }
-    } else if (e.key === 'q' || e.key === 'Q' || e.key === 'Escape') {
-      // Quit
-      if (e.key === 'Escape') {
-        // if modals are open, don't quit
-        if (!linkModal.classList.contains('hidden') || 
-            !profileModal.classList.contains('hidden') || 
-            !shareModal.classList.contains('hidden') || 
-            !wintunModal.classList.contains('hidden') ||
-            !junkModal.classList.contains('hidden') ||
-            !fragModal.classList.contains('hidden') ||
-            !$('update-modal').classList.contains('hidden') ||
-            !addMenu.classList.contains('hidden')) {
-          return;
-        }
-      }
-      try { invoke('close_window'); } catch { window.close(); }
-    }
-  });
+  setupAccessibility();
 });
 
+// ── ACCESSIBILITY ─────────────────────────────────────────────────────
+// Names for controls whose text is elsewhere, dialog semantics, and the
+// keyboard rules for dialogs: Escape closes, Tab stays inside.
+function setupAccessibility() {
+  document.querySelectorAll('.toggle input').forEach(i => {
+    const name = i.closest('.toggle-row')?.querySelector('.toggle-name');
+    if (name) i.setAttribute('aria-label', name.textContent.trim());
+  });
+
+  // Buttons made later (cards, user lists) only have a title: reuse it as the name.
+  const label = n => {
+    if (n.nodeType !== 1) return;
+    if (n.matches('button[title]:not([aria-label])')) n.setAttribute('aria-label', n.title);
+    n.querySelectorAll('button[title]:not([aria-label])').forEach(b => b.setAttribute('aria-label', b.title));
+  };
+  label(document.body);
+  new MutationObserver(ms => ms.forEach(r => r.addedNodes.forEach(label))).observe(document.body, { childList: true, subtree: true });
+
+  document.querySelectorAll('.modal-overlay').forEach(overlay => {
+    const box = overlay.querySelector('.modal-content');
+    box.setAttribute('role', 'dialog');
+    box.setAttribute('aria-modal', 'true');
+    const title = box.querySelector('.modal-title');
+    if (title) { title.id = title.id || overlay.id + '-title'; box.setAttribute('aria-labelledby', title.id); }
+    let opener = null;
+    new MutationObserver(() => {
+      if (!overlay.classList.contains('hidden')) {
+        opener = document.activeElement;
+        if (!overlay.contains(document.activeElement)) {
+          (overlay.querySelector('input:not([readonly]):not([type="file"]), textarea, select') || overlay.querySelector('.btn'))?.focus();
+        }
+      } else if (opener) {
+        if (document.contains(opener)) opener.focus();
+        opener = null;
+      }
+    }).observe(overlay, { attributes: true, attributeFilter: ['class'] });
+  });
+
+  const topDialog = () => [...document.querySelectorAll('.modal-overlay:not(.hidden)')].pop();
+  document.addEventListener('keydown', e => {
+    if (e.key === 'Escape') {
+      if (!addMenu.classList.contains('hidden')) { addMenu.classList.add('hidden'); btnAddProfile.focus(); return; }
+      // The button marked data-dismiss is the dialog's way out (Cancel, Close,
+      // Later). It is disabled while a server job runs, which keeps Escape
+      // from hiding a job in progress.
+      topDialog()?.querySelector('[data-dismiss]:not(:disabled)')?.click();
+    } else if (e.key === 'Tab') {
+      const dlg = topDialog();
+      if (!dlg) return;
+      const items = [...dlg.querySelectorAll('button, input, textarea, select, a[href], summary')]
+        .filter(x => !x.disabled && x.offsetParent !== null && x.type !== 'file');
+      if (!items.length) return;
+      const first = items[0], last = items[items.length - 1];
+      if (!dlg.contains(document.activeElement)) { e.preventDefault(); first.focus(); }
+      else if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
+      else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
+    }
+  });
+}
