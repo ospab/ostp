@@ -35,6 +35,12 @@ $isAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIde
 if (-not (Test-Path $InstallDir)) {
     try {
         New-Item -ItemType Directory -Path $InstallDir -ErrorAction Stop | Out-Null
+        if ($isAdmin) {
+            # A folder made under C:\ inherits "Authenticated Users: Modify". It is
+            # then put on the machine PATH and holds binaries that run elevated,
+            # so any local user could replace them.
+            & icacls $InstallDir /inheritance:r /grant:r "*S-1-5-18:(OI)(CI)F" "*S-1-5-32-544:(OI)(CI)F" "*S-1-5-32-545:(OI)(CI)RX" | Out-Null
+        }
     } catch {
         Write-Error "Cannot create '$InstallDir'. Run as Administrator."
         exit 1
