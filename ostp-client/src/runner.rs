@@ -182,13 +182,10 @@ pub async fn run_client(config: crate::config::ClientConfig) -> Result<()> {
     run_client_core(config, metrics, shutdown_rx, None).await
 }
 
-/// Runs the client with auto-reconnect: any subsystem ending — a network
-/// change stranding the TUN adapter/UDP socket on a dead interface, the OSTP
-/// protocol connection dropping in a way the inner Bridge-level retry (see
-/// `UiEvent::TunnelStopped` below) couldn't recover from, or a proxy/TUN task
-/// crashing outright — triggers a full clean restart (fresh DNS resolution,
-/// fresh Bridge, fresh TUN/proxy) with exponential backoff, instead of the
-/// client just dying. Only an explicit shutdown request stops this loop.
+/// Runs the client until shutdown. Reconnecting to the server is the bridge's
+/// job (one policy: move the session, else handshake again). This loop only
+/// restarts everything when a task dies outright (proxy listener, TUN device),
+/// with backoff, so a crashed component does not end the client.
 pub async fn run_client_core(
     config: crate::config::ClientConfig,
     metrics: Arc<BridgeMetrics>,
@@ -306,7 +303,6 @@ async fn run_client_once(
     let debug_enabled = config.debug;
 
     // Headless event logger
-    let cmd_tx_clone = cmd_tx.clone();
     tokio::spawn(async move {
         let mut last_status = None;
         while let Some(msg) = ui_rx.recv().await {
@@ -331,12 +327,7 @@ async fn run_client_once(
                     }
                 }
                 crate::app::UiEvent::TunnelStopped => {
-                    println!("[ostp] Connection interrupted. Reconnecting in 5 seconds...");
-                    let cmd_tx_inner = cmd_tx_clone.clone();
-                    tokio::spawn(async move {
-                        tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
-                        let _ = cmd_tx_inner.send(BridgeCommand::ToggleTunnel).await;
-                    });
+                    println!("[ostp] Tunnel stopped");
                 }
             }
         }
@@ -457,7 +448,9 @@ fn is_essential_log(text: &str) -> bool {
             | "Bridge stopped"
             | "Runtime config reloaded"
             | "Connecting to remote server..."
-    ) || text.starts_with("Connected to ")
+    ) || text.starts_with("Reconnect attempt")
+        || text.starts_with("Connection attempt")
+        || text.starts_with("Connected to ")
         || text.starts_with("TURN relay allocated")
         || text.starts_with("TURN allocation failed")
         || text.starts_with("Allocating TURN relay")

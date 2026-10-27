@@ -24,31 +24,20 @@ use crate::tunnel::{ProxyEvent, ProxyToClientMsg};
 /// candidate address is tried.
 const UOT_CONNECT_TIMEOUT: Duration = Duration::from_secs(4);
 
-/// How long to keep retrying a resume-triggered reconnect before handing the
-/// problem back to the ordinary stall path. That path is what releases the
-/// system proxy, so this is really a bound on how long the machine may be left
-/// with no working internet at all after waking.
-const RESUME_RECONNECT_GIVE_UP: Duration = Duration::from_secs(45);
-
-/// Silence after which the session is moved to a fresh socket. Pings go out on
-/// every keepalive tick and a healthy path answers within one RTT, so two
-/// ticks of silence already mean the path is gone or blocked. Moving the
-/// session costs no handshake and keeps every stream, so it is tried long
-/// before the 25s full reconnect.
-const STALL_MIGRATE_AFTER: Duration = Duration::from_secs(10);
+/// Silence after which the path is considered dead and recovery starts. Raised
+/// above two keepalive intervals when those are long.
+const STALL_AFTER: Duration = Duration::from_secs(10);
 
 /// How long a moved session gets to show a sign of life on its new path.
 const MIGRATION_TIMEOUT_MIN: Duration = Duration::from_secs(4);
 
-/// After a move got no answer, no further move is tried for this long: the
-/// server most likely no longer knows the session.
-const MIGRATION_BACKOFF: Duration = Duration::from_secs(30);
+/// Pause after a failed full-handshake attempt, by attempt number; the last
+/// value repeats until the user stops the tunnel.
+const RETRY_BACKOFF_SECS: [u64; 6] = [1, 2, 5, 10, 20, 30];
 
-/// A session move in progress: sockets are already swapped, the move counts
-/// as done once an authenticated datagram arrives after `started`.
-struct PathMigration {
-    started: Instant,
-}
+/// Outage after which the system proxy is released (proxy mode, no kill switch)
+/// so the machine has internet while the tunnel keeps reconnecting.
+const PROXY_RELEASE_AFTER: Duration = Duration::from_secs(45);
 
 static SOCKET_PROTECTOR: std::sync::OnceLock<Box<dyn Fn(i32) -> bool + Send + Sync>> = std::sync::OnceLock::new();
 
@@ -92,12 +81,11 @@ fn collect_datagrams(action: ProtocolAction, out: &mut Vec<Bytes>) {
 struct SessionState {
     socket: crate::transport::Transport,
     machine: ProtocolMachine,
-    /// Handle to this session's spawned receiver task. Held so the task is
-    /// aborted when the session is dropped (e.g. replaced on reconnect).
-    /// Otherwise, on a dead connection the task blocks forever in recv() while
-    /// keeping the old socket alive — leaking a task + socket on every
-    /// reconnect, which piles up across sleep/resume cycles.
+    /// Aborted on drop: on a dead connection the task would otherwise block in
+    /// recv() forever and leak itself and its socket on every reconnect.
     rx_task: tokio::task::AbortHandle,
+    /// Last authenticated datagram from the server on this session.
+    last_recv: Instant,
 }
 
 impl Drop for SessionState {
@@ -106,8 +94,6 @@ impl Drop for SessionState {
     }
 }
 
-/// Spawn the per-session receiver loop that reads inbound datagrams from the
-/// transport and forwards them to the bridge, returning an AbortHandle so the
 /// Build a fresh, valid handshake datagram for the TTL-desync hop probe. Each
 /// call uses a new session id and timestamp so the server's anti-replay does not
 /// drop it as a duplicate. Returns an empty vec on the (unexpected) construction
@@ -155,9 +141,9 @@ fn build_probe_handshake(
     }
 }
 
-/// task is torn down when its `SessionState` is dropped. Consolidates the three
-/// previously-duplicated inline copies (initial connect, network-change, and
-/// keepalive reconnect).
+/// Spawns the per-session receiver loop that forwards inbound datagrams to the
+/// bridge. The returned handle lets the task be torn down with its
+/// `SessionState`.
 fn spawn_session_receiver(
     socket: crate::transport::Transport,
     session_index: usize,
@@ -191,9 +177,36 @@ fn spawn_session_receiver(
     .abort_handle()
 }
 
+/// Where the tunnel is. One state, one policy: `Up` goes to `Moving` when the
+/// path looks dead (the session is carried to a new socket, streams kept), and
+/// to `Down` when that fails; `Down` retries a full handshake to the same
+/// server over the same transport until it works or the user stops.
+#[derive(Clone, Copy, PartialEq)]
+enum Link {
+    /// Stopped by the user.
+    Idle,
+    Up,
+    /// Sockets are swapped; done once every session has had an authenticated
+    /// datagram after `started`.
+    Moving { started: Instant },
+    Down { since: Instant, attempt: u32, next_try: Instant },
+}
+
+/// Sessions that finished their handshake, not yet installed.
+struct Established {
+    sessions: Vec<SessionState>,
+    udp_rx: mpsc::Receiver<(usize, Bytes)>,
+    rtt_ms: f64,
+}
+
+/// What cut a connection attempt short.
+enum Interrupt {
+    NetworkChanged,
+    Command(Option<BridgeCommand>),
+    Shutdown,
+}
+
 pub struct Bridge {
-    running: bool,
-    pub debug: bool,
     profile: TrafficProfile,
     server_addr: String,
     local_bind_addr: String,
@@ -201,6 +214,7 @@ pub struct Bridge {
     access_key: Bytes,
     handshake_timeout_ms: u64,
     io_timeout_ms: u64,
+    pub debug: bool,
 
     pub keepalive_interval_sec: u64,
     pub mode: String,
@@ -221,8 +235,8 @@ pub struct Bridge {
     pub tls_sni: Option<String>,
     pub tls_insecure: bool,
     pub ws_path: Option<String>,
-    /// Cached result of the hop-distance measurement, so the TTL sweep runs once
-    /// rather than on every (re)connect. Cleared on a network change.
+    /// Hop-distance measurement for TTL-desync, cached so the sweep does not run
+    /// on every (re)connect; cleared when the network changes.
     ttl_desync_measured: Option<u8>,
     pub mtu: usize,
     pub kill_switch: bool,
@@ -233,30 +247,20 @@ pub struct Bridge {
     sample_recv: u64,
     last_rtt_ms: f64,
     last_sample_at: Instant,
-    last_valid_recv: Instant,
-    /// Set when a suspend/resume is detected, cleared once a reconnect actually
-    /// succeeds. Waking is precisely when the network is least likely to be
-    /// ready — Wi-Fi has not reassociated yet — so a single attempt fired
-    /// milliseconds after resume usually fails, and a one-shot forced reconnect
-    /// then fell back to the ordinary 25s stall heuristic. That heuristic keys
-    /// off a monotonic clock which does not advance while the machine is
-    /// asleep, so it could take a further 25s of real uptime to fire, or not
-    /// fire at all. Retrying until success removes the dependency on either.
-    forced_reconnect_pending: bool,
-    last_forced_reconnect_try: Instant,
-    /// Wall-clock start of the current resume-reconnect campaign, used to bound
-    /// it. Wall clock rather than Instant because the monotonic clock does not
-    /// advance across suspend on Windows, so it cannot measure anything that
-    /// begins at wake.
-    forced_reconnect_started: Option<SystemTime>,
-    migration: Option<PathMigration>,
-    migration_failed_at: Option<Instant>,
+
+    link: Link,
+    sessions: Vec<SessionState>,
+    udp_rx: Option<mpsc::Receiver<(usize, Bytes)>>,
+    stream_map: std::collections::HashMap<u16, usize>,
+    proxy_guard: Option<crate::sysproxy::SystemProxyGuard>,
+    /// Whether this run has been connected before, to word the logs and to
+    /// clear stale proxy events only on a reconnect.
+    established_once: bool,
 }
 
 impl Bridge {
     pub fn new(config: &ClientConfig, metrics: Arc<BridgeMetrics>) -> Result<Self> {
         Ok(Self {
-            running: false,
             debug: config.debug,
             profile: TrafficProfile::JsonRpc,
             server_addr: config.ostp.server_addr.clone(),
@@ -295,15 +299,15 @@ impl Bridge {
             sample_recv: 0,
             last_rtt_ms: 0.0,
             last_sample_at: Instant::now(),
-            last_valid_recv: Instant::now(),
-            forced_reconnect_pending: false,
-            last_forced_reconnect_try: Instant::now(),
-            forced_reconnect_started: None,
-            migration: None,
-            migration_failed_at: None,
+
+            link: Link::Idle,
+            sessions: Vec::new(),
+            udp_rx: None,
+            stream_map: std::collections::HashMap::new(),
+            proxy_guard: None,
+            established_once: false,
         })
     }
-
 
     pub async fn run(
         mut self,
@@ -314,22 +318,16 @@ impl Bridge {
         proxy_tx: mpsc::UnboundedSender<(u16, ProxyToClientMsg)>,
     ) -> Result<()> {
         let mut metrics_tick = interval(Duration::from_millis(500));
-        let mut keepalive_tick = tokio::time::interval(Duration::from_secs(self.keepalive_interval_sec.max(1)));
-        let mut retransmit_tick = tokio::time::interval(Duration::from_millis(10));
-        // CRITICAL for suspend/resume: the default MissedTickBehavior is `Burst`,
-        // which after a laptop sleep or a phone backgrounding the app fires ALL
-        // the ticks that "should" have happened during the gap back-to-back. For
-        // the 10ms retransmit tick that is tens of thousands of instant ticks on
-        // resume — a CPU storm that hangs the bridge and manifests as the app
-        // freezing or getting stuck "Connecting". Skip missed ticks instead.
+        let mut keepalive_tick = interval(Duration::from_secs(self.keepalive_interval_sec.max(1)));
+        let mut retransmit_tick = interval(Duration::from_millis(10));
+        // The default `Burst` replays every tick missed during a suspend, which
+        // for the 10 ms retransmit tick is a CPU storm right after waking.
         metrics_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
         keepalive_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
         retransmit_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
-        // Wall-clock anchor for suspend/resume detection. tokio's timers run on a
-        // monotonic clock; comparing it against wall-clock lets us notice that
-        // the machine slept (or the app was frozen in the background) and force
-        // one clean reconnect instead of trying to resume a long-dead session.
+        // tokio's clock does not advance while the machine sleeps on Windows,
+        // so a suspend is only visible as a jump of the wall clock.
         let mut last_wall_check = SystemTime::now();
         let init_msg = if self.mode == "tun" {
             "Bridge initialized (TUN mode)".to_string()
@@ -338,171 +336,83 @@ impl Bridge {
         };
         tx.send(UiEvent::Log(init_msg)).await.ok();
 
-        let mut sessions_opt: Option<Vec<SessionState>> = None;
-        let mut udp_rx_opt: Option<mpsc::Receiver<(usize, Bytes)>> = None;
-        let mut proxy_guard: Option<crate::sysproxy::SystemProxyGuard> = None;
-        let mut stream_map: std::collections::HashMap<u16, usize> = std::collections::HashMap::new();
-
         loop {
             // Upload is held back when the window has room but the pacing
-            // bucket is empty this instant. It refills in microseconds, so
-            // wake exactly then; otherwise nothing re-checked until the next
-            // event, up to the 10 ms retransmit tick.
-            let pace_wait = sessions_opt.as_ref().and_then(|s| {
-                s.iter()
-                    .filter(|ses| ses.machine.in_flight_count() < ses.machine.cwnd_packets() && !ses.machine.can_pace_packet())
-                    .map(|ses| ses.machine.time_to_pace())
-                    .min()
-            });
+            // bucket is empty this instant; wake exactly when it refills.
+            let pace_wait = self
+                .sessions
+                .iter()
+                .filter(|ses| ses.machine.in_flight_count() < ses.machine.cwnd_packets() && !ses.machine.can_pace_packet())
+                .map(|ses| ses.machine.time_to_pace())
+                .min();
+            let next_try = match self.link {
+                Link::Down { next_try, .. } => Some(next_try),
+                _ => None,
+            };
             tokio::select! {
                 biased;
                 _ = tokio::time::sleep(pace_wait.unwrap_or_default()), if pace_wait.is_some() => {}
                 _ = shutdown.changed() => {
                     if *shutdown.borrow() {
-                        // Tell the server the session is over, so it frees it now
-                        // instead of holding it for its idle timeout (10 minutes):
-                        // otherwise every reconnect in that window counts as one
-                        // more live session of this user. Best effort, bounded so
-                        // a dead TCP path cannot hold up the stop.
-                        if let Some(sessions) = sessions_opt.as_mut() {
-                            for session in sessions.iter_mut() {
-                                if let Ok(ProtocolAction::SendDatagram(frame)) = session.machine.on_event(OstpEvent::Close) {
-                                    let send = send_datagram(&session.socket, &frame, self.transport_mode == "udp");
-                                    let _ = tokio::time::timeout(Duration::from_millis(300), send).await;
-                                }
-                            }
-                        }
-                        self.running = false;
-                        self.metrics.connection_state.store(0, Ordering::Relaxed);
-                        #[allow(unused_assignments)]
-                        { proxy_guard = None; }
-                        stream_map.clear();
-                        self.reset_proxy_streams(&tx, &proxy_tx, "manual stop");
                         break;
                     }
                 }
                 udp_msg = async {
-                    match udp_rx_opt.as_mut() {
+                    match self.udp_rx.as_mut() {
                         Some(rx) => rx.recv().await,
                         None => std::future::pending().await,
                     }
-                }, if self.running => {
-                    self.handle_inbound_udp(udp_msg, &mut sessions_opt, &mut udp_rx_opt, &mut proxy_guard, &mut stream_map, &tx, &proxy_tx).await;
+                }, if self.udp_rx.is_some() => {
+                    self.handle_inbound_udp(udp_msg, &tx, &proxy_tx).await;
                 }
                 cmd = bridge_rx.recv() => {
-                    if !self.handle_bridge_cmd(cmd, &mut bridge_rx, &mut sessions_opt, &mut udp_rx_opt, &mut proxy_guard, &mut stream_map, &tx, &proxy_tx).await {
+                    if !self.handle_bridge_cmd(cmd, &mut bridge_rx, &tx, &proxy_tx).await {
+                        break;
+                    }
+                }
+                _ = tokio::time::sleep_until(next_try.unwrap_or_else(Instant::now)), if next_try.is_some() => {
+                    if !self.reconnect_attempt(&mut bridge_rx, &mut shutdown, &tx, &proxy_tx, &mut proxy_rx).await {
                         break;
                     }
                 }
                 _ = metrics_tick.tick() => {
-                    // Suspend/resume detection: the wall clock jumps forward on
-                    // wake even when the monotonic timer clock does not, so a
-                    // large gap here means the machine slept / the app was frozen.
-                    // The sockets are likely stale, so restore the session now
-                    // rather than waiting on stall heuristics: a move to a fresh
-                    // socket first, and a full reconnect if the server has
-                    // evicted the session meanwhile (it does after 10 min idle).
                     let wall_gap = last_wall_check.elapsed().unwrap_or_default();
                     last_wall_check = SystemTime::now();
-                    if self.running && wall_gap > Duration::from_secs(15) {
+                    if wall_gap > Duration::from_secs(15) && self.link != Link::Idle {
                         let _ = tx.send(UiEvent::Log(format!(
-                            "Resumed after ~{}s suspend — restoring the connection", wall_gap.as_secs()
+                            "Resumed after ~{}s suspend", wall_gap.as_secs()
                         ))).await;
-                        self.forced_reconnect_pending = true;
-                        self.forced_reconnect_started = Some(SystemTime::now());
-                        self.last_forced_reconnect_try = Instant::now() - Duration::from_secs(60);
+                        self.recover_now("Resumed after suspend", &tx, &proxy_tx).await;
                     }
-
-                    // Give up if resume reconnects keep failing. Retrying forever
-                    // looks harmless but is not: the system proxy stays pointed at
-                    // our local listener the whole time, so the machine has NO
-                    // working internet — not merely no tunnel — while the UI sits
-                    // on "connecting". Handing the retry to the ordinary keepalive
-                    // path restores the proxy through its hard-timeout branch,
-                    // which force=true deliberately skips.
-                    //
-                    // Measured on the wall clock: Instant does not advance across
-                    // suspend on Windows (QPC stops), so a monotonic deadline can
-                    // not bound anything that starts at wake.
-                    if self.forced_reconnect_pending {
-                        let pending_for = self
-                            .forced_reconnect_started
-                            .and_then(|t| t.elapsed().ok())
-                            .unwrap_or_default();
-                        if pending_for > RESUME_RECONNECT_GIVE_UP {
-                            self.forced_reconnect_pending = false;
-                            self.forced_reconnect_started = None;
-                            let _ = tx.send(UiEvent::Log(format!(
-                                "Reconnect after suspend failed for {}s — releasing the system \
-                                 proxy so normal traffic works; will keep retrying in the \
-                                 background",
-                                pending_for.as_secs()
-                            ))).await;
-                            // Make the ordinary stall path fire on the next
-                            // keepalive tick: it is the one that tears the proxy
-                            // back down (or, with kill switch on, deliberately
-                            // keeps blocking).
-                            self.last_valid_recv = Instant::now()
-                                .checked_sub(Duration::from_secs(3600))
-                                .unwrap_or_else(Instant::now);
-                        }
-                    }
-
-                    // Keep retrying a resume-triggered reconnect until one lands.
-                    // The first attempt fires within half a second of waking, when
-                    // the NIC is typically still reassociating, so treating it as
-                    // one-shot left the tunnel dead until some other timer noticed.
-                    if self.running
-                        && self.forced_reconnect_pending
-                        && self.last_forced_reconnect_try.elapsed() >= Duration::from_secs(3)
-                    {
-                        self.last_forced_reconnect_try = Instant::now();
-                        self.handle_keepalive(true, &mut sessions_opt, &mut udp_rx_opt, &mut proxy_guard, &mut stream_map, &tx, &proxy_tx, &mut proxy_rx).await;
-                        // handle_keepalive refreshes last_valid_recv only when a
-                        // session was actually established, so this is a real
-                        // success check rather than "we tried".
-                        if self.last_valid_recv.elapsed() < Duration::from_secs(3) {
-                            self.forced_reconnect_pending = false;
-                            self.forced_reconnect_started = None;
-                            let _ = tx.send(UiEvent::Log("Reconnected after suspend".into())).await;
-                        }
-                    }
-                    if self.running {
-                        self.check_migration(&tx).await;
-                    }
-                    if self.running {
+                    self.check_link(&tx, &proxy_tx).await;
+                    if self.link != Link::Idle {
                         self.emit_metrics(&tx).await;
                     }
                 }
                 _ = keepalive_tick.tick() => {
-                    if self.running {
-                        self.handle_keepalive(false, &mut sessions_opt, &mut udp_rx_opt, &mut proxy_guard, &mut stream_map, &tx, &proxy_tx, &mut proxy_rx).await;
-                    }
+                    self.send_keepalives().await;
                 }
                 _ = retransmit_tick.tick() => {
-                    if self.running {
-                        self.handle_retransmit(&mut sessions_opt, &mut udp_rx_opt, &mut proxy_guard, &mut stream_map, &tx, &proxy_tx).await;
-                    }
+                    self.handle_retransmit(&tx, &proxy_tx).await;
                 }
-                proxy_ev = proxy_rx.recv(), if self.running && sessions_opt.as_ref().map(|s| {
+                proxy_ev = proxy_rx.recv(), if self.link != Link::Idle && (self.sessions.is_empty() || self.sessions.iter().any(|ses| {
                     // Two independent gates. cwnd bounds how much may be in
                     // flight (the controller caps it at MAX_CWND_PACKETS);
                     // pacing bounds how FAST it is released. Without the
                     // second, a full window goes out back-to-back and lands in
                     // the bottleneck's buffer as standing queue rather than
-                    // throughput — the thing that produced multi-second RTT.
-                    // The `pace_wait` branch above wakes the loop when pacing
-                    // allows the next packet.
-                    s.iter().any(|ses| {
-                        ses.machine.in_flight_count() < ses.machine.cwnd_packets()
-                            && ses.machine.can_pace_packet()
-                    })
-                }).unwrap_or(true) => {
-                    self.handle_proxy_event(proxy_ev, &mut sessions_opt, &mut stream_map, &tx, &proxy_tx).await;
+                    // throughput. The `pace_wait` branch wakes the loop when
+                    // pacing allows the next packet.
+                    ses.machine.in_flight_count() < ses.machine.cwnd_packets()
+                        && ses.machine.can_pace_packet()
+                })) => {
+                    self.handle_proxy_event(proxy_ev, &tx, &proxy_tx).await;
                 }
             }
         }
 
+        self.close_sessions().await;
+        self.reset_proxy_streams(&tx, &proxy_tx, "bridge stopped");
         tx.send(UiEvent::Log("Bridge stopped".to_string())).await.ok();
         Ok(())
     }
@@ -510,156 +420,110 @@ impl Bridge {
     async fn handle_inbound_udp(
         &mut self,
         udp_msg: Option<(usize, Bytes)>,
-        sessions_opt: &mut Option<Vec<SessionState>>,
-        udp_rx_opt: &mut Option<mpsc::Receiver<(usize, Bytes)>>,
-        _proxy_guard: &mut Option<crate::sysproxy::SystemProxyGuard>,
-        stream_map: &mut std::collections::HashMap<u16, usize>,
         tx: &mpsc::Sender<UiEvent>,
         proxy_tx: &mpsc::UnboundedSender<(u16, ProxyToClientMsg)>,
     ) {
-        match udp_msg {
-            Some((session_index, inbound)) => {
-                // Raw byte counter — every datagram that reached the socket counts.
-                self.metrics.bytes_recv.fetch_add(inbound.len() as u64, Ordering::Relaxed);
-                if let Some(sessions) = sessions_opt.as_mut() {
-                    if session_index < sessions.len() {
-                        let session = &mut sessions[session_index];
-                        let authenticated_before = session.machine.authenticated_recv_count();
-                        let initial_action = match session.machine.on_event(OstpEvent::Inbound(inbound)) {
-                            Ok(a) => a,
-                            Err(e) => {
-                                let _ = tx.send(UiEvent::Log(format!("Protocol decrypt error: {e}"))).await;
-                                tracing::warn!("Inbound protocol error (session {}): {}", session_index, e);
-                                return;
-                            }
-                        };
+        let Some((session_index, inbound)) = udp_msg else {
+            // Every receiver ended: with UoT the TCP connections were closed or
+            // reset (a DPI reset included).
+            self.udp_rx = None;
+            match self.link {
+                Link::Up => self.recover_now("Connection to the server closed", tx, proxy_tx).await,
+                Link::Moving { .. } => self.begin_reconnect("The new connection closed", tx, proxy_tx).await,
+                Link::Idle | Link::Down { .. } => {}
+            }
+            return;
+        };
 
-                        // Only NOW, after the datagram actually authenticated and
-                        // decrypted, does it count as a sign of life. This used to
-                        // be set above, before any validation — so a datagram that
-                        // failed to decrypt still reset the stall detector on its
-                        // way to the `return` above. Anything arriving at this port
-                        // (frames from a session the server already evicted, stale
-                        // retransmits, or plain garbage from an off-path source that
-                        // knows the ip:port) kept the client convinced the tunnel
-                        // was healthy: the 25s background reconnect in
-                        // handle_keepalive never fired and the tunnel sat dead at
-                        // 0 b/s until the user reconnected by hand. It also made
-                        // `is_healthy` (see emit_metrics) lie in the UI, and handed
-                        // any off-path sender a trivial way to pin a client in a
-                        // dead session indefinitely.
-                        //
-                        // "Authenticated" means the datagram was actually
-                        // decrypted: on_event also returns Ok for a duplicate
-                        // or for a datagram whose (unauthenticated) nonce is
-                        // far outside the window, neither of which proves the
-                        // server is there. This is also what confirms a
-                        // session move (check_migration).
-                        if session.machine.authenticated_recv_count() != authenticated_before {
-                            self.last_valid_recv = Instant::now();
+        self.metrics.bytes_recv.fetch_add(inbound.len() as u64, Ordering::Relaxed);
+        let Some(session) = self.sessions.get_mut(session_index) else { return };
+        let authenticated_before = session.machine.authenticated_recv_count();
+        let initial_action = match session.machine.on_event(OstpEvent::Inbound(inbound)) {
+            Ok(a) => a,
+            Err(e) => {
+                let _ = tx.send(UiEvent::Log(format!("Protocol decrypt error: {e}"))).await;
+                tracing::warn!("Inbound protocol error (session {}): {}", session_index, e);
+                return;
+            }
+        };
+
+        // Only a datagram that authenticated and decrypted proves the server is
+        // there: `on_event` also returns Ok for duplicates and for datagrams
+        // outside the window. Counting anything else lets frames from an evicted
+        // session, stale retransmits or an off-path sender keep a dead tunnel
+        // looking alive. This is also what confirms a session move.
+        if session.machine.authenticated_recv_count() != authenticated_before {
+            session.last_recv = Instant::now();
+        }
+
+        let mut actions_queue = std::collections::VecDeque::new();
+        actions_queue.push_back(initial_action);
+
+        while let Some(current_action) = actions_queue.pop_front() {
+            match current_action {
+                ProtocolAction::Multiple(nested) => {
+                    for a in nested {
+                        actions_queue.push_back(a);
+                    }
+                }
+                ProtocolAction::DeliverApp(stream_id, dec_payload) => {
+                    match RelayMessage::decode(&dec_payload) {
+                        Ok(relay_msg) => {
+                            match relay_msg {
+                                RelayMessage::ConnectOk => {
+                                    let _ = tx.send(UiEvent::Log(format!("Relay CONNECT OK stream_id={stream_id}"))).await;
+                                    let _ = proxy_tx.send((stream_id, ProxyToClientMsg::ConnectOk));
+                                }
+                                RelayMessage::Data(data) => {
+                                    let _ = proxy_tx.send((stream_id, ProxyToClientMsg::Data(Bytes::from(data))));
+                                }
+                                RelayMessage::Close => {
+                                    let _ = proxy_tx.send((stream_id, ProxyToClientMsg::Close));
+                                }
+                                RelayMessage::Error(msg) => {
+                                    let _ = tx.send(UiEvent::Log(format!("Relay error for stream {stream_id}: {msg}"))).await;
+                                    let _ = proxy_tx.send((stream_id, ProxyToClientMsg::Error(msg)));
+                                }
+                                RelayMessage::Pong(ts) => {
+                                    let now = SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+                                    self.last_rtt_ms = now.saturating_sub(ts) as f64;
+                                    self.metrics.rtt_ms.store(self.last_rtt_ms as u32, Ordering::Relaxed);
+                                }
+                                RelayMessage::UdpAssociate => {}
+                                RelayMessage::UdpData(target, data) => {
+                                    let _ = proxy_tx.send((stream_id, ProxyToClientMsg::UdpData(target, Bytes::from(data))));
+                                }
+                                RelayMessage::KeepAlive | RelayMessage::Ping(_) | RelayMessage::Connect(_) => {}
+                            }
                         }
-
-                        let mut actions_queue = std::collections::VecDeque::new();
-                        actions_queue.push_back(initial_action);
-
-                        while let Some(current_action) = actions_queue.pop_front() {
-                            match current_action {
-                                ProtocolAction::Multiple(nested) => {
-                                    for a in nested {
-                                        actions_queue.push_back(a);
-                                    }
-                                }
-                                ProtocolAction::DeliverApp(stream_id, dec_payload) => {
-                                    match RelayMessage::decode(&dec_payload) {
-                                        Ok(relay_msg) => {
-                                            match relay_msg {
-                                                RelayMessage::ConnectOk => {
-                                                    let _ = tx.send(UiEvent::Log(format!("Relay CONNECT OK stream_id={stream_id}"))).await;
-                                                    let _ = proxy_tx.send((stream_id, ProxyToClientMsg::ConnectOk));
-                                                }
-                                                RelayMessage::Data(data) => {
-                                                    let _ = proxy_tx.send((stream_id, ProxyToClientMsg::Data(Bytes::from(data))));
-                                                }
-                                                RelayMessage::Close => {
-                                                    let _ = proxy_tx.send((stream_id, ProxyToClientMsg::Close));
-                                                }
-                                                RelayMessage::Error(msg) => {
-                                                    let _ = tx.send(UiEvent::Log(format!("Relay error for stream {stream_id}: {msg}"))).await;
-                                                    let _ = proxy_tx.send((stream_id, ProxyToClientMsg::Error(msg)));
-                                                }
-                                                RelayMessage::Pong(ts) => {
-                                                    let now = SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
-                                                    self.last_rtt_ms = now.saturating_sub(ts) as f64;
-                                                    self.metrics.rtt_ms.store(self.last_rtt_ms as u32, Ordering::Relaxed);
-                                                }
-                                                RelayMessage::UdpAssociate => {}
-                                                RelayMessage::UdpData(target, data) => {
-                                                    let _ = proxy_tx.send((stream_id, ProxyToClientMsg::UdpData(target, Bytes::from(data))));
-                                                }
-                                                RelayMessage::KeepAlive | RelayMessage::Ping(_) | RelayMessage::Connect(_) => {}
-                                            }
-                                        }
-                                        Err(err) => {
-                                            let _ = tx.send(UiEvent::Log(format!("Relay decode error for stream {stream_id}: {err}"))).await;
-                                            let _ = proxy_tx.send((stream_id, ProxyToClientMsg::Error("relay decode failed".to_string())));
-                                        }
-                                    }
-                                }
-                                ProtocolAction::SendDatagram(frame) => {
-                                    let _ = send_datagram(&session.socket, &frame, self.transport_mode == "udp" ).await;
-                                    self.metrics.bytes_sent.fetch_add(frame.len() as u64, Ordering::Relaxed);
-                                }
-                                _ => {}
-                            }
+                        Err(err) => {
+                            let _ = tx.send(UiEvent::Log(format!("Relay decode error for stream {stream_id}: {err}"))).await;
+                            let _ = proxy_tx.send((stream_id, ProxyToClientMsg::Error("relay decode failed".to_string())));
                         }
                     }
                 }
-            }
-            None => {
-                // Every receiver ended: with UoT that means the TCP connections
-                // were closed or reset (a DPI reset included). Move the session
-                // to a new connection instead of tearing the tunnel down.
-                // A move already in progress settles on its own timer.
-                *udp_rx_opt = None;
-                if self.running
-                    && (self.migration.is_some()
-                        || self.try_migrate("Connection to the server closed", sessions_opt, udp_rx_opt, tx).await)
-                {
-                    return;
+                ProtocolAction::SendDatagram(frame) => {
+                    let _ = send_datagram(&session.socket, &frame, false).await;
+                    self.metrics.bytes_sent.fetch_add(frame.len() as u64, Ordering::Relaxed);
                 }
-                let _ = tx.send(UiEvent::Log("UDP channel closed, resetting connection".to_string())).await;
-                self.running = false;
-                crate::sysproxy::disable_system_proxy();
-                *sessions_opt = None;
-                *udp_rx_opt = None;
-                stream_map.clear();
-                self.reset_proxy_streams(&tx, &proxy_tx, "udp reader closed");
-                let _ = tx.send(UiEvent::TunnelStopped).await;
+                _ => {}
             }
         }
     }
 
+    /// Returns false when the bridge should stop.
     async fn handle_bridge_cmd(
         &mut self,
         cmd: Option<BridgeCommand>,
         bridge_rx: &mut mpsc::Receiver<BridgeCommand>,
-        sessions_opt: &mut Option<Vec<SessionState>>,
-        udp_rx_opt: &mut Option<mpsc::Receiver<(usize, Bytes)>>,
-        proxy_guard: &mut Option<crate::sysproxy::SystemProxyGuard>,
-        stream_map: &mut std::collections::HashMap<u16, usize>,
         tx: &mpsc::Sender<UiEvent>,
         proxy_tx: &mpsc::UnboundedSender<(u16, ProxyToClientMsg)>,
     ) -> bool {
         match cmd {
             Some(BridgeCommand::ToggleTunnel) => {
-                if self.running {
-                    self.running = false;
-                    self.metrics.connection_state.store(0, Ordering::Relaxed);
-                    *proxy_guard = None;
-                    *sessions_opt = None;
-                    *udp_rx_opt = None;
-                    stream_map.clear();
-                    self.reset_proxy_streams(&tx, &proxy_tx, "manual stop");
+                if self.link != Link::Idle {
+                    self.close_sessions().await;
+                    self.reset_proxy_streams(tx, proxy_tx, "manual stop");
                     tx.send(UiEvent::TunnelStopped).await.ok();
                     let stop_msg = if self.mode == "tun" { "TUN tunnel stopped" } else { "Bridge stopped" };
                     tx.send(UiEvent::Log(stop_msg.to_string())).await.ok();
@@ -667,86 +531,9 @@ impl Bridge {
                     tx.send(UiEvent::Log("Connecting to remote server...".to_string())).await.ok();
                     tx.send(UiEvent::Metrics { status: ConnectionStatus::Handshaking, rtt_ms: 0.0, throughput_bps: 0 }).await.ok();
                     self.metrics.connection_state.store(1, Ordering::Relaxed);
-                    
-                    let session_count = if self.mux_enabled { self.mux_sessions.max(1) } else { 1 };
-                    let (udp_tx, udp_rx) = mpsc::channel(1024);
-                    let mut sessions = Vec::with_capacity(session_count);
-                    let mut rtt_sum = 0.0;
-                    let mut successful_sessions = 0;
-
-                    for idx in 0..session_count {
-                        let session_id: u32 = rand::thread_rng().gen();
-                        match self.perform_handshake_with_id(&tx, session_id).await {
-                            Ok((sock, mach, rtt)) => {
-                                let session_index = sessions.len();
-                                let rx_task = spawn_session_receiver(sock.clone(), session_index, udp_tx.clone());
-
-                                sessions.push(SessionState { socket: sock, machine: mach, rx_task });
-                                rtt_sum += rtt;
-                                successful_sessions += 1;
-                            }
-                            Err(err) => {
-                                // Every session goes to the same server over the same
-                                // path: when not one has got through yet, the rest would
-                                // only fail the same way, each taking as long again.
-                                if successful_sessions == 0 {
-                                    tx.send(UiEvent::Log(format!("Multiplex session {}/{} handshake failed: {}", idx + 1, session_count, err))).await.ok();
-                                    break;
-                                }
-                                tx.send(UiEvent::Log(format!("Multiplex session {}/{} handshake failed: {}. Continuing with remaining sessions...", idx + 1, session_count, err))).await.ok();
-                            }
-                        }
-                    }
-
-                    if sessions.is_empty() {
-                        *proxy_guard = None;
-                        if self.transport_mode == "udp" {
-                            tx.send(UiEvent::Log(udp_failure_diagnosis(&self.server_addr).await)).await.ok();
-                        }
-                        tx.send(UiEvent::Log("All multiplexed handshake attempts failed. Connection aborted.".to_string())).await.ok();
-                        tx.send(UiEvent::TunnelStopped).await.ok();
-                        self.metrics.connection_state.store(0, Ordering::Relaxed);
-                        return true;
-                    }
-
-                    *udp_rx_opt = Some(udp_rx);
-                    *sessions_opt = Some(sessions);
-                    self.last_rtt_ms = rtt_sum / successful_sessions as f64;
-                    self.running = true;
                     self.last_sample_at = Instant::now();
-                    self.last_valid_recv = Instant::now();
-                    
-                    // The system proxy is for proxy mode. In TUN mode the TUN
-                    // device carries the traffic: setting it too routed everything
-                    // through the proxy, so traffic flowed even when TUN never
-                    // came up, and the logs could not tell.
-                    if self.mode != "tun" {
-                        let sys_proxy_addr = self.proxy_addr.replace("0.0.0.0:", "127.0.0.1:");
-                        *proxy_guard = Some(crate::sysproxy::SystemProxyGuard::enable(&sys_proxy_addr));
-                        // Enabling resets the bypass list; put the exclusions back.
-                        if let Some(reload) = &self.reload_tx {
-                            let ex = reload.borrow();
-                            crate::sysproxy::update_proxy_bypass_list(&ex.domains, &ex.ips);
-                        }
-                    }
-
-                    tx.send(UiEvent::Metrics {
-                        status: ConnectionStatus::Established,
-                        rtt_ms: self.last_rtt_ms,
-                        throughput_bps: 0,
-                    }).await.ok();
-                    self.metrics.connection_state.store(2, Ordering::Relaxed);
-                    // The connection to the server; the TUN device reports its own state.
-                    tx.send(UiEvent::Log("Connection established".to_string())).await.ok();
-
-                    for session in sessions_opt.as_mut().unwrap().iter_mut() {
-                        let ts = SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
-                        let ping_payload = Bytes::from(RelayMessage::Ping(ts).encode());
-                        if let Ok(ProtocolAction::SendDatagram(frame)) = session.machine.on_event(OstpEvent::Outbound(0, ping_payload)) {
-                            let _ = send_datagram(&session.socket, &frame, self.transport_mode == "udp").await;
-                            self.metrics.bytes_sent.fetch_add(frame.len() as u64, Ordering::Relaxed);
-                        }
-                    }
+                    let now = Instant::now();
+                    self.link = Link::Down { since: now, attempt: 0, next_try: now };
                 }
             }
             Some(BridgeCommand::NextProfile) => {
@@ -755,84 +542,19 @@ impl Bridge {
                 tx.send(UiEvent::Log(format!("Obfuscation profile switched to {:?}", self.profile))).await.ok();
             }
             Some(BridgeCommand::NetworkChanged) => {
-                // A real network handoff (Wi-Fi <-> cellular) commonly fires
-                // onLost + onAvailable within milliseconds of each other on
-                // Android, queuing several NetworkChanged commands back to
-                // back. Each reconnect below is a full sequential handshake
-                // (up to ~1.2s x 4 attempts x mux_sessions) run synchronously
-                // in this select-loop iteration, so without coalescing, the
-                // first attempt often races the OS's own network switch and
-                // fails on the now-dead interface, then the SECOND queued
-                // NetworkChanged only starts its own full reconnect after
-                // that first one finishes - multiplying a sub-second handoff
-                // into many seconds of extra outage. Drain same-kind repeats
-                // so a burst collapses into one reconnect on the freshest
-                // signal; a different command found while draining is
-                // handled immediately rather than dropped.
+                // A handoff often fires several of these within milliseconds;
+                // one recovery on the freshest signal is enough. Another command
+                // found while draining is handled right away, not dropped.
                 while let Ok(next) = bridge_rx.try_recv() {
                     if !matches!(next, BridgeCommand::NetworkChanged) {
-                        let more = Box::pin(self.handle_bridge_cmd(
-                            Some(next), bridge_rx, sessions_opt, udp_rx_opt, proxy_guard, stream_map, tx, proxy_tx,
-                        )).await;
-                        if !more {
+                        let keep_going = Box::pin(self.handle_bridge_cmd(Some(next), bridge_rx, tx, proxy_tx)).await;
+                        if !keep_going {
                             return false;
                         }
                         break;
                     }
                 }
-
-                // Move the session to a socket on the new network first: no
-                // handshake, and the apps keep their connections. A move that
-                // is already in progress was opened on the old network, so it
-                // is replaced. If no connection can be opened at all, fall
-                // back to the full reconnect below.
-                if self.running {
-                    self.migration = None;
-                    if self.try_migrate("Network changed", sessions_opt, udp_rx_opt, tx).await {
-                        return true;
-                    }
-                }
-
-                if self.running {
-                    let _ = tx.send(UiEvent::Log("Network changed — starting immediate reconnect".to_string())).await;
-                    self.metrics.connection_state.store(1, Ordering::Relaxed);
-                    self.last_valid_recv = Instant::now() - Duration::from_secs(100);
-
-                    let session_count = if self.mux_enabled { self.mux_sessions.max(1) } else { 1 };
-                    let (udp_tx, udp_rx) = mpsc::channel(1024);
-                    let mut new_sessions = Vec::with_capacity(session_count);
-                    let mut successful_sessions = 0;
-                    let mut rtt_sum = 0.0;
-
-                    for idx in 0..session_count {
-                        let session_id: u32 = rand::thread_rng().gen();
-                        match self.perform_handshake_with_id(&tx, session_id).await {
-                            Ok((sock, mach, rtt)) => {
-                                let session_index = new_sessions.len();
-                                let rx_task = spawn_session_receiver(sock.clone(), session_index, udp_tx.clone());
-                                new_sessions.push(SessionState { socket: sock, machine: mach, rx_task });
-                                rtt_sum += rtt;
-                                successful_sessions += 1;
-                            }
-                            Err(err) => {
-                                let _ = tx.send(UiEvent::Log(format!("NetworkChanged reconnect session {}/{} failed: {}", idx + 1, session_count, err))).await;
-                            }
-                        }
-                    }
-
-                    if !new_sessions.is_empty() {
-                        *sessions_opt = Some(new_sessions);
-                        *udp_rx_opt = Some(udp_rx);
-                        self.last_rtt_ms = rtt_sum / successful_sessions as f64;
-                        self.last_valid_recv = Instant::now();
-                        stream_map.clear();
-                        self.reset_proxy_streams(&tx, &proxy_tx, "network changed");
-                        self.metrics.connection_state.store(2, Ordering::Relaxed);
-                        let _ = tx.send(UiEvent::Log("NetworkChanged reconnect successful!".to_string())).await;
-                    } else {
-                        let _ = tx.send(UiEvent::Log("NetworkChanged reconnect failed — will retry on keepalive tick".to_string())).await;
-                    }
-                }
+                self.recover_now("Network changed", tx, proxy_tx).await;
             }
             Some(BridgeCommand::ReloadConfig) => {
                 match ClientConfig::reload_from_json_near_binary() {
@@ -841,29 +563,23 @@ impl Bridge {
                         let old_mode = self.mode.clone();
                         let old_transport = self.transport_mode.clone();
                         let old_carrier = (self.tls, self.tls_sni.clone(), self.tls_insecure, self.ws_path.clone());
-                        
+
                         self.apply_runtime_config(&cfg);
-                        
-                        let requires_restart = self.server_addr != old_server || 
-                                               self.mode != old_mode || 
+
+                        let requires_restart = self.server_addr != old_server ||
+                                               self.mode != old_mode ||
                                                self.transport_mode != old_transport ||
                                                (self.tls, self.tls_sni.clone(), self.tls_insecure, self.ws_path.clone()) != old_carrier;
-                                               
+
                         if !requires_restart {
                             if let Some(tx_watch) = &self.reload_tx {
                                 let _ = tx_watch.send(cfg.exclusions.clone());
                             }
                             tx.send(UiEvent::Log("Exclusions updated in real-time (hot reload)".to_string())).await.ok();
                         } else {
-                            tx.send(UiEvent::Log("Runtime config reloaded. Restarting tunnel due to critical parameter changes.".to_string())).await.ok();
-                            if self.running {
-                                self.running = false;
-                                self.metrics.connection_state.store(0, Ordering::Relaxed);
-                                *proxy_guard = None;
-                                *sessions_opt = None;
-                                stream_map.clear();
-                                self.reset_proxy_streams(&tx, &proxy_tx, "config reload");
-                                let _ = tx.send(UiEvent::TunnelStopped).await;
+                            tx.send(UiEvent::Log("Runtime config reloaded. Reconnecting with the new settings.".to_string())).await.ok();
+                            if self.link != Link::Idle {
+                                self.begin_reconnect("Settings changed", tx, proxy_tx).await;
                             }
                         }
                     }
@@ -872,136 +588,295 @@ impl Bridge {
                     }
                 }
             }
-            Some(BridgeCommand::Shutdown) | None => {
-                self.running = false;
-                *proxy_guard = None;
-                return false;
-            }
+            Some(BridgeCommand::Shutdown) | None => return false,
         }
         true
     }
 
-    async fn handle_keepalive(
+    /// Ends the tunnel: tells the server to free the sessions (so reconnects do
+    /// not pile up as live sessions of this user until its idle timeout), drops
+    /// everything and releases the system proxy. Bounded, so a dead TCP path
+    /// cannot hold up the stop.
+    async fn close_sessions(&mut self) {
+        for session in self.sessions.iter_mut() {
+            if let Ok(ProtocolAction::SendDatagram(frame)) = session.machine.on_event(OstpEvent::Close) {
+                let send = send_datagram(&session.socket, &frame, false);
+                let _ = tokio::time::timeout(Duration::from_millis(300), send).await;
+            }
+        }
+        self.sessions.clear();
+        self.udp_rx = None;
+        self.stream_map.clear();
+        self.proxy_guard = None;
+        self.link = Link::Idle;
+        self.established_once = false;
+        self.metrics.connection_state.store(0, Ordering::Relaxed);
+    }
+
+    /// Longest silence a healthy path may show. Pings go out on every keepalive
+    /// tick and are answered within an RTT, so two ticks of silence mean the
+    /// path is gone or blocked.
+    fn stall_after(&self) -> Duration {
+        STALL_AFTER.max(Duration::from_secs(self.keepalive_interval_sec.saturating_mul(2)))
+    }
+
+    /// Silence of the quietest session. A session that stopped answering must
+    /// not be hidden by one that still does: streams are spread across all.
+    fn silence(&self) -> Duration {
+        self.sessions.iter().map(|s| s.last_recv.elapsed()).max().unwrap_or_default()
+    }
+
+    /// The one place that notices a bad link: a stalled path, a move that got
+    /// no answer, a long outage.
+    async fn check_link(
         &mut self,
-        force: bool,
-        sessions_opt: &mut Option<Vec<SessionState>>,
-        udp_rx_opt: &mut Option<mpsc::Receiver<(usize, Bytes)>>,
-        proxy_guard: &mut Option<crate::sysproxy::SystemProxyGuard>,
-        stream_map: &mut std::collections::HashMap<u16, usize>,
+        tx: &mpsc::Sender<UiEvent>,
+        proxy_tx: &mpsc::UnboundedSender<(u16, ProxyToClientMsg)>,
+    ) {
+        match self.link {
+            Link::Up => {
+                let silence = self.silence();
+                if silence > self.stall_after() {
+                    let reason = format!("No answer from the server for {}s", silence.as_secs());
+                    self.recover_now(&reason, tx, proxy_tx).await;
+                }
+            }
+            Link::Moving { started } => {
+                if self.sessions.iter().all(|s| s.last_recv >= started) {
+                    self.link = Link::Up;
+                    self.metrics.connection_state.store(2, Ordering::Relaxed);
+                    tx.send(UiEvent::Log(format!(
+                        "Session moved to the new path in {} ms, no connection was dropped",
+                        started.elapsed().as_millis()
+                    ))).await.ok();
+                    return;
+                }
+                let deadline = MIGRATION_TIMEOUT_MIN.max(Duration::from_millis((self.last_rtt_ms * 4.0) as u64));
+                if started.elapsed() >= deadline {
+                    // The server stays silent to unknown sessions on purpose, so
+                    // "session expired" and "path blocked" look the same here.
+                    // Either way only a new handshake can help.
+                    let reason = format!(
+                        "The server did not answer on the new path within {} s (session expired, or this \
+                         transport is blocked on this network)",
+                        deadline.as_secs()
+                    );
+                    self.begin_reconnect(&reason, tx, proxy_tx).await;
+                }
+            }
+            Link::Down { since, .. } => {
+                // The system proxy points at our listener, which cannot carry
+                // anything now: without a kill switch give the machine its own
+                // internet back while we keep retrying.
+                if self.proxy_guard.is_some() && !self.kill_switch && since.elapsed() >= PROXY_RELEASE_AFTER {
+                    self.proxy_guard = None;
+                    tx.send(UiEvent::Log(format!(
+                        "No connection for {}s: released the system proxy, still reconnecting",
+                        since.elapsed().as_secs()
+                    ))).await.ok();
+                }
+            }
+            Link::Idle => {}
+        }
+    }
+
+    /// Recovery, step one: carry the session to a new socket (no handshake,
+    /// apps keep their connections). If no socket can be opened at all, step two
+    /// right away. A recovery already in progress is replaced or sped up.
+    async fn recover_now(
+        &mut self,
+        reason: &str,
+        tx: &mpsc::Sender<UiEvent>,
+        proxy_tx: &mpsc::UnboundedSender<(u16, ProxyToClientMsg)>,
+    ) {
+        // The hop count to the server may differ on the new network.
+        self.ttl_desync_measured = None;
+        match self.link {
+            Link::Idle => {}
+            Link::Down { since, attempt, .. } => {
+                self.link = Link::Down { since, attempt, next_try: Instant::now() };
+            }
+            Link::Up | Link::Moving { .. } => {
+                if !self.try_migrate(reason, tx).await {
+                    self.begin_reconnect(reason, tx, proxy_tx).await;
+                }
+            }
+        }
+    }
+
+    /// Recovery, step two: drop the sessions and handshake again with the same
+    /// server and transport. The old streams cannot continue on a new session.
+    async fn begin_reconnect(
+        &mut self,
+        reason: &str,
+        tx: &mpsc::Sender<UiEvent>,
+        proxy_tx: &mpsc::UnboundedSender<(u16, ProxyToClientMsg)>,
+    ) {
+        if matches!(self.link, Link::Idle | Link::Down { .. }) {
+            return;
+        }
+        tx.send(UiEvent::Log(format!("{reason}: reconnecting to the server"))).await.ok();
+        self.sessions.clear();
+        self.udp_rx = None;
+        self.stream_map.clear();
+        self.reset_proxy_streams(tx, proxy_tx, "reconnect");
+        self.metrics.connection_state.store(1, Ordering::Relaxed);
+        let now = Instant::now();
+        self.link = Link::Down { since: now, attempt: 0, next_try: now };
+    }
+
+    /// One full-handshake attempt while `Down`. Stays responsive: a stop,
+    /// shutdown or settings change cancels it, a network change restarts it.
+    /// Returns false when the bridge should stop.
+    async fn reconnect_attempt(
+        &mut self,
+        bridge_rx: &mut mpsc::Receiver<BridgeCommand>,
+        shutdown: &mut watch::Receiver<bool>,
+        tx: &mpsc::Sender<UiEvent>,
+        proxy_tx: &mpsc::UnboundedSender<(u16, ProxyToClientMsg)>,
+        proxy_rx: &mut mpsc::Receiver<ProxyEvent>,
+    ) -> bool {
+        let Link::Down { since, attempt, .. } = self.link else { return true };
+
+        let outcome = {
+            let establish = self.establish_sessions(tx);
+            tokio::pin!(establish);
+            loop {
+                tokio::select! {
+                    result = &mut establish => break Ok(result),
+                    _ = shutdown.changed() => {
+                        if *shutdown.borrow() {
+                            break Err(Interrupt::Shutdown);
+                        }
+                    }
+                    cmd = bridge_rx.recv() => {
+                        break Err(match cmd {
+                            Some(BridgeCommand::NetworkChanged) => Interrupt::NetworkChanged,
+                            other => Interrupt::Command(other),
+                        });
+                    }
+                }
+            }
+        };
+
+        match outcome {
+            Err(Interrupt::Shutdown) => false,
+            Err(Interrupt::NetworkChanged) => {
+                self.ttl_desync_measured = None;
+                self.link = Link::Down { since, attempt, next_try: Instant::now() };
+                true
+            }
+            Err(Interrupt::Command(cmd)) => self.handle_bridge_cmd(cmd, bridge_rx, tx, proxy_tx).await,
+            Ok(Ok(established)) => {
+                self.install_sessions(established, tx, proxy_tx, proxy_rx).await;
+                true
+            }
+            Ok(Err(err)) => {
+                if attempt == 0 && self.transport_mode == "udp" {
+                    tx.send(UiEvent::Log(udp_failure_diagnosis(&self.server_addr).await)).await.ok();
+                }
+                let wait = RETRY_BACKOFF_SECS[(attempt as usize).min(RETRY_BACKOFF_SECS.len() - 1)];
+                let what = if self.established_once { "Reconnect attempt" } else { "Connection attempt" };
+                tx.send(UiEvent::Log(format!(
+                    "{what} {} failed: {err}. Next try in {wait}s", attempt + 1
+                ))).await.ok();
+                self.link = Link::Down {
+                    since,
+                    attempt: attempt + 1,
+                    next_try: Instant::now() + Duration::from_secs(wait),
+                };
+                true
+            }
+        }
+    }
+
+    /// Handshakes every mux session; the single place sessions are created.
+    /// Fails only when not one session got through.
+    async fn establish_sessions(&mut self, tx: &mpsc::Sender<UiEvent>) -> Result<Established> {
+        let count = if self.mux_enabled { self.mux_sessions.max(1) } else { 1 };
+        let (udp_tx, udp_rx) = mpsc::channel(1024);
+        let mut sessions: Vec<SessionState> = Vec::with_capacity(count);
+        let mut rtt_sum = 0.0;
+
+        for idx in 0..count {
+            let session_id: u32 = rand::thread_rng().gen();
+            match self.perform_handshake_with_id(tx, session_id).await {
+                Ok((socket, machine, rtt)) => {
+                    let rx_task = spawn_session_receiver(socket.clone(), sessions.len(), udp_tx.clone());
+                    sessions.push(SessionState { socket, machine, rx_task, last_recv: Instant::now() });
+                    rtt_sum += rtt;
+                }
+                // All sessions use the same server and path: when none has got
+                // through yet, the rest would only fail the same way.
+                Err(err) if sessions.is_empty() => return Err(err),
+                Err(err) => {
+                    tx.send(UiEvent::Log(format!(
+                        "Multiplex session {}/{} handshake failed: {err}. Continuing with the others", idx + 1, count
+                    ))).await.ok();
+                }
+            }
+        }
+        let rtt_ms = rtt_sum / sessions.len() as f64;
+        Ok(Established { sessions, udp_rx, rtt_ms })
+    }
+
+    async fn install_sessions(
+        &mut self,
+        established: Established,
         tx: &mpsc::Sender<UiEvent>,
         proxy_tx: &mpsc::UnboundedSender<(u16, ProxyToClientMsg)>,
         proxy_rx: &mut mpsc::Receiver<ProxyEvent>,
     ) {
-        let silence = self.last_valid_recv.elapsed();
-        // A move in progress is settled by check_migration; starting another
-        // one or a full reconnect on top of it would throw away its sockets.
-        let recovering = self.migration.is_some();
-        // On a stall, move the session to a new socket of the same transport:
-        // no handshake, no dropped streams. The full reconnect below keeps its
-        // own, older trigger; a move neither replaces nor hastens it.
-        let moved = !recovering
-            && (force || silence > STALL_MIGRATE_AFTER)
-            && self.try_migrate(
-                &format!("No answer from the server for {}s", silence.as_secs()),
-                sessions_opt,
-                udp_rx_opt,
-                tx,
-            ).await;
-        if !recovering && !moved && (force || silence.as_secs() > 25) {
-            let elapsed = self.last_valid_recv.elapsed().as_secs();
-            // On a forced (post-resume) reconnect the monotonic clock may not
-            // have advanced, so `elapsed` can be small — never treat a forced
-            // reconnect as a hard timeout; we specifically want to re-establish.
-            if !force && elapsed > 180 {
-                if self.kill_switch {
-                    let _ = tx.send(UiEvent::Log(format!("Connection stall ({}s). Kill Switch is ON, retrying reconnect indefinitely...", elapsed))).await;
-                } else {
-                    let _ = tx.send(UiEvent::Log("Connection permanently lost (3-minute hard timeout). Stopping tunnel.".into())).await;
-                    self.running = false;
-                    *proxy_guard = None;
-                    *sessions_opt = None;
-                    stream_map.clear();
-                    self.reset_proxy_streams(&tx, &proxy_tx, "keepalive hard timeout");
-                    let _ = tx.send(UiEvent::TunnelStopped).await;
-                    self.metrics.connection_state.store(0, Ordering::Relaxed);
-                    return;
-                }
-            } else {
-                let _ = tx.send(UiEvent::Log(format!("Connection stall detected ({}s silence). Attempting background reconnect...", elapsed))).await;
-            }
+        self.sessions = established.sessions;
+        self.udp_rx = Some(established.udp_rx);
+        self.last_rtt_ms = established.rtt_ms;
+        self.link = Link::Up;
+        self.last_sample_at = Instant::now();
+        self.stream_map.clear();
 
-            self.metrics.connection_state.store(1, Ordering::Relaxed);
-
-            let session_count = if self.mux_enabled { self.mux_sessions.max(1) } else { 1 };
-            let (udp_tx, udp_rx) = mpsc::channel(1024);
-            let mut new_sessions = Vec::with_capacity(session_count);
-            let mut successful_sessions = 0;
-            let mut rtt_sum = 0.0;
-
-            for idx in 0..session_count {
-                let session_id: u32 = rand::thread_rng().gen();
-                match self.perform_handshake_with_id(&tx, session_id).await {
-                    Ok((sock, mach, rtt)) => {
-                        let session_index = new_sessions.len();
-                        let rx_task = spawn_session_receiver(sock.clone(), session_index, udp_tx.clone());
-
-                        new_sessions.push(SessionState { socket: sock, machine: mach, rx_task });
-                        rtt_sum += rtt;
-                        successful_sessions += 1;
-                    }
-                    Err(err) => {
-                        let _ = tx.send(UiEvent::Log(format!("Background reconnect session {}/{} failed: {}", idx + 1, session_count, err))).await;
-                    }
+        if self.established_once {
+            // Streams of the lost session are gone, and so are the requests
+            // queued for it while the attempt blocked the loop.
+            self.reset_proxy_streams(tx, proxy_tx, "reconnect");
+            while let Ok(stale) = proxy_rx.try_recv() {
+                if let ProxyEvent::NewStream { stream_id, .. } = stale {
+                    let _ = proxy_tx.send((stream_id, ProxyToClientMsg::Error("connection reset".into())));
                 }
             }
+        }
+        self.established_once = true;
 
-            if !new_sessions.is_empty() {
-                *sessions_opt = Some(new_sessions);
-                *udp_rx_opt = Some(udp_rx);
-                self.last_rtt_ms = rtt_sum / successful_sessions as f64;
-                self.last_valid_recv = Instant::now();
-                self.metrics.connection_state.store(2, Ordering::Relaxed);
-                let _ = tx.send(UiEvent::Log("Background reconnect successful! Connection restored.".into())).await;
-
-                for session in sessions_opt.as_mut().unwrap().iter_mut() {
-                    let ts = SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
-                    let ping_payload = Bytes::from(RelayMessage::Ping(ts).encode());
-                    if let Ok(ProtocolAction::SendDatagram(frame)) = session.machine.on_event(OstpEvent::Outbound(0, ping_payload)) {
-                        let _ = send_datagram(&session.socket, &frame, self.transport_mode == "udp").await;
-                        self.metrics.bytes_sent.fetch_add(frame.len() as u64, Ordering::Relaxed);
-                    }
-                }
-                
-                stream_map.clear();
-                self.reset_proxy_streams(&tx, &proxy_tx, "background reconnect");
-
-                let mut flushed = 0;
-                while let Ok(stale) = proxy_rx.try_recv() {
-                    if let ProxyEvent::NewStream { stream_id, .. } = stale {
-                        let _ = proxy_tx.send((stream_id, ProxyToClientMsg::Error("connection reset".into())));
-                    }
-                    flushed += 1;
-                }
-                if flushed > 0 {
-                    let _ = tx.send(UiEvent::Log(format!("Flushed {} stale proxy messages to prevent UDP burst", flushed))).await;
-                }
-            } else {
-                let _ = tx.send(UiEvent::Log("Background reconnect failed. Will retry on next tick...".into())).await;
+        // The system proxy is for proxy mode; in TUN mode the TUN device
+        // carries the traffic and setting it too hides a TUN that never came up.
+        if self.mode != "tun" && self.proxy_guard.is_none() {
+            let sys_proxy_addr = self.proxy_addr.replace("0.0.0.0:", "127.0.0.1:");
+            self.proxy_guard = Some(crate::sysproxy::SystemProxyGuard::enable(&sys_proxy_addr));
+            // Enabling resets the bypass list; put the exclusions back.
+            if let Some(reload) = &self.reload_tx {
+                let ex = reload.borrow();
+                crate::sysproxy::update_proxy_bypass_list(&ex.domains, &ex.ips);
             }
         }
 
-        if let Some(sessions) = sessions_opt.as_mut() {
-            for session in sessions.iter_mut() {
-                let ts = SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
-                let ping_payload = Bytes::from(RelayMessage::Ping(ts).encode());
-                if let Ok(ProtocolAction::SendDatagram(frame)) = session.machine.on_event(OstpEvent::Outbound(0, ping_payload)) {
-                    let _ = send_datagram(&session.socket, &frame, self.transport_mode == "udp" ).await;
-                    self.metrics.bytes_sent.fetch_add(frame.len() as u64, Ordering::Relaxed);
-                }
+        tx.send(UiEvent::Metrics {
+            status: ConnectionStatus::Established,
+            rtt_ms: self.last_rtt_ms,
+            throughput_bps: 0,
+        }).await.ok();
+        self.metrics.connection_state.store(2, Ordering::Relaxed);
+        tx.send(UiEvent::Log("Connection established".to_string())).await.ok();
+        self.send_keepalives().await;
+    }
 
-                let ka_payload = Bytes::from(RelayMessage::KeepAlive.encode());
-                if let Ok(ProtocolAction::SendDatagram(frame)) = session.machine.on_event(OstpEvent::Outbound(0, ka_payload)) {
-                    let _ = send_datagram(&session.socket, &frame, self.transport_mode == "udp" ).await;
+    /// A ping and a keepalive per session. The ping's answer is the liveness
+    /// signal the stall detection relies on.
+    async fn send_keepalives(&mut self) {
+        for session in self.sessions.iter_mut() {
+            let ts = SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
+            for msg in [RelayMessage::Ping(ts), RelayMessage::KeepAlive] {
+                let payload = Bytes::from(msg.encode());
+                if let Ok(ProtocolAction::SendDatagram(frame)) = session.machine.on_event(OstpEvent::Outbound(0, payload)) {
+                    let _ = send_datagram(&session.socket, &frame, false).await;
                     self.metrics.bytes_sent.fetch_add(frame.len() as u64, Ordering::Relaxed);
                 }
             }
@@ -1010,147 +885,120 @@ impl Bridge {
 
     async fn handle_retransmit(
         &mut self,
-        sessions_opt: &mut Option<Vec<SessionState>>,
-        udp_rx_opt: &mut Option<mpsc::Receiver<(usize, Bytes)>>,
-        proxy_guard: &mut Option<crate::sysproxy::SystemProxyGuard>,
-        stream_map: &mut std::collections::HashMap<u16, usize>,
         tx: &mpsc::Sender<UiEvent>,
         proxy_tx: &mpsc::UnboundedSender<(u16, ProxyToClientMsg)>,
     ) {
         let mut fatal_err = None;
-        if let Some(sessions) = sessions_opt.as_mut() {
-            for session in sessions.iter_mut() {
-                match session.machine.on_event(OstpEvent::Tick) {
-                    Ok(action) => {
-                        let mut queue = vec![action];
-                        while let Some(current_action) = queue.pop() {
-                            match current_action {
-                                ProtocolAction::Multiple(nested) => {
-                                    for a in nested {
-                                        queue.push(a);
-                                    }
-                                }
-                                ProtocolAction::SendDatagram(frame) => {
-                                    let _ = send_datagram(&session.socket, &frame, self.transport_mode == "udp" ).await;
-                                    self.metrics.bytes_sent.fetch_add(frame.len() as u64, Ordering::Relaxed);
-                                }
-                                _ => {}
-                            }
-                        }
+        for session in self.sessions.iter_mut() {
+            match session.machine.on_event(OstpEvent::Tick) {
+                Ok(action) => {
+                    let mut frames = Vec::new();
+                    collect_datagrams(action, &mut frames);
+                    for frame in frames {
+                        let _ = send_datagram(&session.socket, &frame, false).await;
+                        self.metrics.bytes_sent.fetch_add(frame.len() as u64, Ordering::Relaxed);
                     }
-                    Err(e) => {
-                        fatal_err = Some(e);
-                        break;
-                    }
+                }
+                Err(e) => {
+                    fatal_err = Some(e);
+                    break;
                 }
             }
         }
 
         if let Some(e) = fatal_err {
             let _ = tx.send(UiEvent::Log(format!("Protocol tick fatal error: {e}"))).await;
-            self.running = false;
-            *proxy_guard = None;
-            *sessions_opt = None;
-            *udp_rx_opt = None;
-            stream_map.clear();
-            self.reset_proxy_streams(&tx, &proxy_tx, "protocol fatal error");
-            let _ = tx.send(UiEvent::TunnelStopped).await;
-            self.metrics.connection_state.store(0, Ordering::Relaxed);
+            self.begin_reconnect("Protocol error", tx, proxy_tx).await;
         }
     }
+
 
     async fn handle_proxy_event(
         &mut self,
         proxy_ev: Option<ProxyEvent>,
-        sessions_opt: &mut Option<Vec<SessionState>>,
-        stream_map: &mut std::collections::HashMap<u16, usize>,
         tx: &mpsc::Sender<UiEvent>,
         proxy_tx: &mpsc::UnboundedSender<(u16, ProxyToClientMsg)>,
     ) {
-        if let Some(ev) = proxy_ev {
-            if let Some(sessions) = sessions_opt.as_mut() {
-                if sessions.is_empty() {
-                    if let ProxyEvent::NewStream { stream_id, .. } = ev {
-                        let _ = proxy_tx.send((stream_id, ProxyToClientMsg::Error("tunnel stopped".into())));
+        let Some(ev) = proxy_ev else { return };
+        // No session while reconnecting: fail new streams at once so the apps
+        // retry instead of waiting on a tunnel that cannot carry them.
+        if self.sessions.is_empty() {
+            if let ProxyEvent::NewStream { stream_id, .. } = ev {
+                let _ = proxy_tx.send((stream_id, ProxyToClientMsg::Error("reconnecting".into())));
+            }
+            return;
+        }
+        let (stream_id, relay_msg, is_close) = match ev {
+            ProxyEvent::NewStream { stream_id, target } => {
+                let _ = tx.send(UiEvent::Log(format!("Proxy CONNECT stream_id={stream_id} target={target}"))).await;
+                (stream_id, RelayMessage::Connect(target), false)
+            }
+            ProxyEvent::UdpAssociate { stream_id } => {
+                let _ = tx.send(UiEvent::Log(format!("Proxy UDP ASSOCIATE stream_id={stream_id}"))).await;
+                (stream_id, RelayMessage::UdpAssociate, false)
+            }
+            ProxyEvent::UdpData { stream_id, target, payload } => {
+                (stream_id, RelayMessage::UdpData(target, payload.to_vec()), false)
+            }
+            ProxyEvent::Data { stream_id, payload } => (stream_id, RelayMessage::Data(payload.to_vec()), false),
+            ProxyEvent::Close { stream_id } => {
+                let _ = tx.send(UiEvent::Log(format!("Proxy CLOSE stream_id={stream_id}"))).await;
+                (stream_id, RelayMessage::Close, true)
+            }
+        };
+        let len = self.sessions.len();
+        let session_index = *self.stream_map.entry(stream_id).or_insert_with(|| {
+            rand::thread_rng().gen_range(0..len)
+        });
+        if is_close {
+            self.stream_map.remove(&stream_id);
+        }
+        let session = &mut self.sessions[session_index];
+        // Stream data goes out in datagrams that fit the MTU: reads from
+        // local apps are up to 64 KiB, which as one datagram was a burst of
+        // IP fragments over UDP and, past 65535 bytes, a truncated payload
+        // and a broken length prefix over TCP and TLS.
+        let messages: Vec<RelayMessage> = match relay_msg {
+            RelayMessage::Data(data) => ostp_core::relay::data_chunks(&data, session.machine.max_payload())
+                .map(|c| RelayMessage::Data(c.to_vec()))
+                .collect(),
+            other => vec![other],
+        };
+        for relay_msg in messages {
+            let out_payload = Bytes::from(relay_msg.encode());
+            match session.machine.on_event(OstpEvent::Outbound(stream_id, out_payload)) {
+                Ok(ProtocolAction::SendDatagram(frame)) => {
+                    if send_datagram(&session.socket, &frame, self.transport_mode == "udp" ).await.is_ok() {
+                        self.metrics.bytes_sent.fetch_add(frame.len() as u64, Ordering::Relaxed);
+                        tracing::trace!("Outbound datagram sent stream_id={stream_id} bytes={}", frame.len());
                     }
-                    return;
                 }
-                let (stream_id, relay_msg, is_close) = match ev {
-                    ProxyEvent::NewStream { stream_id, target } => {
-                        let _ = tx.send(UiEvent::Log(format!("Proxy CONNECT stream_id={stream_id} target={target}"))).await;
-                        (stream_id, RelayMessage::Connect(target), false)
-                    }
-                    ProxyEvent::UdpAssociate { stream_id } => {
-                        let _ = tx.send(UiEvent::Log(format!("Proxy UDP ASSOCIATE stream_id={stream_id}"))).await;
-                        (stream_id, RelayMessage::UdpAssociate, false)
-                    }
-                    ProxyEvent::UdpData { stream_id, target, payload } => {
-                        (stream_id, RelayMessage::UdpData(target, payload.to_vec()), false)
-                    }
-                    ProxyEvent::Data { stream_id, payload } => (stream_id, RelayMessage::Data(payload.to_vec()), false),
-                    ProxyEvent::Close { stream_id } => {
-                        let _ = tx.send(UiEvent::Log(format!("Proxy CLOSE stream_id={stream_id}"))).await;
-                        (stream_id, RelayMessage::Close, true)
-                    }
-                };
-                let len = sessions.len();
-                let session_index = *stream_map.entry(stream_id).or_insert_with(|| {
-                    rand::thread_rng().gen_range(0..len)
-                });
-                if is_close {
-                    stream_map.remove(&stream_id);
-                }
-                let session = &mut sessions[session_index];
-                // Stream data goes out in datagrams that fit the MTU: reads from
-                // local apps are up to 64 KiB, which as one datagram was a burst of
-                // IP fragments over UDP and, past 65535 bytes, a truncated payload
-                // and a broken length prefix over TCP and TLS.
-                let messages: Vec<RelayMessage> = match relay_msg {
-                    RelayMessage::Data(data) => ostp_core::relay::data_chunks(&data, session.machine.max_payload())
-                        .map(|c| RelayMessage::Data(c.to_vec()))
-                        .collect(),
-                    other => vec![other],
-                };
-                for relay_msg in messages {
-                    let out_payload = Bytes::from(relay_msg.encode());
-                    match session.machine.on_event(OstpEvent::Outbound(stream_id, out_payload)) {
-                        Ok(ProtocolAction::SendDatagram(frame)) => {
+                Ok(ProtocolAction::Multiple(list)) => {
+                    let mut sent = 0usize;
+                    for item in list {
+                        if let ProtocolAction::SendDatagram(frame) = item {
                             if send_datagram(&session.socket, &frame, self.transport_mode == "udp" ).await.is_ok() {
                                 self.metrics.bytes_sent.fetch_add(frame.len() as u64, Ordering::Relaxed);
-                                tracing::trace!("Outbound datagram sent stream_id={stream_id} bytes={}", frame.len());
+                                sent += 1;
                             }
-                        }
-                        Ok(ProtocolAction::Multiple(list)) => {
-                            let mut sent = 0usize;
-                            for item in list {
-                                if let ProtocolAction::SendDatagram(frame) = item {
-                                    if send_datagram(&session.socket, &frame, self.transport_mode == "udp" ).await.is_ok() {
-                                        self.metrics.bytes_sent.fetch_add(frame.len() as u64, Ordering::Relaxed);
-                                        sent += 1;
-                                    }
-                                }
-                            }
-                            tracing::trace!("Outbound datagram batch stream_id={stream_id} sent={sent}");
-                        }
-                        Ok(ProtocolAction::Noop) => {
-                            tracing::trace!("Outbound datagram noop stream_id={stream_id}");
-                        }
-                        Ok(_) => {
-                            tracing::trace!("Outbound datagram unexpected action stream_id={stream_id}");
-                        }
-                        Err(e) => {
-                            tracing::warn!("Protocol error packing outbound stream_id={}: {}", stream_id, e);
-                            let _ = tx.send(UiEvent::Log(format!("Protocol error packing TCP: {e}"))).await;
                         }
                     }
+                    tracing::trace!("Outbound datagram batch stream_id={stream_id} sent={sent}");
                 }
-            } else {
-                if let ProxyEvent::NewStream { stream_id, .. } = ev {
-                    let _ = proxy_tx.send((stream_id, ProxyToClientMsg::Error("tunnel stopped".into())));
+                Ok(ProtocolAction::Noop) => {
+                    tracing::trace!("Outbound datagram noop stream_id={stream_id}");
+                }
+                Ok(_) => {
+                    tracing::trace!("Outbound datagram unexpected action stream_id={stream_id}");
+                }
+                Err(e) => {
+                    tracing::warn!("Protocol error packing outbound stream_id={}: {}", stream_id, e);
+                    let _ = tx.send(UiEvent::Log(format!("Protocol error packing TCP: {e}"))).await;
                 }
             }
         }
     }
+
 
 
     fn reset_proxy_streams(
@@ -1175,6 +1023,7 @@ impl Bridge {
         }
     }
 
+
     async fn emit_metrics(&mut self, tx: &mpsc::Sender<UiEvent>) {
         let now = Instant::now();
         let elapsed = now.duration_since(self.last_sample_at).as_secs_f64().max(0.001);
@@ -1185,7 +1034,7 @@ impl Bridge {
 
         let sent_delta = cur_sent.saturating_sub(self.sample_sent);
         let recv_delta = cur_recv.saturating_sub(self.sample_recv);
-        
+
         self.sample_sent = cur_sent;
         self.sample_recv = cur_recv;
 
@@ -1195,8 +1044,8 @@ impl Bridge {
 
         tx.send(UiEvent::Traffic { incoming_bps: incoming, outgoing_bps: outgoing }).await.ok();
 
-        // Dynamically report connection status based on whether we have received server packets recently (last 10 seconds)
-        let is_healthy = self.last_valid_recv.elapsed() < Duration::from_secs(10);
+        // "Connected" means the server answered recently, not that sockets exist.
+        let is_healthy = self.link == Link::Up && self.silence() <= self.stall_after();
         let status = if is_healthy {
             self.metrics.connection_state.store(2, Ordering::Relaxed);
             ConnectionStatus::Established
@@ -1211,6 +1060,7 @@ impl Bridge {
             throughput_bps: throughput,
         }).await.ok();
     }
+
 
     async fn perform_handshake_with_id(
         &mut self,
@@ -1513,27 +1363,22 @@ impl Bridge {
         Err(last_err)
     }
 
+
+
     /// Moves every live session onto a fresh connection of the configured
     /// transport, with no new handshake: keys, nonces and streams stay, so the
     /// apps behind the tunnel keep their connections. The server moves the
     /// session to the new address on the first authenticated packet with a
     /// fresh nonce.
     ///
-    /// Only the sockets are swapped here; `check_migration` later reports
-    /// whether the server answered on the new path. The transport is never
-    /// changed and no reconnect is started from here: that stays the user's
-    /// choice.
-    async fn start_migration(
-        &mut self,
-        sessions_opt: &mut Option<Vec<SessionState>>,
-        udp_rx_opt: &mut Option<mpsc::Receiver<(usize, Bytes)>>,
-        tx: &mpsc::Sender<UiEvent>,
-    ) -> Result<()> {
-        let count = match sessions_opt.as_ref() {
-            Some(sessions) if !sessions.is_empty() => sessions.len(),
-            _ => anyhow::bail!("no session to move"),
-        };
-        if sessions_opt.as_ref().is_some_and(|s| s.iter().any(|ses| ses.machine.state() != ostp_core::OstpState::Established)) {
+    /// Only the sockets are swapped here; `check_link` settles the move. The
+    /// transport and the server are never changed.
+    async fn start_migration(&mut self, tx: &mpsc::Sender<UiEvent>) -> Result<()> {
+        let count = self.sessions.len();
+        if count == 0 {
+            anyhow::bail!("no session to move");
+        }
+        if self.sessions.iter().any(|ses| ses.machine.state() != ostp_core::OstpState::Established) {
             anyhow::bail!("a session is not established");
         }
 
@@ -1545,8 +1390,7 @@ impl Bridge {
         }
 
         let (udp_tx, udp_rx) = mpsc::channel(1024);
-        let sessions = sessions_opt.as_mut().expect("checked above");
-        for (index, (session, socket)) in sessions.iter_mut().zip(sockets).enumerate() {
+        for (index, (session, socket)) in self.sessions.iter_mut().zip(sockets).enumerate() {
             session.rx_task.abort();
             session.rx_task = spawn_session_receiver(socket.clone(), index, udp_tx.clone());
             session.socket = socket;
@@ -1569,9 +1413,9 @@ impl Bridge {
                 }
             }
         }
-        *udp_rx_opt = Some(udp_rx);
+        self.udp_rx = Some(udp_rx);
 
-        self.migration = Some(PathMigration { started: Instant::now() });
+        self.link = Link::Moving { started: Instant::now() };
         self.metrics.connection_state.store(1, Ordering::Relaxed);
         tx.send(UiEvent::Log(
             "Moving the session to a new connection (no reconnect, streams kept)...".to_string(),
@@ -1579,20 +1423,10 @@ impl Bridge {
         Ok(())
     }
 
-    /// Starts a move unless a recent one already went unanswered. Returns
-    /// whether a move was started.
-    async fn try_migrate(
-        &mut self,
-        reason: &str,
-        sessions_opt: &mut Option<Vec<SessionState>>,
-        udp_rx_opt: &mut Option<mpsc::Receiver<(usize, Bytes)>>,
-        tx: &mpsc::Sender<UiEvent>,
-    ) -> bool {
-        if self.migration_failed_at.is_some_and(|t| t.elapsed() < MIGRATION_BACKOFF) {
-            return false;
-        }
+    /// Starts a move; false if no new connection could be opened.
+    async fn try_migrate(&mut self, reason: &str, tx: &mpsc::Sender<UiEvent>) -> bool {
         tx.send(UiEvent::Log(format!("{reason}: moving the session to a new path"))).await.ok();
-        match self.start_migration(sessions_opt, udp_rx_opt, tx).await {
+        match self.start_migration(tx).await {
             Ok(()) => true,
             Err(e) => {
                 tx.send(UiEvent::Log(format!("Could not move the session: {e}"))).await.ok();
@@ -1601,38 +1435,6 @@ impl Bridge {
         }
     }
 
-    /// Settles a move in progress: done once the server answered on the new
-    /// path, reported as failed after the timeout. A failed move does not start
-    /// anything else.
-    async fn check_migration(&mut self, tx: &mpsc::Sender<UiEvent>) {
-        let Some(started) = self.migration.as_ref().map(|m| m.started) else { return };
-
-        if self.last_valid_recv >= started {
-            self.migration = None;
-            self.migration_failed_at = None;
-            self.metrics.connection_state.store(2, Ordering::Relaxed);
-            tx.send(UiEvent::Log(format!(
-                "Session moved to the new path in {} ms, no connection was dropped",
-                started.elapsed().as_millis()
-            ))).await.ok();
-            return;
-        }
-
-        let deadline = MIGRATION_TIMEOUT_MIN.max(Duration::from_millis((self.last_rtt_ms * 4.0) as u64));
-        if started.elapsed() < deadline {
-            return;
-        }
-        self.migration = None;
-        self.migration_failed_at = Some(Instant::now());
-        // The server stays silent to unknown sessions on purpose: an explicit
-        // "unknown session" answer would let any scanner confirm it is talking
-        // to an OSTP server. So "expired" and "blocked" look the same here.
-        tx.send(UiEvent::Log(format!(
-            "The server did not answer on the new path within {} s (session expired, or this \
-             transport is blocked on this network)",
-            deadline.as_secs()
-        ))).await.ok();
-    }
 
     fn apply_runtime_config(&mut self, cfg: &ClientConfig) {
         self.server_addr = cfg.ostp.server_addr.clone();
@@ -1662,7 +1464,6 @@ impl Bridge {
         self.mtu = cfg.ostp.mtu;
         self.keepalive_interval_sec = cfg.ostp.keepalive_interval_sec;
         self.kill_switch = cfg.kill_switch;
-        self.migration = None;
     }
 
     async fn try_connect_transport(

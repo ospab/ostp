@@ -40,10 +40,8 @@ pub enum BridgeCommand {
     ToggleTunnel,
     NextProfile,
     ReloadConfig,
-    /// Triggered by Android NetworkCallback when the active network changes (WiFi→LTE, etc.).
-    /// Moves the session to a socket on the new network at once (no handshake,
-    /// streams kept), without waiting for stall detection. Only if no new
-    /// connection can be opened at all does it run the older full reconnect.
+    /// The default network changed (Wi-Fi to cellular, SIM switch). Starts the
+    /// recovery at once: move the session to a new socket, else reconnect.
     NetworkChanged,
     Shutdown,
 }
