@@ -307,6 +307,7 @@ pub(crate) async fn connect_via_socks5(
     socks5_negotiate_auth(&mut stream, username, password).await?;
 
     let (host, port) = split_host_port(target).ok_or_else(|| anyhow::anyhow!("invalid target"))?;
+    check_wire_host(&host)?;
     let mut req = Vec::new();
     req.extend_from_slice(&[0x05, 0x01, 0x00]);
     if let Ok(ip) = host.parse::<std::net::IpAddr>() {
@@ -352,8 +353,22 @@ pub(crate) async fn connect_via_socks5(
     Ok(stream)
 }
 
+/// A client-chosen host that is safe to put into a proxy request: SOCKS5
+/// stores its length in one byte (a longer one would wrap and leave the rest
+/// to be read as the next request), and a CR, LF or space in an HTTP CONNECT
+/// line starts a second header or request at the operator's proxy.
+fn check_wire_host(host: &str) -> Result<()> {
+    if host.is_empty() || host.len() > 255 || host.bytes().any(|b| b <= b' ' || b == 0x7f) {
+        anyhow::bail!("invalid target host");
+    }
+    Ok(())
+}
+
 async fn connect_via_http(proxy_addr: &str, target: &str, bind_ip: Option<&str>) -> Result<TcpStream> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let (host, _) = split_host_port(target).ok_or_else(|| anyhow::anyhow!("invalid target"))?;
+    check_wire_host(&host)?;
 
     let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host(proxy_addr).await?.collect();
     let mut stream = if let Some(addr) = addrs.into_iter().next() {
@@ -390,6 +405,7 @@ impl UdpProxySocket {
             }
             UdpProxySocket::Socks5 { udp_sock, proxy_bnd_addr, .. } => {
                 let (host, port) = split_host_port(target).ok_or_else(|| anyhow::anyhow!("invalid target"))?;
+                check_wire_host(&host)?;
                 let mut req = Vec::with_capacity(10 + host.len() + data.len());
                 req.extend_from_slice(&[0x00, 0x00, 0x00]); // RSV, FRAG
                 if let Ok(ip) = host.parse::<std::net::IpAddr>() {
@@ -662,6 +678,16 @@ pub fn split_host_port(target: &str) -> Option<(String, u16)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wire_host_refuses_what_could_split_a_proxy_request() {
+        assert!(check_wire_host("example.com").is_ok());
+        assert!(check_wire_host("xn--e1afmkfd.xn--p1ai").is_ok());
+        assert!(check_wire_host("").is_err());
+        assert!(check_wire_host("a.com\r\nProxy-Authorization: x").is_err());
+        assert!(check_wire_host("a.com HTTP/1.1").is_err());
+        assert!(check_wire_host(&"a".repeat(256)).is_err());
+    }
 
     #[test]
     fn test_split_host_port() {

@@ -1293,7 +1293,10 @@ async fn handle_bulk_create_users(
     };
 
     for _ in 0..payload.count {
-        let key = uuid::Uuid::new_v4().to_string().replace("-", "")[..16].to_string();
+        // 128 random bits, like a single created key: the access key is the
+        // handshake's pre-shared key, so a captured handshake can be guessed
+        // against offline. (Sixteen hex digits of a UUIDv4 are only 60 bits.)
+        let key: String = rand::random::<[u8; 16]>().iter().map(|b| format!("{b:02x}")).collect();
         keys.insert(key.clone(), UserMeta {
             name: None,
             limit_bytes: payload.limit_bytes,
@@ -1501,17 +1504,27 @@ async fn handle_put_rules(
     // Save to config.json
     if let Some(path) = &state.config_path {
         if let Ok(content) = std::fs::read_to_string(path) {
-            let mut cfg: serde_json::Value = serde_json::from_str(&content).unwrap_or_default();
-            if let Some(obj) = cfg.as_object_mut() {
-                if let Some(outbound) = obj.get_mut("outbound") {
-                    if let Some(outbound_obj) = outbound.as_object_mut() {
+            // The config may carry comments; a parse failure must not end in
+            // writing "null" over it (and with it every access key).
+            let mut stripped = String::new();
+            let parsed = {
+                use std::io::Read;
+                json_comments::StripComments::new(content.as_bytes()).read_to_string(&mut stripped).ok()
+            }
+            .and_then(|_| serde_json::from_str::<serde_json::Value>(&stripped).ok());
+            match parsed {
+                Some(mut cfg) => {
+                    if let Some(outbound_obj) = cfg.get_mut("outbound").and_then(|o| o.as_object_mut()) {
                         if let Ok(rules_json) = serde_json::to_value(&new_rules) {
                             outbound_obj.insert("rules".to_string(), rules_json);
                         }
                     }
+                    if let Ok(text) = serde_json::to_string_pretty(&cfg) {
+                        let _ = std::fs::write(path, text);
+                    }
                 }
+                None => tracing::warn!("panel: {} could not be parsed, the new rules are applied but not saved", path.display()),
             }
-            let _ = std::fs::write(path, serde_json::to_string_pretty(&cfg).unwrap_or_default());
         }
     }
     

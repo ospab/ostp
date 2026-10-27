@@ -27,6 +27,15 @@ fi
 
 mkdir -p "$INSTALL_DIR"
 mkdir -p "$CONFIG_DIR"
+# The config holds every access key and the panel credentials: root only, or any
+# local user could read the keys and use the VPN as its owner.
+chmod 700 "$CONFIG_DIR"
+
+# Private download directory: a fixed name in /tmp lets a local user pre-create
+# it as a symlink and make this root script overwrite any file, or swap the
+# archive between download and extraction.
+WORK_DIR=$(mktemp -d) || { echo "[error] Cannot create a temporary directory."; exit 1; }
+trap 'rm -rf "$WORK_DIR"' EXIT
 
 # -- Migration from legacy installations ------------------------------
 
@@ -62,6 +71,10 @@ for lpath in "${LEGACY_PATHS[@]}"; do
         migrate_legacy "$lpath"
     fi
 done
+
+if [ -f "$CONFIG_FILE" ]; then
+    chmod 600 "$CONFIG_FILE"
+fi
 
 # Remove stale symlinks
 if [ -L "$BIN_LINK" ] && [ ! -e "$BIN_LINK" ]; then
@@ -160,8 +173,8 @@ if [ -z "$LATEST_RELEASE" ] || [[ "$LATEST_RELEASE" == *"null"* ]]; then
     echo "or press Enter if the binary is already in $INSTALL_DIR/ostp."
     read -p "URL: " DIRECT_URL
     if [ -n "$DIRECT_URL" ]; then
-        TEMP_TAR="/tmp/ostp_temp.tar.gz"
-        curl -L "$DIRECT_URL" -o "$TEMP_TAR"
+        TEMP_TAR="$WORK_DIR/ostp.tar.gz"
+        curl -fL --proto '=https' "$DIRECT_URL" -o "$TEMP_TAR"
         tar -xzf "$TEMP_TAR" -C "$INSTALL_DIR" ostp 2>/dev/null || tar -xzf "$TEMP_TAR" -C "$INSTALL_DIR"
         rm -f "$TEMP_TAR"
     fi
@@ -170,8 +183,8 @@ else
     DOWNLOAD_URL="https://github.com/${GITHUB_REPO}/releases/download/${LATEST_RELEASE}/${ARCHIVE_NAME}"
     echo "Downloading: $ARCHIVE_NAME ($LATEST_RELEASE)"
 
-    TEMP_TAR="/tmp/ostp_temp.tar.gz"
-    HTTP_CODE=$(curl -sL -w "%{http_code}" "$DOWNLOAD_URL" -o "$TEMP_TAR")
+    TEMP_TAR="$WORK_DIR/ostp.tar.gz"
+    HTTP_CODE=$(curl -sL --proto '=https' --proto-redir '=https' -w "%{http_code}" "$DOWNLOAD_URL" -o "$TEMP_TAR")
 
     if [ "$HTTP_CODE" -eq 200 ]; then
         tar -xzf "$TEMP_TAR" -C "$INSTALL_DIR" ostp 2>/dev/null || tar -xzf "$TEMP_TAR" -C "$INSTALL_DIR"
@@ -265,6 +278,8 @@ echo "No configuration found. Launching setup wizard..."
 echo ""
 
 cd "$INSTALL_DIR"
+# Files the wizard creates (config, keys, certificates) are root's alone.
+umask 077
 if [ "$ASSUME_YES" -eq 1 ]; then
     exec ./ostp manage install --config "$CONFIG_FILE" "${MANAGE_ARGS[@]}"
 fi

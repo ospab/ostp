@@ -101,16 +101,48 @@ async fn udp(addr: SocketAddr, q: &[u8]) -> Result<Vec<u8>> {
     let bind: SocketAddr = if addr.is_ipv6() { "[::]:0".parse()? } else { "0.0.0.0:0".parse()? };
     let sock = tokio::net::UdpSocket::bind(bind).await?;
     sock.connect(addr).await?;
-    sock.send(q).await?;
+    // The client chose the id of its query and may share it with someone who
+    // forges answers; an id of our own leaves a forger the full 16 bits to
+    // guess, on top of the random source port.
+    let mut wire = q.to_vec();
+    if wire.len() < 12 {
+        bail!("query too short");
+    }
+    let wire_id: [u8; 2] = rand::random();
+    wire[..2].copy_from_slice(&wire_id);
+    let question = question_end(&wire).map(|end| wire[12..end].to_vec());
+    sock.send(&wire).await?;
     let mut buf = vec![0u8; 4096];
     loop {
         let n = sock.recv(&mut buf).await?;
         // Ignore anything that is not the answer to this query.
-        if n >= 12 && buf[..2] == q[..2] {
+        let answers_ours = n >= 12
+            && buf[..2] == wire_id
+            && question.as_ref().map_or(true, |qs| n >= 12 + qs.len() && buf[12..12 + qs.len()].eq_ignore_ascii_case(qs));
+        if answers_ours {
             buf.truncate(n);
+            buf[..2].copy_from_slice(&q[..2]);
             return Ok(buf);
         }
     }
+}
+
+/// Offset just past the first question of a query (name, type, class), or
+/// `None` when it is not a plain uncompressed one.
+fn question_end(q: &[u8]) -> Option<usize> {
+    let mut pos = 12;
+    loop {
+        let len = *q.get(pos)? as usize;
+        if len & 0xC0 != 0 {
+            return None;
+        }
+        pos += 1 + len;
+        if len == 0 {
+            break;
+        }
+    }
+    let end = pos + 4;
+    (end <= q.len()).then_some(end)
 }
 
 async fn tcp(addr: SocketAddr, q: &[u8]) -> Result<Vec<u8>> {
@@ -217,6 +249,18 @@ impl Upstreams {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn question_end_finds_the_end_of_a_plain_question() {
+        // 12-byte header, "a.b" A IN.
+        let mut q = vec![0u8; 12];
+        q.extend_from_slice(&[1, b'a', 1, b'b', 0, 0, 1, 0, 1]);
+        assert_eq!(question_end(&q), Some(q.len()));
+        assert_eq!(question_end(&q[..q.len() - 1]), None, "truncated");
+        let mut compressed = vec![0u8; 12];
+        compressed.extend_from_slice(&[0xC0, 12, 0, 1, 0, 1]);
+        assert_eq!(question_end(&compressed), None);
+    }
 
     #[test]
     fn parse_forms() {

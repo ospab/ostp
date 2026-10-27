@@ -108,6 +108,8 @@ pub struct Dispatcher {
     /// Open connections (TCP streams, UDP associations) per key; see
     /// `stream_permit`.
     stream_limits: HashMap<String, Arc<tokio::sync::Semaphore>>,
+    /// Sessions removed by `drop_session` since the last tick.
+    dropped: Vec<u32>,
 }
 
 /// Server-wide key trials per second for sources not seen authenticating.
@@ -159,6 +161,7 @@ impl Dispatcher {
             junk_cache: HashMap::new(),
             trials: crate::admission::Admission::new(TRIAL_SOURCE_RATE, TRIAL_SOURCE_BURST, TRIAL_RATE),
             stream_limits: HashMap::new(),
+            dropped: Vec::new(),
         }
     }
 
@@ -384,7 +387,9 @@ impl Dispatcher {
                 let raised_highest = highest_after.is_some() && highest_after != highest_before;
                 if peer_state.last_addr != peer && raised_highest {
                     tracing::info!("Client roamed: session {} from {} to {}", session_id, peer_state.last_addr, peer);
-                    self.addr_to_session.remove(&peer_state.last_addr);
+                    if self.addr_to_session.get(&peer_state.last_addr) == Some(&session_id) {
+                        self.addr_to_session.remove(&peer_state.last_addr);
+                    }
                     peer_state.last_addr = peer;
                     self.addr_to_session.insert(peer, session_id);
                     self.trials.mark_known(peer.ip());
@@ -551,6 +556,16 @@ impl Dispatcher {
 
                             self.replay_cache.insert(payload.to_vec(), ts);
 
+                            // The session id is the client's choice. Inserting over a
+                            // live id would silently replace another user's session
+                            // (and skip its counter); only the same key may reuse one.
+                            if let Some(existing) = self.peer_machines.get(&candidate_session_id) {
+                                if existing.access_key != candidate_key {
+                                    return Ok(DispatchOutcome::Unauthorized);
+                                }
+                                self.drop_session(candidate_session_id);
+                            }
+
                             // This key's oldest session makes room.
                             let mine: Vec<(u32, std::time::Instant)> = self
                                 .peer_machines
@@ -646,6 +661,7 @@ impl Dispatcher {
             self.stream_limits.retain(|k, _| keys.contains_key(k));
         }
 
+        let mut dropped_earlier = std::mem::take(&mut self.dropped);
         let mut frames = Vec::new();
         let mut expired = Vec::new();
         let now = std::time::Instant::now();
@@ -711,6 +727,12 @@ impl Dispatcher {
             }
         }
 
+        // Sessions dropped between ticks (evicted for a key's cap, key removed, limit
+        // reached) are reported too, so the relay closes their streams; an id that
+        // a newer session has taken since is not theirs to close.
+        self.dropped.clear();
+        dropped_earlier.retain(|sid| !self.peer_machines.contains_key(sid) && !expired.contains(sid));
+        expired.extend(dropped_earlier);
         (frames, expired)
     }
 
@@ -728,7 +750,13 @@ impl Dispatcher {
 
     pub fn drop_session(&mut self, session_id: u32) {
         if let Some(state) = self.peer_machines.remove(&session_id) {
-            self.addr_to_session.remove(&state.last_addr);
+            // A newer session of the same client may have taken this address;
+            // removing its entry would push every packet of it onto the slow
+            // roaming scan.
+            if self.addr_to_session.get(&state.last_addr) == Some(&session_id) {
+                self.addr_to_session.remove(&state.last_addr);
+            }
+            self.dropped.push(session_id);
             let stats = self.get_or_create_user_stats(&state.access_key);
             let _ = stats.connections.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| Some(n.saturating_sub(1)));
         }
@@ -927,6 +955,24 @@ mod roaming_tests {
         assert_eq!(dispatcher.peer_machines[&SID].last_addr, roamed);
         assert_eq!(dispatcher.addr_to_session.get(&roamed), Some(&SID));
         assert_eq!(dispatcher.addr_to_session.get(&home), None);
+    }
+
+    #[test]
+    fn a_session_dropped_between_ticks_is_reported_once_by_the_next_tick() {
+        let (mut dispatcher, _client) = established(addr("198.51.100.1:40000"));
+        dispatcher.drop_session(SID);
+        let (_, dropped) = dispatcher.on_tick();
+        assert_eq!(dropped, vec![SID], "its streams must be closed");
+        assert!(dispatcher.on_tick().1.is_empty());
+    }
+
+    #[test]
+    fn dropping_an_old_session_keeps_the_address_of_a_newer_one() {
+        let home = addr("198.51.100.1:40000");
+        let (mut dispatcher, _client) = established(home);
+        dispatcher.addr_to_session.insert(home, SID + 1);
+        dispatcher.drop_session(SID);
+        assert_eq!(dispatcher.addr_to_session.get(&home), Some(&(SID + 1)));
     }
 
     fn live_sessions(dispatcher: &Dispatcher) -> u64 {
