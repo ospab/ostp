@@ -125,13 +125,13 @@ fn key_and_name(u: &Value) -> (String, String) {
     }
 }
 
-const UNIT: &str = "/etc/systemd/system/ostp.service";
+pub(crate) const UNIT: &str = "/etc/systemd/system/ostp.service";
 
-fn systemctl(args: &[&str]) -> bool {
+pub(crate) fn systemctl(args: &[&str]) -> bool {
     Command::new("systemctl").args(args).output().is_ok_and(|o| o.status.success())
 }
 
-fn service_active() -> bool {
+pub(crate) fn service_active() -> bool {
     systemctl(&["is-active", "--quiet", "ostp"])
 }
 
@@ -164,7 +164,7 @@ fn restart() -> Result<bool> {
     Ok(service_active())
 }
 
-fn journal_tail(lines: usize) -> Vec<String> {
+pub(crate) fn journal_tail(lines: usize) -> Vec<String> {
     Command::new("journalctl")
         .args(["-u", "ostp", "-n", &lines.to_string(), "--no-pager", "-o", "short-iso"])
         .output()

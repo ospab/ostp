@@ -11,6 +11,7 @@ mod dns_cmd;
 mod overnet_cmd;
 mod changelog_cmd;
 mod manage_cmd;
+mod service_cmd;
 mod webserver;
 
 #[derive(Parser, Debug)]
@@ -135,6 +136,23 @@ enum Commands {
         /// Language: en or ru (default: the system language)
         #[arg(short, long)]
         lang: Option<String>,
+    },
+    /// Start the ostp service (Linux)
+    Start,
+    /// Stop the ostp service (Linux)
+    Stop,
+    /// Restart the ostp service (Linux)
+    Restart,
+    /// Whether ostp is running, since when, and the last log lines
+    Status,
+    /// Show the log: the service journal on Linux, ostp.log elsewhere
+    Log {
+        /// Number of lines
+        #[arg(short = 'n', long, default_value_t = 50)]
+        lines: usize,
+        /// Keep printing new lines until Ctrl+C
+        #[arg(short, long)]
+        follow: bool,
     },
     /// Upgrade the configuration file to the current schema (only when you run this command)
     Migrate {
@@ -1281,6 +1299,11 @@ async fn run_app() -> Result<()> {
             Commands::Manage { action } => manage_cmd::run(action, &args.config),
             Commands::Dns { action } => return dns_cmd::run(action, &args.config).await,
             Commands::Overnet { action } => return overnet_cmd::run(action, &args.config),
+            Commands::Start => return service_cmd::run(service_cmd::Action::Start),
+            Commands::Stop => return service_cmd::run(service_cmd::Action::Stop),
+            Commands::Restart => return service_cmd::run(service_cmd::Action::Restart),
+            Commands::Status => return service_cmd::status(&args.config),
+            Commands::Log { lines, follow } => return service_cmd::log(lines, follow),
             Commands::Changelog { all, last, version, lang } => {
                 return changelog_cmd::run(changelog_cmd::Options { all, last, version, lang });
             }

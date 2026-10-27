@@ -128,6 +128,9 @@ ostp [--config PATH] [COMMAND]
 | `setup` | Interactive setup wizard |
 | `init server\|client\|relay` | Write a template config |
 | `check` | Validate the config and print a summary |
+| `start`, `stop`, `restart` | Control the `ostp` service (Linux, registered by `setup`) |
+| `status` | Whether ostp is running, since when, and the last log lines |
+| `log [-n N] [-f]` | The log: the service journal on Linux, `ostp.log` elsewhere; `-f` follows it |
 | `connect <URL>` | Connect once with an `ostp://` link |
 | `import <URL>` | Save an `ostp://` link or a subscription URL to the config |
 | `links [qr]` | Print the users' `ostp://` links, or show them as QR codes |

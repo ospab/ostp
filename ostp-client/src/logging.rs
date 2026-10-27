@@ -20,7 +20,8 @@ pub fn invocation_is_daemon<I: IntoIterator<Item = String>>(args: I) -> bool {
     const ONE_SHOT: &[&str] = &[
         "gk", "generate-key", "check", "init", "setup", "links", "import",
         "update", "migrate", "proxy-env", "proxy-env-clear", "uninstall",
-        "cert", "sub", "panel", "dns", "manage", "changelog", "cl", "hash-password", "hp",
+        "cert", "sub", "panel", "dns", "overnet", "manage", "changelog", "cl", "hash-password", "hp",
+        "start", "stop", "restart", "status", "log",
         "-V", "--version", "-h", "--help", "help",
     ];
     !args
