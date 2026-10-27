@@ -194,6 +194,34 @@ async fn create_udp_socket_bypassing_tun(
     Ok(socket)
 }
 
+/// Local connections open at once. Stream ids are 16 bits and the id search
+/// below only ends while one is free; the cap also keeps a runaway program
+/// from taking every descriptor of the machine.
+const MAX_LOCAL_STREAMS: usize = 20_000;
+/// Download bytes waiting for a local program to read them. The server sends
+/// as fast as the window allows whether or not the program reads (per-stream
+/// flow control is for protocol v6), so a stalled reader would otherwise grow
+/// the client's memory by the whole download. Past it the stream is reset.
+const MAX_QUEUED_DOWNLOAD: usize = 32 * 1024 * 1024;
+/// How long a local program gets to send its first byte (browsers keep
+/// pre-opened sockets idle for a while) and to finish a SOCKS5 or HTTP request.
+const LOCAL_FIRST_BYTE_TIMEOUT: Duration = Duration::from_secs(120);
+const LOCAL_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// A local connection's queue towards its task: the messages, and how many
+/// download bytes are in them.
+struct StreamSlot {
+    tx: mpsc::UnboundedSender<ProxyToClientMsg>,
+    queued: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+async fn read_exact_within(client: &mut TcpStream, buf: &mut [u8], limit: Duration) -> Result<()> {
+    timeout(limit, client.read_exact(buf))
+        .await
+        .map_err(|_| anyhow!("the local program did not finish its request in time"))??;
+    Ok(())
+}
+
 pub async fn run_local_socks5_proxy(
     cfg: LocalProxyConfig,
     ostp: OstpConfig,
@@ -226,7 +254,7 @@ pub async fn run_local_socks5_proxy(
     let max_chunk = ostp.mtu.saturating_sub(150).max(512);
 
     let mut next_stream_id: u16 = 1;
-    let mut active_streams: HashMap<u16, mpsc::UnboundedSender<ProxyToClientMsg>> = HashMap::new();
+    let mut active_streams: HashMap<u16, StreamSlot> = HashMap::new();
 
     loop {
         tokio::select! {
@@ -243,7 +271,21 @@ pub async fn run_local_socks5_proxy(
                 }
             }
             accepted = listener.accept() => {
-                let (socket, _) = accepted?;
+                // An accept error (out of descriptors, a connection reset
+                // before it was accepted) is about that connection, not the
+                // listener: ending here stops the whole client.
+                let (socket, _) = match accepted {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::warn!("local proxy accept failed: {e}");
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        continue;
+                    }
+                };
+                if active_streams.len() >= MAX_LOCAL_STREAMS {
+                    tracing::warn!("local proxy: {MAX_LOCAL_STREAMS} connections open, refusing another");
+                    continue;
+                }
                 let stream_id = next_stream_id;
                 // Advance, skipping zero and any stream_id still in active_streams
                 loop {
@@ -253,7 +295,8 @@ pub async fn run_local_socks5_proxy(
                 }
 
                 let (tx, rx) = mpsc::unbounded_channel();
-                active_streams.insert(stream_id, tx);
+                let queued = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                active_streams.insert(stream_id, StreamSlot { tx, queued: queued.clone() });
 
                 let event_tx = proxy_events_tx.clone();
                 let c_tx = connect_tx.clone();
@@ -264,6 +307,7 @@ pub async fn run_local_socks5_proxy(
                         stream_id,
                         event_tx,
                         rx,
+                        queued,
                         c_tx,
                         connect_timeout,
                         debug,
@@ -288,12 +332,26 @@ pub async fn run_local_socks5_proxy(
                         if true {
                             tracing::info!("Resetting all active proxy streams on reconnect");
                         }
-                        for (_, tx) in active_streams.drain() {
-                            let _ = tx.send(ProxyToClientMsg::Close);
+                        for (_, slot) in active_streams.drain() {
+                            let _ = slot.tx.send(ProxyToClientMsg::Close);
                         }
                     }
-                } else if let Some(tx) = active_streams.get(&stream_id) {
-                    if tx.send(msg).is_err() {
+                } else if let Some(slot) = active_streams.get(&stream_id) {
+                    let mut stalled = false;
+                    if let ProxyToClientMsg::Data(data) = &msg {
+                        let queued = slot.queued.fetch_add(data.len(), std::sync::atomic::Ordering::Relaxed) + data.len();
+                        stalled = queued > MAX_QUEUED_DOWNLOAD;
+                    }
+                    if stalled {
+                        tracing::warn!("stream {stream_id}: over {} MB waiting for the local program, resetting it", MAX_QUEUED_DOWNLOAD >> 20);
+                        let _ = slot.tx.send(ProxyToClientMsg::Error("the local program does not read fast enough".into()));
+                        active_streams.remove(&stream_id);
+                        // The server keeps sending until told otherwise.
+                        let events = proxy_events_tx.clone();
+                        tokio::spawn(async move {
+                            let _ = events.send(ProxyEvent::Close { stream_id }).await;
+                        });
+                    } else if slot.tx.send(msg).is_err() {
                         active_streams.remove(&stream_id);
                     }
                 }
@@ -587,6 +645,7 @@ async fn handle_proxy_client(
     stream_id: u16,
     event_tx: mpsc::Sender<ProxyEvent>,
     mut rx: mpsc::UnboundedReceiver<ProxyToClientMsg>,
+    queued: Arc<std::sync::atomic::AtomicUsize>,
     close_tx: mpsc::Sender<u16>,
     connect_timeout: Duration,
     debug: bool,
@@ -611,7 +670,7 @@ async fn handle_proxy_client(
 
     // Peek the first byte to distinguish SOCKS5 (0x05) from HTTP (any printable ASCII)
     let mut first_byte = [0_u8; 1];
-    client.read_exact(&mut first_byte).await?;
+    read_exact_within(&mut client, &mut first_byte, LOCAL_FIRST_BYTE_TIMEOUT).await?;
 
     let target: String;
     let is_socks5 = first_byte[0] == 0x05;
@@ -619,18 +678,18 @@ async fn handle_proxy_client(
     if is_socks5 {
         // ── SOCKS5 Handshake ──────────────────────────────────────────
         let mut second_byte = [0_u8; 1];
-        client.read_exact(&mut second_byte).await?;
+        read_exact_within(&mut client, &mut second_byte, LOCAL_REQUEST_TIMEOUT).await?;
         let nmethods = second_byte[0] as usize;
         if nmethods > 0 {
             let mut methods_buf = vec![0_u8; nmethods];
-            client.read_exact(&mut methods_buf).await?;
+            read_exact_within(&mut client, &mut methods_buf, LOCAL_REQUEST_TIMEOUT).await?;
         }
         // Reply: version=5, NO AUTHENTICATION
         client.write_all(&[0x05, 0x00]).await?;
 
         // ── SOCKS5 Request ────────────────────────────────────────────
         let mut req = [0_u8; 4];
-        client.read_exact(&mut req).await?;
+        read_exact_within(&mut client, &mut req, LOCAL_REQUEST_TIMEOUT).await?;
         if req[0] != 0x05 {
             return Err(anyhow!("SOCKS5 request version mismatch"));
         }
@@ -646,23 +705,23 @@ async fn handle_proxy_client(
         target = match req[3] {
             0x01 => {
                 // IPv4: 4 bytes address + 2 bytes port
-                client.read_exact(&mut addr_buf[0..6]).await?;
+                read_exact_within(&mut client, &mut addr_buf[0..6], LOCAL_REQUEST_TIMEOUT).await?;
                 let ip = std::net::Ipv4Addr::new(addr_buf[0], addr_buf[1], addr_buf[2], addr_buf[3]);
                 let port = u16::from_be_bytes([addr_buf[4], addr_buf[5]]);
                 format!("{}:{}", ip, port)
             }
             0x03 => {
                 // Domain: 1 byte length, then domain, then 2 bytes port
-                client.read_exact(&mut addr_buf[0..1]).await?;
+                read_exact_within(&mut client, &mut addr_buf[0..1], LOCAL_REQUEST_TIMEOUT).await?;
                 let domain_len = addr_buf[0] as usize;
-                client.read_exact(&mut addr_buf[0..domain_len + 2]).await?;
+                read_exact_within(&mut client, &mut addr_buf[0..domain_len + 2], LOCAL_REQUEST_TIMEOUT).await?;
                 let domain = String::from_utf8_lossy(&addr_buf[0..domain_len]);
                 let port = u16::from_be_bytes([addr_buf[domain_len], addr_buf[domain_len + 1]]);
                 format!("{}:{}", domain, port)
             }
             0x04 => {
                 // IPv6: 16 bytes + 2 bytes port
-                client.read_exact(&mut addr_buf[0..18]).await?;
+                read_exact_within(&mut client, &mut addr_buf[0..18], LOCAL_REQUEST_TIMEOUT).await?;
                 let mut octets = [0u8; 16];
                 octets.copy_from_slice(&addr_buf[0..16]);
                 let ip = std::net::Ipv6Addr::from(octets);
@@ -741,7 +800,9 @@ async fn handle_proxy_client(
         header_bytes.push(first_byte[0]);
         let mut chunk = [0_u8; 512];
         loop {
-            let n = client.read(&mut chunk).await?;
+            let n = timeout(LOCAL_REQUEST_TIMEOUT, client.read(&mut chunk))
+                .await
+                .map_err(|_| anyhow!("the local program did not finish its request in time"))??;
             if n == 0 {
                 return Err(anyhow!("connection closed during HTTP header read"));
             }
@@ -870,6 +931,7 @@ async fn handle_proxy_client(
             msg = rx.recv() => {
                 match msg {
                     Some(ProxyToClientMsg::Data(data)) => {
+                        queued.fetch_sub(data.len(), std::sync::atomic::Ordering::Relaxed);
                         if client.write_all(&data).await.is_err() {
                             let _ = event_tx.send(ProxyEvent::Close { stream_id }).await;
                             break;
