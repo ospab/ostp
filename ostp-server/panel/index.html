@@ -488,9 +488,9 @@ tr:last-child td { border-bottom: 0; }
   <form class="modal" id="f-user" role="dialog" aria-modal="true" aria-labelledby="mu-title">
     <h2 id="mu-title" data-t="add_user">Add user</h2>
     <p class="desc" id="mu-desc" data-t="add_user_desc">A random access key is generated unless you paste one.</p>
-    <div class="field"><label class="lbl" for="mu-name" data-t="name">Name</label><input class="input" id="mu-name" placeholder="alice" /></div>
+    <div class="field"><label class="lbl" for="mu-name" data-t="name">Name</label><input class="input" id="mu-name" placeholder="alice" maxlength="100" /></div>
     <div class="field" id="mu-key-field"><label class="lbl" for="mu-key" data-t="access_key_opt">Access key (optional)</label>
-      <div class="row"><input class="input mono grow" id="mu-key" spellcheck="false" autocomplete="off" /><button type="button" class="btn" id="mu-gen" data-t="generate">Generate</button></div></div>
+      <div class="row"><input class="input mono grow" id="mu-key" maxlength="128" spellcheck="false" autocomplete="off" /><button type="button" class="btn" id="mu-gen" data-t="generate">Generate</button></div></div>
     <div class="field"><label class="lbl" for="mu-limit" data-t="limit_gb">Traffic limit, GB (empty = unlimited)</label><input class="input" id="mu-limit" type="number" min="0.01" step="any" /></div>
     <div class="modal-actions"><button type="button" class="btn" data-close data-t="cancel">Cancel</button><button class="btn primary" data-t="save">Save</button></div>
   </form>
@@ -577,7 +577,19 @@ const I18N = {
     server_error: 'The server failed (HTTP {code}). Look at its log: journalctl -u ostp.',
     copy_failed: 'Could not copy. Select the text and copy it by hand.',
     key_bad: 'The access key must be 8 to 128 characters with no spaces, slashes, ? or #.',
-    key_exists: 'A user with this access key already exists. Saving would overwrite it.',
+    key_exists: 'A user with this access key already exists.',
+    timeout_error: 'The server did not answer in time. Try again.',
+    too_large: 'The request is too large for the server.',
+    bad_request: 'The server did not accept the request (HTTP {code}).',
+    limit_bad: 'Traffic limit: enter a number above zero (up to 1000000), or leave the field empty.',
+    count_bad: 'Count: a whole number from 1 to 1000.',
+    user_changed: 'Someone else changed this user while you were editing. The form now shows the current values. Check them and save again.',
+    changed_title: 'Changed on the server', changed_text: 'It differs from what you loaded: someone saved it since. Overwriting loses their changes.',
+    show_more: 'Show more ({n} left)',
+    resume_note: 'Signed in again. Your input is kept: press the button to send it.',
+    err_exists: 'A user with this access key already exists.',
+    err_users_cap: 'The server holds up to 10000 users. Delete some first.',
+    err_busy: 'The same operation is already running. Wait for it to finish.',
     rule_list: 'The rules must be a JSON list: [ { ... }, { ... } ].',
     rule_bad: 'Rule {n} is not an object.',
     rule_action: 'Rule {n}: action must be "proxy", "direct" or "block".',
@@ -587,8 +599,8 @@ const I18N = {
     overwrite: 'Overwrite', discard: 'Discard', confirm_discard: 'Discard your edits?', confirm_discard_text: 'The text is reloaded from the server and your changes are lost.',
     confirm_dns_clear: 'Clear the query log?', confirm_dns_clear_text: 'All logged DNS queries are removed. The statistics stay.', dns_cleared: 'Query log cleared',
     url_bad: 'The list address must start with http:// or https://.',
-    interval_bad: 'Update interval: enter a whole number of hours, 1 or more.',
-    cache_bad: 'Cache entries: enter a whole number, 0 or more.',
+    interval_bad: 'Update interval: enter a whole number of hours, from 1 to 8760.',
+    cache_bad: 'Cache entries: enter a whole number from 0 to 1000000.',
     rw_empty: 'Enter both the name and the answer.',
     dns_not_loaded: 'DNS settings are not loaded yet. Wait a moment and try again.',
     dns_test_empty: 'Enter a domain to check.',
@@ -674,7 +686,19 @@ const I18N = {
     server_error: 'Ошибка на сервере (HTTP {code}). Посмотрите его журнал: journalctl -u ostp.',
     copy_failed: 'Не удалось скопировать. Выделите текст и скопируйте вручную.',
     key_bad: 'Ключ доступа: от 8 до 128 символов, без пробелов, слэшей, ? и #.',
-    key_exists: 'Пользователь с таким ключом уже есть. Сохранение перезапишет его.',
+    key_exists: 'Пользователь с таким ключом уже есть.',
+    timeout_error: 'Сервер не ответил вовремя. Повторите попытку.',
+    too_large: 'Запрос слишком большой для сервера.',
+    bad_request: 'Сервер не принял запрос (HTTP {code}).',
+    limit_bad: 'Лимит трафика: введите число больше нуля (до 1000000) или оставьте поле пустым.',
+    count_bad: 'Количество: целое число от 1 до 1000.',
+    user_changed: 'Пользователя изменил кто-то другой, пока вы правили. В форме теперь текущие значения. Проверьте их и сохраните снова.',
+    changed_title: 'Изменено на сервере', changed_text: 'Это отличается от того, что вы загрузили: кто-то уже сохранил свою версию. Перезапись потеряет его изменения.',
+    show_more: 'Показать ещё (осталось {n})',
+    resume_note: 'Вы снова вошли. Ввод сохранён: нажмите кнопку, чтобы отправить его.',
+    err_exists: 'Пользователь с таким ключом уже есть.',
+    err_users_cap: 'На сервере может быть до 10000 пользователей. Сначала удалите лишних.',
+    err_busy: 'Эта операция уже выполняется. Дождитесь её конца.',
     rule_list: 'Правила должны быть списком JSON: [ { ... }, { ... } ].',
     rule_bad: 'Правило {n}: это не объект.',
     rule_action: 'Правило {n}: action должен быть "proxy", "direct" или "block".',
@@ -684,8 +708,8 @@ const I18N = {
     overwrite: 'Перезаписать', discard: 'Отбросить', confirm_discard: 'Отбросить ваши правки?', confirm_discard_text: 'Текст загрузится с сервера заново, изменения пропадут.',
     confirm_dns_clear: 'Очистить журнал запросов?', confirm_dns_clear_text: 'Все записанные DNS-запросы будут удалены. Статистика останется.', dns_cleared: 'Журнал запросов очищен',
     url_bad: 'Адрес списка должен начинаться с http:// или https://.',
-    interval_bad: 'Обновление списков: введите целое число часов, 1 или больше.',
-    cache_bad: 'Размер кэша: введите целое число, 0 или больше.',
+    interval_bad: 'Обновление списков: введите целое число часов от 1 до 8760.',
+    cache_bad: 'Размер кэша: введите целое число от 0 до 1000000.',
     rw_empty: 'Введите и имя, и ответ.',
     dns_not_loaded: 'Настройки DNS ещё не загружены. Подождите и повторите.',
     dns_test_empty: 'Введите домен для проверки.',
@@ -757,11 +781,22 @@ function fmtUptime(s) {
   return d ? `${d}${t('days')} ${h}${t('hours')}` : h ? `${h}${t('hours')} ${m}${t('minutes')}` : `${m}${t('minutes')}`;
 }
 const GB = 1024 ** 3;
+const MAX_LIMIT_GB = 1000000;
+// Bytes from a "GB" field: null when empty (unlimited), undefined when it is not a usable number.
+function readLimit(id) {
+  const raw = $(id).value.trim();
+  if (raw === '') return null;
+  const n = Number(raw);
+  return n > 0 && n <= MAX_LIMIT_GB ? Math.round(n * GB) : undefined;
+}
 function toast(msg, err = false) {
   const el = document.createElement('div');
   el.className = 'toast' + (err ? ' err' : '');
   el.textContent = msg;
-  $('toasts').appendChild(el);
+  const box = $('toasts');
+  // A failing poll or a stuck server must not stack toasts without end.
+  while (box.children.length >= 4) box.firstElementChild.remove();
+  box.appendChild(el);
   setTimeout(() => el.remove(), err ? 7000 : 3500);
 }
 async function copy(text) {
@@ -778,8 +813,14 @@ async function copy(text) {
 const copyToast = async text => (await copy(text)) ? true : (toast(t('copy_failed'), true), false);
 // Disables a button while its request runs, so a double click cannot send it twice.
 async function busy(btn, fn) {
+  if (btn.disabled) return;
   btn.disabled = true;
-  try { return await fn(); } finally { btn.disabled = false; }
+  // While a form is being sent its fields are locked, so text typed in the
+  // meantime is not taken for part of what was saved.
+  const form = btn.closest('form');
+  const locked = form ? [...form.querySelectorAll('input, textarea, select')].filter(x => !x.disabled) : [];
+  locked.forEach(x => { x.disabled = true; });
+  try { return await fn(); } finally { locked.forEach(x => { x.disabled = false; }); btn.disabled = false; }
 }
 const fail = (key, err) => toast(t(key, { err: err.message }), true);
 
@@ -825,22 +866,34 @@ const KNOWN_ERRORS = [
   [/no config path/i, 'err_no_config_path'],
   [/user not found/i, 'err_user_gone'],
   [/failed to save configuration/i, 'err_save_cfg'],
+  [/already exists/i, 'err_exists'],
+  [/too many users/i, 'err_users_cap'],
+  [/already running/i, 'err_busy'],
 ];
 function apiText(msg) { const k = KNOWN_ERRORS.find(([re]) => re.test(msg)); return k ? t(k[1]) : msg; }
+// A hung server must not leave a button disabled or a poll waiting for ever.
+const API_TIMEOUT = 15000, API_SLOW = { 'dns/update': 120000 };
 async function api(path, opts = {}) {
+  const ctl = new AbortController();
+  // The timer also covers reading the body, which can stall after the headers.
+  const killer = setTimeout(() => ctl.abort(), API_SLOW[path] || API_TIMEOUT);
+  try { return await apiCall(path, opts, ctl.signal); } finally { clearTimeout(killer); }
+}
+async function apiCall(path, opts, signal) {
   const headers = { 'Content-Type': 'application/json' };
   if (token) headers.Authorization = 'Bearer ' + token;
   let res;
-  try { res = await fetch('api/' + path, { ...opts, headers, body: opts.body !== undefined ? JSON.stringify(opts.body) : undefined }); }
-  catch { throw new Error(t('net_error')); }
+  try { res = await fetch('api/' + path, { ...opts, headers, signal, body: opts.body !== undefined ? JSON.stringify(opts.body) : undefined }); }
+  catch (err) { throw new Error(t(err && err.name === 'AbortError' ? 'timeout_error' : 'net_error')); }
   if (res.status === 401) {
     if (path === 'login') throw new Unauthorized(t('bad_login'));
     showLogin(token ? t('session_ended') : '');
     throw new Unauthorized(t('session_ended'));
   }
   if (res.status === 429) throw new Error(t('too_many_logins'));
+  if (res.status === 413) throw new Error(t('too_large'));
   let json;
-  try { json = await res.json(); } catch { throw new Error(res.status >= 500 ? t('server_error', { code: res.status }) : 'HTTP ' + res.status); }
+  try { json = await res.json(); } catch (err) { if (err && err.name === 'AbortError') throw new Error(t('timeout_error')); throw new Error(res.status >= 500 ? t('server_error', { code: res.status }) : t('bad_request', { code: res.status })); }
   if (!json.ok) throw new Error(apiText(json.error || '') || 'HTTP ' + res.status);
   return json.data;
 }
@@ -856,9 +909,13 @@ let sortKey = 'down', sortDir = -1, filter = 'all';
 const PAGES = ['overview', 'users', 'routing', 'config', 'dns', 'overnet', 'activity'];
 
 // ── login ─────────────────────────────────────────────────────────────
+// A half-filled user form survives a lost session: it comes back after signing in.
+let resumeModal = null;
 function showLogin(msg) {
-  clearInterval(timer);
+  clearTimeout(timer);
   token = ''; sessionStorage.removeItem('ostp_panel_token');
+  const open = ['m-user', 'm-bulk'].find(id => !$(id).classList.contains('hidden'));
+  if (open) resumeModal = open;
   closeModals();
   const shown = !$('login').classList.contains('hidden');
   $('app').classList.add('hidden'); $('login').classList.remove('hidden');
@@ -874,6 +931,7 @@ $('login-form').addEventListener('submit', async e => {
       token = d.token; sessionStorage.setItem('ostp_panel_token', token);
       $('lg-pass').value = '';
       $('login').classList.add('hidden'); start();
+      if (resumeModal) { openModal(resumeModal); toast(t('resume_note')); resumeModal = null; }
     } catch (err) {
       $('lg-err').textContent = err.message; $('lg-err').classList.remove('hidden');
       $('lg-pass').select();
@@ -934,8 +992,11 @@ async function loadOvernet(withForm) {
   try { renderOvernet(await api('overnet'), withForm); }
   catch (err) { if (withForm && !(err instanceof Unauthorized)) fail('f_load', err); }
 }
-$('page-overnet').addEventListener('input', e => { if (e.target.closest('.card input')) ovDirty = true; });
-$('page-overnet').addEventListener('change', e => { if (e.target.closest('.card input')) ovDirty = true; });
+// Counts edits, so a save can tell whether the form changed while it was in flight.
+let ovEdits = 0;
+const ovMark = e => { if (e.target.closest('.card input')) { ovDirty = true; ovEdits++; } };
+$('page-overnet').addEventListener('input', ovMark);
+$('page-overnet').addEventListener('change', ovMark);
 const hostPort = a => { const m = /^(?:\[[0-9a-f:.]+\]|[^\s:\[\]]+):(\d{1,5})$/i.exec(a); return !!m && +m[1] >= 1 && +m[1] <= 65535; };
 $('btn-ov-save').addEventListener('click', e => busy(e.currentTarget, async () => {
   const body = {
@@ -947,8 +1008,9 @@ $('btn-ov-save').addEventListener('click', e => busy(e.currentTarget, async () =
   }
   // Opening an exit puts other people's traffic on this server's IP: ask first.
   if (body.exit && !(ovStatus && ovStatus.config.exit) && !await confirmBox(t('ov_exit_confirm'), t('ov_exit_confirm_text'), t('ov_exit_on'))) return;
+  const edits = ovEdits;
   try {
-    renderOvernet(await api('overnet', { method: 'PUT', body }), true);
+    renderOvernet(await api('overnet', { method: 'PUT', body }), edits === ovEdits);
     audit('ev_overnet', '');
     setNote('ov-save-note', '');
     toast(t('ov_saved'));
@@ -962,14 +1024,23 @@ function setLive(ok) {
   $('ov-live').firstElementChild.className = 'dot' + (ok ? ' on' : '');
   $('ov-live-text').textContent = t(ok ? 'conn_ok' : 'conn_lost');
 }
-async function refresh() {
+// One refresh at a time: a slow server must not collect a queue of them, and
+// an action that refreshes while a poll is running shares its result.
+let refreshing = null, failures = 0;
+function refresh() {
+  if (!refreshing) refreshing = doRefresh().finally(() => { refreshing = null; });
+  return refreshing;
+}
+async function doRefresh() {
   try {
     [status, users] = await Promise.all([api('server/status'), api('users')]);
   } catch (err) {
     if (err instanceof Unauthorized) return false;
+    failures++;
     setLive(false); // the old numbers stay on screen, marked as possibly stale
     return true;
   }
+  failures = 0;
   setLive(true);
   samples.push({ t: Date.now(), up: status.bytes_up || 0, down: status.bytes_down || 0 });
   while (samples.length > 61) samples.shift();
@@ -1076,6 +1147,9 @@ const iconBtn = (act, icon, label, who, cls = '') =>
   `<button class="icon-btn ${cls}" data-act="${act}" title="${esc(label)}" aria-label="${esc(label + ': ' + who)}">${icon}</button>`;
 const usage = u => u.limit_bytes ? (u.bytes_down + u.bytes_up) / u.limit_bytes : null;
 
+// Thousands of rows rebuilt every few seconds would freeze the tab: show a page at a time.
+const USERS_STEP = 200;
+let usersShown = USERS_STEP;
 function renderUsers() {
   $('users-sub').textContent = t('users_sub', { total: users.length, online: users.filter(u => u.online).length });
   document.querySelectorAll('th.sortable').forEach(th =>
@@ -1086,6 +1160,8 @@ function renderUsers() {
   if (filter === 'limited') list = list.filter(u => (usage(u) ?? 0) >= 0.8);
   const val = u => ({ name: (u.name || '').toLowerCase(), connections: u.connections, down: u.bytes_down + u.bytes_up, usage: usage(u) ?? -1 })[sortKey];
   list.sort((a, b) => (val(a) > val(b) ? 1 : val(a) < val(b) ? -1 : 0) * sortDir);
+  const hiddenRows = Math.max(0, list.length - usersShown);
+  list = list.slice(0, usersShown);
 
   const body = $('users-body');
   // The table is redrawn every few seconds: keep the keyboard focus on the same button.
@@ -1114,24 +1190,24 @@ function renderUsers() {
         ${iconBtn('reset', ICON.reset, t('reset'), who)}
         ${iconBtn('del', ICON.del, t('delete'), who, 'danger')}
       </div></td></tr>`;
-  }).join('');
+  }).join('') + (hiddenRows ? `<tr><td colspan="5" class="empty"><button class="btn" data-more>${esc(t('show_more', { n: hiddenRows }))}</button></td></tr>` : '');
   if (focused) {
     const row = [...body.querySelectorAll('tr')].find(r => r.dataset.key === focused[0]);
     const el = row && [...row.querySelectorAll('[data-act]')].find(b => b.dataset.act === focused[1]);
     if (el) el.focus();
   }
 }
-$('user-search').addEventListener('input', renderUsers);
+$('user-search').addEventListener('input', () => { usersShown = USERS_STEP; renderUsers(); });
 $('user-filter').addEventListener('click', e => {
   const b = e.target.closest('button'); if (!b) return;
-  filter = b.dataset.f;
+  filter = b.dataset.f; usersShown = USERS_STEP;
   $('user-filter').querySelectorAll('button').forEach(x => { x.classList.toggle('on', x === b); x.setAttribute('aria-pressed', x === b); });
   renderUsers();
 });
 function sortBy(th) {
   const k = th.dataset.sort;
   sortDir = sortKey === k ? -sortDir : (k === 'name' ? 1 : -1);
-  sortKey = k; renderUsers();
+  sortKey = k; usersShown = USERS_STEP; renderUsers();
 }
 document.querySelectorAll('th.sortable').forEach(th => {
   th.addEventListener('click', () => sortBy(th));
@@ -1139,6 +1215,11 @@ document.querySelectorAll('th.sortable').forEach(th => {
 });
 
 $('users-body').addEventListener('click', async e => {
+  if (e.target.closest('[data-more]')) {
+    usersShown += USERS_STEP; renderUsers();
+    const b = $('users-body').querySelector('[data-more]'); if (b) b.focus();
+    return;
+  }
   const btn = e.target.closest('[data-act]'); if (!btn) return;
   const key = btn.closest('tr').dataset.key;
   const u = users.find(x => x.access_key === key); if (!u) return;
@@ -1167,14 +1248,17 @@ $('users-body').addEventListener('click', async e => {
 
 // add / edit
 let editing = null;
+function fillUserForm(u) {
+  $('mu-name').value = u?.name || '';
+  $('mu-limit').value = u?.limit_bytes ? +(u.limit_bytes / GB).toPrecision(4) : '';
+}
 function openUserModal(u) {
   editing = u || null;
   $('mu-title').textContent = t(u ? 'edit_user' : 'add_user');
   $('mu-desc').textContent = t(u ? 'edit_user_desc' : 'add_user_desc');
   $('mu-key-field').classList.toggle('hidden', !!u);
-  $('mu-name').value = u?.name || '';
+  fillUserForm(u);
   $('mu-key').value = '';
-  $('mu-limit').value = u?.limit_bytes ? +(u.limit_bytes / GB).toPrecision(4) : '';
   openModal('m-user');
   setTimeout(() => $('mu-name').focus(), 50);
 }
@@ -1188,15 +1272,21 @@ $('mu-gen').addEventListener('click', () => {
 $('f-user').addEventListener('submit', async e => {
   e.preventDefault();
   const name = $('mu-name').value.trim() || null;
-  const lim = parseFloat($('mu-limit').value);
-  const limit_bytes = lim > 0 ? Math.round(lim * GB) : null;
-  // The server accepts any key and overwrites an existing one, so check here.
+  const limit_bytes = readLimit('mu-limit');
+  if (limit_bytes === undefined) { toast(t('limit_bad'), true); $('mu-limit').focus(); return; }
+  // The server refuses an existing key too; checking here saves the round trip.
   const key = editing ? null : ($('mu-key').value.trim() || null);
   if (key && !/^[^\s\/?#%\\]{8,128}$/.test(key)) { toast(t('key_bad'), true); $('mu-key').focus(); return; }
   if (key && users.some(x => x.access_key === key)) { toast(t('key_exists'), true); $('mu-key').focus(); return; }
   await busy($('f-user').querySelector('.btn.primary'), async () => {
     try {
       if (editing) {
+        // Another admin may have saved this user since the form was opened.
+        const cur = await api(`users/${encodeURIComponent(editing.access_key)}`);
+        if ((cur.name || null) !== (editing.name || null) || (cur.limit_bytes || null) !== (editing.limit_bytes || null)) {
+          editing = cur; fillUserForm(cur); toast(t('user_changed'), true); refresh();
+          return;
+        }
         await api(`users/${encodeURIComponent(editing.access_key)}`, { method: 'PUT', body: { name, limit_bytes } });
         audit('ev_edit', name || editing.access_key.slice(0, 8)); toast(t('saved'));
         closeModals(); refresh();
@@ -1215,11 +1305,13 @@ $('f-user').addEventListener('submit', async e => {
 $('btn-bulk').addEventListener('click', () => { openModal('m-bulk'); setTimeout(() => $('mb-count').focus(), 50); });
 $('f-bulk').addEventListener('submit', async e => {
   e.preventDefault();
-  const count = parseInt($('mb-count').value, 10);
-  const lim = parseFloat($('mb-limit').value);
+  const raw = $('mb-count').value.trim(), count = Number(raw);
+  if (!/^\d+$/.test(raw) || count < 1 || count > 1000) { toast(t('count_bad'), true); $('mb-count').focus(); return; }
+  const limit_bytes = readLimit('mb-limit');
+  if (limit_bytes === undefined) { toast(t('limit_bad'), true); $('mb-limit').focus(); return; }
   await busy($('f-bulk').querySelector('.btn.primary'), async () => {
     try {
-      const keys = await api('users/bulk', { method: 'POST', body: { count, limit_bytes: lim > 0 ? Math.round(lim * GB) : null } });
+      const keys = await api('users/bulk', { method: 'POST', body: { count, limit_bytes } });
       audit('ev_bulk', String(keys.length)); toast(t('created_n', { n: keys.length }));
       closeModals(); refresh();
     } catch (err) { fail('f_bulk', err); }
@@ -1286,9 +1378,13 @@ $('btn-save-rules').addEventListener('click', e => busy(e.currentTarget, async (
   try { rules = JSON.parse($('rules').value); } catch (err) { setNote('rules-note', t('invalid_json', { err: err.message }), true); return; }
   const bad = checkRules(rules);
   if (bad) { setNote('rules-note', bad, true); return; }
+  const sent = $('rules').value;
   try {
+    // Someone else may have saved other rules since this text was loaded.
+    if (rulesSnap !== null && JSON.stringify(await api('router/rules'), null, 2) !== rulesSnap
+        && !await confirmBox(t('changed_title'), t('changed_text'), t('overwrite'))) return;
     await api('router/rules', { method: 'PUT', body: rules });
-    audit('ev_rules', ''); rulesSnap = $('rules').value; toast(t('rules_saved')); setNote('rules-note', '');
+    audit('ev_rules', ''); rulesSnap = sent; toast(t('rules_saved')); setNote('rules-note', '');
   } catch (err) { setNote('rules-note', t('f_rules', { err: err.message }), true); }
 }));
 
@@ -1307,10 +1403,15 @@ $('btn-save-config').addEventListener('click', e => busy(e.currentTarget, async 
   try { cfg = JSON.parse($('config').value); } catch (err) { setNote('config-note', t('invalid_json', { err: err.message }), true); return; }
   if (!cfg || typeof cfg !== 'object' || Array.isArray(cfg)) { setNote('config-note', t('config_obj'), true); return; }
   if (!('mode' in cfg)) { setNote('config-note', t('config_mode'), true); return; }
-  if (!await confirmBox(t('confirm_config'), t('confirm_config_text'), t('overwrite'))) return;
+  const sent = $('config').value;
+  let changed = false;
+  try { changed = configSnap !== null && JSON.stringify(await api('server/config'), null, 2) !== configSnap; }
+  catch (err) { setNote('config-note', t('f_config', { err: err.message }), true); return; }
+  // Users added in the meantime, or an edit by another admin, are in the file but not in this text.
+  if (!await (changed ? confirmBox(t('changed_title'), t('changed_text'), t('overwrite')) : confirmBox(t('confirm_config'), t('confirm_config_text'), t('overwrite')))) return;
   try {
     await api('server/config', { method: 'PUT', body: cfg });
-    audit('ev_config', ''); configSnap = $('config').value; toast(t('saved'));
+    audit('ev_config', ''); configSnap = sent; toast(t('saved'));
     setNote('config-note', t('restart_note'), true);
   } catch (err) { setNote('config-note', t('f_config', { err: err.message }), true); }
 }));
@@ -1387,7 +1488,8 @@ function renderDnsSettings() {
 }
 
 // Typing in the settings form marks it as edited, so a reload does not wipe it.
-const dnsMark = e => { if (e.target.closest('#dns-upstreams-edit, #dns-upstream-mode, #dns-safe, #dns-doh, #dns-blocking, #dns-interval, #dns-cache, #dns-rules-edit, #dns-lists, #dns-services')) dnsDirty = true; };
+let dnsEdits = 0; // counts edits, so a save can tell whether the form changed while it was in flight
+const dnsMark = e => { if (e.target.closest('#dns-upstreams-edit, #dns-upstream-mode, #dns-safe, #dns-doh, #dns-blocking, #dns-interval, #dns-cache, #dns-rules-edit, #dns-lists, #dns-services')) { dnsDirty = true; dnsEdits++; } };
 $('page-dns').addEventListener('input', dnsMark);
 $('page-dns').addEventListener('change', dnsMark);
 
@@ -1396,8 +1498,8 @@ function collectDns() {
   const s = dnsSettings;
   if (!s) { toast(t('dns_not_loaded'), true); return false; }
   const interval = Number($('dns-interval').value), cache = Number($('dns-cache').value);
-  if (!Number.isInteger(interval) || interval < 1) { toast(t('interval_bad'), true); $('dns-interval').focus(); return false; }
-  if ($('dns-cache').value.trim() === '' || !Number.isInteger(cache) || cache < 0) { toast(t('cache_bad'), true); $('dns-cache').focus(); return false; }
+  if (!Number.isInteger(interval) || interval < 1 || interval > 8760) { toast(t('interval_bad'), true); $('dns-interval').focus(); return false; }
+  if ($('dns-cache').value.trim() === '' || !Number.isInteger(cache) || cache < 0 || cache > 1000000) { toast(t('cache_bad'), true); $('dns-cache').focus(); return false; }
   s.upstreams = $('dns-upstreams-edit').value.split('\n').map(x => x.trim()).filter(Boolean);
   s.upstream_mode = $('dns-upstream-mode').value;
   s.safe_search = $('dns-safe').checked;
@@ -1414,11 +1516,13 @@ function collectDns() {
 async function saveDns() {
   if (dnsSaving) return;
   dnsSaving = true; $('btn-dns-save').disabled = true;
+  const edits = dnsEdits;
   try {
     await api('dns/settings', { method: 'PUT', body: dnsSettings });
     toast(t('dns_saved'));
     setNote('dns-save-note', '');
-    await loadDns(true);
+    // Text typed while saving stays in the form instead of being overwritten.
+    await loadDns(edits === dnsEdits);
   } catch (err) {
     setNote('dns-save-note', t('f_dns', { err: err.message }), true); fail('f_dns', err);
     // Show what was attempted, so the form and dnsSettings agree and the user can correct it.
@@ -1545,15 +1649,33 @@ async function start() {
   const p = location.hash.slice(1);
   go(PAGES.includes(p) ? p : 'overview');
   loadLog();
-  clearInterval(timer);
-  timer = setInterval(async () => {
-    if (await refresh()) {
-      if (page === 'overview') loadLog();
-      if (page === 'dns') loadDns(false);
-      if (page === 'overnet') loadOvernet(false);
-    }
-  }, 5000);
+  schedule();
 }
+// The next poll starts after the previous one ended (never two at once), later
+// and later while the server does not answer, and not at all in a hidden tab.
+let ticking = false;
+function schedule() {
+  clearTimeout(timer);
+  timer = setTimeout(tick, Math.min(30000, 5000 * 2 ** Math.min(failures, 3)));
+}
+async function tick() {
+  if (ticking) return;
+  ticking = true;
+  try {
+    if (document.hidden) return;
+    if (await refresh()) {
+      if (page === 'overview') await loadLog();
+      if (page === 'dns') await loadDns(false);
+      if (page === 'overnet') await loadOvernet(false);
+    }
+  } finally {
+    ticking = false;
+    if (!$('app').classList.contains('hidden')) schedule();
+  }
+}
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden && !$('app').classList.contains('hidden')) { clearTimeout(timer); tick(); }
+});
 applyLang();
 start();
 </script>
