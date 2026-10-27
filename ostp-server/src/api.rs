@@ -15,7 +15,7 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use portable_atomic::AtomicU64;
 use std::time::Instant;
 
@@ -40,7 +40,9 @@ pub struct ApiState {
     pub access_keys: Arc<RwLock<HashMap<String, UserMeta>>>,
     pub user_stats: Arc<RwLock<HashMap<String, Arc<UserStats>>>>,
     pub start_time: Instant,
-    pub session_token: Arc<RwLock<Option<String>>>,
+    /// Live panel sessions, oldest first: a second admin signing in must not
+    /// log the first one out.
+    pub session_token: Arc<RwLock<Vec<String>>>,
     pub api_token: Option<String>,
     pub webpath: String,
     pub username: String,
@@ -214,6 +216,10 @@ fn api_error<T: Serialize>(msg: &str) -> (StatusCode, Json<ApiResponse<T>>) {
     (StatusCode::BAD_REQUEST, Json(ApiResponse { ok: false, data: None, error: Some(msg.to_string()) }))
 }
 
+fn api_status<T: Serialize>(code: StatusCode, msg: &str) -> (StatusCode, Json<ApiResponse<T>>) {
+    (code, Json(ApiResponse { ok: false, data: None, error: Some(msg.to_string()) }))
+}
+
 fn api_unauthorized<T: Serialize>() -> (StatusCode, Json<ApiResponse<T>>) {
     (StatusCode::UNAUTHORIZED, Json(ApiResponse { ok: false, data: None, error: Some("unauthorized".to_string()) }))
 }
@@ -293,7 +299,9 @@ pub fn create_api_router(state: ApiState) -> Router {
         .route("/dns/update", post(handle_dns_update))
         .route("/dns/test", post(handle_dns_test))
         .route("/dns/meta", get(handle_dns_meta))
-        .route("/overnet", get(handle_overnet_status).put(handle_overnet_put));
+        .route("/overnet", get(handle_overnet_status).put(handle_overnet_put))
+        // Every body here is small except a pasted config.json; a larger one is a mistake or an attack.
+        .layer(axum::extract::DefaultBodyLimit::max(MAX_BODY));
 
     let webpath = state.webpath.clone();
     let webpath = webpath.trim_matches('/');
@@ -350,7 +358,7 @@ pub async fn start_api_server(
         access_keys,
         user_stats,
         start_time: Instant::now(),
-        session_token: Arc::new(RwLock::new(None)),
+        session_token: Arc::new(RwLock::new(Vec::new())),
         api_token,
         webpath: config.webpath.clone(),
         username: config.username.clone(),
@@ -410,12 +418,13 @@ fn check_token(state: &ApiState, headers: &axum::http::HeaderMap) -> bool {
     if let Some(value) = headers.get("authorization") {
         if let Ok(val) = value.to_str() {
             if let Some(token) = val.strip_prefix("Bearer ") {
-                let current_session = state.session_token.read().unwrap_or_else(|e| e.into_inner()).clone();
-                if let Some(session) = current_session {
-                    if secure_eq(token, &session) {
+                let sessions = state.session_token.read().unwrap_or_else(|e| e.into_inner());
+                for session in sessions.iter() {
+                    if secure_eq(token, session) {
                         allowed = true;
                     }
                 }
+                drop(sessions);
 
                 if let Some(api_tok) = api_token {
                     if secure_eq(token, api_tok) {
@@ -443,7 +452,10 @@ async fn handle_login(
         return api_error("Auth not configured");
     }
 
-    if !login_attempt_allowed() {
+    // The attempt is paid for up front: with PBKDF2 running off the async
+    // workers, checking the bucket and spending it only after a failure would
+    // let any number of parallel requests through at once.
+    if !login_reserve() {
         return (
             StatusCode::TOO_MANY_REQUESTS,
             Json(ApiResponse { ok: false, data: None, error: Some("too many sign-in attempts, wait a minute".into()) }),
@@ -451,6 +463,10 @@ async fn handle_login(
     }
 
     let password = payload.password.unwrap_or_default();
+    if payload.username.len() > 256 || password.len() > 1024 {
+        login_failed();
+        return api_unauthorized::<LoginResponse>();
+    }
     let stored = state.password_hash.clone();
     // PBKDF2 is meant to be slow: off the async workers.
     let password_ok = tokio::task::spawn_blocking(move || crate::password::verify(&password, &stored))
@@ -458,8 +474,15 @@ async fn handle_login(
         .unwrap_or(false);
 
     if secure_eq(&payload.username, &state.username) && password_ok {
+        login_refund();
         let token = uuid::Uuid::new_v4().to_string();
-        *state.session_token.write().unwrap_or_else(|e| e.into_inner()) = Some(token.clone());
+        {
+            let mut sessions = state.session_token.write().unwrap_or_else(|e| e.into_inner());
+            sessions.push(token.clone());
+            if sessions.len() > MAX_SESSIONS {
+                sessions.remove(0);
+            }
+        }
         (StatusCode::OK, ApiResponse::success(LoginResponse { token }))
     } else {
         login_failed();
@@ -490,13 +513,119 @@ fn login_bucket(take: f64) -> bool {
     true
 }
 
-fn login_attempt_allowed() -> bool {
-    login_bucket(0.0) && LOGIN_BUCKET.lock().unwrap_or_else(|e| e.into_inner()).is_some_and(|(t, _)| t >= 1.0)
+/// Takes one attempt from the bucket; false when it is empty.
+fn login_reserve() -> bool {
+    login_bucket(1.0)
+}
+
+/// A correct sign-in gives its attempt back: only failures count.
+fn login_refund() {
+    if let Some((tokens, _)) = LOGIN_BUCKET.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+        *tokens = (*tokens + 1.0).min(LOGIN_BURST);
+    }
 }
 
 fn login_failed() {
-    let _ = login_bucket(1.0);
     tracing::warn!("panel: failed sign-in");
+}
+
+// ── Limits ───────────────────────────────────────────────────────────────────
+
+/// Largest request body. Only a pasted config.json comes near it.
+const MAX_BODY: usize = 1 << 20;
+/// Users the server keeps: every one is rewritten into config.json on each
+/// change and listed on each panel refresh.
+const MAX_USERS: usize = 10_000;
+const MAX_NAME_CHARS: usize = 100;
+/// 1 PiB. Also keeps the number exact in the panel's JavaScript (below 2^53).
+const MAX_LIMIT_BYTES: u64 = 1 << 50;
+/// Panel sessions held at once; the oldest is dropped past this.
+const MAX_SESSIONS: usize = 8;
+
+/// 8 to 128 characters, nothing that breaks a URL path or a share link.
+fn check_key(key: &str) -> Result<(), &'static str> {
+    let n = key.chars().count();
+    if !(8..=128).contains(&n) || key.chars().any(|c| c.is_whitespace() || c.is_control() || "/?#%\\".contains(c)) {
+        return Err("access key must be 8 to 128 characters with no spaces, slashes, ? or #");
+    }
+    Ok(())
+}
+
+/// Trims the name; empty means none.
+fn check_name(name: Option<String>) -> Result<Option<String>, &'static str> {
+    let Some(name) = name else { return Ok(None) };
+    let name = name.trim();
+    if name.chars().count() > MAX_NAME_CHARS || name.chars().any(|c| c.is_control()) {
+        return Err("name is too long (100 characters at most) or has control characters");
+    }
+    Ok(Some(name.to_string()).filter(|n| !n.is_empty()))
+}
+
+fn check_limit(limit: Option<u64>) -> Result<(), &'static str> {
+    match limit {
+        Some(l) if l > MAX_LIMIT_BYTES => Err("traffic limit is too large (1 PiB at most)"),
+        _ => Ok(()),
+    }
+}
+
+// ── config.json ──────────────────────────────────────────────────────────────
+
+/// Every change to config.json goes through this lock: two requests at once
+/// would otherwise each read the old file and the second write would drop the
+/// first one's change.
+static CONFIG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Replaces the file in one step, so the hot-reloader and a crash see either
+/// the old content or the new, never half of it.
+fn write_config_atomic(path: &std::path::Path, text: &str) -> Result<(), String> {
+    use std::io::Write;
+    // Through a symlink the real file is replaced, not the link.
+    let path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let tmp = std::path::PathBuf::from(tmp);
+    let written = (|| -> std::io::Result<()> {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(text.as_bytes())?;
+        f.sync_all()?;
+        // The file holds the password hash and every key: keep its mode.
+        if let Ok(meta) = std::fs::metadata(&path) {
+            let _ = std::fs::set_permissions(&tmp, meta.permissions());
+        }
+        std::fs::rename(&tmp, &path)
+    })();
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("failed to write config file: {e}"));
+    }
+    Ok(())
+}
+
+fn parse_config(path: &std::path::Path) -> Result<serde_json::Value, String> {
+    use std::io::Read;
+    let content = std::fs::read_to_string(path).map_err(|e| format!("failed to read config file: {e}"))?;
+    let mut text = String::new();
+    json_comments::StripComments::new(content.as_bytes())
+        .read_to_string(&mut text)
+        .map_err(|e| format!("failed to strip comments from config: {e}"))?;
+    serde_json::from_str(&text).map_err(|e| format!("failed to parse config JSON: {e}"))
+}
+
+/// Reads config.json, lets `change` edit it and writes it back, all under the
+/// lock. A config that cannot be parsed is left untouched.
+fn edit_config(
+    path: &std::path::Path,
+    backup: bool,
+    change: impl FnOnce(&mut serde_json::Value) -> Result<(), String>,
+) -> Result<(), String> {
+    let _guard = CONFIG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut value = parse_config(path)?;
+    change(&mut value)?;
+    let text = serde_json::to_string_pretty(&value).map_err(|e| format!("failed to serialize config JSON: {e}"))?;
+    if backup {
+        let _ = std::fs::copy(path, path.with_extension("json.bak"));
+    }
+    write_config_atomic(path, &text)
 }
 
 fn save_config_keys(state: &ApiState) -> Result<(), String> {
@@ -504,49 +633,34 @@ fn save_config_keys(state: &ApiState) -> Result<(), String> {
         return Ok(());
     };
 
-    let content = std::fs::read_to_string(path)
-        .map_err(|e| format!("failed to read config file: {}", e))?;
-
-    let mut stripped = json_comments::StripComments::new(content.as_bytes());
-    let mut content_str = String::new();
-    use std::io::Read;
-    stripped.read_to_string(&mut content_str)
-        .map_err(|e| format!("failed to strip comments from config: {}", e))?;
-
-    let mut json_val: serde_json::Value = serde_json::from_str(&content_str)
-        .map_err(|e| format!("failed to parse config JSON: {}", e))?;
-
-    let keys = state.access_keys.read().unwrap_or_else(|e| e.into_inner());
-    let mut access_keys_json = Vec::new();
-    for (k, m) in keys.iter() {
-        if m.name.is_none() && m.limit_bytes.is_none() {
-            access_keys_json.push(serde_json::Value::String(k.clone()));
-        } else {
-            let mut obj = serde_json::Map::new();
-            obj.insert("access_key".to_string(), serde_json::Value::String(k.clone()));
-            if let Some(ref name) = m.name {
-                obj.insert("name".to_string(), serde_json::Value::String(name.clone()));
+    edit_config(path, false, |json_val| {
+        // Read inside the lock: the newest in-memory state is what gets written,
+        // whichever request got here first.
+        let keys = state.access_keys.read().unwrap_or_else(|e| e.into_inner());
+        let mut access_keys_json = Vec::new();
+        for (k, m) in keys.iter() {
+            if m.name.is_none() && m.limit_bytes.is_none() {
+                access_keys_json.push(serde_json::Value::String(k.clone()));
+            } else {
+                let mut obj = serde_json::Map::new();
+                obj.insert("access_key".to_string(), serde_json::Value::String(k.clone()));
+                if let Some(ref name) = m.name {
+                    obj.insert("name".to_string(), serde_json::Value::String(name.clone()));
+                }
+                if let Some(limit) = m.limit_bytes {
+                    obj.insert("limit_bytes".to_string(), serde_json::Value::Number(limit.into()));
+                }
+                access_keys_json.push(serde_json::Value::Object(obj));
             }
-            if let Some(limit) = m.limit_bytes {
-                obj.insert("limit_bytes".to_string(), serde_json::Value::Number(limit.into()));
-            }
-            access_keys_json.push(serde_json::Value::Object(obj));
         }
-    }
-
-    if let Some(obj) = json_val.as_object_mut() {
-        obj.insert("access_keys".to_string(), serde_json::Value::Array(access_keys_json));
-    } else {
-        return Err("config root is not an object".to_string());
-    }
-
-    let new_content = serde_json::to_string_pretty(&json_val)
-        .map_err(|e| format!("failed to serialize config JSON: {}", e))?;
-
-    std::fs::write(path, new_content)
-        .map_err(|e| format!("failed to write config file: {}", e))?;
-
-    Ok(())
+        match json_val.as_object_mut() {
+            Some(obj) => {
+                obj.insert("access_keys".to_string(), serde_json::Value::Array(access_keys_json));
+                Ok(())
+            }
+            None => Err("config root is not an object".to_string()),
+        }
+    })
 }
 
 
@@ -594,8 +708,15 @@ async fn handle_put_config(
         return api_error("No config path registered (run-time only)");
     };
 
-    if body.get("mode").is_none() {
+    if body.get("mode").and_then(|m| m.as_str()).is_none() {
         return api_error("Invalid config: missing 'mode' field");
+    }
+    if let Some(keys) = body.get("access_keys") {
+        match keys.as_array() {
+            None => return api_error("Invalid config: access_keys must be a list"),
+            Some(list) if list.len() > MAX_USERS => return api_error("too many users (10000 at most)"),
+            Some(_) => {}
+        }
     }
 
     let new_content = match serde_json::to_string_pretty(&body) {
@@ -603,8 +724,14 @@ async fn handle_put_config(
         Err(e) => return api_error(&format!("Failed to format config JSON: {}", e)),
     };
 
-    if let Err(e) = std::fs::write(path, new_content) {
-        return api_error(&format!("Failed to write config file: {}", e));
+    {
+        // Same lock as every other change, so a user created at this moment is
+        // not half-merged into the new file; a copy of the old file is kept.
+        let _guard = CONFIG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = std::fs::copy(path, path.with_extension("json.bak"));
+        if let Err(e) = write_config_atomic(path, &new_content) {
+            return api_error(&e);
+        }
     }
 
     (StatusCode::OK, ApiResponse::success(true))
@@ -750,16 +877,38 @@ async fn handle_create_user(
         return api_unauthorized::<String>();
     }
 
-    let key = body.access_key.unwrap_or_else(|| {
-        use rand::RngCore;
-        let mut buf = [0u8; 16];
-        rand::thread_rng().fill_bytes(&mut buf);
-        buf.iter().map(|b| format!("{:02x}", b)).collect()
-    });
+    let name = match check_name(body.name) {
+        Ok(n) => n,
+        Err(m) => return api_error::<String>(m),
+    };
+    if let Err(m) = check_limit(body.limit_bytes) {
+        return api_error::<String>(m);
+    }
+    let key = match body.access_key.filter(|k| !k.is_empty()) {
+        Some(k) => {
+            if let Err(m) = check_key(&k) {
+                return api_error::<String>(m);
+            }
+            k
+        }
+        None => {
+            use rand::RngCore;
+            let mut buf = [0u8; 16];
+            rand::thread_rng().fill_bytes(&mut buf);
+            buf.iter().map(|b| format!("{:02x}", b)).collect()
+        }
+    };
 
     {
         let mut keys = state.access_keys.write().unwrap_or_else(|e| e.into_inner());
-        keys.insert(key.clone(), UserMeta { name: body.name.clone(), limit_bytes: body.limit_bytes });
+        // Inserting over an existing key would silently reset that user's traffic and limit.
+        if keys.contains_key(&key) {
+            return api_status::<String>(StatusCode::CONFLICT, "user already exists");
+        }
+        if keys.len() >= MAX_USERS {
+            return api_error::<String>("too many users (10000 at most)");
+        }
+        keys.insert(key.clone(), UserMeta { name, limit_bytes: body.limit_bytes });
     }
 
     let mut stats = state.user_stats.write().unwrap_or_else(|e| e.into_inner());
@@ -768,6 +917,9 @@ async fn handle_create_user(
 
     if let Err(e) = save_config_keys(&state) {
         tracing::error!("Failed to save config after creating user: {}", e);
+        // Not on disk, so not kept in memory either: a restart would lose it silently.
+        state.access_keys.write().unwrap_or_else(|e| e.into_inner()).remove(&key);
+        state.user_stats.write().unwrap_or_else(|e| e.into_inner()).remove(&key);
         return api_error::<String>("failed to save configuration");
     }
 
@@ -814,10 +966,18 @@ async fn update_user(
         return api_unauthorized::<String>();
     }
 
+    let name = match check_name(body.name) {
+        Ok(n) => n,
+        Err(m) => return api_error::<String>(m),
+    };
+    if let Err(m) = check_limit(body.limit_bytes) {
+        return api_error::<String>(m);
+    }
+
     {
         let mut keys = state.access_keys.write().unwrap_or_else(|e| e.into_inner());
         if let Some(meta) = keys.get_mut(&key) {
-            meta.name = body.name.clone();
+            meta.name = name;
             meta.limit_bytes = body.limit_bytes;
         } else {
             return api_error::<String>("User not found");
@@ -854,6 +1014,9 @@ async fn handle_set_limit(
 ) -> impl IntoResponse {
     if !check_token(&state, &headers) {
         return api_unauthorized::<bool>();
+    }
+    if let Err(m) = check_limit(body.limit_bytes) {
+        return api_error(m);
     }
 
     {
@@ -1093,7 +1256,7 @@ mod tests {
             access_keys: Arc::new(RwLock::new(HashMap::new())),
             user_stats: Arc::new(RwLock::new(HashMap::new())),
             start_time: std::time::Instant::now(),
-            session_token: Arc::new(RwLock::new(None)),
+            session_token: Arc::new(RwLock::new(Vec::new())),
             api_token: Some("test-token".to_string()),
             webpath: webpath.to_string(),
             username: "admin".to_string(),
@@ -1168,7 +1331,7 @@ mod tests {
     #[test]
     fn test_check_token_accepts_matching_session_token() {
         let state = make_test_state("panel");
-        *state.session_token.write().unwrap() = Some("live-session".to_string());
+        state.session_token.write().unwrap().push("live-session".to_string());
         assert!(check_token(&state, &headers_with_bearer("live-session")));
     }
 
@@ -1197,6 +1360,97 @@ mod tests {
         headers.insert("authorization", axum::http::HeaderValue::from_static(""));
         assert!(!check_token(&state, &headers));
         assert!(!check_token(&state, &headers_with_bearer("")));
+    }
+
+    #[test]
+    fn test_check_key_rules() {
+        assert!(check_key("0123456789abcdef").is_ok());
+        assert!(check_key("short").is_err());
+        assert!(check_key(&"a".repeat(129)).is_err());
+        assert!(check_key("has space in it").is_err());
+        assert!(check_key("slash/inside-key").is_err());
+        assert!(check_key("hash#inside-key").is_err());
+        assert!(check_key("nul\u{0}inside-key").is_err());
+    }
+
+    #[test]
+    fn test_check_name_and_limit() {
+        assert_eq!(check_name(None), Ok(None));
+        assert_eq!(check_name(Some("  ".into())), Ok(None));
+        assert_eq!(check_name(Some(" alice ".into())), Ok(Some("alice".into())));
+        assert!(check_name(Some("x".repeat(101))).is_err());
+        assert!(check_name(Some("a\nb".into())).is_err());
+        assert!(check_limit(Some(MAX_LIMIT_BYTES)).is_ok());
+        assert!(check_limit(Some(MAX_LIMIT_BYTES + 1)).is_err());
+        assert!(check_limit(Some(u64::MAX)).is_err());
+        assert!(check_limit(None).is_ok());
+    }
+
+    #[test]
+    fn test_check_rules_caps() {
+        let rule = |n: usize| OutboundRule {
+            domain_suffix: vec!["example.org".into(); n],
+            ip_cidr: vec![],
+            protocol: None,
+            action: crate::outbound::OutboundAction::Direct,
+            send_from: None,
+        };
+        assert!(check_rules(&[rule(3)]).is_ok());
+        assert!(check_rules(&vec![rule(1); 2_001]).is_err());
+        assert!(check_rules(&vec![rule(26); 2_000]).is_err());
+        let mut long = rule(1);
+        long.domain_suffix[0] = "a".repeat(300);
+        assert!(check_rules(&[long]).is_err());
+    }
+
+    /// Many requests changing config.json at once: every change must survive
+    /// and the file must stay valid JSON.
+    #[test]
+    fn test_edit_config_concurrent_writes_keep_all_changes() {
+        let dir = std::env::temp_dir().join(format!("ostp-api-test-{}", rand::random::<u64>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+        std::fs::write(&path, r#"{ "mode": "server", "n": [] }"#).unwrap();
+        let threads: Vec<_> = (0..16)
+            .map(|i| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    edit_config(&path, false, |v| {
+                        v["n"].as_array_mut().unwrap().push(serde_json::json!(i));
+                        Ok(())
+                    })
+                    .unwrap();
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        let v = parse_config(&path).unwrap();
+        assert_eq!(v["n"].as_array().unwrap().len(), 16);
+        assert!(!dir.join("config.json.tmp").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A config that does not parse is not overwritten.
+    #[test]
+    fn test_edit_config_leaves_broken_file_alone() {
+        let dir = std::env::temp_dir().join(format!("ostp-api-test-{}", rand::random::<u64>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+        std::fs::write(&path, "{ not json").unwrap();
+        assert!(edit_config(&path, false, |_| Ok(())).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{ not json");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_sessions_of_two_admins_both_work() {
+        let state = make_test_state("panel");
+        state.session_token.write().unwrap().extend(["first".to_string(), "second".to_string()]);
+        assert!(check_token(&state, &headers_with_bearer("first")));
+        assert!(check_token(&state, &headers_with_bearer("second")));
+        assert!(!check_token(&state, &headers_with_bearer("third")));
     }
 
     /// The server does not serve the API at all without a way to sign in.
@@ -1250,14 +1504,16 @@ async fn handle_create_audit(
     if !check_token(&state, &headers) {
         return api_unauthorized::<bool>();
     }
+    // The panel writes these; a client of the API may write anything.
+    let short = |s: String| -> String { s.chars().take(300).collect() };
     let mut logs = state.audit_logs.write().unwrap_or_else(|e| e.into_inner());
     let id = format!("{:x}", rand::random::<u64>());
     let now = chrono::Local::now();
     let entry = AuditLogEntry {
         id,
         time: now.format("%H:%M:%S").to_string(),
-        event_en: req.event_en,
-        event_ru: req.event_ru,
+        event_en: short(req.event_en),
+        event_ru: short(req.event_ru),
         success: req.success,
     };
     logs.insert(0, entry);
@@ -1285,12 +1541,21 @@ async fn handle_bulk_create_users(
     if payload.count > 1000 {
         return api_error("Count too large, max 1000");
     }
+    if payload.count == 0 {
+        return api_error("Count must be at least 1");
+    }
+    if let Err(m) = check_limit(payload.limit_bytes) {
+        return api_error(m);
+    }
 
     let mut new_keys = Vec::new();
     let mut keys = match state.access_keys.write() {
         Ok(k) => k,
         Err(e) => e.into_inner(),
     };
+    if keys.len() + payload.count > MAX_USERS {
+        return api_error("too many users (10000 at most)");
+    }
 
     for _ in 0..payload.count {
         // 128 random bits, like a single created key: the access key is the
@@ -1305,7 +1570,14 @@ async fn handle_bulk_create_users(
     }
     // Save keys by dropping lock, then saving to config
     drop(keys);
-    let _ = save_config_keys(&state);
+    if let Err(e) = save_config_keys(&state) {
+        tracing::error!("Failed to save config after bulk create: {}", e);
+        let mut keys = state.access_keys.write().unwrap_or_else(|e| e.into_inner());
+        for k in &new_keys {
+            keys.remove(k);
+        }
+        return api_error("failed to save configuration");
+    }
 
     (StatusCode::OK, ApiResponse::success(new_keys))
 }
@@ -1361,21 +1633,17 @@ async fn handle_dns_put_settings(
     if !check_token(&state, &headers) {
         return api_unauthorized::<bool>();
     }
+    if let Err(m) = check_dns_settings(&settings) {
+        return api_error(m);
+    }
     if let Err(e) = state.dns_server.apply(settings) {
         return api_error(&format!("{e:#}"));
     }
     if let Some(path) = &state.config_path {
-        let saved = (|| -> Result<(), String> {
-            let content = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
-            let mut stripped = json_comments::StripComments::new(content.as_bytes());
-            let mut text = String::new();
-            use std::io::Read;
-            stripped.read_to_string(&mut text).map_err(|e| e.to_string())?;
-            let mut v: serde_json::Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+        let saved = edit_config(path, true, |v| {
             v["dns"] = serde_json::to_value(&*state.dns_server.settings()).map_err(|e| e.to_string())?;
-            let _ = std::fs::copy(path, path.with_extension("json.bak"));
-            std::fs::write(path, serde_json::to_string_pretty(&v).map_err(|e| e.to_string())?).map_err(|e| e.to_string())
-        })();
+            Ok(())
+        });
         if let Err(e) = saved {
             return api_error(&format!("applied, but config.json was not written: {e}"));
         }
@@ -1383,11 +1651,50 @@ async fn handle_dns_put_settings(
     (StatusCode::OK, ApiResponse::success(true))
 }
 
+/// Downloads every filter list: slow and heavy, so one run at a time.
+static DNS_UPDATING: AtomicBool = AtomicBool::new(false);
+
+struct UpdateFlight;
+impl Drop for UpdateFlight {
+    fn drop(&mut self) {
+        DNS_UPDATING.store(false, Ordering::Release);
+    }
+}
+
 async fn handle_dns_update(State(state): State<ApiState>, headers: axum::http::HeaderMap) -> impl IntoResponse {
     if !check_token(&state, &headers) {
         return api_unauthorized::<Vec<ostp_dns::lists::UpdateResult>>();
     }
-    (StatusCode::OK, ApiResponse::success(state.dns_server.update_lists().await))
+    if DNS_UPDATING.swap(true, Ordering::AcqRel) {
+        return api_error("a list update is already running");
+    }
+    let _flight = UpdateFlight;
+    // Shorter than the panel's own timeout, so the panel gets an answer.
+    match tokio::time::timeout(std::time::Duration::from_secs(100), state.dns_server.update_lists()).await {
+        Ok(results) => (StatusCode::OK, ApiResponse::success(results)),
+        Err(_) => api_error("the list update took too long and was stopped"),
+    }
+}
+
+/// Caps on what one settings request may carry: every entry stays in memory and in config.json.
+fn check_dns_settings(s: &ostp_dns::DnsSettings) -> Result<(), &'static str> {
+    if s.upstreams.len() > 16 || s.lists.len() > 200 || s.allowlists.len() > 200 || s.rewrites.len() > 5_000
+        || s.user_rules.len() > 50_000 || s.blocked_services.len() > 500
+    {
+        return Err("too many entries in the DNS settings");
+    }
+    if s.cache_size > 1_000_000 || s.query_log_size > 100_000 {
+        return Err("DNS cache or query log size is too large");
+    }
+    let long = |x: &str| x.len() > 2048;
+    if s.upstreams.iter().any(|x| long(x))
+        || s.user_rules.iter().any(|x| long(x))
+        || s.lists.iter().chain(&s.allowlists).any(|l| long(&l.name) || long(&l.url))
+        || s.rewrites.iter().any(|r| long(&r.domain) || long(&r.answer))
+    {
+        return Err("an entry in the DNS settings is too long");
+    }
+    Ok(())
 }
 
 #[derive(Deserialize)]
@@ -1402,6 +1709,9 @@ async fn handle_dns_test(
 ) -> impl IntoResponse {
     if !check_token(&state, &headers) {
         return api_unauthorized::<ostp_dns::Explanation>();
+    }
+    if req.domain.len() > 253 {
+        return api_error("domain name is too long");
     }
     (StatusCode::OK, ApiResponse::success(state.dns_server.explain(&req.domain)))
 }
@@ -1422,21 +1732,17 @@ async fn handle_overnet_put(
     if !check_token(&state, &headers) {
         return api_unauthorized::<crate::overnet::OvernetStatus>();
     }
+    // Applying opens and closes listeners: two requests at once would race over them.
+    static APPLYING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    let _one_at_a_time = APPLYING.lock().await;
     if let Err(e) = crate::overnet::apply(cfg.clone(), &state.router).await {
         return api_error(&format!("{e:#}"));
     }
     if let Some(path) = &state.config_path {
-        let saved = (|| -> Result<(), String> {
-            let content = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
-            let mut stripped = json_comments::StripComments::new(content.as_bytes());
-            let mut text = String::new();
-            use std::io::Read;
-            stripped.read_to_string(&mut text).map_err(|e| e.to_string())?;
-            let mut v: serde_json::Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+        let saved = edit_config(path, true, |v| {
             v["overnet"] = serde_json::to_value(&cfg).map_err(|e| e.to_string())?;
-            let _ = std::fs::copy(path, path.with_extension("json.bak"));
-            std::fs::write(path, serde_json::to_string_pretty(&v).map_err(|e| e.to_string())?).map_err(|e| e.to_string())
-        })();
+            Ok(())
+        });
         if let Err(e) = saved {
             return api_error(&format!("applied, but config.json was not written: {e}"));
         }
@@ -1477,13 +1783,37 @@ async fn handle_get_rules(
     (StatusCode::OK, ApiResponse::success(rules))
 }
 
+/// Caps for a rule set: the whole list is matched against every connection.
+fn check_rules(rules: &[OutboundRule]) -> Result<(), &'static str> {
+    if rules.len() > 2_000 {
+        return Err("too many rules (2000 at most)");
+    }
+    let mut entries = 0usize;
+    for r in rules {
+        entries += r.domain_suffix.len() + r.ip_cidr.len();
+        if r.domain_suffix.iter().chain(&r.ip_cidr).any(|x| x.len() > 253 || x.chars().any(|c| c.is_control())) {
+            return Err("a rule entry is too long or has control characters");
+        }
+        if r.protocol.as_deref().is_some_and(|p| p.len() > 32) || r.send_from.as_deref().is_some_and(|p| p.len() > 64) {
+            return Err("a rule field is too long");
+        }
+    }
+    if entries > 50_000 {
+        return Err("too many entries in the rules (50000 at most)");
+    }
+    Ok(())
+}
+
 async fn handle_put_rules(
     State(state): State<ApiState>,
     headers: axum::http::HeaderMap,
     Json(new_rules): Json<Vec<OutboundRule>>,
 ) -> impl IntoResponse {
     if !check_token(&state, &headers) { return api_unauthorized(); }
-    
+    if let Err(m) = check_rules(&new_rules) {
+        return api_error(m);
+    }
+
     // Update memory
     #[allow(unused_assignments)]
     let mut updated_outbound = None;
@@ -1500,34 +1830,22 @@ async fn handle_put_rules(
     if let Some(cfg) = updated_outbound {
         state.dns_server.set_proxy(crate::dns::proxy_url(Some(&cfg)));
     }
-    
-    // Save to config.json
+
+    // Save to config.json. A config that cannot be parsed is left alone (never
+    // "null" over every access key); the rules stay applied either way.
     if let Some(path) = &state.config_path {
-        if let Ok(content) = std::fs::read_to_string(path) {
-            // The config may carry comments; a parse failure must not end in
-            // writing "null" over it (and with it every access key).
-            let mut stripped = String::new();
-            let parsed = {
-                use std::io::Read;
-                json_comments::StripComments::new(content.as_bytes()).read_to_string(&mut stripped).ok()
+        let saved = edit_config(path, false, |cfg| {
+            if let Some(outbound_obj) = cfg.get_mut("outbound").and_then(|o| o.as_object_mut()) {
+                let rules_json = serde_json::to_value(&new_rules).map_err(|e| e.to_string())?;
+                outbound_obj.insert("rules".to_string(), rules_json);
             }
-            .and_then(|_| serde_json::from_str::<serde_json::Value>(&stripped).ok());
-            match parsed {
-                Some(mut cfg) => {
-                    if let Some(outbound_obj) = cfg.get_mut("outbound").and_then(|o| o.as_object_mut()) {
-                        if let Ok(rules_json) = serde_json::to_value(&new_rules) {
-                            outbound_obj.insert("rules".to_string(), rules_json);
-                        }
-                    }
-                    if let Ok(text) = serde_json::to_string_pretty(&cfg) {
-                        let _ = std::fs::write(path, text);
-                    }
-                }
-                None => tracing::warn!("panel: {} could not be parsed, the new rules are applied but not saved", path.display()),
-            }
+            Ok(())
+        });
+        if let Err(e) = saved {
+            return api_error(&format!("applied, but config.json was not written: {e}"));
         }
     }
-    
+
     (StatusCode::OK, ApiResponse::success(true))
 }
 
