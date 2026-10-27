@@ -108,6 +108,8 @@ pub struct Dispatcher {
     /// Open connections (TCP streams, UDP associations) per key; see
     /// `stream_permit`.
     stream_limits: HashMap<String, Arc<tokio::sync::Semaphore>>,
+    /// Sessions removed by `drop_session` since the last tick.
+    dropped: Vec<u32>,
 }
 
 /// Server-wide key trials per second for sources not seen authenticating.
@@ -159,6 +161,7 @@ impl Dispatcher {
             junk_cache: HashMap::new(),
             trials: crate::admission::Admission::new(TRIAL_SOURCE_RATE, TRIAL_SOURCE_BURST, TRIAL_RATE),
             stream_limits: HashMap::new(),
+            dropped: Vec::new(),
         }
     }
 
@@ -658,6 +661,7 @@ impl Dispatcher {
             self.stream_limits.retain(|k, _| keys.contains_key(k));
         }
 
+        let mut dropped_earlier = std::mem::take(&mut self.dropped);
         let mut frames = Vec::new();
         let mut expired = Vec::new();
         let now = std::time::Instant::now();
@@ -723,6 +727,12 @@ impl Dispatcher {
             }
         }
 
+        // Sessions dropped between ticks (evicted for a key's cap, key removed, limit
+        // reached) are reported too, so the relay closes their streams; an id that
+        // a newer session has taken since is not theirs to close.
+        self.dropped.clear();
+        dropped_earlier.retain(|sid| !self.peer_machines.contains_key(sid) && !expired.contains(sid));
+        expired.extend(dropped_earlier);
         (frames, expired)
     }
 
@@ -746,6 +756,7 @@ impl Dispatcher {
             if self.addr_to_session.get(&state.last_addr) == Some(&session_id) {
                 self.addr_to_session.remove(&state.last_addr);
             }
+            self.dropped.push(session_id);
             let stats = self.get_or_create_user_stats(&state.access_key);
             let _ = stats.connections.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| Some(n.saturating_sub(1)));
         }
@@ -944,6 +955,15 @@ mod roaming_tests {
         assert_eq!(dispatcher.peer_machines[&SID].last_addr, roamed);
         assert_eq!(dispatcher.addr_to_session.get(&roamed), Some(&SID));
         assert_eq!(dispatcher.addr_to_session.get(&home), None);
+    }
+
+    #[test]
+    fn a_session_dropped_between_ticks_is_reported_once_by_the_next_tick() {
+        let (mut dispatcher, _client) = established(addr("198.51.100.1:40000"));
+        dispatcher.drop_session(SID);
+        let (_, dropped) = dispatcher.on_tick();
+        assert_eq!(dropped, vec![SID], "its streams must be closed");
+        assert!(dispatcher.on_tick().1.is_empty());
     }
 
     #[test]
