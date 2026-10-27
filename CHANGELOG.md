@@ -32,6 +32,9 @@ Older history is on the [Releases](https://github.com/ospab/ostp/releases) page 
 - CLI: no ASCII banner at start, no "Enable debug mode?" question on connect, shorter error messages that say what to do. The setup wizard asks about service registration and autostart after it has saved the config.
 - Docs: the relay is described as what it is, a transparent forwarder without keys (`upstream_api_*` settings are ignored); congestion control is described as CUBIC, as in the code. The client recovery section matches the new reconnect policy.
 
+### Added
+- `ostp start`, `ostp stop`, `ostp restart` for the service on Linux; `ostp status` shows whether ostp is running, since when, whether it starts at boot and the last log lines; `ostp log` shows the log (`-n` lines, `-f` to follow): the service journal on Linux, `ostp.log` on Windows and macOS. A start that fails within 3 seconds prints the journal lines that say why.
+
 ### Security
 - `install.sh` downloaded the release as root into a fixed file in `/tmp`: a local user could replace it or point the write at another file. It now uses a private temporary directory and HTTPS only.
 - `install.sh` left `/etc/ostp` and `config.json` (access keys, panel password hash) readable by every local user. The directory is now 700 and the config 600.
