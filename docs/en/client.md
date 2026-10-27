@@ -26,10 +26,11 @@ There is no STUN/TURN client. Strict NATs are handled by roaming on `session_id`
 
 The client does not switch transport or server on its own; that is the user's choice. Within one transport it recovers like this:
 
-- After 10 seconds without a valid datagram the session moves to a new socket of the same transport, without a new handshake.
-- After 25 seconds a background reconnect starts while the old session stays usable.
-- After 180 seconds in total the tunnel stops. With the kill switch on, the client keeps retrying instead of letting traffic out unprotected.
-- On resume from sleep, or after a network change, the reconnect starts at once instead of waiting for the timers.
+- When a session has heard nothing authenticated from the server for 10 seconds (or two keepalive intervals, if longer), it moves to a new socket of the same transport, without a new handshake.
+- If the moved session gets no answer within a few round trips, the client drops it and handshakes again with the same server and transport. Failed attempts are retried after 1, 2, 5, 10, 20 and then every 30 seconds, until one succeeds or the user stops the tunnel. Open connections are reset at each reconnect.
+- In proxy mode without the kill switch, the system proxy is released after 45 seconds without a connection so the computer keeps internet access, and set again when the tunnel is back. With the kill switch on, it stays set.
+- On resume from sleep, or after a network change, recovery starts at once instead of waiting for the timers.
+- A first connection that fails (wrong key, address or transport) is not retried: the tunnel stops and shows the error.
 
 Ordinary TCP errors (`ConnectionReset`, `BrokenPipe`, `UnexpectedEof`) are not written to the log.
 

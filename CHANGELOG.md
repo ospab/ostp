@@ -27,6 +27,10 @@ Older history is on the [Releases](https://github.com/ospab/ostp/releases) page 
 - Desktop app: "Disconnected" appeared even when stopping failed; the button could be clicked twice while TUN mode waited for the administrator prompt; an error disappeared after 5 seconds; the beta warning was shown for stable versions too. Tab, B, Q and Escape no longer close the app or switch screens; Escape closes the open dialog.
 - Desktop app: no longer loads fonts from Google at start.
 - Web panel: clearer error messages, confirmation before deleting, input checks before saving, keyboard access and screen reader labels; the Overview subtitle showed the overnet text.
+- Routing rules: the `block` action was read as `proxy`, so traffic meant to be blocked went through the tunnel.
+- Windows: one-off commands such as `ostp changelog`, `ostp cert` or `ostp manage` could trim the log of a running client.
+- CLI: no ASCII banner at start, no "Enable debug mode?" question on connect, shorter error messages that say what to do. The setup wizard asks about service registration and autostart after it has saved the config.
+- Docs: the relay is described as what it is, a transparent forwarder without keys (`upstream_api_*` settings are ignored); congestion control is described as CUBIC, as in the code. The client recovery section matches the new reconnect policy.
 
 ### Security
 - `install.sh` downloaded the release as root into a fixed file in `/tmp`: a local user could replace it or point the write at another file. It now uses a private temporary directory and HTTPS only.
