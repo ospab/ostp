@@ -87,7 +87,7 @@ pub fn update_proxy_bypass_list(domains: &[String], ips: &[String]) {
 
 #[cfg(not(target_os = "windows"))]
 pub fn update_proxy_bypass_list(_domains: &[String], _ips: &[String]) {
-    // Linux/macOS: no-op (gnome/kde proxy bypass list update not implemented)
+    // The Linux/macOS system proxy has no bypass list.
 }
 
 #[cfg(target_os = "windows")]
@@ -204,7 +204,6 @@ pub fn enable_system_proxy(proxy_addr: &str) {
     if is_gui {
         tracing::info!("Enabling Linux system proxy (GNOME/KDE): {}", proxy_addr);
         
-        // Try GNOME gsettings
         let gnome_res = std::process::Command::new("gsettings")
             .args(["set", "org.gnome.system.proxy", "mode", "manual"])
             .output();
@@ -219,7 +218,6 @@ pub fn enable_system_proxy(proxy_addr: &str) {
             }
         }
 
-        // Try KDE kwriteconfig5/6
         for cmd in ["kwriteconfig5", "kwriteconfig6"] {
             let kde_res = std::process::Command::new(cmd)
                 .args(["--file", "kioslaverc", "--group", "Proxy Settings", "--key", "ProxyType", "1"])
@@ -237,14 +235,8 @@ pub fn enable_system_proxy(proxy_addr: &str) {
         }
     }
 
-    // Headless fallback
-    println!("\n===================================================================");
-    println!("OSTP Local Proxy is running at socks5://{}", proxy_addr);
-    println!("Since you are in a headless/terminal environment, OSTP cannot automatically");
-    println!("configure your system proxy. To route traffic from this terminal, run:");
-    println!("\n    eval $(ostp proxy-env)\n");
-    println!("Or configure your application (e.g. curl -x socks5://{})", proxy_addr);
-    println!("===================================================================\n");
+    println!("[ostp] SOCKS5 proxy on socks5://{proxy_addr}; no desktop session to set it on.");
+    println!("[ostp] In this shell: eval $(ostp proxy-env)    or: curl -x socks5://{proxy_addr} ...");
 }
 
 #[cfg(not(target_os = "windows"))]

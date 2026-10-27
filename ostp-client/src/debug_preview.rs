@@ -1,12 +1,7 @@
-//! Debug-mode-only preview of bytes that failed to parse as an ostp frame,
-//! shared between the live bridge (`bridge.rs`) and the diagnostic prober
-//! (`prober.rs`). Used for diagnosing operators/paths whose DPI or a
-//! transparent proxy injects its own response instead of relaying to the
-//! real server.
+//! Preview of bytes that did not parse as an ostp frame (a block page or an injected
+//! reply from DPI or a transparent proxy), for `bridge.rs` and `prober.rs`.
 
-/// Shows a lossy-UTF8 text preview (block/redirect pages are usually plain
-/// HTTP) alongside hex, capped so a large injected payload doesn't flood the
-/// log or a probe report.
+/// Lossy-UTF8 text plus hex, capped at 300 bytes.
 pub fn describe_foreign_bytes(data: &[u8]) -> String {
     const MAX_PREVIEW: usize = 300;
     let shown = &data[..data.len().min(MAX_PREVIEW)];

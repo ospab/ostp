@@ -70,8 +70,6 @@ pub fn run(action: ManageAction, config_path: &Path) -> ! {
     }
 }
 
-// ── Config access ────────────────────────────────────────────────────────────
-
 fn load(config_path: &Path) -> Result<(Value, ServerConfig)> {
     let v = crate::cert_cmd::read_json(config_path)?;
     let cfg: UnifiedConfig = serde_json::from_value(v.clone())?;
@@ -126,8 +124,6 @@ fn key_and_name(u: &Value) -> (String, String) {
         ),
     }
 }
-
-// ── Service ──────────────────────────────────────────────────────────────────
 
 const UNIT: &str = "/etc/systemd/system/ostp.service";
 
@@ -205,8 +201,6 @@ fn open_firewall(port: u16) -> Vec<String> {
     }
     done
 }
-
-// ── Commands ─────────────────────────────────────────────────────────────────
 
 fn install(config_path: &Path, port: u16, host: Option<&str>, user: &str) -> Result<Value> {
     let config_dir = crate::config_dir_of(config_path);
@@ -416,8 +410,6 @@ fn user_rename(config_path: &Path, who: &str, name: &str) -> Result<Value> {
 fn logs(lines: usize) -> Result<Value> {
     Ok(json!({ "lines": journal_tail(lines.clamp(1, 5000)) }))
 }
-
-// ── System ───────────────────────────────────────────────────────────────────
 
 fn system_info() -> Value {
     let read = |p: &str| std::fs::read_to_string(p).unwrap_or_default();

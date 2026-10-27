@@ -1,11 +1,6 @@
-/// Windows routing table utilities for OSTP split tunneling.
-///
-/// The approach used here matches how sing-box/v2rayN implement split tunneling on Windows:
-/// - A high-priority default route (metric=1) via ostp_tun captures ALL traffic.
-/// - Per-host /32 routes via the REAL gateway with an even lower metric (=0, auto-managed by OS)
-///   force excluded IPs to bypass the TUN.
-/// - Process-based exclusions are NOT supported via pure routing — they would require WFP.
-///   Instead, we surface a diagnostic warning in logs.
+// Windows routing table helpers. A default route through ostp_tun takes all traffic;
+// /32 routes via the physical gateway keep the server and excluded IPs outside it.
+// Process exclusions are not handled here.
 
 #[cfg(target_os = "windows")]
 pub mod sys {
@@ -88,20 +83,12 @@ pub mod sys {
         if_index: u32,
         metric: u32,
     ) -> Result<(), String> {
-        // Installed through route.exe rather than CreateIpForwardEntry.
-        //
-        // The legacy CreateIpForwardEntry API was failing here with error 160
-        // (ERROR_BAD_ARGUMENTS) on every single route — server-IP bypass and TUN
-        // default route alike — which left the server IP routed INTO the tunnel
-        // (a loop that froze the link for seconds under load) and the default
-        // route uninstalled. route.exe resolves the interface and validates the
-        // gateway itself, and is what the teardown path already uses, so it
-        // succeeds where the hand-built MIB_IPFORWARDROW did not.
+        // route.exe instead of CreateIpForwardEntry, which failed with ERROR_BAD_ARGUMENTS
+        // (160) for every route here.
         use std::os::windows::process::CommandExt;
         use std::process::Command;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
-        // route add <dest> mask <mask> <gateway> metric <m> if <ifindex>
         let out = Command::new("route")
             .args([
                 "add",
@@ -199,10 +186,8 @@ pub mod sys {
         }
     }
 
-    /// Delete every routing-table entry whose destination is `dest`/`mask`,
-    /// regardless of its gateway or interface. Used to purge stale bypass routes
-    /// left by a previous session (possibly pointing at an old gateway after a
-    /// network change) so a fresh, correct one can be installed. (Ported from 0.3.x b6e78c1.)
+    /// Deletes every route to `dest`/`mask`, whatever its gateway, so stale bypass routes
+    /// from an earlier session (e.g. before a network change) do not linger.
     pub fn delete_routes_for_dest(dest: Ipv4Addr, mask: Ipv4Addr) {
         unsafe {
             let mut size: ULONG = 0;
