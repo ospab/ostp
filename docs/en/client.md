@@ -1,79 +1,56 @@
-# OSTP Client Daemon
+# Client
 
-## Overview
-The OSTP Client operates as an autonomous background daemon (or system service) responsible for high-performance interception of local application traffic, encapsulation into the obfuscated secure tunnel, and maintaining robust endpoint connectivity to the remote OSTP server.
+The client takes your applications' traffic, sends it through an encrypted session to the OSTP server and keeps that session alive. It runs as a background process or service (`ostp`, the desktop app, the Android app).
 
----
+## Taking traffic
 
-## Traffic Ingestion Mechanisms
+**Local proxy.** One TCP port (`socks5_bind`, default `127.0.0.1:1088`) speaks both protocols and tells them apart by the first byte: `0x05` is SOCKS5 (RFC 1928); anything else is an HTTP proxy (`CONNECT host:port` and plain `GET http://...`).
 
-To maximize platform compatibility and application support, the client integrates three primary mechanisms:
+**System proxy (Windows).** In proxy mode the client writes the system proxy settings (WinINet) in the form browsers expect, `http=127.0.0.1:1088;https=127.0.0.1:1088`, and restores the previous values on a normal stop. On Linux with a desktop session it sets the GNOME or KDE proxy; without a desktop `ostp proxy-env` prints the shell exports instead.
 
-### 1. Dual-Protocol Inbound Proxy
-The internal proxy server binds to a single TCP port and dynamically distinguishes the protocol based on the initial byte of the incoming stream:
-- **SOCKS5 (RFC 1928)**: Activated when the first byte equals `0x05`. Standard stream encapsulation occurs.
-- **HTTP Forward Proxy**: Triggered when the first byte differs from `0x05`. The parser supports:
-  - The `CONNECT host:port` method for establishing encrypted end-to-end TLS pipelines.
-  - Standard `GET http://...` methods for clear-text HTTP proxying.
+**TUN.** On Windows (Wintun), Linux and macOS the client can create a virtual adapter and take all of the machine's IP traffic. A user-space TCP/IP stack (`netstack-smoltcp`) rebuilds TCP and UDP flows from the packets and feeds them into the session as `RelayMessage`s (see [specification.md](specification.md)). The desktop app creates the adapter in the separate `ostp-tun-helper` process, so the app itself does not run elevated (see [integrations.md](integrations.md)). `tun.kill_switch` blocks traffic while the tunnel is down.
 
-### 2. Windows System Proxy Integration (Sysproxy)
-For zero-configuration deployments on Windows, the client programmatically configures the host's system proxy configuration (WinINet API):
-- Proxy server registries are written in the strict format demanded by modern browsers (Edge, Chrome, Firefox):
-  `http=127.0.0.1:1088;https=127.0.0.1:1088`
-- Upon graceful shutdown, previous registry values are fully restored, ensuring the user is never left without basic internet connectivity.
+## Transports
 
-### 3. Virtual Network Interface (TUN)
-On Windows and Linux, the client can instantiate a virtual TUN adapter (Wintun on Windows) that intercepts 100% of machine traffic at OSI Layer 3 (raw IP packets). A userspace TCP/IP stack (the `netstack-smoltcp` crate) reconstructs logical TCP/UDP flows from those raw packets and routes them into the OSTP multiplexer (§`RelayMessage`, see [`specification.md`](specification.md)), enabling system-wide VPN-grade tunneling without per-application configuration. On the desktop GUI, TUN-adapter creation is delegated to a separately-privileged `ostp-tun-helper` process so the GUI itself doesn't need to run elevated (see [`integrations.md`](integrations.md)).
+`transport.mode` in the config:
 
----
+- `udp` (default): one OSTP datagram per UDP datagram, from a single socket kept for the whole session so the NAT mapping stays put.
+- `uot`: the same datagrams over one TCP connection, each with a 2-byte length prefix. For networks that block or throttle unknown UDP. Nothing is imitated; the stream is length-prefixed opaque data.
+- `uot` with `tls`: UoT inside real TLS to the server's domain, directly on 443 or through nginx/apache/caddy with `ws_path`. The certificate is checked against the Mozilla roots; `tls_insecure` turns that off for testing. See [tls.md](tls.md).
 
-## Transport Modes
+Other options of the `transport` block: `junk_pc` / `junk_ps` (count and size range of random datagrams sent before the handshake), `tcp_fragmentation` / `frag_chunk` / `frag_sleep` (the first TCP segment, which holds the handshake, is split into small pieces with short pauses) and `ttl_desync*` (UDP only, decoy datagrams that expire before the server). Details in [obfuscation.md](obfuscation.md).
 
-The client speaks OSTP over one of two carrier transports, selected by `transport.mode` in the config:
+There is no STUN/TURN client. Strict NATs are handled by roaming on `session_id` (see [server.md](server.md)) and by `uot`.
 
-- **`udp`** (default): each OSTP datagram is sent as one UDP datagram directly to the server. The client binds a single `UdpSocket` and reuses it for the entire session, so NAT/firewall mapping stays stable for the tunnel's lifetime.
-- **`uot`** (UDP-over-TCP): each OSTP datagram is instead carried over a plain TCP connection, framed with a 2-byte length prefix. This is for networks that block or heavily throttle unrecognized UDP; no protocol is mimicked (not a fake TLS/HTTP shell) — the TCP stream is just length-prefixed opaque blobs, consistent with OSTP's "no recognizable header" design.
-- **`uot` + `tls`**: the same UoT stream inside real TLS to the server's domain (optionally through nginx/apache/caddy on 443 via `ws_path`), with certificate verification against the bundled Mozilla roots; `tls_insecure` disables it for testing. See [Domains and TLS](tls.md).
+## Silence and recovery
 
-Two further obfuscation knobs apply mainly to `uot`, configured under the same `transport` block: `junk_pc`/`junk_ps` (count/size range of random filler datagrams sent before the handshake, each stamped with a key-derived, time-rotating marker) and `tcp_fragmentation`/`frag_chunk`/`frag_sleep` (splits the first TCP segment — the handshake — into small chunks with short delays, so DPI inspecting only the first segment never sees a complete handshake). See [`obfuscation.md`](obfuscation.md) for the cryptographic detail.
+The client does not switch transport or server on its own; that is the user's choice. Within one transport it recovers like this:
 
-There is no STUN/TURN client in the production path — `session_id`-based roaming (§ [`server.md`](server.md)) and, for UDP-blocking networks, the `uot` transport are how OSTP handles restrictive NATs and firewalls instead.
+- After 10 seconds without a valid datagram the session moves to a new socket of the same transport, without a new handshake.
+- After 25 seconds a background reconnect starts while the old session stays usable.
+- After 180 seconds in total the tunnel stops. With the kill switch on, the client keeps retrying instead of letting traffic out unprotected.
+- On resume from sleep, or after a network change, the reconnect starts at once instead of waiting for the timers.
 
----
+Ordinary TCP errors (`ConnectionReset`, `BrokenPipe`, `UnexpectedEof`) are not written to the log.
 
-## Fault Tolerance & Automated Recovery
+## Exclusions
 
-The client is engineered to maintain persistence without requiring user intervention:
-- **Stall detection and reconnection:** if no valid datagram has been received for 25 seconds, the client starts a background reconnect attempt while keeping the existing session usable in the meantime. If silence continues to 180 seconds (3 minutes) total, the session is declared permanently lost and the tunnel stops — unless the kill switch is enabled, in which case the client keeps retrying indefinitely instead of falling open to unencrypted traffic.
-- **Sleep/resume handling:** on OS resume (or a detected network change), the client forces an immediate reconnect rather than waiting out the normal stall timer, since the monotonic clock it uses may not have advanced across a sleep.
-- **Log de-noising**: standard, expected TCP interruptions (such as `ConnectionReset`, `BrokenPipe`, or `UnexpectedEof`) are actively suppressed from console output, preserving log clarity for true state transitions (`Idle -> Connecting -> Connected`).
+The `exclude` block lists what bypasses the tunnel and goes out directly:
 
----
+- `domains`: domain suffixes such as `["trusted-site.com", "local.lan"]`. Internationalized names work (`пример.рф`); every name is compared in punycode.
+- `ips`: networks in CIDR form, such as `["192.168.1.0/24", "10.0.0.0/8"]`.
+- `processes`: executable names or parts of them (`["discord", "steam.exe"]`, case-insensitive). All connections of those programs go direct. The client finds the program from the connection's local address in the system socket tables (`GetExtendedTcpTable` / `GetExtendedUdpTable` on Windows, `/proc/net/{tcp,udp}{,6}` on Linux). In TUN mode it uses the packet's source address; in proxy mode, the program's connection to the local proxy, so only programs that use the system proxy are matched. The client's own sockets never match. Not available on Android, which has per-app split tunneling instead.
 
-## Routing Exclusions (Bypass Mode)
-
-To minimize latency and overhead for trusted resources, the OSTP client incorporates an integrated direct-routing bypass engine. This is configured inside the `"exclude"` block of the `config.json` file:
-
-- **`domains`**: A list of domain suffixes (e.g., `["trusted-site.com", "local.lan"]`). Traffic bound for these domains is instantly channeled via the default local gateway, bypassing encryption entirely. Internationalized names (`пример.рф`) work: every name is compared in punycode (`xn--e1afmkfd.xn--p1ai`), the form DNS, TLS SNI and browsers use.
-- **`ips`**: A list of target subnet destinations in CIDR format (e.g., `["192.168.1.0/24", "10.0.0.0/8"]`), ensuring local area networks maintain full wire-speed throughput.
-- **`processes`**: A list of executable names or parts of them (e.g., `["discord", "steam.exe"]`, case-insensitive). Every connection those programs open goes direct. The client finds a connection's program by its local address in the system socket tables: `GetExtendedTcpTable`/`GetExtendedUdpTable` (IPv4 and IPv6) on Windows, `/proc/net/{tcp,udp}{,6}` on Linux. It works in both modes: in TUN mode by the packet's source address, in proxy mode by the program's end of its connection to the local proxy (programs that honor the system proxy). The client's own sockets are never matched, so an entry like `ostp` cannot send the tunnel itself direct. Not available on Android, where per-app split tunneling does this.
-
-Exclusions are hot-reloadable: editing `config.json` while the client is running updates the active exclusion set without a reconnect.
-
----
+Changes to `config.json` take effect without a reconnect.
 
 ## Multiplexing
 
-Two independent things are called "multiplexing" in OSTP and should not be confused:
+Every proxied TCP connection and UDP flow already shares the one encrypted session as `RelayMessage`s (`Connect`, `Data`, `Close`, `UdpAssociate`, `UdpData`), so any number of tabs and downloads fit in it.
 
-1. **Per-flow multiplexing** (always on): every proxied TCP connection and UDP flow rides the *same* single encrypted session as a sequence of `RelayMessage`s (`Connect`/`Data`/`Close`, `UdpAssociate`/`UdpData`) — this is how one OSTP session already carries an arbitrary number of concurrent browser tabs, downloads, etc.
-2. **Session-level multiplexing** (opt-in, the `"mux"` block below): running more than one independent OSTP session to the same server in parallel, to spread traffic and loss across multiple nonce sequences / congestion-control instances.
+The `mux` block is a different, optional thing: several independent sessions to the same server, to spread traffic and loss over separate nonce sequences and congestion controllers.
 
 ```json
-"mux": {
-  "enabled": false,
-  "sessions": 1
-}
+"mux": { "enabled": true, "sessions": 5 }
 ```
 
-Setting `sessions > 1` with `enabled: true` activates session-level multiplexing.
+It takes effect only with `enabled: true` and `sessions` above 1.

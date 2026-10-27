@@ -62,8 +62,6 @@ pub async fn run(action: CertAction, config_path: &Path) -> Result<()> {
     }
 }
 
-// ── Config access ────────────────────────────────────────────────────────────
-
 pub(crate) fn read_json(config_path: &Path) -> Result<serde_json::Value> {
     let raw = std::fs::read_to_string(config_path).with_context(|| format!("cannot read {}", config_path.display()))?;
     let mut stripped = json_comments::StripComments::new(raw.as_bytes());
@@ -130,8 +128,6 @@ pub(crate) fn subscription_prefix(v: &serde_json::Value) -> Option<String> {
     let cfg: ostp_client::config::SubscriptionCfg = serde_json::from_value(v.get("subscription")?.clone()).ok()?;
     cfg.is_enabled().then(|| cfg.path())
 }
-
-// ── issue ────────────────────────────────────────────────────────────────────
 
 pub async fn issue_interactive(config_path: &Path, a: IssueArgs) -> Result<()> {
     let mut v = read_json(config_path)?;
@@ -405,8 +401,6 @@ pub(crate) fn restart_service(skip: bool) {
         _ => crate::wizard_warn("could not restart ostp; run: sudo systemctl restart ostp"),
     }
 }
-
-// ── status / renew ───────────────────────────────────────────────────────────
 
 async fn status(config_path: &Path) -> Result<()> {
     let t = tls_settings(config_path)?;

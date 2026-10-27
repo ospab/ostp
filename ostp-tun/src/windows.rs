@@ -83,11 +83,8 @@ pub async fn create(opts: OstpTunOptions) -> Result<OstpTunInterface> {
         .mtu(opts.mtu)
         .up();
 
-    // The IpHelper calls the `tun` crate performs right after Adapter::create
-    // (set address / mtu) can transiently fail with ERROR_INVALID_PARAMETER
-    // (os error 87) when the freshly created interface is not yet registered
-    // in the IP stack. Retry a few times; on retry the crate reuses the
-    // existing adapter via Adapter::open. (Ported from 0.3.x b6e78c1.)
+    // Setting the address right after the adapter is created can fail with os error 87
+    // until the interface is registered in the IP stack; a retry reuses the adapter.
     let dev = {
         let mut attempt = 0;
         loop {
@@ -96,7 +93,7 @@ pub async fn create(opts: OstpTunOptions) -> Result<OstpTunInterface> {
                 Ok(d) => break d,
                 Err(e) if attempt < 5 => {
                     tracing::warn!(
-                        "TUN device creation attempt {}/5 failed: {} — retrying in 300ms",
+                        "TUN device creation attempt {}/5 failed: {}; retrying in 300 ms",
                         attempt, e
                     );
                     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
@@ -110,13 +107,8 @@ pub async fn create(opts: OstpTunOptions) -> Result<OstpTunInterface> {
 
     let current_exe = std::env::current_exe()?.to_string_lossy().into_owned();
 
-    // Take the interface index straight from the adapter WinTun just created,
-    // via the tun crate. The old code looked it up by FriendlyName == "ostp_tun"
-    // through GetAdaptersAddresses — but WinTun does NOT set the FriendlyName to
-    // the adapter name, so that match never succeeded: on every single connect
-    // it spun the full 15s and then gave up with "traffic will NOT be captured",
-    // leaving the default route (and, above, the server-IP bypass) uninstalled.
-    // get_adapter_index() is instant and correct.
+    // WinTun does not put the adapter name in FriendlyName, so the index is read from the
+    // device itself; the name lookup is only a fallback.
     use tun::AbstractDevice;
     let tun_index = match dev.tun_index() {
         Ok(idx) if idx > 0 => Some(idx as u32),
@@ -125,8 +117,7 @@ pub async fn create(opts: OstpTunOptions) -> Result<OstpTunInterface> {
             None
         }
         Err(e) => {
-            // Fall back to the old name lookup rather than fail outright.
-            tracing::warn!("Could not read TUN index from the adapter ({e}); falling back to name lookup");
+            tracing::warn!("cannot read the TUN index from the adapter ({e}); looking it up by name");
             let mut idx = None;
             for _ in 0..75 {
                 if let Some(i) = windows_route::sys::get_interface_index("ostp_tun") {
@@ -148,10 +139,10 @@ pub async fn create(opts: OstpTunOptions) -> Result<OstpTunInterface> {
             5,
         ) {
             Ok(()) => tracing::info!("Default route via TUN (if_index={idx}, metric=5) added."),
-            Err(e) => tracing::error!("Failed to add default route via TUN (if_index={idx}): {e} — traffic will NOT be captured."),
+            Err(e) => tracing::error!("cannot add the default route via TUN (if_index={idx}): {e}; traffic is not captured"),
         }
     } else {
-        tracing::error!("Could not find ostp_tun index in routing table after 15s — traffic will NOT be captured.");
+        tracing::error!("cannot find the ostp_tun interface index after 15 s; traffic is not captured");
     }
 
     // IPv6 through the tunnel too (see ostp_tun::IPV6_HALVES). The routes are
@@ -213,7 +204,7 @@ pub async fn create(opts: OstpTunOptions) -> Result<OstpTunInterface> {
     }
 
     if opts.kill_switch {
-        tracing::info!("Kill Switch enabled: Adding metric 10 blackhole route to prevent leakage");
+        tracing::info!("kill switch: adding a metric 10 blackhole route");
         let _ = tokio::task::spawn_blocking(move || {
             let _ = Command::new("route")
                 .creation_flags(CREATE_NO_WINDOW)

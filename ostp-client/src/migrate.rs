@@ -72,8 +72,6 @@ pub fn detect_version(json: &Value) -> u32 {
     if modular { 0 } else { 1 }
 }
 
-// ── Steps ────────────────────────────────────────────────────────────────────
-
 /// One schema change: applies to files of `kind` at version `from`.
 struct Step {
     kind: ConfigKind,
@@ -230,8 +228,6 @@ fn server_add_overnet(v: &mut Value, notes: &mut Vec<String>) {
     });
     notes.push("added overnet (off): .ov sites for clients with `ostp overnet install` and `ostp overnet enable`".into());
 }
-
-// ── Driver ───────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Change {

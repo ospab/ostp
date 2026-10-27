@@ -1,10 +1,8 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-/// Client runtime configuration.
-/// Constructed by the main binary from the unified `config.json`,
-/// then passed into `runner::run_client`. All I/O happens in the
-/// binary layer — this crate only owns the plain data structures.
+/// Runtime configuration the engine runs on. The CLI builds it from `config.json`
+/// and passes it to `runner::run_client`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClientConfig {
     pub mode: String,
@@ -69,10 +67,8 @@ pub struct LocalProxyConfig {
     pub connect_timeout_ms: u64,
 }
 
-/// Transport layer configuration.
-/// `mode` = "udp" (default) or "uot" (UDP over TCP). Plain UoT has no
-/// recognizable header at all; optionally it runs inside real TLS to the
-/// server's own domain (`tls`), which is genuine HTTPS, not a mimicked shell.
+/// `mode` is "udp" (default) or "uot" (UDP over TCP). UoT can run inside real TLS to the
+/// server's own domain (`tls`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TransportConfig {
     /// "udp" or "uot"
@@ -95,9 +91,7 @@ pub struct TransportConfig {
     #[serde(default = "default_junk_size")]
     pub junk_ps: [usize; 2],
     /// TTL-desync (UDP only): before the handshake, send decoy datagrams with a
-    /// lowered IP TTL so they reach an on-path DPI box but expire before the
-    /// server, poisoning the box's classification of the flow. Off by default —
-    /// it needs the TTL calibrated to the network, and the wrong value is inert.
+    /// lowered IP TTL so they reach an on-path DPI box but expire before the server.
     #[serde(default)]
     pub ttl_desync: bool,
     /// TTL the decoy datagrams are sent with. Set it to one or two hops past the
@@ -107,9 +101,8 @@ pub struct TransportConfig {
     /// How many decoy datagrams to send per handshake.
     #[serde(default = "default_ttl_desync_count")]
     pub ttl_desync_count: u8,
-    /// Auto-calibrate the decoy TTL by measuring the hop distance to the server
-    /// (see ttl_probe). On by default, so turning desync on "just works"; the
-    /// measured value overrides ttl_desync_ttl. Turn off to pin ttl_desync_ttl.
+    /// Measure the hop distance to the server (see ttl_probe) and use it instead of
+    /// `ttl_desync_ttl`. Turn off to pin the value.
     #[serde(default = "default_true")]
     pub ttl_desync_auto: bool,
     /// Wrap UoT in TLS (UoT only). The certificate is verified against the
@@ -119,8 +112,7 @@ pub struct TransportConfig {
     /// TLS server name; defaults to the host part of `server_addr`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tls_sni: Option<String>,
-    /// Accept any server certificate. For testing only: it removes the
-    /// protection against someone impersonating the server.
+    /// Accept any server certificate. For testing only: anyone can impersonate the server.
     #[serde(default)]
     pub tls_insecure: bool,
     /// Secret HTTP-upgrade path, needed when a web server (nginx/apache/caddy)
@@ -160,10 +152,6 @@ impl Default for TransportConfig {
     }
 }
 
-
-
-
-
 impl Default for OstpConfig {
     fn default() -> Self {
         Self {
@@ -186,7 +174,6 @@ impl Default for LocalProxyConfig {
         }
     }
 }
-
 
 impl Default for ClientConfig {
     fn default() -> Self {
@@ -215,12 +202,9 @@ impl Default for MultiplexConfig {
     }
 }
 
-/// Unified shape of `config.json` as seen by the client.
-/// Used only for hot-reloading (`BridgeCommand::ReloadConfig`).
+/// `config.json` as the client reads it on hot reload (`BridgeCommand::ReloadConfig`).
 #[derive(Debug, Deserialize)]
 struct RawUnifiedConfig {
-    #[allow(dead_code)]
-    mode: String,
     debug: Option<bool>,
     server: Option<String>,
     access_key: Option<String>,
@@ -272,11 +256,8 @@ struct RawMuxSection {
     sessions: Option<usize>,
 }
 
-
-
 impl ClientConfig {
-    /// Hot-reload from `config.json` placed next to the running binary.
-    /// Returns a new `ClientConfig` built from the unified JSON format.
+    /// Reads `config.json` next to the running binary.
     pub fn reload_from_json_near_binary() -> Result<Self> {
         let exe = std::env::current_exe().context("cannot resolve binary path")?;
         let dir = exe.parent().context("cannot resolve binary directory")?;
@@ -352,26 +333,8 @@ impl ClientConfig {
     }
 }
 
-// ═══════════════════════════════════════════════════════════════════════
-// On-disk config.json shapes — client, server, and relay.
-//
-// This is the ONE place these are defined. They used to be declared locally
-// inside ostp/src/main.rs (the CLI binary) with no other consumer able to
-// see them, which is exactly how ostp-client::migrate ended up working
-// against loosely-typed serde_json::Value instead of a real schema, and how
-// the CLI, the migrator, and this crate's own hot-reload path could each
-// silently drift out of sync with what a config.json actually looks like.
-// main.rs now imports these instead of re-declaring them (see the `use
-// ostp_client::config::{...}` at its top).
-//
-// These are DELIBERATELY separate from ClientConfig/OstpConfig/etc. above:
-// this section is the friendly, minimal shape a user actually edits by
-// hand; the types above are what the running engine needs internally
-// (handshake/io timeouts, resolved addresses, ...) and are built FROM one
-// of these via the mapping in ostp/src/main.rs::run_client_directly. Only
-// `ClientConfig` collides by name with the runtime type above, so the
-// on-disk one is `ClientFileConfig` — everything else keeps its natural name.
-// ═══════════════════════════════════════════════════════════════════════
+// On-disk config.json shapes. `ClientFileConfig` is the file's client section; the
+// `ClientConfig` above is what the engine runs on.
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "mode", rename_all = "lowercase")]
@@ -397,15 +360,13 @@ impl UnifiedConfig {
         match &self.mode {
             AppMode::Server(cfg) => {
                 if cfg.access_keys.is_empty() {
-                    anyhow::bail!("Server configuration must contain at least one access_key.");
+                    anyhow::bail!("a server config needs at least one access key");
                 }
                 if let Some(outbound) = &cfg.outbound {
                     if outbound.enabled {
                         let action = outbound.default_action.as_deref().unwrap_or("direct");
                         if action == "direct" && outbound.rules.is_empty() {
-                            println!("\n[WARNING] Server outbound proxy is ENABLED, but default_action is 'direct' and there are no rules!");
-                            println!("          This means ALL traffic will bypass the proxy and go out directly from the server IP.");
-                            println!("          If you want all traffic to be proxied, change 'default_action' to 'proxy'.\n");
+                            println!("[warn] outbound proxy is enabled, but default_action is 'direct' and there are no rules: nothing will use the proxy. Set default_action to 'proxy' or add rules.");
                         }
                     }
                 }
@@ -423,22 +384,16 @@ impl UnifiedConfig {
             }
             AppMode::Client(cfg) => {
                 if cfg.access_key.is_empty() {
-                    anyhow::bail!("Client configuration must contain an access_key.");
+                    anyhow::bail!("a client config needs an access_key");
                 }
             }
             AppMode::Relay(cfg) => {
-                // The relay forwards to a fixed next hop on both carriers, so it
-                // needs both upstream addresses. It does NOT need upstream_api_url:
-                // that field belonged to the old design where the relay
-                // authenticated clients itself, which it no longer does. Requiring
-                // it here was the bug that made every generated relay config
-                // (wizard and template alike write no api_url) fail to load with
-                // "must specify upstream_api_url" — a relay that could never start.
+                // The relay forwards to a fixed next hop on both carriers.
                 if cfg.upstream_tcp.is_empty() {
-                    anyhow::bail!("Relay configuration must specify upstream_tcp (the next hop's TCP/UoT address).");
+                    anyhow::bail!("a relay config needs upstream_tcp (the next hop's TCP/UoT address)");
                 }
                 if cfg.upstream_udp.is_empty() {
-                    anyhow::bail!("Relay configuration must specify upstream_udp (the next hop's UDP address).");
+                    anyhow::bail!("a relay config needs upstream_udp (the next hop's UDP address)");
                 }
             }
         }
@@ -488,10 +443,8 @@ pub struct ServerConfig {
     pub api: Option<ApiConfig>,
     pub fallback: Option<FallbackCfg>,
     pub transport: Option<TransportConfigRaw>,
-    // Left untyped: ostp-client does not (and should not) depend on
-    // ostp-server just to name its DnsConfig type. The CLI binary — which
-    // already depends on both crates — deserializes this into
-    // ostp_server::dns::DnsConfig right before handing it to run_server().
+    // Untyped so ostp-client need not depend on ostp-server; the CLI parses it into
+    // `ostp_server::dns::DnsConfig`.
     pub dns: Option<serde_json::Value>,
     /// Public name of the server; used in share links, with or without TLS.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -697,13 +650,7 @@ pub struct RelayServerConfig {
     pub upstream_tcp: String,
     /// Upstream address for UDP traffic
     pub upstream_udp: String,
-    // ── Deprecated ──────────────────────────────────────────────────────────
-    // The relay used to authenticate clients itself and pulled the access-key
-    // list from the target server's management API to do it. It no longer does:
-    // sessions are authenticated end-to-end by the target server, and a relay
-    // that re-checks credentials only adds a weaker second gate plus a copy of
-    // the key list on a machine that does not need one. These are kept solely
-    // so existing relay configs still parse; they are ignored.
+    // Ignored: the target server authenticates sessions. Kept so old relay configs still parse.
     #[serde(default)]
     pub upstream_api_url: String,
     #[serde(default)]
@@ -878,10 +825,7 @@ pub struct MuxConfig {
 mod tests {
     use super::*;
 
-    /// Loads a config.json exactly as the daemon does: parse the JSON into the
-    /// canonical `UnifiedConfig`, then validate. This is the real drift-catcher —
-    /// if the wizard/template and the validator ever disagree on required fields,
-    /// this fails instead of a user's relay refusing to start.
+    /// Loads a config.json the way the daemon does: parse, then validate.
     fn load(json: &str) -> Result<UnifiedConfig> {
         let cfg: UnifiedConfig = serde_json::from_str(json)?;
         cfg.validate()?;
@@ -920,14 +864,9 @@ mod tests {
         }
     }
 
-    /// Regression: the relay used to authenticate clients and so its config
-    /// carried `upstream_api_url`. The relay is a transparent pipe now and both
-    /// the wizard and the `init` template write NO api_url — yet validation kept
-    /// demanding it, so every generated relay config failed to load with
-    /// "must specify upstream_api_url". A relay that could never start.
+    /// The wizard and `ostp init relay` write no `upstream_api_url`, so it must not be required.
     #[test]
     fn relay_config_without_api_url_loads() {
-        // Byte-for-byte the shape the wizard (main.rs) emits.
         let json = r#"{
             "mode": "relay",
             "listen": "0.0.0.0:50000",
@@ -938,9 +877,7 @@ mod tests {
         load(json).expect("a transparent-relay config must load without upstream_api_url");
     }
 
-    /// A relay still needs somewhere to forward to on both carriers, so an
-    /// incomplete relay config must fail loudly at load, not connect-to-empty
-    /// per session at runtime.
+    /// Both upstreams are required.
     #[test]
     fn relay_config_missing_upstream_udp_is_rejected() {
         let json = r#"{
@@ -953,8 +890,7 @@ mod tests {
         assert!(load(json).is_err(), "a relay with no UDP upstream must be rejected");
     }
 
-    /// A deprecated api_url left in an OLD config must not break loading — it is
-    /// ignored, not required and not forbidden.
+    /// An `upstream_api_url` left in an old config is ignored.
     #[test]
     fn relay_config_with_leftover_api_url_still_loads() {
         let json = r#"{

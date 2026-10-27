@@ -1,13 +1,13 @@
 # OSTP documentation
 
-Every document exists in English (`en/`) and Russian (`ru/`) with the same content. Start with the [README](../README.md) for installation and a quick start.
+Each document exists in English (`en/`) and Russian (`ru/`) with the same content. Installation and a quick start are in the [README](../README.md).
 
 | Topic | English | Русский | What is in it |
 |---|---|---|---|
 | Client | [client.md](en/client.md) | [client.md](ru/client.md) | Proxy and TUN modes, transports, recovery and roaming, exclusions, multiplexing |
-| Server | [server.md](en/server.md) | [server.md](ru/server.md) | Session dispatcher, attack mitigation, roaming, management API and web panel, `ostp manage`, DNS, fallback listener, outbound chaining |
+| Server | [server.md](en/server.md) | [server.md](ru/server.md) | Dispatcher, attack mitigation, roaming, management API and web panel, `ostp manage`, DNS, fallback listener, outbound proxy, overnet, relay node |
 | Domains and TLS | [tls.md](en/tls.md) | [tls.md](ru/tls.md) | TLS on 443, how the server tells connections apart, `ostp cert`, web servers, renewal, subscriptions |
-| Protocol specification | [specification.md](en/specification.md) | [specification.md](ru/specification.md) | Wire format, header masking, key derivation and handshake, frames, ARQ, congestion control, roaming |
+| Protocol specification | [specification.md](en/specification.md) | [specification.md](ru/specification.md) | Wire format, header masking, key derivation and handshake, frames, ARQ, congestion control (CUBIC), roaming |
 | Obfuscation | [obfuscation.md](en/obfuscation.md) | [obfuscation.md](ru/obfuscation.md) | Kerckhoffs's principle (what is public, what is secret), secret derivation, masking, padding, junk packets, fragmentation |
 | Architecture | [architecture.md](en/architecture.md) | [architecture.md](ru/architecture.md) | How the crates fit together, envelope vs. frame, multiplexing, ARQ, roaming, server subsystems |
 | Integrations | [integrations.md](en/integrations.md) | [integrations.md](ru/integrations.md) | Android app and JNI, desktop GUI, first-run screen, installing and managing your own server over SSH, system interfaces |

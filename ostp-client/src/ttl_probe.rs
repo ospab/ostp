@@ -1,30 +1,17 @@
-//! Lightweight "how many hops to the server" probe, for auto-calibrating the
-//! TTL-desync decoys — without pulling in the full ostp-prober, and without any
-//! new server code or exposed port.
+//! Hop distance to the server, to calibrate the TTL-desync decoys.
 //!
-//! The trick: the OSTP server answers only a *valid* handshake and silently
-//! drops everything else. So we send the real handshake datagram with a rising
-//! IP TTL and watch for the first TTL that draws a reply. A datagram whose TTL
-//! is too low dies on a router before the server and creates no state there;
-//! only the TTL that actually reaches the server elicits a response. That first
-//! responding TTL is the hop distance to the server.
-//!
-//! This is inherently key-gated (no key → no valid handshake → no reply, so an
-//! unauthenticated caller learns nothing) and rides the existing UDP port, which
-//! is exactly the "works for key holders, no prober-server, no extra ports"
-//! property we want. Decoys are then sent at `hops - 1`, so they clear the DPI
-//! (which sits far closer than the server) yet die before the server.
+//! The server answers only a valid handshake, so the real handshake datagram is sent with
+//! a rising IP TTL and the first TTL that draws a reply is the distance. Without the key
+//! there is no valid handshake and no reply. Decoys are then sent at `hops - 1`: past the
+//! DPI, short of the server.
 
 use std::net::SocketAddr;
 use std::time::Duration;
 use tokio::net::UdpSocket;
 
-/// Upper bound on the hop sweep. Beyond ~30 the internet does not go, and a
-/// server we cannot reach within that many hops is unreachable for other
-/// reasons the caller will already be handling.
+/// Upper bound on the hop sweep.
 const MAX_HOPS: u8 = 30;
-/// Per-TTL wait for a reply. Kept short so the whole sweep is quick; each TTL is
-/// tried a couple of times to ride out isolated loss.
+/// Per-TTL wait for a reply; each TTL is tried twice to ride out loss.
 const PER_TTL_TIMEOUT: Duration = Duration::from_millis(400);
 const SENDS_PER_TTL: usize = 2;
 

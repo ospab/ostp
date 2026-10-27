@@ -1,20 +1,19 @@
-# Native Integrations
+# Integrations
 
-## Cross-Platform Engineering
-The OSTP core protocol (`ostp-core`) is `sans-io` and completely platform-agnostic. Each host application links it and supplies the actual networking, TUN adapter, and UI — described below.
+`ostp-core` does no I/O of its own. Each host application links it and supplies the sockets, the TUN adapter and the interface, as described below.
 
-## Mobile: Flutter App + Android JNI Bindings
-`ostp-flutter` is the cross-platform mobile app (Flutter, Android today). It embeds the Rust client engine on Android through `ostp-jni`, a dedicated crate exporting a small JNI surface (`Java_net_ostp_client_OstpClientSdk_*`) consumed by the app's Kotlin layer (`OstpClientSdk.kt`, `OstpVpnService.kt`, `MainActivity.kt`): start/stop the client, metrics, logs, network changes, the prober, subscriptions, update checks, and `serversCall` for server management (below).
+## Android: Flutter app and JNI
+`ostp-flutter` is the mobile app (Flutter; Android only for now). It embeds the Rust client engine on Android through `ostp-jni`, a dedicated crate exporting a small JNI surface (`Java_net_ostp_client_OstpClientSdk_*`) consumed by the app's Kotlin layer (`OstpClientSdk.kt`, `OstpVpnService.kt`, `MainActivity.kt`): start/stop the client, metrics, logs, network changes, the prober, subscriptions, update checks, and `serversCall` for server management (below).
 
-- **Isolated runtime**: `ostp-jni` owns its own multithreaded Tokio runtimes inside the host process, so tunnel I/O never blocks the Android UI thread. Every blocking call is made from a background thread on the Kotlin side.
-- **Telemetry bridge**: metrics, logs and the output of running server commands are polled across the JNI boundary through plain getter calls rather than a push channel, keeping the FFI surface small.
+- **Runtime**: `ostp-jni` runs its own multithreaded Tokio runtimes in the app process, and the Kotlin side calls it from background threads, so tunnel I/O does not block the UI thread.
+- **Polling**: metrics, logs and the output of server commands are read through plain getter calls; there is no push channel.
 - **Split tunneling** is per app (Android's `VpnService` allow/deny lists); process-name exclusions do not exist on Android.
 
 ## Desktop GUI
 `ostp-gui` is a Tauri v2 desktop application (Windows and Linux) that drives the same client engine in-process for proxy mode and through a helper for TUN mode. It has one dark theme and two buttons in the top bar: the network prober and settings.
 
-### Privilege separation for TUN
-Creating a TUN adapter requires elevated privileges; running the whole GUI elevated is undesirable. Instead, TUN setup is delegated to `ostp-tun-helper`, a small standalone process the GUI launches and talks to over a local command channel (start/stop with a config + auth token) — only that helper, not the GUI, needs to run elevated (UAC on Windows, polkit/pkexec on Linux). The actual adapter creation code lives in the shared `ostp-tun` crate, used by both the helper and the CLI's own native TUN path (see [`client.md`](client.md)).
+### TUN privileges
+Creating a TUN adapter needs elevated rights, and the app should not run elevated. TUN setup is therefore done by `ostp-tun-helper`, a small process the app starts and controls over a local command channel (start and stop, with a config and token). Only the helper runs elevated (UAC on Windows, polkit/pkexec on Linux). The actual adapter creation code lives in the shared `ostp-tun` crate, used by both the helper and the CLI's own native TUN path (see [`client.md`](client.md)).
 
 ## Your own server from the apps
 
@@ -41,8 +40,7 @@ Changes that restart the service are refused while this device's VPN goes throug
 - A password or key is kept only when the user asks. It is sealed with ChaCha20-Poly1305 in `servers.json` under a random 32-byte master key; the master key lives in the system credential store (Windows Credential Manager, Secret Service on Linux, the Android Keystore wraps it on Android). Without a usable store nothing secret is written and the app asks at each connection.
 - The app runs only a fixed set of commands on the server (`ostp manage` subcommands, update, restart, reboot, uninstall, panel, certificate, subscriptions); the page cannot send arbitrary shell.
 
-## System Interfaces
-On desktop, platform-specific modules handle host integration:
-- **Windows system proxy** (`sysproxy.rs`): writes/restores WinINet proxy registry values for zero-configuration browser proxying; excluded domains go into its bypass list in both punycode and readable form.
+## System interfaces
+- **Windows system proxy** (`sysproxy.rs`): writes and restores the WinINet proxy values; excluded domains go into its bypass list in both punycode and readable form.
 - **TUN adapters** (`ostp-tun`): Wintun on Windows, native TUN devices on Linux/macOS; a userspace `netstack-smoltcp` stack reconstructs TCP/UDP flows from the raw IP packets the adapter delivers.
 - **Process-based exclusion** (`process_lookup.rs`): finds the program behind a local socket through `GetExtendedTcpTable`/`GetExtendedUdpTable` on Windows and `/proc/net` on Linux, in both TUN and proxy mode, so per-process bypass rules (§[`client.md`](client.md)) work without a kernel driver.

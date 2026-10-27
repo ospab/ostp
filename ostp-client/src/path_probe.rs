@@ -24,8 +24,6 @@ use tokio::net::{TcpSocket, TcpStream, UdpSocket};
 /// The deepest hop searched.
 pub const MAX_HOPS: u32 = 32;
 
-// ── Sockets that bypass the tunnel ───────────────────────────────────────────
-
 /// A TCP socket that leaves through the physical network even while the
 /// ostp tunnel is up: VpnService.protect on Android, the physical interface
 /// (IP_UNICAST_IF) on Windows, SO_BINDTODEVICE on Linux when permitted.
@@ -82,8 +80,6 @@ pub async fn bypass_udp_socket(v6: bool) -> std::io::Result<UdpSocket> {
     sock.set_nonblocking(true)?;
     UdpSocket::from_std(sock.into())
 }
-
-// ── Reactions ────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -189,8 +185,6 @@ pub async fn locate(addr: SocketAddr, trigger: &[u8], benign: &[u8], window: Dur
     }
 }
 
-// ── Path (routers per hop, via the system ping) ──────────────────────────────
-
 #[derive(Debug, Clone, Serialize)]
 pub struct Hop {
     pub ttl: u32,
@@ -294,8 +288,6 @@ pub async fn path(target: IpAddr, max: u32) -> Vec<Hop> {
     }
     hops
 }
-
-// ── Who owns each hop (Team Cymru IP-to-ASN over DNS) ────────────────────────
 
 /// One TXT record, asked over UDP from the physical network.
 async fn dns_txt(name: &str) -> Option<String> {
