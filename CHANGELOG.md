@@ -18,6 +18,29 @@ Older history is on the [Releases](https://github.com/ospab/ostp/releases) page 
   - No answer from 8.8.8.8 showed "DNS not hijacked"; it is "not measured" now, like the CONNECT and reset tests when they have nothing to compare.
   - The score was a sum of hand-picked weights; it is now the level of the worst finding, with a one-line verdict and advice on which OSTP carrier to use (a relay under an allowlist, UDP or UoT when TLS abroad is filtered, TLS when unknown data is dropped).
   - All messages are in English, like the rest of the prober.
+- Linux, TUN mode: the client waited for "yes" typed into the log window and crashed on any other input, while the log already said "TUN tunnel established". The prompt is gone; the log says the tunnel is up only after the TUN interface is created.
+- TUN mode no longer turns on the system proxy (on Windows it also reset the proxy exclusion list).
+- Client reconnects, rewritten as one policy instead of five overlapping ones. A silent server is noticed within about 10 seconds (each multiplex session is watched on its own, so a live session no longer hides a dead one). The client first moves the session to a new socket; if that fails, it reconnects to the same server and transport with pauses of 1, 2, 5, 10, 20 and then 30 seconds until it succeeds or the user stops it. A network change or waking from sleep starts recovery at once. Old streams are reset on every reconnect. This fixes tunnels on Windows that stayed "connected" while nothing went through, and a stop/start swing caused by a delayed automatic toggle. A first connection that fails (wrong key, address or transport) is not retried: the client stops and shows the error.
+- Proxy mode: after 45 seconds without a connection the system proxy is released so the computer keeps internet access, and turned on again when the connection is back.
+- Android with two SIM cards: switching mobile data to the other SIM did not move the tunnel to the new network. The app now follows the default network, sets it as the tunnel's underlying network and reconnects after the switch.
+- Android: "Connected" is shown only after the server answered the handshake, and stays "Connecting" while the connection is being restored.
+- Desktop app: "Disconnected" appeared even when stopping failed; the button could be clicked twice while TUN mode waited for the administrator prompt; an error disappeared after 5 seconds; the beta warning was shown for stable versions too. Tab, B, Q and Escape no longer close the app or switch screens; Escape closes the open dialog.
+- Desktop app: no longer loads fonts from Google at start.
+- Web panel: clearer error messages, confirmation before deleting, input checks before saving, keyboard access and screen reader labels; the Overview subtitle showed the overnet text.
+
+### Security
+- `install.sh` downloaded the release as root into a fixed file in `/tmp`: a local user could replace it or point the write at another file. It now uses a private temporary directory and HTTPS only.
+- `install.sh` left `/etc/ostp` and `config.json` (access keys, panel password hash) readable by every local user. The directory is now 700 and the config 600.
+- `install.ps1` left `C:\opt\ostp`, which is on the system PATH, writable by every user, so anyone could replace `ostp.exe`. Only administrators and SYSTEM can write there now.
+- Server: a client could put line breaks into a destination name and send its own headers to an HTTP upstream proxy; a name longer than 255 bytes broke a SOCKS5 upstream. Such names are refused.
+- Server: a client with a key could make the server compare every unacknowledged frame against hundreds of ACK ranges per packet and stall all users. ACK and NACK lookups are now binary searches.
+- Server: a client could take over another user's session by reusing its session ID; this is refused now. Sessions dropped between server ticks (too many per key, key deleted) kept their outgoing connections open.
+- Server: users created in bulk got 60-bit access keys; they now get 128 bits like users created one by one. Keys issued that way should be reissued.
+- Server: saving routing rules from the panel could overwrite a config that has comments with `null`. A config that cannot be parsed is no longer written.
+- DNS: queries to a plain UDP upstream used the client's query ID and accepted any answer with that ID; the server now uses a random ID and checks the question.
+
+### Removed
+- The terminal interface (TUI in `ostp-client`), the `test_route` tool, an outdated relay config example and an unused icon.
 
 ## [0.4.7-beta.8] - 2026-10-07
 
