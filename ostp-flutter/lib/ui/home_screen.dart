@@ -35,6 +35,14 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
   Timer? _uptimeTimer;
   int _uptimeSecs = 0;
 
+  // True while _toggleConnection waits for the service to start, so the poll
+  // does not read "not running yet" as a failure.
+  bool _starting = false;
+  // The core reported connecting/connected at least once since the tunnel
+  // started: a later "not connected" is then a real failure, not start-up.
+  bool _coreActive = false;
+  DateTime _startedAt = DateTime.now();
+
   // Single active profile — the core only ever connects to one server at a
   // time (no multi-server/urltest failover since the 0.4.x flat config),
   // matching how the desktop GUI picks exactly one profile as `activeId`.
@@ -113,7 +121,9 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
     try {
       final isRunning = await platform.invokeMethod('isRunning');
       if (isRunning == true && mounted) {
-        _setConnected();
+        // The service is up, but whether the handshake finished is for the
+        // poll to say (connection_state), not for us to assume.
+        _setConnecting(resumed: true);
       }
     } catch (e) {
       debugPrint("Failed to check initial state: $e");
@@ -222,16 +232,13 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
     if (_state == ConnectionStateEnum.disconnected) {
       if (_activeProfile == null || _activeProfile!.serverAddr.isEmpty || _activeProfile!.accessKey.isEmpty) {
         ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('Please select or add a profile in Settings')),
+          const SnackBar(content: Text('No profile selected. Add or choose one in Settings.')),
         );
         return;
       }
 
-      setState(() {
-        _state = ConnectionStateEnum.connecting;
-      });
-      _pulseController.repeat(reverse: true);
-      _spinController.repeat();
+      _starting = true;
+      _setConnecting();
 
       final configMap = _buildConfigMap();
       final configStr = jsonEncode(configMap);
@@ -251,24 +258,27 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
           }
         }
 
+        _starting = false;
         if (started) {
-          _setConnected();
+          // Stays "Connecting" until the core reports the handshake done.
+          _startedAt = DateTime.now();
         } else {
           _setDisconnected();
           if (mounted) {
             ScaffoldMessenger.of(context).showSnackBar(
-              const SnackBar(content: Text('Failed to connect. Check logs for details.')),
+              const SnackBar(content: Text('The VPN service did not start. See Logs for the reason.')),
             );
           }
         }
       } catch (e, stackTrace) {
         debugPrint("Failed to start tunnel: $e\n$stackTrace");
+        _starting = false;
         _setDisconnected();
         if (mounted) {
           showDialog(
             context: context,
             builder: (ctx) => AlertDialog(
-              title: const Text('Error', style: TextStyle(color: Colors.redAccent)),
+              title: const Text('Could not start the VPN', style: TextStyle(color: Colors.redAccent)),
               content: SingleChildScrollView(
                 child: SelectableText(e.toString(), style: const TextStyle(fontFamily: 'monospace', fontSize: 12)),
               ),
@@ -276,7 +286,7 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
                 TextButton(
                   onPressed: () {
                     Clipboard.setData(ClipboardData(text: e.toString()));
-                    ScaffoldMessenger.of(ctx).showSnackBar(const SnackBar(content: Text('Copied!')));
+                    ScaffoldMessenger.of(ctx).showSnackBar(const SnackBar(content: Text('Copied')));
                   },
                   child: const Text('Copy'),
                 ),
@@ -297,6 +307,20 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
       }
       _setDisconnected();
     }
+  }
+
+  void _setConnecting({bool resumed = false}) {
+    if (!mounted) return;
+    setState(() {
+      _state = ConnectionStateEnum.connecting;
+    });
+    _uptimeTimer?.cancel();
+    // A service found already running has an unknown start time, so the
+    // start-up grace period for a silent core does not apply to it.
+    _coreActive = resumed;
+    _startedAt = DateTime.now();
+    _pulseController.repeat(reverse: true);
+    _spinController.repeat();
   }
 
   void _setConnected() {
@@ -321,23 +345,29 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
       if (!mounted) return;
       try {
         final isRunning = await platform.invokeMethod('isRunning');
+        if (_starting) return;
 
         if (isRunning == true && _state == ConnectionStateEnum.disconnected) {
-          _setConnected();
-        } else if (isRunning == false && _state == ConnectionStateEnum.connected) {
+          _setConnecting(resumed: true);
+        } else if (isRunning == false && _state != ConnectionStateEnum.disconnected) {
           _setDisconnected();
         }
 
-        if (_state == ConnectionStateEnum.connected) {
+        if (_state != ConnectionStateEnum.disconnected) {
           final metricsJson = await platform.invokeMethod('getMetrics');
           if (metricsJson != null && metricsJson.isNotEmpty) {
             final Map<String, dynamic> parsed = jsonDecode(metricsJson);
             final bytesSent = parsed['bytes_sent'] as int? ?? 0;
             final bytesRecv = parsed['bytes_recv'] as int? ?? 0;
-            final connState = parsed['connection_state'] as int? ?? 2;
+            // 0 = not connected, 1 = handshake or reconnect in progress, 2 = connected.
+            final connState = parsed['connection_state'] as int? ?? 0;
             final rttMs = parsed['rtt_ms'] as int? ?? 0;
 
-            if (connState == 0) {
+            if (connState != 0) _coreActive = true;
+
+            // Zero right after start is normal; the core gets 20 s to report anything.
+            final grace = DateTime.now().difference(_startedAt) < const Duration(seconds: 20);
+            if (connState == 0 && (_coreActive || !grace)) {
               try {
                 await platform.invokeMethod('stopTunnel');
               } catch (e) {
@@ -346,10 +376,17 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
               _setDisconnected();
               if (mounted) {
                 ScaffoldMessenger.of(context).showSnackBar(
-                  const SnackBar(content: Text('Connection failed. Check logs for details.')),
+                  const SnackBar(content: Text('Could not connect to the server. See Logs for the reason.')),
                 );
               }
               return;
+            }
+
+            if (connState == 2 && _state != ConnectionStateEnum.connected) {
+              _setConnected();
+            } else if (connState == 1 && _state == ConnectionStateEnum.connected) {
+              // The link dropped and the core is bringing it back: do not keep showing "Connected".
+              _setConnecting(resumed: true);
             }
 
             if (mounted) {
@@ -636,7 +673,7 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
 
         Text(
           _state == ConnectionStateEnum.disconnected ? 'Disconnected' :
-          _state == ConnectionStateEnum.connecting ? 'Connecting...' : 'Connected',
+          _state == ConnectionStateEnum.connecting ? 'Connecting…' : 'Connected',
           style: TextStyle(
             fontSize: 26,
             fontWeight: FontWeight.w700,
@@ -645,7 +682,9 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
         ),
         const SizedBox(height: 8),
         Text(
-          _state == ConnectionStateEnum.connected ? _formatTime(_uptimeSecs) : 'Tap to protect your traffic',
+          _state == ConnectionStateEnum.connected
+              ? _formatTime(_uptimeSecs)
+              : _state == ConnectionStateEnum.connecting ? 'Tap to cancel' : 'Tap to connect',
           style: const TextStyle(
             fontSize: 16,
             color: Colors.white54,

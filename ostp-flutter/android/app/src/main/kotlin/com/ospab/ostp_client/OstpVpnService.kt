@@ -71,7 +71,7 @@ class OstpVpnService : VpnService() {
                 "OSTP VPN",
                 NotificationManager.IMPORTANCE_LOW
             ).apply {
-                description = "OSTP VPN connection status"
+                description = "VPN connection status"
                 setShowBadge(false)
             }
             val nm = getSystemService(NotificationManager::class.java)
@@ -96,9 +96,9 @@ class OstpVpnService : VpnService() {
         )
 
         val (statusText, actionLabel) = if (connecting) {
-            Pair("Подключение...", "Отмена")
+            Pair("Connecting…", "Cancel")
         } else {
-            Pair("Подключено", "Отключить")
+            Pair("Connected", "Disconnect")
         }
 
         return NotificationCompat.Builder(this, CHANNEL_ID)
@@ -328,7 +328,7 @@ class OstpVpnService : VpnService() {
         } catch (e: Throwable) {
             Log.e("OstpVpnService", "Error starting VPN", e)
             android.os.Handler(android.os.Looper.getMainLooper()).post {
-                android.widget.Toast.makeText(applicationContext, "VPN Error: ${e.message}", android.widget.Toast.LENGTH_LONG).show()
+                android.widget.Toast.makeText(applicationContext, "Could not start the VPN: ${e.message}", android.widget.Toast.LENGTH_LONG).show()
             }
             stopVpn()
         }

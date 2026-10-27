@@ -57,7 +57,7 @@ class _LogsScreenState extends State<LogsScreen> {
         showDialog(
           context: context,
           builder: (ctx) => AlertDialog(
-            title: const Text('Logs Error', style: TextStyle(color: Colors.redAccent)),
+            title: const Text('Could not read the logs', style: TextStyle(color: Colors.redAccent)),
             content: SingleChildScrollView(
               child: SelectableText(e.toString(), style: const TextStyle(fontFamily: 'monospace', fontSize: 12)),
             ),
@@ -65,7 +65,7 @@ class _LogsScreenState extends State<LogsScreen> {
               TextButton(
                 onPressed: () {
                   Clipboard.setData(ClipboardData(text: e.toString()));
-                  ScaffoldMessenger.of(ctx).showSnackBar(const SnackBar(content: Text('Copied!')));
+                  ScaffoldMessenger.of(ctx).showSnackBar(const SnackBar(content: Text('Copied')));
                 },
                 child: const Text('Copy'),
               ),
@@ -134,12 +134,12 @@ class _LogsScreenState extends State<LogsScreen> {
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: const Text('System Logs', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 18)),
+        title: const Text('Logs', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 18)),
         backgroundColor: Theme.of(context).colorScheme.surface,
         elevation: 0,
         actions: [
           IconButton(icon: const Icon(Icons.delete_outline), onPressed: _clearLogs, tooltip: 'Clear'),
-          IconButton(icon: const Icon(Icons.copy_rounded), onPressed: _copyLogs, tooltip: 'Copy All'),
+          IconButton(icon: const Icon(Icons.copy_rounded), onPressed: _copyLogs, tooltip: 'Copy all'),
         ],
       ),
       body: Container(

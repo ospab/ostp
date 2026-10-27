@@ -65,13 +65,13 @@ class _SettingsScreenState extends State<SettingsScreen> {
 
   Future<void> _importSubscription(String url) async {
     final messenger = ScaffoldMessenger.of(context);
-    messenger.showSnackBar(const SnackBar(content: Text('Fetching subscription...'), duration: Duration(seconds: 2)));
+    messenger.showSnackBar(const SnackBar(content: Text('Fetching subscription…'), duration: Duration(seconds: 2)));
     try {
       final n = await SubscriptionStore(widget.prefs).add(url);
       _reloadProfilesAndSubs();
       messenger.showSnackBar(SnackBar(content: Text('Subscription added: $n profile(s)')));
     } catch (e) {
-      messenger.showSnackBar(SnackBar(content: Text('Subscription error: ${e.toString().replaceFirst('Exception: ', '')}')));
+      messenger.showSnackBar(SnackBar(content: Text('Could not add the subscription: ${e.toString().replaceFirst('Exception: ', '')}')));
     }
   }
 
@@ -82,7 +82,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
       final n = await SubscriptionStore(widget.prefs).refresh(s.id);
       messenger.showSnackBar(SnackBar(content: Text('Updated: $n profile(s)')));
     } catch (e) {
-      messenger.showSnackBar(SnackBar(content: Text('Update failed: ${e.toString().replaceFirst('Exception: ', '')}')));
+      messenger.showSnackBar(SnackBar(content: Text('Could not update the subscription: ${e.toString().replaceFirst('Exception: ', '')}')));
     } finally {
       _refreshing.remove(s.id);
       if (mounted) _reloadProfilesAndSubs();
@@ -264,9 +264,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
         ));
         _saveProfiles();
       });
-      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Imported successfully')));
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Profile imported')));
     } catch (e) {
-      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Error: $e')));
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Could not import: ${e.toString().replaceFirst('Exception: ', '').replaceFirst('FormatException: ', '')}')));
     }
   }
 
