@@ -217,8 +217,17 @@ class _InstallDialogState extends State<InstallDialog> {
     _run();
   }
 
-  void _set(int i, InstallStep s) => setState(() => _states[i] = s);
-  void _line(String l) => setState(() => _log.add(l));
+  void _set(int i, InstallStep s) {
+    if (!mounted) return;
+    setState(() => _states[i] = s);
+  }
+  void _line(String l) {
+    if (!mounted) return;
+    setState(() {
+      _log.add(l);
+      if (_log.length > 500) _log.removeRange(0, _log.length - 500);
+    });
+  }
 
   Future<void> _run() async {
     var step = 0;
@@ -269,14 +278,20 @@ class _InstallDialogState extends State<InstallDialog> {
       setState(() => _stepLabel2 = mode == 'keep' ? 'Reading the users' : (probe['installed'] == true ? 'Updating OSTP' : _steps[2]));
       _set(2, InstallStep.running);
       var since = (await ServersApi.lines(0)).$2;
+      var busy = false;
       poll = Timer.periodic(const Duration(milliseconds: 600), (_) async {
+        if (busy) return;
+        busy = true;
         try {
           final (lines, next) = await ServersApi.lines(since);
           since = next;
           for (final l in lines) {
             if (l['id'] == id && mounted) _line(l['line'] as String);
           }
-        } catch (_) {}
+        } catch (_) {
+        } finally {
+          busy = false;
+        }
       });
       if (!mounted) return;
       final result = await ServersApi.call(
@@ -297,6 +312,7 @@ class _InstallDialogState extends State<InstallDialog> {
     } catch (e) {
       poll?.cancel();
       _set(step, InstallStep.failed);
+      if (!mounted) return;
       setState(() {
         _error = e.toString();
         _finished = true;

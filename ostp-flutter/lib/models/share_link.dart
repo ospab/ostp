@@ -35,6 +35,8 @@ class ShareLink {
   /// `host:port`, bracketing IPv6 literals.
   String get server => host.contains(':') ? '[$host]:$port' : '$host:$port';
 
+  static const maxLength = 4096;
+
   static bool _truthy(String v) => const {'1', 'true', 'yes'}.contains(v.toLowerCase());
 
   static String _decode(String s) => Uri.decodeComponent(s.replaceAll('+', ' '));
@@ -43,6 +45,8 @@ class ShareLink {
 
   /// Throws [FormatException] with a readable message on a malformed link.
   static ShareLink parse(String input) {
+    // Real links are a few hundred bytes; refuse pasted documents before any parsing.
+    if (input.length > maxLength) throw const FormatException('link is too long');
     var rest = input.trim();
     if (!rest.toLowerCase().startsWith('ostp://')) {
       throw const FormatException('not an ostp:// link');
@@ -75,8 +79,9 @@ class ShareLink {
     }
     if (host.isEmpty) throw const FormatException('link has no host');
     final port = int.tryParse(portStr);
-    if (port == null || port < 0 || port > 65535) throw FormatException('invalid port "$portStr"');
+    if (port == null || port < 1 || port > 65535) throw FormatException('invalid port "$portStr"');
 
+    if (host.length > 255) throw const FormatException('link has a host name that is too long');
     final link = ShareLink(key: key, host: host, port: port);
     for (final pair in query.split('&').where((p) => p.isNotEmpty)) {
       final eq = pair.indexOf('=');
@@ -114,6 +119,7 @@ class ShareLink {
     }
     // TLS and the upgrade path only exist on the TCP carrier.
     if (link.tls || link.path != null) link.transport = 'uot';
+    if ((link.name?.length ?? 0) > 64) link.name = link.name!.substring(0, 64);
     return link;
   }
 

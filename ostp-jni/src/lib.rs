@@ -83,7 +83,18 @@ static LOGS: RwLock<VecDeque<String>> = RwLock::new(VecDeque::new());
 static JVM: RwLock<Option<jni::JavaVM>> = RwLock::new(None);
 static CLASS_REF: RwLock<Option<jni::objects::GlobalRef>> = RwLock::new(None);
 
-fn add_log(text: String) {
+/// Longest stored log line; a runaway message must not grow the buffer without bound.
+const MAX_LOG_LINE: usize = 4096;
+
+fn add_log(mut text: String) {
+    if text.len() > MAX_LOG_LINE {
+        let mut end = MAX_LOG_LINE;
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        text.truncate(end);
+        text.push_str("...");
+    }
     if let Ok(mut guard) = LOGS.write() {
         if guard.len() >= 1000 {
             guard.pop_front();
@@ -280,7 +291,11 @@ pub extern "system" fn Java_net_ostp_client_OstpClientSdk_startClient(
     t2s_bin_path: JString,
     local_proxy: JString,
 ) -> jboolean {
-    Java_net_ostp_client_OstpClientSdk_nativeStartClient(env, class, config_json, fd, t2s_bin_path, local_proxy)
+    // A panic must not unwind across the JNI boundary (that aborts the whole app).
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        Java_net_ostp_client_OstpClientSdk_nativeStartClient(env, class, config_json, fd, t2s_bin_path, local_proxy)
+    }))
+    .unwrap_or(jni::sys::JNI_FALSE)
 }
 
 #[no_mangle]
@@ -317,7 +332,10 @@ pub extern "system" fn Java_net_ostp_client_OstpClientSdk_stopClient(
     env: JNIEnv,
     class: JClass,
 ) -> jboolean {
-    Java_net_ostp_client_OstpClientSdk_nativeStopClient(env, class)
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        Java_net_ostp_client_OstpClientSdk_nativeStopClient(env, class)
+    }))
+    .unwrap_or(jni::sys::JNI_FALSE)
 }
 
 #[no_mangle]

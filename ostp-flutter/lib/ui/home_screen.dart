@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io';
 import 'dart:ui';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -7,6 +8,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:package_info_plus/package_info_plus.dart';
 import '../models/connection_state_enum.dart';
 import '../models/ostp_profile.dart';
+import '../models/share_link.dart';
 import '../models/subscription.dart';
 import '../services/updates.dart' as updates;
 import 'prober_screen.dart';
@@ -27,7 +29,7 @@ class HomeScreen extends StatefulWidget {
   State<HomeScreen> createState() => _HomeScreenState();
 }
 
-class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
+class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin, WidgetsBindingObserver {
   static const platform = MethodChannel('com.ospab.ostp/vpn');
 
   ConnectionStateEnum _state = ConnectionStateEnum.disconnected;
@@ -42,6 +44,23 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
   // started: a later "not connected" is then a real failure, not start-up.
   bool _coreActive = false;
   DateTime _startedAt = DateTime.now();
+  // A stop is being carried out; taps and polls wait for it.
+  bool _stopping = false;
+  // One poll at a time: a slow platform call must not pile up behind the 1 s timer.
+  bool _polling = false;
+  // Bumped on every user start/stop. A poll that began before it holds a stale
+  // picture of the service and drops it instead of overwriting the new state.
+  int _epoch = 0;
+  // The profile the running tunnel was started with; the active profile can be
+  // changed in Settings meanwhile, which only takes effect on the next connect.
+  String? _sessionProfileName;
+
+  static const _callTimeout = Duration(seconds: 5);
+  // The system VPN consent dialog waits for the user, so startTunnel gets longer.
+  static const _consentTimeout = Duration(seconds: 120);
+
+  Future<T?> _call<T>(String method, [dynamic args, Duration timeout = _callTimeout]) =>
+      platform.invokeMethod<T>(method, args).timeout(timeout);
 
   // Single active profile — the core only ever connects to one server at a
   // time (no multi-server/urltest failover since the 0.4.x flat config),
@@ -74,6 +93,7 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     _loadSettings();
     _loadVersion();
     _pulseController = AnimationController(
@@ -117,9 +137,16 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
     }
   }
 
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    // Back from the background (or from the system VPN/battery dialogs): the
+    // 1 s timer may not have run for a while, so refresh the state right away.
+    if (state == AppLifecycleState.resumed) _pollOnce();
+  }
+
   Future<void> _checkInitialState() async {
     try {
-      final isRunning = await platform.invokeMethod('isRunning');
+      final isRunning = await _call<bool>('isRunning');
       if (isRunning == true && mounted) {
         // The service is up, but whether the handshake finished is for the
         // poll to say (connection_state), not for us to assume.
@@ -152,15 +179,17 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
     final exDomains = widget.prefs.getString('ex_domains') ?? '';
     final exIps = widget.prefs.getString('ex_ips') ?? '';
     final debugMode = widget.prefs.getBool('debug_mode') ?? false;
-    final mtu = widget.prefs.getString('mtu') ?? '1140';
+    final mtu = (int.tryParse(widget.prefs.getString('mtu') ?? '') ?? 1140).clamp(576, 1500);
     final muxEnabled = widget.prefs.getBool('mux_enabled') ?? false;
     final muxSessions = widget.prefs.getString('mux_sessions') ?? '2';
     final dnsServer = widget.prefs.getString('dns_server');
-    final effectiveDnsServer = (dnsServer == null || dnsServer.isEmpty) ? '1.1.1.1' : dnsServer;
+    // The VPN builder throws on anything but an IP literal, which would fail the start.
+    final effectiveDnsServer =
+        (dnsServer != null && InternetAddress.tryParse(dnsServer.trim()) != null) ? dnsServer.trim() : '1.1.1.1';
     const tunStack = 'ostp';
     final appRoutingMode = widget.prefs.getString('app_routing_mode') ?? 'bypass';
     final appRoutingPackages = widget.prefs.getStringList('app_routing_packages') ?? [];
-    final localBind = widget.prefs.getString('local_bind') ?? '127.0.0.1:1088';
+    final localBind = _validBind(widget.prefs.getString('local_bind')) ?? '127.0.0.1:1088';
 
     return {
       "mode": "client",
@@ -171,7 +200,7 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
         "access_key": p?.accessKey ?? '',
         "handshake_timeout_ms": 10000,
         "io_timeout_ms": 5000,
-        "mtu": int.tryParse(mtu) ?? 1140,
+        "mtu": mtu,
       },
       "local_proxy": {
         "bind_addr": localBind,
@@ -182,10 +211,11 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
       "transport": {
         "mode": p?.transportMode ?? 'udp',
         "tcp_fragmentation": p?.tcpFragmentation ?? false,
-        "frag_chunk": p?.fragChunk ?? 2,
-        "frag_sleep": p?.fragSleep ?? 2,
-        "junk_pc": [p?.junkPcMin ?? 2, p?.junkPcMax ?? 5],
-        "junk_ps": [p?.junkPsMin ?? 100, p?.junkPsMax ?? 1000],
+        // The core reads these as unsigned: a negative or absurd value would fail the whole config.
+        "frag_chunk": (p?.fragChunk ?? 2).clamp(1, 1400),
+        "frag_sleep": (p?.fragSleep ?? 2).clamp(0, 1000),
+        "junk_pc": _range(p?.junkPcMin ?? 2, p?.junkPcMax ?? 5, 30),
+        "junk_ps": _range(p?.junkPsMin ?? 100, p?.junkPsMax ?? 1000, 1400),
         "ttl_desync": p?.ttlDesync ?? false,
         "ttl_desync_auto": true,
         "tls": (p?.transportMode == 'uot') && (p?.tls ?? false),
@@ -195,32 +225,56 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
       },
       "multiplex": {
         "enabled": muxEnabled,
-        "sessions": int.tryParse(muxSessions) ?? 2,
+        "sessions": (int.tryParse(muxSessions) ?? 2).clamp(1, 16),
       },
       "exclusions": {
-        "domains": exDomains.split('\n').where((s) => s.trim().isNotEmpty).toList(),
-        "ips": exIps.split('\n').where((s) => s.trim().isNotEmpty).toList(),
+        "domains": exDomains.split('\n').map((s) => s.trim()).where((s) => s.isNotEmpty).take(2000).toList(),
+        "ips": exIps.split('\n').map((s) => s.trim()).where((s) => s.isNotEmpty).take(2000).toList(),
         // No per-process exclusion field on mobile — Android's per-app
         // selection (app_rules below) is the equivalent, and correct, control.
         "processes": const [],
       },
       "app_rules": {
         "mode": appRoutingMode,
-        "packages": appRoutingPackages,
+        "packages": appRoutingPackages.take(2000).toList(),
       },
       "dns_server": effectiveDnsServer,
       "tun_stack": tunStack,
     };
   }
 
+  // The native side refuses larger configs; huge exclusion lists are cut at the source.
+  static const _maxConfigChars = 200000;
+
+  static String? _validBind(String? v) {
+    final s = v?.trim() ?? '';
+    final c = s.lastIndexOf(':');
+    if (c <= 0) return null;
+    final port = int.tryParse(s.substring(c + 1));
+    if (port == null || port < 1 || port > 65535) return null;
+    final host = s.substring(0, c).replaceAll(RegExp(r'^\[|\]$'), '');
+    return InternetAddress.tryParse(host) == null ? null : s;
+  }
+
+  static List<int> _range(int a, int b, int max) {
+    final lo = a.clamp(0, max), hi = b.clamp(0, max);
+    return lo <= hi ? [lo, hi] : [hi, lo];
+  }
+
   void _updateLatestConfigJson() {
     final configMap = _buildConfigMap();
     widget.prefs.setString('latest_config_json', jsonEncode(configMap));
-    platform.invokeMethod('saveConfig', {"configJson": jsonEncode(configMap)});
+    final json = jsonEncode(configMap);
+    if (json.length > _maxConfigChars) return;
+    _call('saveConfig', {"configJson": json}).catchError((e) {
+      debugPrint('saveConfig failed: $e');
+      return null;
+    });
   }
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     _pollTimer?.cancel();
     _uptimeTimer?.cancel();
     _pulseController.dispose();
@@ -228,51 +282,79 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
     super.dispose();
   }
 
+  void _snack(String text) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context)
+      ..hideCurrentSnackBar()
+      ..showSnackBar(SnackBar(content: Text(text)));
+  }
+
   Future<void> _toggleConnection() async {
+    // A start or stop in progress owns the tunnel until it finishes; a second tap would race it.
+    if (_starting || _stopping) return;
     if (_state == ConnectionStateEnum.disconnected) {
-      if (_activeProfile == null || _activeProfile!.serverAddr.isEmpty || _activeProfile!.accessKey.isEmpty) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('No profile selected. Add or choose one in Settings.')),
-        );
+      final profile = _activeProfile;
+      if (profile == null || profile.serverAddr.isEmpty || profile.accessKey.isEmpty) {
+        _snack('No profile selected. Add or choose one in Settings.');
+        return;
+      }
+      try {
+        ShareLink.parse('ostp://x@${profile.serverAddr}');
+      } on FormatException {
+        _snack('The server address of this profile is not valid. Use host:port.');
+        return;
+      }
+
+      // Android treats an empty allow-list as "every app", the opposite of what this mode says.
+      if (widget.prefs.getString('app_routing_mode') == 'proxy' &&
+          (widget.prefs.getStringList('app_routing_packages') ?? const []).isEmpty) {
+        _snack('App routing is set to proxy but no apps are selected. Choose apps or switch the mode.');
+        return;
+      }
+
+      final configStr = jsonEncode(_buildConfigMap());
+      if (configStr.length > _maxConfigChars) {
+        _snack('The settings are too large to start. Shorten the exclusion lists.');
         return;
       }
 
       _starting = true;
+      _epoch++;
+      _sessionProfileName = profile.name;
       _setConnecting();
-
-      final configMap = _buildConfigMap();
-      final configStr = jsonEncode(configMap);
       widget.prefs.setString('latest_config_json', configStr);
 
       try {
-        await platform.invokeMethod('saveConfig', {"configJson": configStr});
-        await platform.invokeMethod('startTunnel', {"configJson": configStr});
+        await _call('saveConfig', {"configJson": configStr});
+        final granted = await _call<bool>('startTunnel', {"configJson": configStr}, _consentTimeout);
+        if (granted != true) {
+          _setDisconnected();
+          _snack('The VPN permission was not granted, so the VPN did not start.');
+          return;
+        }
 
         bool started = false;
-        for (int i = 0; i < 10; i++) {
+        for (int i = 0; i < 10 && mounted; i++) {
           await Future.delayed(const Duration(milliseconds: 500));
-          final isRunning = await platform.invokeMethod('isRunning');
+          final isRunning = await _call<bool>('isRunning');
           if (isRunning == true) {
             started = true;
             break;
           }
         }
 
-        _starting = false;
         if (started) {
           // Stays "Connecting" until the core reports the handshake done.
           _startedAt = DateTime.now();
         } else {
           _setDisconnected();
-          if (mounted) {
-            ScaffoldMessenger.of(context).showSnackBar(
-              const SnackBar(content: Text('The VPN service did not start. See Logs for the reason.')),
-            );
-          }
+          _snack('The VPN service did not start. See Logs for the reason.');
         }
+      } on TimeoutException {
+        _setDisconnected();
+        _snack('The system did not answer in time. Try again.');
       } catch (e, stackTrace) {
         debugPrint("Failed to start tunnel: $e\n$stackTrace");
-        _starting = false;
         _setDisconnected();
         if (mounted) {
           showDialog(
@@ -298,15 +380,25 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
             ),
           );
         }
+      } finally {
+        _starting = false;
       }
     } else {
-      try {
-        await platform.invokeMethod('stopTunnel');
-      } catch (e) {
-        debugPrint("Stop error: $e");
-      }
-      _setDisconnected();
+      await _stopTunnel();
     }
+  }
+
+  Future<void> _stopTunnel() async {
+    _stopping = true;
+    _epoch++;
+    try {
+      await _call('stopTunnel');
+    } catch (e) {
+      debugPrint("Stop error: $e");
+    } finally {
+      _stopping = false;
+    }
+    _setDisconnected();
   }
 
   void _setConnecting({bool resumed = false}) {
@@ -341,82 +433,89 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
 
   void _startPolling() {
     _pollTimer?.cancel();
-    _pollTimer = Timer.periodic(const Duration(seconds: 1), (timer) async {
-      if (!mounted) return;
-      try {
-        final isRunning = await platform.invokeMethod('isRunning');
-        if (_starting) return;
+    _pollTimer = Timer.periodic(const Duration(seconds: 1), (_) => _pollOnce());
+  }
 
-        if (isRunning == true && _state == ConnectionStateEnum.disconnected) {
-          _setConnecting(resumed: true);
-        } else if (isRunning == false && _state != ConnectionStateEnum.disconnected) {
-          _setDisconnected();
+  Future<void> _pollOnce() async {
+    if (!mounted || _polling || _starting || _stopping) return;
+    _polling = true;
+    final epoch = _epoch;
+    try {
+      final isRunning = await _call<bool>('isRunning');
+      if (!mounted || epoch != _epoch) return;
+
+      if (isRunning == true && _state == ConnectionStateEnum.disconnected) {
+        _setConnecting(resumed: true);
+      } else if (isRunning == false && _state != ConnectionStateEnum.disconnected) {
+        // Not a stop from this screen (that sets the state itself): the service
+        // ended on its own, another VPN app took over, or the system stopped it.
+        _setDisconnected();
+        _snack('The VPN stopped. See Logs for the reason.');
+        return;
+      }
+
+      if (_state == ConnectionStateEnum.disconnected) return;
+      final metricsJson = await _call<String>('getMetrics');
+      if (!mounted || epoch != _epoch || metricsJson == null || metricsJson.isEmpty) return;
+
+      final parsed = jsonDecode(metricsJson) as Map<String, dynamic>;
+      final bytesSent = (parsed['bytes_sent'] as num?)?.toInt() ?? 0;
+      final bytesRecv = (parsed['bytes_recv'] as num?)?.toInt() ?? 0;
+      // 0 = not connected, 1 = handshake or reconnect in progress, 2 = connected.
+      final connState = (parsed['connection_state'] as num?)?.toInt() ?? 0;
+      final rttMs = (parsed['rtt_ms'] as num?)?.toInt() ?? 0;
+
+      if (connState != 0) _coreActive = true;
+
+      // Zero right after start is normal; the core gets 20 s to report anything.
+      final grace = DateTime.now().difference(_startedAt) < const Duration(seconds: 20);
+      if (connState == 0 && (_coreActive || !grace)) {
+        _stopping = true;
+        _epoch++;
+        try {
+          await _call('stopTunnel');
+        } catch (e) {
+          debugPrint("Failed to stop background tunnel: $e");
+        } finally {
+          _stopping = false;
         }
+        _setDisconnected();
+        _snack('Could not connect to the server. See Logs for the reason.');
+        return;
+      }
 
-        if (_state != ConnectionStateEnum.disconnected) {
-          final metricsJson = await platform.invokeMethod('getMetrics');
-          if (metricsJson != null && metricsJson.isNotEmpty) {
-            final Map<String, dynamic> parsed = jsonDecode(metricsJson);
-            final bytesSent = parsed['bytes_sent'] as int? ?? 0;
-            final bytesRecv = parsed['bytes_recv'] as int? ?? 0;
-            // 0 = not connected, 1 = handshake or reconnect in progress, 2 = connected.
-            final connState = parsed['connection_state'] as int? ?? 0;
-            final rttMs = parsed['rtt_ms'] as int? ?? 0;
+      if (connState == 2 && _state != ConnectionStateEnum.connected) {
+        _setConnected();
+      } else if (connState == 1 && _state == ConnectionStateEnum.connected) {
+        // The link dropped and the core is bringing it back: do not keep showing "Connected".
+        _setConnecting(resumed: true);
+      }
 
-            if (connState != 0) _coreActive = true;
-
-            // Zero right after start is normal; the core gets 20 s to report anything.
-            final grace = DateTime.now().difference(_startedAt) < const Duration(seconds: 20);
-            if (connState == 0 && (_coreActive || !grace)) {
-              try {
-                await platform.invokeMethod('stopTunnel');
-              } catch (e) {
-                debugPrint("Failed to stop background tunnel: $e");
-              }
-              _setDisconnected();
-              if (mounted) {
-                ScaffoldMessenger.of(context).showSnackBar(
-                  const SnackBar(content: Text('Could not connect to the server. See Logs for the reason.')),
-                );
-              }
-              return;
-            }
-
-            if (connState == 2 && _state != ConnectionStateEnum.connected) {
-              _setConnected();
-            } else if (connState == 1 && _state == ConnectionStateEnum.connected) {
-              // The link dropped and the core is bringing it back: do not keep showing "Connected".
-              _setConnecting(resumed: true);
-            }
-
-            if (mounted) {
-              setState(() {
-                _download = _formatBytes(bytesRecv);
-                _upload = _formatBytes(bytesSent);
-                final dRecv = bytesRecv > _prevBytesRecv ? bytesRecv - _prevBytesRecv : 0;
-                final dSent = bytesSent > _prevBytesSent ? bytesSent - _prevBytesSent : 0;
-                _prevBytesRecv = bytesRecv;
-                _prevBytesSent = bytesSent;
-                _downSpeed = '${_formatBytes(dRecv)}/s';
-                _upSpeed = '${_formatBytes(dSent)}/s';
-                if (rttMs > 0) {
-                  _pingText = '$rttMs ms';
-                  if (rttMs < 100) {
-                    _pingColor = const Color(0xFF22D3A5);
-                  } else if (rttMs < 250) {
-                    _pingColor = Colors.amberAccent;
-                  } else {
-                    _pingColor = Colors.redAccent;
-                  }
-                }
-              });
-            }
+      setState(() {
+        _download = _formatBytes(bytesRecv);
+        _upload = _formatBytes(bytesSent);
+        final dRecv = bytesRecv > _prevBytesRecv ? bytesRecv - _prevBytesRecv : 0;
+        final dSent = bytesSent > _prevBytesSent ? bytesSent - _prevBytesSent : 0;
+        _prevBytesRecv = bytesRecv;
+        _prevBytesSent = bytesSent;
+        _downSpeed = '${_formatBytes(dRecv)}/s';
+        _upSpeed = '${_formatBytes(dSent)}/s';
+        if (rttMs > 0) {
+          _pingText = '$rttMs ms';
+          if (rttMs < 100) {
+            _pingColor = const Color(0xFF22D3A5);
+          } else if (rttMs < 250) {
+            _pingColor = Colors.amberAccent;
+          } else {
+            _pingColor = Colors.redAccent;
           }
         }
-      } catch (e) {
-        debugPrint("Failed to get state/metrics: $e");
-      }
-    });
+      });
+    } catch (e) {
+      debugPrint("Failed to get state/metrics: $e");
+    } finally {
+      _polling = false;
+    }
   }
 
   String _formatBytes(int bytes) {
@@ -438,6 +537,7 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
       _prevBytesSent = 0;
       _pingText = '-- ms';
       _pingColor = Colors.white54;
+      _sessionProfileName = null;
     });
     _pulseController.stop();
     _pulseController.value = 0.0;
@@ -705,14 +805,20 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
             children: [
               const Icon(Icons.dns_rounded, size: 18, color: Colors.white70),
               const SizedBox(width: 10),
-              Text(
-                _activeProfile?.name ?? 'No profile selected',
+              Flexible(
+                child: Text(
+                (_state != ConnectionStateEnum.disconnected ? _sessionProfileName : null) ??
+                    _activeProfile?.name ??
+                    'No profile selected',
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
                 style: const TextStyle(
                   fontFamily: 'monospace',
                   fontSize: 15,
                   fontWeight: FontWeight.w600,
                   color: Colors.white70,
                 ),
+              ),
               ),
             ],
           ),

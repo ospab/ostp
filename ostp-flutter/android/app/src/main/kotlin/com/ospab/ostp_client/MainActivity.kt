@@ -17,6 +17,11 @@ class MainActivity : FlutterActivity() {
     private val CHANNEL = "com.ospab.ostp/vpn"
     private val VPN_REQUEST_CODE = 0x0F
     private var pendingConfigJson: String? = null
+    // Answer owed to Dart for a startTunnel that is waiting for the system VPN
+    // consent dialog. Replied to exactly once: on the dialog result or on destroy.
+    private var pendingStartResult: MethodChannel.Result? = null
+    // A config larger than this is a bug or garbage, not a profile; it would not fit an Intent extra either.
+    private val MAX_CONFIG_BYTES = 256 * 1024
 
     private fun getAppIconBase64(pm: PackageManager, appInfo: ApplicationInfo): String? {
         try {
@@ -43,19 +48,41 @@ class MainActivity : FlutterActivity() {
             when (call.method) {
                 "saveConfig" -> {
                     val configJson = call.argument<String>("configJson")
-                    val prefs = getSharedPreferences("OstpPrefs", android.content.Context.MODE_PRIVATE)
-                    prefs.edit().putString("latest_config_json", configJson).apply()
-                    result.success(true)
+                    if (configJson == null || configJson.length > MAX_CONFIG_BYTES) {
+                        result.error("BAD_CONFIG", "Config is missing or too large", null)
+                    } else {
+                        try {
+                            val prefs = getSharedPreferences("OstpPrefs", android.content.Context.MODE_PRIVATE)
+                            prefs.edit().putString("latest_config_json", configJson).apply()
+                            result.success(true)
+                        } catch (e: Throwable) {
+                            result.error("ERROR", e.message, null)
+                        }
+                    }
                 }
                 "startTunnel" -> {
-                    pendingConfigJson = call.argument<String>("configJson")
-                    val intent = VpnService.prepare(this)
-                    if (intent != null) {
-                        startActivityForResult(intent, VPN_REQUEST_CODE)
-                        result.success(true) 
+                    val configJson = call.argument<String>("configJson")
+                    if (configJson == null || configJson.length > MAX_CONFIG_BYTES) {
+                        result.error("BAD_CONFIG", "Config is missing or too large", null)
+                    } else if (pendingStartResult != null) {
+                        // The consent dialog from an earlier tap is still open.
+                        result.error("BUSY", "Waiting for the VPN permission dialog", null)
                     } else {
-                        startVpnService()
-                        result.success(true)
+                        try {
+                            pendingConfigJson = configJson
+                            val intent = VpnService.prepare(this)
+                            if (intent != null) {
+                                pendingStartResult = result
+                                startActivityForResult(intent, VPN_REQUEST_CODE)
+                            } else {
+                                startVpnService()
+                                result.success(true)
+                            }
+                        } catch (e: Throwable) {
+                            pendingStartResult = null
+                            pendingConfigJson = null
+                            result.error("ERROR", e.message, null)
+                        }
                     }
                 }
                 "stopTunnel" -> {
@@ -232,18 +259,40 @@ class MainActivity : FlutterActivity() {
     }
 
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
-        if (requestCode == VPN_REQUEST_CODE && resultCode == RESULT_OK) {
-            startVpnService()
+        if (requestCode == VPN_REQUEST_CODE) {
+            val reply = pendingStartResult
+            pendingStartResult = null
+            if (resultCode == RESULT_OK) {
+                try {
+                    startVpnService()
+                    reply?.success(true)
+                } catch (e: Throwable) {
+                    reply?.error("ERROR", e.message, null)
+                }
+            } else {
+                // Denied or dismissed: nothing was started, say so instead of leaving Dart to time out.
+                pendingConfigJson = null
+                reply?.success(false)
+            }
         }
         super.onActivityResult(requestCode, resultCode, data)
+    }
+
+    override fun onDestroy() {
+        // The dialog result can no longer reach a live engine; do not leave Dart waiting on it.
+        pendingStartResult?.let {
+            pendingStartResult = null
+            try { it.success(false) } catch (_: Throwable) {}
+        }
+        super.onDestroy()
     }
 
     private fun startVpnService() {
         val intent = Intent(this, OstpVpnService::class.java)
         intent.action = "START"
-        if (pendingConfigJson != null) {
-            intent.putExtra("configJson", pendingConfigJson)
-        }
+        val cfg = pendingConfigJson ?: return
+        pendingConfigJson = null
+        intent.putExtra("configJson", cfg)
         androidx.core.content.ContextCompat.startForegroundService(this, intent)
         // Ask to be exempt from battery optimization so Doze does not freeze the
         // service (which drops the tunnel AND stops the in-process reconnect from
@@ -254,8 +303,12 @@ class MainActivity : FlutterActivity() {
 
     private fun requestBatteryExemptionIfNeeded() {
         try {
+            // Asked once: a user who declined should not meet the dialog on every connect.
+            val prefs = getSharedPreferences("OstpPrefs", android.content.Context.MODE_PRIVATE)
+            if (prefs.getBoolean("battery_prompted", false)) return
             val pm = getSystemService(android.content.Context.POWER_SERVICE) as android.os.PowerManager
             if (!pm.isIgnoringBatteryOptimizations(packageName)) {
+                prefs.edit().putBoolean("battery_prompted", true).apply()
                 val intent = Intent(android.provider.Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS)
                 intent.data = android.net.Uri.parse("package:$packageName")
                 intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)

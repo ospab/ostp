@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 
 import 'package:flutter/services.dart';
@@ -60,7 +61,13 @@ class OstpSubscription {
 List<OstpSubscription> decodeSubscriptions(String? json) {
   if (json == null || json.isEmpty) return [];
   try {
-    return (jsonDecode(json) as List).map((e) => OstpSubscription.fromJson(e)).toList();
+    final out = <OstpSubscription>[];
+    for (final e in jsonDecode(json) as List) {
+      try {
+        out.add(OstpSubscription.fromJson(e as Map<String, dynamic>));
+      } catch (_) {}
+    }
+    return out;
   } catch (_) {
     return [];
   }
@@ -90,13 +97,40 @@ class SubscriptionStore {
   final SharedPreferences prefs;
   SubscriptionStore(this.prefs);
 
+  // Each operation reads the stored lists, waits for the network and writes them
+  // back. Two at once (the background refresh on start and a manual import)
+  // would overwrite each other, so they run one after another.
+  static Future<void> _tail = Future.value();
+
+  static Future<T> _serialized<T>(Future<T> Function() body) {
+    final done = Completer<T>();
+    final prev = _tail;
+    _tail = done.future.then((_) {}, onError: (_) {});
+    prev.then((_) async {
+      try {
+        done.complete(await body());
+      } catch (e, st) {
+        done.completeError(e, st);
+      }
+    });
+    return done.future;
+  }
+
+  // More links than this in one document is not a server list.
+  static const _maxLinks = 50;
+
   List<OstpSubscription> load() => decodeSubscriptions(prefs.getString(_subsKey));
 
   Future<void> _save(List<OstpSubscription> subs) => prefs.setString(_subsKey, encodeSubscriptions(subs));
 
   /// The native core downloads it (verified TLS, same parser as the CLI).
   static Future<Map<String, dynamic>> _fetch(String url) async {
-    final String? raw = await _channel.invokeMethod('fetchSubscription', {'url': url.trim()});
+    final String? raw;
+    try {
+      raw = await _channel.invokeMethod<String>('fetchSubscription', {'url': url.trim()}).timeout(const Duration(seconds: 45));
+    } on TimeoutException {
+      throw Exception('the server did not answer in time');
+    }
     if (raw == null) throw Exception('no answer from the native core');
     final doc = jsonDecode(raw) as Map<String, dynamic>;
     if (doc['error'] != null) throw Exception(doc['error']);
@@ -105,7 +139,9 @@ class SubscriptionStore {
 
   /// Adds a subscription (or refreshes it if the URL is already known).
   /// Returns how many profiles it produced.
-  Future<int> add(String url) async {
+  Future<int> add(String url) => _serialized(() => _add(url));
+
+  Future<int> _add(String url) async {
     final subs = load();
     final existing = subs.where((s) => s.url == url.trim()).toList();
     final sub = existing.isNotEmpty
@@ -117,7 +153,9 @@ class SubscriptionStore {
     return n;
   }
 
-  Future<int> refresh(String id) async {
+  Future<int> refresh(String id) => _serialized(() => _refresh(id));
+
+  Future<int> _refresh(String id) async {
     final subs = load();
     final sub = subs.firstWhere((s) => s.id == id);
     try {
@@ -132,7 +170,9 @@ class SubscriptionStore {
 
   /// Refreshes every subscription whose interval has passed; errors are
   /// recorded on the subscription, never thrown.
-  Future<bool> refreshDue() async {
+  Future<bool> refreshDue() => _serialized(_refreshDue);
+
+  Future<bool> _refreshDue() async {
     final subs = load();
     var changed = false;
     for (final sub in subs.where((s) => s.isDue)) {
@@ -147,7 +187,9 @@ class SubscriptionStore {
     return changed;
   }
 
-  Future<void> remove(String id) async {
+  Future<void> remove(String id) => _serialized(() => _remove(id));
+
+  Future<void> _remove(String id) async {
     final subs = load()..removeWhere((s) => s.id == id);
     await _save(subs);
     final profiles = decodeProfiles(prefs.getString(_profilesKey));
@@ -163,7 +205,7 @@ class SubscriptionStore {
   Future<int> _refreshOne(OstpSubscription sub) async {
     final doc = await _fetch(sub.url);
     final links = <ShareLink>[];
-    for (final l in (doc['links'] as List? ?? const [])) {
+    for (final l in (doc['links'] as List? ?? const []).take(_maxLinks)) {
       try {
         links.add(ShareLink.parse(l as String));
       } catch (_) {}
@@ -171,7 +213,8 @@ class SubscriptionStore {
     if (links.isEmpty) throw Exception('the subscription has no usable links');
 
     final name = (doc['name'] as String?)?.trim() ?? '';
-    sub.name = name.isNotEmpty ? name : Uri.tryParse(sub.url)?.host ?? sub.url;
+    final shown = name.isNotEmpty ? name : Uri.tryParse(sub.url)?.host ?? sub.url;
+    sub.name = shown.length > 64 ? shown.substring(0, 64) : shown;
     sub.intervalHours = ((doc['update_interval_hours'] as num?)?.toInt() ?? 12).clamp(1, 720);
     final usage = doc['usage'] as Map<String, dynamic>?;
     sub.usedBytes = (usage?['used_bytes'] as num?)?.toInt();

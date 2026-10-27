@@ -34,6 +34,36 @@ class _SettingsScreenState extends State<SettingsScreen> {
   List<OstpProfile> _profiles = [];
   List<OstpSubscription> _subs = [];
   final Set<String> _refreshing = {};
+  bool _importing = false;
+
+  static const _maxProfiles = 100;
+  static const _maxSubscriptions = 20;
+  static const _vpn = MethodChannel('com.ospab.ostp/vpn');
+  // Digits only, five at most: ports, sizes, delays.
+  static final List<TextInputFormatter> _digits = [FilteringTextInputFormatter.digitsOnly, LengthLimitingTextInputFormatter(5)];
+
+  /// Profile changes do not touch a running tunnel; say so instead of letting the user wonder.
+  Future<void> _noteIfRunning() async {
+    try {
+      final running = await _vpn.invokeMethod<bool>('isRunning').timeout(const Duration(seconds: 3));
+      if (running == true && mounted) {
+        ScaffoldMessenger.of(context)
+          ..hideCurrentSnackBar()
+          ..showSnackBar(const SnackBar(content: Text('The VPN is running. The change applies on the next connect.')));
+      }
+    } catch (_) {}
+  }
+
+  /// Why a profile for this server cannot be added, or null when it can.
+  String? _addProblem(String server, String key, String carrier, {String? exceptId}) {
+    if (_profiles.length >= _maxProfiles) return 'Too many profiles. Remove some first.';
+    final dup = _profiles.any((p) =>
+        p.id != exceptId &&
+        p.accessKey == key &&
+        p.serverAddr == server &&
+        (p.tls ? 'tls' : p.transportMode) == carrier);
+    return dup ? 'This server is already in the list.' : null;
+  }
 
   @override
   void initState() {
@@ -55,6 +85,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
   }
 
   void _reloadProfilesAndSubs() {
+    if (!mounted) return;
     setState(() {
       _profiles = decodeProfiles(widget.prefs.getString('profiles_json'));
       _subs = SubscriptionStore(widget.prefs).load();
@@ -65,6 +96,19 @@ class _SettingsScreenState extends State<SettingsScreen> {
 
   Future<void> _importSubscription(String url) async {
     final messenger = ScaffoldMessenger.of(context);
+    if (_importing) {
+      messenger.showSnackBar(const SnackBar(content: Text('Another import is still running.')));
+      return;
+    }
+    if (url.length > 2048) {
+      messenger.showSnackBar(const SnackBar(content: Text('The subscription link is too long.')));
+      return;
+    }
+    if (_subs.length >= _maxSubscriptions && !_subs.any((x) => x.url == url.trim())) {
+      messenger.showSnackBar(const SnackBar(content: Text('Too many subscriptions. Remove some first.')));
+      return;
+    }
+    _importing = true;
     messenger.showSnackBar(const SnackBar(content: Text('Fetching subscription…'), duration: Duration(seconds: 2)));
     try {
       final n = await SubscriptionStore(widget.prefs).add(url);
@@ -72,10 +116,13 @@ class _SettingsScreenState extends State<SettingsScreen> {
       messenger.showSnackBar(SnackBar(content: Text('Subscription added: $n profile(s)')));
     } catch (e) {
       messenger.showSnackBar(SnackBar(content: Text('Could not add the subscription: ${e.toString().replaceFirst('Exception: ', '')}')));
+    } finally {
+      _importing = false;
     }
   }
 
   Future<void> _refreshSubscription(OstpSubscription s) async {
+    if (_refreshing.contains(s.id)) return;
     setState(() => _refreshing.add(s.id));
     final messenger = ScaffoldMessenger.of(context);
     try {
@@ -103,6 +150,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
               Navigator.pop(context);
               await SubscriptionStore(widget.prefs).remove(s.id);
               _reloadProfilesAndSubs();
+              _noteIfRunning();
             },
             child: const Text('Remove', style: TextStyle(color: Colors.redAccent)),
           ),
@@ -221,7 +269,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
     widget.prefs.setString('mtu', _mtuCtrl.text.trim());
     widget.prefs.setBool('mux_enabled', _muxEnabled);
     widget.prefs.setString('mux_sessions', _muxSessionsCtrl.text.trim());
-    widget.prefs.setString('profiles_json', encodeProfiles(_profiles));
+    // The profile list is saved by each change to it. Writing it here as well
+    // would overwrite a subscription refresh that finished while this screen was open.
   }
 
   void _saveProfiles() {
@@ -237,16 +286,22 @@ class _SettingsScreenState extends State<SettingsScreen> {
       }
       _saveProfiles();
     });
+    _noteIfRunning();
   }
 
   void _importFromLink(String link) {
-    if (link.isEmpty) return;
+    if (link.isEmpty || !mounted) return;
     if (isSubscriptionUrl(link)) {
       _importSubscription(link);
       return;
     }
     try {
       final l = ShareLink.parse(link);
+      final problem = _addProblem(l.server, l.key, l.tls ? 'tls' : l.transport);
+      if (problem != null) {
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(problem)));
+        return;
+      }
       final wasEmpty = _profiles.isEmpty;
 
       setState(() {
@@ -288,6 +343,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   context,
                   MaterialPageRoute(builder: (context) => const QRScannerScreen()),
                 );
+                if (!mounted) return;
                 if (result != null && result is String && (result.toLowerCase().startsWith('ostp://') || isSubscriptionUrl(result))) {
                   _importFromLink(result);
                 }
@@ -324,6 +380,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
         backgroundColor: Theme.of(context).colorScheme.surface,
         content: TextField(
           controller: linkCtrl,
+          // A pasted document is cut here; ShareLink.parse rejects what is still too long.
+          inputFormatters: [LengthLimitingTextInputFormatter(ShareLink.maxLength + 1)],
           decoration: const InputDecoration(
             hintText: 'ostp://... or https://.../sub/...',
             helperText: 'A subscription keeps its profiles up to date',
@@ -387,13 +445,22 @@ class _SettingsScreenState extends State<SettingsScreen> {
                 mainAxisSize: MainAxisSize.min,
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  TextField(controller: nameCtrl, decoration: const InputDecoration(labelText: 'Name')),
+                  TextField(
+                    controller: nameCtrl,
+                    inputFormatters: [LengthLimitingTextInputFormatter(64)],
+                    decoration: const InputDecoration(labelText: 'Name'),
+                  ),
                   const SizedBox(height: 12),
-                  TextField(controller: serverCtrl, decoration: const InputDecoration(labelText: 'Server Address (host:port)')),
+                  TextField(
+                    controller: serverCtrl,
+                    inputFormatters: [LengthLimitingTextInputFormatter(260)],
+                    decoration: const InputDecoration(labelText: 'Server Address (host:port)'),
+                  ),
                   const SizedBox(height: 12),
                   TextField(
                     controller: keyCtrl,
                     obscureText: obscureKey,
+                    inputFormatters: [LengthLimitingTextInputFormatter(512)],
                     decoration: InputDecoration(
                       labelText: 'Access Key',
                       suffixIcon: IconButton(
@@ -432,6 +499,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                     if (tls) ...[
                       TextField(
                         controller: sniCtrl,
+                        inputFormatters: [LengthLimitingTextInputFormatter(255)],
                         decoration: InputDecoration(
                           labelText: 'Server name (SNI)',
                           hintText: _hostOf(serverCtrl.text),
@@ -443,6 +511,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                       const SizedBox(height: 8),
                       TextField(
                         controller: wsPathCtrl,
+                        inputFormatters: [LengthLimitingTextInputFormatter(255)],
                         decoration: const InputDecoration(labelText: 'Upgrade path', hintText: 'only through nginx/apache/caddy'),
                       ),
                       SwitchListTile(
@@ -510,6 +579,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                       _saveProfiles();
                     });
                     Navigator.pop(context);
+                    _noteIfRunning();
                   },
                   child: const Text('Delete', style: TextStyle(color: Colors.redAccent)),
                 ),
@@ -522,6 +592,20 @@ class _SettingsScreenState extends State<SettingsScreen> {
                     ScaffoldMessenger.of(context).showSnackBar(
                       const SnackBar(content: Text('Server and Access Key are required')),
                     );
+                    return;
+                  }
+                  try {
+                    ShareLink.parse('ostp://x@$server');
+                  } on FormatException {
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      const SnackBar(content: Text('The server address must look like host:port')),
+                    );
+                    return;
+                  }
+                  final problem = _addProblem(server, key, tls && transportMode == 'uot' ? 'tls' : transportMode,
+                      exceptId: profile?.id);
+                  if (problem != null && (isNew || problem.startsWith('This'))) {
+                    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(problem)));
                     return;
                   }
                   setState(() {
@@ -568,6 +652,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                     _saveProfiles();
                   });
                   Navigator.pop(context);
+                  _noteIfRunning();
                 },
                 child: const Text('Save'),
               ),
@@ -608,17 +693,17 @@ class _SettingsScreenState extends State<SettingsScreen> {
               const SizedBox(height: 16),
               Row(
                 children: [
-                  Expanded(child: TextField(controller: pcMin, keyboardType: TextInputType.number, decoration: const InputDecoration(labelText: 'Count (min)'))),
+                  Expanded(child: TextField(controller: pcMin, keyboardType: TextInputType.number, inputFormatters: _digits, decoration: const InputDecoration(labelText: 'Count (min)'))),
                   const SizedBox(width: 12),
-                  Expanded(child: TextField(controller: pcMax, keyboardType: TextInputType.number, decoration: const InputDecoration(labelText: 'Count (max)'))),
+                  Expanded(child: TextField(controller: pcMax, keyboardType: TextInputType.number, inputFormatters: _digits, decoration: const InputDecoration(labelText: 'Count (max)'))),
                 ],
               ),
               const SizedBox(height: 12),
               Row(
                 children: [
-                  Expanded(child: TextField(controller: psMin, keyboardType: TextInputType.number, decoration: const InputDecoration(labelText: 'Size min (bytes)'))),
+                  Expanded(child: TextField(controller: psMin, keyboardType: TextInputType.number, inputFormatters: _digits, decoration: const InputDecoration(labelText: 'Size min (bytes)'))),
                   const SizedBox(width: 12),
-                  Expanded(child: TextField(controller: psMax, keyboardType: TextInputType.number, decoration: const InputDecoration(labelText: 'Size max (bytes)'))),
+                  Expanded(child: TextField(controller: psMax, keyboardType: TextInputType.number, inputFormatters: _digits, decoration: const InputDecoration(labelText: 'Size max (bytes)'))),
                 ],
               ),
             ],
@@ -659,9 +744,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   const SizedBox(height: 8),
                   Row(
                     children: [
-                      Expanded(child: TextField(controller: chunkCtrl, keyboardType: TextInputType.number, decoration: const InputDecoration(labelText: 'Chunk size (bytes)'))),
+                      Expanded(child: TextField(controller: chunkCtrl, keyboardType: TextInputType.number, inputFormatters: _digits, decoration: const InputDecoration(labelText: 'Chunk size (bytes)'))),
                       const SizedBox(width: 12),
-                      Expanded(child: TextField(controller: sleepCtrl, keyboardType: TextInputType.number, decoration: const InputDecoration(labelText: 'Delay (ms)'))),
+                      Expanded(child: TextField(controller: sleepCtrl, keyboardType: TextInputType.number, inputFormatters: _digits, decoration: const InputDecoration(labelText: 'Delay (ms)'))),
                     ],
                   ),
                 ],
@@ -771,6 +856,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
           TextField(
             controller: controller,
             maxLines: maxLines,
+            inputFormatters: [LengthLimitingTextInputFormatter(255)],
             style: const TextStyle(fontSize: 16),
             decoration: InputDecoration(
               hintText: hint,

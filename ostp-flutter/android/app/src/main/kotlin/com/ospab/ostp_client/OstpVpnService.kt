@@ -54,14 +54,46 @@ class OstpVpnService : VpnService() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         val action = intent?.action
         if (action == "START") {
-            val configJson = intent.getStringExtra("configJson") ?: return START_NOT_STICKY
-            // Launch foreground immediately so Android doesn't kill us
-            ServiceCompat.startForeground(this, NOTIF_ID, buildNotification(connecting = true), ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE)
+            // A service started with startForegroundService must call startForeground
+            // soon even if it then has nothing to run, or the system kills the app.
+            startForegroundSafe()
+            val configJson = intent.getStringExtra("configJson")
+            if (configJson == null) {
+                stopVpn()
+                return START_NOT_STICKY
+            }
             startVpn(configJson)
         } else if (action == "STOP") {
             stopVpn()
+        } else if (!isRunning) {
+            // A restart by the system after the process died (null intent) or a bind by
+            // always-on VPN: there is no tunnel, and a service idling without one only
+            // pretends to be a VPN. Stop; the user connects from the app.
+            stopSelf()
         }
-        return START_STICKY
+        // Not sticky: after the process is killed the tunnel is gone and is not brought
+        // back behind the user's back.
+        return START_NOT_STICKY
+    }
+
+    private fun startForegroundSafe() {
+        try {
+            ServiceCompat.startForeground(this, NOTIF_ID, buildNotification(connecting = true), ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE)
+        } catch (e: Throwable) {
+            // Blocked notifications (Android 13+) do not prevent the foreground state;
+            // anything else is logged and the tunnel still tries to start.
+            Log.e("OstpVpnService", "startForeground failed", e)
+        }
+    }
+
+    /** Another VPN app took over, or the permission was revoked in system settings. */
+    override fun onRevoke() {
+        Log.w("OstpVpnService", "VPN permission revoked")
+        try {
+            OstpClientSdk.addLog("The VPN was taken over by another app or its permission was revoked")
+        } catch (_: Throwable) {}
+        stopVpn()
+        super.onRevoke()
     }
 
     private fun createNotificationChannel() {
@@ -304,8 +336,9 @@ class OstpVpnService : VpnService() {
                 }
             }
 
+            // null means the consent was revoked or another VPN app is now the active one.
             vpnInterface = builder.establish()
-            val fd = vpnInterface?.fd ?: throw Exception("Failed to get VPN FD")
+            val fd = vpnInterface?.fd ?: throw Exception("The system gave no VPN interface. The permission may have been revoked.")
             
             // CRITICAL: Clear O_CLOEXEC so the child process inherits the TUN file descriptor
             try {
@@ -337,24 +370,40 @@ class OstpVpnService : VpnService() {
     private fun stopVpn() {
         isRunning = false
         releaseWakeLock()
+        // Stop following the network first, so no late callback signals a core that is going away.
+        unregisterNetworkCallback()
 
+        // Each step is independent: a failure in the core must not leave the TUN fd open.
         try {
             OstpClientSdk.stopClient()
+        } catch (e: Throwable) {
+            Log.e("OstpVpnService", "Error stopping the core", e)
+        }
+        try {
             vpnInterface?.close()
-            vpnInterface = null
         } catch (e: IOException) {
             Log.e("OstpVpnService", "Error closing VPN interface", e)
         }
+        vpnInterface = null
 
-        stopForeground(true)
+        try {
+            stopForeground(true)
+        } catch (e: Throwable) {
+            Log.e("OstpVpnService", "stopForeground failed", e)
+        }
         OstpTileService.requestListeningState(applicationContext)
-        unregisterNetworkCallback()
         stopSelf()
     }
 
     override fun onDestroy() {
         super.onDestroy()
-        instance = null
-        stopVpn()
+        // A quick stop+start can create the next instance before this one is destroyed;
+        // its state is not ours to tear down.
+        if (instance === this) {
+            instance = null
+            stopVpn()
+        } else {
+            releaseWakeLock()
+        }
     }
 }
