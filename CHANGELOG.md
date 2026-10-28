@@ -8,6 +8,8 @@ Older history is on the [Releases](https://github.com/ospab/ostp/releases) page 
 
 ## [Unreleased]
 
+## [0.4.7-beta.11] - 2026-10-28
+
 ### Added
 - Android: "Update now" in the update dialog downloads the APK for the phone's architecture from the GitHub release, checks its size and the SHA-256 GitHub publishes for it, and opens the system installer. If installing apps from this source is not allowed yet, the app opens that setting. Nothing is downloaded until the button is pressed.
 - Web panel: "Sign out" now ends the session on the server too. A panel session ends after 12 hours without activity and at most 7 days after sign-in.
