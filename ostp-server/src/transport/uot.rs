@@ -2,10 +2,13 @@ use anyhow::Result;
 use bytes::{BufMut, Bytes, BytesMut};
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use std::time::Duration;
 use tokio::sync::{mpsc, RwLock};
+
+use super::limiter::UnauthGuard;
 
 /// A connection that delivers no datagram for this long is closed. Clients
 /// send a keepalive every few seconds (5 s by default), so only a dead or
@@ -15,16 +18,29 @@ use tokio::sync::{mpsc, RwLock};
 /// carry on over a new connection.
 pub const IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// Time from the connection being taken for UoT to the server's first reply.
+/// A client sends its handshake the moment the connection is up (after the TLS
+/// or HTTP upgrade step, which the sniffer has already passed), and the server
+/// answers a valid one at once, so a healthy link needs a few round trips.
+/// 20 s leaves room for a lossy mobile link losing the first flight a few
+/// times (the client resends), and is still short next to `IDLE_TIMEOUT`,
+/// which any frame, valid or not, used to reset.
+pub const AUTH_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// `unauth` is the source's slot among not-yet-authenticated connections; it
+/// is given back as soon as the server has answered (a reply is only ever
+/// sent to a valid handshake or a live session), or when the connection ends.
 pub async fn handle_tcp_connection<S>(
     stream: S,
     peer_addr: SocketAddr,
     tcp_map: Arc<RwLock<HashMap<SocketAddr, mpsc::Sender<Bytes>>>>,
     udp_tx: mpsc::Sender<(Bytes, SocketAddr)>,
+    unauth: Option<UnauthGuard>,
 ) -> Result<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    handle_tcp_connection_with_idle(stream, peer_addr, tcp_map, udp_tx, IDLE_TIMEOUT).await
+    handle_tcp_connection_with_idle(stream, peer_addr, tcp_map, udp_tx, unauth, IDLE_TIMEOUT, AUTH_TIMEOUT).await
 }
 
 async fn handle_tcp_connection_with_idle<S>(
@@ -32,7 +48,9 @@ async fn handle_tcp_connection_with_idle<S>(
     peer_addr: SocketAddr,
     tcp_map: Arc<RwLock<HashMap<SocketAddr, mpsc::Sender<Bytes>>>>,
     udp_tx: mpsc::Sender<(Bytes, SocketAddr)>,
+    unauth: Option<UnauthGuard>,
     idle: Duration,
+    auth_timeout: Duration,
 ) -> Result<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -49,15 +67,22 @@ where
     }
 
     let (mut read_half, mut write_half) = tokio::io::split(stream);
+    let authenticated = Arc::new(AtomicBool::new(false));
+    let auth_deadline = tokio::time::Instant::now() + auth_timeout;
 
     // Writer: length-prefix (u16 BE) each outbound datagram. OSTP datagrams are
     // always well under 64 KiB (MTU-bounded), so the u16 prefix never truncates.
+    let writer_authed = authenticated.clone();
     let writer = async move {
+        let mut unauth = unauth;
         while let Some(packet) = rx.recv().await {
             let mut out = BytesMut::with_capacity(2 + packet.len());
             out.put_u16(packet.len() as u16);
             out.put_slice(&packet);
             if write_half.write_all(&out).await.is_err() { break; }
+            if !writer_authed.swap(true, Ordering::Relaxed) {
+                drop(unauth.take());
+            }
         }
     };
 
@@ -68,7 +93,14 @@ where
         loop {
             // The whole frame must arrive within `idle`: a peer that stops
             // halfway through one is as dead as one that sends nothing.
-            let frame = tokio::time::timeout(idle, async {
+            // Until the server has replied, the deadline is fixed: frames do
+            // not extend it.
+            let limit = if authenticated.load(Ordering::Relaxed) {
+                idle
+            } else {
+                auth_deadline.saturating_duration_since(tokio::time::Instant::now()).min(idle)
+            };
+            let frame = tokio::time::timeout(limit, async {
                 read_half.read_exact(&mut len_buf).await?;
                 let mut data = vec![0u8; u16::from_be_bytes(len_buf) as usize];
                 read_half.read_exact(&mut data).await?;
@@ -79,7 +111,7 @@ where
                 Ok(Ok(data)) => data,
                 Ok(Err(_)) => break,
                 Err(_) => {
-                    tracing::debug!("UoT client {} idle for {:?}, closing", peer_addr, idle);
+                    tracing::debug!("UoT client {} idle or unauthenticated for {:?}, closing", peer_addr, limit);
                     break;
                 }
             };
@@ -125,7 +157,7 @@ mod tests {
         let tcp_map: Arc<RwLock<HashMap<SocketAddr, mpsc::Sender<Bytes>>>> =
             Arc::new(RwLock::new(HashMap::new()));
         let (udp_tx, mut udp_rx) = mpsc::channel(16);
-        let handle = tokio::spawn(handle_tcp_connection(server, peer(), tcp_map.clone(), udp_tx));
+        let handle = tokio::spawn(handle_tcp_connection(server, peer(), tcp_map.clone(), udp_tx, None));
 
         // Two datagrams; write the second one byte-at-a-time to exercise the
         // read_exact reassembly across TCP segment boundaries.
@@ -158,7 +190,7 @@ mod tests {
         let tcp_map: Arc<RwLock<HashMap<SocketAddr, mpsc::Sender<Bytes>>>> =
             Arc::new(RwLock::new(HashMap::new()));
         let (udp_tx, _udp_rx) = mpsc::channel(16);
-        let handle = tokio::spawn(handle_tcp_connection(server, peer(), tcp_map.clone(), udp_tx));
+        let handle = tokio::spawn(handle_tcp_connection(server, peer(), tcp_map.clone(), udp_tx, None));
 
         // Wait for registration, then push an outbound datagram.
         let tx = loop {
@@ -190,16 +222,59 @@ mod tests {
         let (udp_tx, _udp_rx) = mpsc::channel(16);
 
         let (client_a, server_a) = tokio::io::duplex(1024);
-        let handle_a = tokio::spawn(handle_tcp_connection(server_a, peer(), tcp_map.clone(), udp_tx.clone()));
+        let handle_a = tokio::spawn(handle_tcp_connection(server_a, peer(), tcp_map.clone(), udp_tx.clone(), None));
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         let (_client_b, server_b) = tokio::io::duplex(1024);
-        let _handle_b = tokio::spawn(handle_tcp_connection(server_b, peer(), tcp_map.clone(), udp_tx));
+        let _handle_b = tokio::spawn(handle_tcp_connection(server_b, peer(), tcp_map.clone(), udp_tx, None));
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         drop(client_a);
         let _ = handle_a.await;
         assert!(tcp_map.read().await.contains_key(&peer()), "the newer connection was unregistered");
+    }
+
+    /// Frames alone do not keep an unauthenticated connection open: without a
+    /// reply from the server it is closed at the authentication deadline.
+    /// Once the server has answered, the same traffic is held to `idle` only.
+    #[tokio::test]
+    async fn a_connection_the_server_never_answers_is_closed_at_the_auth_deadline() {
+        let tcp_map: Arc<RwLock<HashMap<SocketAddr, mpsc::Sender<Bytes>>>> =
+            Arc::new(RwLock::new(HashMap::new()));
+        let (udp_tx, mut udp_rx) = mpsc::channel(64);
+        let (mut client, server) = tokio::io::duplex(64 * 1024);
+        let handle = tokio::spawn(handle_tcp_connection_with_idle(
+            server, peer(), tcp_map.clone(), udp_tx.clone(), None,
+            Duration::from_secs(5), Duration::from_millis(300),
+        ));
+        // A frame every 50 ms never lets `idle` run out.
+        let started = std::time::Instant::now();
+        while !handle.is_finished() {
+            let _ = client.write_all(&[0, 1, 7]).await;
+            let _ = tokio::time::timeout(Duration::from_millis(20), udp_rx.recv()).await;
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert!(started.elapsed() < Duration::from_secs(3), "never closed");
+        }
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(!tcp_map.read().await.contains_key(&peer()));
+
+        // Same, but the server answers: the connection outlives the deadline.
+        let peer2: SocketAddr = "127.0.0.1:40001".parse().unwrap();
+        let (mut client, server) = tokio::io::duplex(64 * 1024);
+        let handle = tokio::spawn(handle_tcp_connection_with_idle(
+            server, peer2, tcp_map.clone(), udp_tx, None,
+            Duration::from_secs(5), Duration::from_millis(300),
+        ));
+        let tx = loop {
+            if let Some(tx) = tcp_map.read().await.get(&peer2).cloned() { break tx; }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        };
+        client.write_all(&[0, 1, 7]).await.unwrap();
+        tx.send(Bytes::from_static(b"r")).await.unwrap();
+        let mut reply = [0u8; 3];
+        client.read_exact(&mut reply).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        assert!(!handle.is_finished(), "an answered connection stays open past the deadline");
     }
 
     /// A connection that goes quiet is closed and unregistered, while one
@@ -211,7 +286,9 @@ mod tests {
         let tcp_map: Arc<RwLock<HashMap<SocketAddr, mpsc::Sender<Bytes>>>> =
             Arc::new(RwLock::new(HashMap::new()));
         let (udp_tx, mut udp_rx) = mpsc::channel(16);
-        let handle = tokio::spawn(handle_tcp_connection_with_idle(server, peer(), tcp_map.clone(), udp_tx, idle));
+        let handle = tokio::spawn(handle_tcp_connection_with_idle(
+            server, peer(), tcp_map.clone(), udp_tx, None, idle, AUTH_TIMEOUT,
+        ));
 
         // Keepalives every 100 ms for 500 ms: longer than `idle` in total.
         for _ in 0..5 {

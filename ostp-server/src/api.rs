@@ -32,6 +32,30 @@ use serde::{Deserialize, Serialize};
 use crate::dispatcher::{UserStats, UserStatsSnapshot};
 use crate::outbound::OutboundRule;
 
+/// A signed-in panel session. It ends after `SESSION_IDLE` without a request
+/// (each request renews it) and in any case `SESSION_MAX` after sign-in, so a
+/// token left in a forgotten browser or a log stops working.
+#[derive(Debug, Clone)]
+pub struct Session {
+    pub token: String,
+    created: Instant,
+    last_seen: Instant,
+}
+
+const SESSION_IDLE: std::time::Duration = std::time::Duration::from_secs(12 * 3600);
+const SESSION_MAX: std::time::Duration = std::time::Duration::from_secs(7 * 24 * 3600);
+
+impl Session {
+    pub fn new(token: String) -> Self {
+        let now = Instant::now();
+        Self { token, created: now, last_seen: now }
+    }
+
+    fn expired_at(&self, now: Instant) -> bool {
+        now.duration_since(self.last_seen) >= SESSION_IDLE || now.duration_since(self.created) >= SESSION_MAX
+    }
+}
+
 // ── Shared state for API handlers ────────────────────────────────────────────
 
 /// API server shared state. Held behind Arc for axum handlers.
@@ -42,7 +66,7 @@ pub struct ApiState {
     pub start_time: Instant,
     /// Live panel sessions, oldest first: a second admin signing in must not
     /// log the first one out.
-    pub session_token: Arc<RwLock<Vec<String>>>,
+    pub session_token: Arc<RwLock<Vec<Session>>>,
     pub api_token: Option<String>,
     pub webpath: String,
     pub username: String,
@@ -285,6 +309,7 @@ pub fn create_api_router(state: ApiState) -> Router {
         .route("/qr", post(handle_qr))
         .route("/subscribe/{key}", get(handle_subscribe))
         .route("/login", post(handle_login))
+        .route("/logout", post(handle_logout))
         .route(
             "/audit",
             get(handle_get_audit)
@@ -418,9 +443,12 @@ fn check_token(state: &ApiState, headers: &axum::http::HeaderMap) -> bool {
     if let Some(value) = headers.get("authorization") {
         if let Ok(val) = value.to_str() {
             if let Some(token) = val.strip_prefix("Bearer ") {
-                let sessions = state.session_token.read().unwrap_or_else(|e| e.into_inner());
-                for session in sessions.iter() {
-                    if secure_eq(token, session) {
+                let now = Instant::now();
+                let mut sessions = state.session_token.write().unwrap_or_else(|e| e.into_inner());
+                sessions.retain(|s| !s.expired_at(now));
+                for session in sessions.iter_mut() {
+                    if secure_eq(token, &session.token) {
+                        session.last_seen = now;
                         allowed = true;
                     }
                 }
@@ -478,7 +506,9 @@ async fn handle_login(
         let token = uuid::Uuid::new_v4().to_string();
         {
             let mut sessions = state.session_token.write().unwrap_or_else(|e| e.into_inner());
-            sessions.push(token.clone());
+            let now = Instant::now();
+            sessions.retain(|s| !s.expired_at(now));
+            sessions.push(Session::new(token.clone()));
             if sessions.len() > MAX_SESSIONS {
                 sessions.remove(0);
             }
@@ -488,6 +518,18 @@ async fn handle_login(
         login_failed();
         api_unauthorized::<LoginResponse>()
     }
+}
+
+/// Ends the session the request signed in with. Other sessions and the static
+/// API token are untouched.
+async fn handle_logout(State(state): State<ApiState>, headers: axum::http::HeaderMap) -> impl IntoResponse {
+    if !check_token(&state, &headers) {
+        return api_unauthorized::<()>();
+    }
+    if let Some(token) = headers.get("authorization").and_then(|v| v.to_str().ok()).and_then(|v| v.strip_prefix("Bearer ")) {
+        state.session_token.write().unwrap_or_else(|e| e.into_inner()).retain(|s| !secure_eq(token, &s.token));
+    }
+    (StatusCode::OK, ApiResponse::success(()))
 }
 
 /// Failed sign-ins, server-wide: a bucket of 10 refilled at 10 a minute. Not
@@ -1152,6 +1194,11 @@ struct SubscribeQuery {
     transport: Option<String>,
 }
 
+/// Unknown keys tried on `/subscribe/{key}`: 30 per 10 minutes.
+static SUBSCRIBE_MISSES: std::sync::LazyLock<crate::transport::limiter::FailureLimiter> =
+    std::sync::LazyLock::new(|| crate::transport::limiter::FailureLimiter::new(std::time::Duration::from_secs(600), 30));
+const SUBSCRIBE_SOURCE: std::net::IpAddr = std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED);
+
 async fn handle_subscribe(
     State(state): State<ApiState>,
     Path(key): Path<String>,
@@ -1167,6 +1214,12 @@ async fn handle_subscribe(
     };
 
     if !key_exists {
+        // Guessing is capped server-wide (see LOGIN_BUCKET for why not per
+        // address); a correct key is never counted or refused.
+        if !SUBSCRIBE_MISSES.allowed(SUBSCRIBE_SOURCE) {
+            return StatusCode::TOO_MANY_REQUESTS.into_response();
+        }
+        SUBSCRIBE_MISSES.record_failure(SUBSCRIBE_SOURCE);
         return (StatusCode::NOT_FOUND, Json(serde_json::json!({
             "ok": false,
             "error": "invalid access key"
@@ -1331,7 +1384,7 @@ mod tests {
     #[test]
     fn test_check_token_accepts_matching_session_token() {
         let state = make_test_state("panel");
-        state.session_token.write().unwrap().push("live-session".to_string());
+        state.session_token.write().unwrap().push(Session::new("live-session".to_string()));
         assert!(check_token(&state, &headers_with_bearer("live-session")));
     }
 
@@ -1445,9 +1498,36 @@ mod tests {
     }
 
     #[test]
+    fn test_sessions_expire_idle_and_absolute() {
+        let state = make_test_state("panel");
+        let now = Instant::now();
+        let mut idle = Session::new("idle".into());
+        idle.last_seen = now.checked_sub(SESSION_IDLE).unwrap();
+        let mut old = Session::new("old".into());
+        old.created = now.checked_sub(SESSION_MAX).unwrap();
+        state.session_token.write().unwrap().extend([idle, old, Session::new("fresh".into())]);
+        assert!(!check_token(&state, &headers_with_bearer("idle")));
+        assert!(!check_token(&state, &headers_with_bearer("old")));
+        assert!(check_token(&state, &headers_with_bearer("fresh")));
+        assert_eq!(state.session_token.read().unwrap().len(), 1, "expired sessions are dropped");
+    }
+
+    #[tokio::test]
+    async fn test_logout_drops_only_its_own_session() {
+        let state = make_test_state("panel");
+        state.session_token.write().unwrap().extend([Session::new("a".into()), Session::new("b".into())]);
+        let resp = handle_logout(State(state.clone()), headers_with_bearer("a")).await.into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(!check_token(&state, &headers_with_bearer("a")));
+        assert!(check_token(&state, &headers_with_bearer("b")));
+        let resp = handle_logout(State(state), headers_with_bearer("a")).await.into_response();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
     fn test_sessions_of_two_admins_both_work() {
         let state = make_test_state("panel");
-        state.session_token.write().unwrap().extend(["first".to_string(), "second".to_string()]);
+        state.session_token.write().unwrap().extend([Session::new("first".into()), Session::new("second".into())]);
         assert!(check_token(&state, &headers_with_bearer("first")));
         assert!(check_token(&state, &headers_with_bearer("second")));
         assert!(!check_token(&state, &headers_with_bearer("third")));

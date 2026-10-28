@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 const WINDOW: Duration = Duration::from_secs(10);
@@ -19,8 +19,21 @@ const PRUNE_EVERY: Duration = Duration::from_secs(60);
 /// pending-connection limit still bounds what that costs.
 const MAX_TRACKED: usize = 100_000;
 
+/// The unit a source is counted in: an IPv4 address, or an IPv6 /64 (one
+/// subscriber holds a whole /64 and can pick any address in it).
+fn source(ip: IpAddr) -> IpAddr {
+    match ip.to_canonical() {
+        IpAddr::V6(v6) => {
+            let s = v6.segments();
+            IpAddr::V6(std::net::Ipv6Addr::new(s[0], s[1], s[2], s[3], 0, 0, 0, 0))
+        }
+        v4 => v4,
+    }
+}
+
 pub struct ConnLimiter {
     inner: Mutex<Inner>,
+    unauth: Arc<UnauthSlots>,
 }
 
 struct Inner {
@@ -38,7 +51,14 @@ impl ConnLimiter {
     pub fn new() -> Self {
         Self {
             inner: Mutex::new(Inner { windows: HashMap::new(), last_prune: Instant::now() }),
+            unauth: Arc::new(UnauthSlots::default()),
         }
+    }
+
+    /// A slot for a UoT connection from `ip` that has not authenticated yet;
+    /// `None` when that source already holds the maximum.
+    pub fn acquire_unauth(&self, ip: IpAddr) -> Option<UnauthGuard> {
+        self.unauth.try_acquire(ip)
     }
 
     /// Counts one connection attempt from `ip`; false once it exceeds the window budget.
@@ -47,14 +67,7 @@ impl ConnLimiter {
     }
 
     fn check_at(&self, ip: IpAddr, now: Instant) -> bool {
-        // An IPv6 subscriber holds a /64: counted as one source.
-        let ip = match ip {
-            IpAddr::V6(v6) if v6.to_ipv4_mapped().is_none() => {
-                let s = v6.segments();
-                IpAddr::V6(std::net::Ipv6Addr::new(s[0], s[1], s[2], s[3], 0, 0, 0, 0))
-            }
-            other => other,
-        };
+        let ip = source(ip);
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         if now.duration_since(inner.last_prune) >= PRUNE_EVERY {
             inner.windows.retain(|_, (_, start)| now.duration_since(*start) < WINDOW);
@@ -76,6 +89,106 @@ impl ConnLimiter {
     #[cfg(test)]
     fn len(&self) -> usize {
         self.inner.lock().unwrap().windows.len()
+    }
+}
+
+/// Connections per source that have been classified as UoT but have not shown
+/// a valid handshake yet. A real client's handshake is answered within a round
+/// trip, so a source holding this many is probing or hoarding descriptors. It
+/// matches `MAX_CONNS` in spirit: above one client's own parallel sessions,
+/// below what makes a single address a threat.
+pub const MAX_UNAUTHENTICATED_PER_SOURCE: u32 = 64;
+
+/// Counts not-yet-authenticated connections per source; a slot is held by the
+/// guard until the connection authenticates or ends.
+#[derive(Default)]
+pub struct UnauthSlots {
+    held: Mutex<HashMap<IpAddr, u32>>,
+}
+
+pub struct UnauthGuard {
+    slots: Arc<UnauthSlots>,
+    ip: IpAddr,
+}
+
+impl UnauthSlots {
+    pub fn try_acquire(self: &Arc<Self>, ip: IpAddr) -> Option<UnauthGuard> {
+        self.try_acquire_max(ip, MAX_UNAUTHENTICATED_PER_SOURCE)
+    }
+
+    fn try_acquire_max(self: &Arc<Self>, ip: IpAddr, max: u32) -> Option<UnauthGuard> {
+        let ip = source(ip);
+        let mut held = self.held.lock().unwrap_or_else(|e| e.into_inner());
+        let n = held.entry(ip).or_insert(0);
+        if *n >= max {
+            return None;
+        }
+        *n += 1;
+        Some(UnauthGuard { slots: self.clone(), ip })
+    }
+}
+
+impl Drop for UnauthGuard {
+    fn drop(&mut self) {
+        let mut held = self.slots.held.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(n) = held.get_mut(&self.ip) {
+            *n -= 1;
+            if *n == 0 {
+                held.remove(&self.ip);
+            }
+        }
+    }
+}
+
+/// Lookups of secrets (subscription tokens, access keys) that found nothing,
+/// per source. Once a source has used its budget in a window its further
+/// lookups are refused without being tried; correct ones never count.
+pub struct FailureLimiter {
+    window: Duration,
+    max: u32,
+    inner: Mutex<Inner>,
+}
+
+impl FailureLimiter {
+    pub fn new(window: Duration, max: u32) -> Self {
+        Self { window, max, inner: Mutex::new(Inner { windows: HashMap::new(), last_prune: Instant::now() }) }
+    }
+
+    /// False while `ip` has used up its failures for the current window.
+    pub fn allowed(&self, ip: IpAddr) -> bool {
+        self.allowed_at(ip, Instant::now())
+    }
+
+    pub fn record_failure(&self, ip: IpAddr) {
+        self.record_failure_at(ip, Instant::now());
+    }
+
+    fn allowed_at(&self, ip: IpAddr, now: Instant) -> bool {
+        let ip = source(ip);
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        match inner.windows.get(&ip) {
+            Some((n, start)) if now.duration_since(*start) < self.window => *n < self.max,
+            _ => true,
+        }
+    }
+
+    fn record_failure_at(&self, ip: IpAddr, now: Instant) {
+        let ip = source(ip);
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if now.duration_since(inner.last_prune) >= PRUNE_EVERY {
+            let window = self.window;
+            inner.windows.retain(|_, (_, start)| now.duration_since(*start) < window);
+            inner.last_prune = now;
+        }
+        if inner.windows.len() >= MAX_TRACKED && !inner.windows.contains_key(&ip) {
+            return;
+        }
+        let entry = inner.windows.entry(ip).or_insert((0, now));
+        if now.duration_since(entry.1) >= self.window {
+            *entry = (1, now);
+        } else {
+            entry.0 = entry.0.saturating_add(1);
+        }
     }
 }
 
@@ -135,6 +248,40 @@ mod tests {
         }
         assert!(!l.check_at(ip("2001:db8:1:2::ffff"), t0), "another address of the same /64 is the same source");
         assert!(l.check_at(ip("2001:db8:1:3::1"), t0), "a different /64 is not");
+    }
+
+    #[test]
+    fn unauthenticated_slots_are_per_source_and_released_on_drop() {
+        let slots = Arc::new(UnauthSlots::default());
+        let a = ip("203.0.113.1");
+        let held: Vec<_> = (0..3).map(|_| slots.try_acquire_max(a, 3).unwrap()).collect();
+        assert!(slots.try_acquire_max(a, 3).is_none(), "the fourth is refused");
+        assert!(slots.try_acquire_max(ip("203.0.113.2"), 3).is_some(), "another source is not");
+        drop(held);
+        assert!(slots.try_acquire_max(a, 3).is_some(), "slots come back");
+        assert_eq!(slots.held.lock().unwrap().len(), 1, "empty entries are removed");
+    }
+
+    #[test]
+    fn unauthenticated_slots_count_an_ipv6_slash64_as_one_source() {
+        let slots = Arc::new(UnauthSlots::default());
+        let _a = slots.try_acquire_max(ip("2001:db8:1:2::1"), 1).unwrap();
+        assert!(slots.try_acquire_max(ip("2001:db8:1:2::2"), 1).is_none());
+        assert!(slots.try_acquire_max(ip("2001:db8:1:3::1"), 1).is_some());
+    }
+
+    #[test]
+    fn failures_block_a_source_until_the_window_ends() {
+        let l = FailureLimiter::new(Duration::from_secs(60), 3);
+        let t0 = Instant::now();
+        let a = ip("203.0.113.1");
+        for _ in 0..3 {
+            assert!(l.allowed_at(a, t0));
+            l.record_failure_at(a, t0);
+        }
+        assert!(!l.allowed_at(a, t0));
+        assert!(l.allowed_at(ip("203.0.113.2"), t0), "others are unaffected");
+        assert!(l.allowed_at(a, t0 + Duration::from_secs(60)));
     }
 
     #[test]

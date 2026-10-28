@@ -22,7 +22,7 @@ use tokio::net::TcpListener;
 use tokio::sync::{mpsc, OwnedSemaphorePermit, RwLock, Semaphore};
 use tokio::time::{timeout_at, Instant};
 
-use super::limiter::{is_trusted_proxy, ConnLimiter};
+use super::limiter::{is_trusted_proxy, ConnLimiter, UnauthGuard};
 use super::rewind::Rewind;
 
 pub type TcpMap = Arc<RwLock<HashMap<SocketAddr, mpsc::Sender<Bytes>>>>;
@@ -182,16 +182,21 @@ where
 
     match classify(buf[0]) {
         Class::Uot | Class::Legacy => {
+            let Some(unauth) = unauth_slot(&ctx, peer.ip(), peer) else {
+                tracing::debug!("too many unauthenticated connections from {}, dropping", peer.ip());
+                return Ok(());
+            };
             drop(permit);
             crate::transport::uot::handle_tcp_connection(
                 Rewind::new(s, buf.freeze()),
                 peer,
                 ctx.tcp_map.clone(),
                 ctx.udp_tx.clone(),
+                unauth,
             )
             .await
         }
-        Class::Tls => decoy(s, buf, &ctx).await,
+        Class::Tls => decoy(s, buf, &ctx, permit).await,
         Class::Http => route_http(s, buf, peer, ctx, permit, deadline, via_tls).await,
     }
 }
@@ -213,7 +218,7 @@ where
             break n;
         }
         if buf.len() >= MAX_HEAD_BYTES {
-            return decoy(s, buf, &ctx).await;
+            return decoy(s, buf, &ctx, permit).await;
         }
         if read_more(&mut s, &mut buf, deadline).await? == 0 {
             return Ok(());
@@ -233,7 +238,7 @@ where
         // internet, only inside TLS or from a local web server that ended it.
         if let Some(sub) = ctx.subscription.as_ref().filter(|_| via_tls || is_trusted_proxy(peer)) {
             if request_path(&buf[..head_len]).is_some_and(|p| sub.wants(&p)) {
-                if let Some(resp) = sub.respond(&buf[..head_len]).await {
+                if let Some(resp) = sub.respond(&buf[..head_len], client_ip(&buf[..head_len], peer)).await {
                     drop(permit);
                     s.write_all(&resp).await?;
                     let _ = s.shutdown().await;
@@ -247,7 +252,7 @@ where
                 return crate::fallback::proxy_with_prefix(s, buf.freeze(), &panel.upstream).await;
             }
         }
-        return decoy(s, buf, &ctx).await;
+        return decoy(s, buf, &ctx, permit).await;
     };
 
     if let Some(real_ip) = upgrade.forwarded_for {
@@ -267,14 +272,60 @@ where
 
     s.write_all(&build_upgrade_response(&ws_accept_key(&upgrade.ws_key))).await?;
     let leftover = buf.split_off(head_len).freeze();
+    let Some(unauth) = unauth_slot(&ctx, upgrade.forwarded_for.unwrap_or(peer.ip()), peer) else {
+        tracing::debug!("too many unauthenticated connections from one source (peer {peer}), dropping");
+        return Ok(());
+    };
     drop(permit);
     crate::transport::uot::handle_tcp_connection(
         Rewind::new(s, leftover),
         peer,
         ctx.tcp_map.clone(),
         ctx.udp_tx.clone(),
+        unauth,
     )
     .await
+}
+
+/// A slot among the source's not-yet-authenticated UoT connections.
+/// `Some(None)` means no cap applies (a local web server that reported no
+/// client address: its one address stands for everybody); `None` means the
+/// source is over its cap.
+fn unauth_slot(ctx: &SniffCtx, source: IpAddr, peer: SocketAddr) -> Option<Option<UnauthGuard>> {
+    if is_trusted_proxy(peer) && source.to_canonical() == peer.ip().to_canonical() {
+        return Some(None);
+    }
+    ctx.limiter.acquire_unauth(source).map(Some)
+}
+
+/// The address a request really comes from: the one a local web server
+/// reports, else the peer's own.
+fn client_ip(head: &[u8], peer: SocketAddr) -> IpAddr {
+    if !is_trusted_proxy(peer) {
+        return peer.ip();
+    }
+    let mut headers = [httparse::EMPTY_HEADER; 32];
+    let mut req = httparse::Request::new(&mut headers);
+    if !matches!(req.parse(head), Ok(httparse::Status::Complete(_))) {
+        return peer.ip();
+    }
+    forwarded_for(|name| {
+        req.headers
+            .iter()
+            .find(|h| h.name.eq_ignore_ascii_case(name))
+            .and_then(|h| std::str::from_utf8(h.value).ok())
+            .map(str::trim)
+    })
+    .unwrap_or(peer.ip())
+}
+
+/// Client address from the headers a local web server sets.
+fn forwarded_for<'a>(header: impl Fn(&str) -> Option<&'a str>) -> Option<IpAddr> {
+    header("x-real-ip").and_then(|v| v.parse::<IpAddr>().ok()).or_else(|| {
+        header("x-forwarded-for")
+            .and_then(|v| v.rsplit(',').next())
+            .and_then(|v| v.trim().parse::<IpAddr>().ok())
+    })
 }
 
 struct Upgrade {
@@ -322,13 +373,7 @@ fn parse_upgrade(head: &[u8], ws_path: Option<&str>, peer: SocketAddr) -> Option
     // Only a local web server is trusted to say who the client is; on a public
     // port these headers are attacker-controlled and ignored.
     let forwarded_for = if is_trusted_proxy(peer) {
-        header("x-real-ip")
-            .and_then(|v| v.parse::<IpAddr>().ok())
-            .or_else(|| {
-                header("x-forwarded-for")
-                    .and_then(|v| v.rsplit(',').next())
-                    .and_then(|v| v.trim().parse::<IpAddr>().ok())
-            })
+        forwarded_for(header)
     } else {
         None
     };
@@ -389,10 +434,13 @@ async fn read_more<S: AsyncRead + Unpin>(s: &mut S, buf: &mut BytesMut, deadline
 const TOO_MANY: &[u8] = b"HTTP/1.1 429 Too Many Requests\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
 const NOT_FOUND: &[u8] = b"HTTP/1.1 404 Not Found\r\nContent-Type: text/html\r\nContent-Length: 48\r\nConnection: close\r\n\r\n<html><body><h1>404 Not Found</h1></body></html>";
 
-async fn decoy<S>(mut s: S, buf: BytesMut, ctx: &SniffCtx) -> Result<()>
+/// Takes the admission permit: a connection handed to the decoy has been
+/// classified, and a long splice must not count against new accepts.
+async fn decoy<S>(mut s: S, buf: BytesMut, ctx: &SniffCtx, permit: OwnedSemaphorePermit) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    drop(permit);
     match &ctx.decoy {
         Decoy::Proxy(target) => crate::fallback::proxy_with_prefix(s, buf.freeze(), target).await,
         Decoy::NotFound => {

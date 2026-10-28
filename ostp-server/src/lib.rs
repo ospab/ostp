@@ -373,6 +373,7 @@ pub async fn run_server(params: ServerParams) -> Result<()> {
                 dns: dns_server.clone(),
                 keys: shared_keys.clone(),
                 stats: dispatcher.user_stats_ref(),
+                lookups: Default::default(),
             }))
         }
         (Some(_), None) => {
