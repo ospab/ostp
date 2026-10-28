@@ -11,7 +11,7 @@ if (window.__TAURI__?.core) {
 const TIMEOUT_MS = {
   get_tunnel_status: 5000, get_metrics: 5000, save_config: 10000, reload_tunnel: 10000,
   stop_tunnel: 15000, start_tunnel: 150000, generate_qr: 10000, decode_qr: 30000,
-  fetch_subscription: 45000, check_updates: 45000, set_autostart: 15000, get_wintun_install_path: 5000,
+  fetch_subscription: 45000, check_updates: 45000, install_update: 16 * 60000, set_autostart: 15000, get_wintun_install_path: 5000,
   app_build_tag: 5000, run_prober_matrix: 75000, run_prober_ttl: 75000, run_dpi_battery: 135000,
   servers_list: 15000, server_rename: 15000, server_remove: 15000, server_add: 120000, server_probe: 120000,
   server_open_panel: 60000, server_install: 20 * 60000, server_action: 20 * 60000,
@@ -1438,12 +1438,68 @@ async function checkUpdates({ manual }) {
     $('update-text').textContent = `Version ${offer.tag} is available. You have ${r.current}.` +
       (isBeta && r.stable ? ` The newest stable release is ${r.stable.tag}.` : '');
     $('update-warning').classList.toggle('hidden', !isBeta);
+    resetUpdateModal();
     $('update-modal').classList.remove('hidden');
   } catch (e) {
     if (manual) showToast('Could not check for updates: ' + (e?.message || e), 'error');
   } finally {
     if (manual) { btn.disabled = false; btn.textContent = 'Check for updates now'; }
   }
+}
+
+let updating = false;
+// After a failed install the main button opens the release page instead.
+let updateFallback = false;
+
+function resetUpdateModal() {
+  updateFallback = false;
+  const status = $('update-status');
+  status.textContent = '';
+  status.classList.add('hidden');
+  status.classList.remove('error-text');
+  $('btn-update-download').textContent = 'Update now';
+}
+
+function setUpdateStatus(text, isError) {
+  const status = $('update-status');
+  status.textContent = text;
+  status.classList.toggle('error-text', !!isError);
+  status.classList.remove('hidden');
+}
+
+// Download, check, install, restart: all in the core. On success the app
+// quits and the new version starts, so nothing here runs after that.
+async function installUpdate() {
+  if (!pendingUpdate || updating) return;
+  if (updateFallback || !window.__TAURI__?.core) {
+    openUrl(pendingUpdate.url);
+    $('update-modal').classList.add('hidden');
+    return;
+  }
+  updating = true;
+  const buttons = ['btn-update-download', 'btn-update-later', 'btn-update-skip'].map($);
+  buttons.forEach(b => { b.disabled = true; });
+  setUpdateStatus(`Downloading ${pendingUpdate.tag}…`);
+  try {
+    await invoke('install_update', { tag: pendingUpdate.tag });
+    setUpdateStatus('Installing. The app will restart.');
+  } catch (e) {
+    setUpdateStatus('The update was not installed: ' + (e?.message || e), true);
+    updateFallback = true;
+    $('btn-update-download').textContent = 'Open download page';
+  } finally {
+    updating = false;
+    buttons.forEach(b => { b.disabled = false; });
+  }
+}
+
+function onUpdateProgress([done, total]) {
+  if (!updating || !total) return;
+  const pct = Math.min(100, Math.floor(done * 100 / total));
+  const mb = n => (n / 1048576).toFixed(1);
+  setUpdateStatus(pct >= 100
+    ? 'Checking the file and installing…'
+    : `Downloading ${pendingUpdate.tag}: ${pct}% (${mb(done)} of ${mb(total)} MB)`);
 }
 
 // ── CLIENT SETTINGS ───────────────────────────────────────────────────
@@ -1641,6 +1697,7 @@ window.addEventListener('DOMContentLoaded', async () => {
     listen('tray_connect', () => { if (appState === 'disconnected') handleToggle(); });
     listen('tray_disconnect', () => { if (appState !== 'disconnected') handleToggle(); });
     // Quit from the tray was refused because a server job is running.
+    listen('update-progress', evt => onUpdateProgress(evt.payload || []));
     listen('exit-blocked', () => showToast('A server job is still running. Wait for it to finish, then quit again.', 'error'));
   }
 
@@ -1771,10 +1828,7 @@ window.addEventListener('DOMContentLoaded', async () => {
     try { if (pendingUpdate) localStorage.setItem(SKIP_UPDATE_KEY, pendingUpdate.tag); } catch {}
     $('update-modal').classList.add('hidden');
   });
-  $('btn-update-download').addEventListener('click', () => {
-    if (pendingUpdate) openUrl(pendingUpdate.url);
-    $('update-modal').classList.add('hidden');
-  });
+  $('btn-update-download').addEventListener('click', installUpdate);
   if (loadClientSettings().updateCheck !== false) setTimeout(() => checkUpdates({ manual: false }), 1500);
 
   // Wintun modal

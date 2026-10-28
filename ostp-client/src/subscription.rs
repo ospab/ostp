@@ -13,14 +13,14 @@ const MAX_BODY: usize = 1024 * 1024;
 
 /// `https://host[:port]/path?query` split into its parts.
 #[derive(Debug, PartialEq, Eq)]
-struct Url {
-    host: String,
-    port: u16,
+pub(crate) struct Url {
+    pub(crate) host: String,
+    pub(crate) port: u16,
     /// Path and query, always starting with '/'.
-    target: String,
+    pub(crate) target: String,
 }
 
-fn parse_url(url: &str) -> Result<Url> {
+pub(crate) fn parse_url(url: &str) -> Result<Url> {
     let url = url.trim();
     let rest = match url.split_once("://") {
         Some((scheme, rest)) if scheme.eq_ignore_ascii_case("https") => rest,

@@ -15,6 +15,14 @@
 ### TUN privileges
 Creating a TUN adapter needs elevated rights, and the app should not run elevated. TUN setup is therefore done by `ostp-tun-helper`, a small process the app starts and controls over a local command channel (start and stop, with a config and token). Only the helper runs elevated (UAC on Windows, polkit/pkexec on Linux). The actual adapter creation code lives in the shared `ostp-tun` crate, used by both the helper and the CLI's own native TUN path (see [`client.md`](client.md)).
 
+### Updates
+The app checks GitHub for a newer stable or beta release when it opens (this can be turned off in settings) and on "Check for updates now". It only tells the user; nothing is downloaded until they press "Update now". Then the app downloads its own build from the release, checks it against the SHA-256 that GitHub publishes for every release file (no hash or a different one: nothing is installed), stops the tunnel and installs it:
+
+- Windows, installed with the setup program: the new setup runs as an update (`/P /R /UPDATE`: a progress bar, no questions, shortcuts and data kept, the app restarts). Windows asks for consent once, because the app is installed for all users.
+- Windows portable, Linux and macOS: the files next to the app (`ostp-gui`, `ostp-tun-helper`, `wintun.dll`) are replaced and the app restarts. The old files are renamed to `.old` first, put back if anything fails, and removed on the next start. The folder has to be writable by the user.
+
+If the install fails, the dialog shows why and offers the release page instead.
+
 ## Your own server from the apps
 
 Both apps can install OSTP on a VPS and manage it afterwards, for people who have bought a server and do not want to learn Linux. The SSH work is done by the `ostp-ssh` crate, shared by the desktop app (Tauri commands in `ostp-gui/src-tauri/src/servers.rs`) and Android (`serversCall` in `ostp-jni`).

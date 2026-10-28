@@ -799,6 +799,88 @@ async fn check_updates() -> Result<serde_json::Value, String> {
     .await
 }
 
+/// Downloads release `tag`, checks its SHA-256, stops the tunnel and installs
+/// it: the Windows installer when the app came from it, otherwise the files
+/// next to the app are replaced. The app then quits and the new one starts.
+/// Runs only when the user pressed "Update now".
+#[tauri::command]
+async fn install_update(tag: String, state: tauri::State<'_, AppState>, app: tauri::AppHandle) -> Result<(), String> {
+    let progress_app = app.clone();
+    let downloaded = off_thread(std::time::Duration::from_secs(900), move || async move {
+        let mut last = 0u64;
+        let d = ostp_client::updates::download_app_update(&tag, |done, total| {
+            // About one event per percent; the bar does not need more.
+            if done == total || done - last >= total / 100 {
+                last = done;
+                let _ = progress_app.emit("update-progress", (done, total));
+            }
+        })
+        .await
+        .map_err(|e| format!("{e:#}"))?;
+        Ok(serde_json::json!({ "path": d.path, "installer": d.installer }))
+    })
+    .await?;
+    let path = PathBuf::from(downloaded["path"].as_str().unwrap_or_default());
+    let installer = downloaded["installer"].as_bool().unwrap_or(false);
+
+    // The installer cannot replace a helper that is still running, and an
+    // archive update renames it: stop the tunnel first either way.
+    shutdown_tunnel(&state).await;
+
+    if installer {
+        run_installer(&path)?;
+    } else {
+        let exe = ostp_client::updates::apply_app_archive(&path).map_err(|e| format!("{e:#}"))?;
+        relaunch(&exe)?;
+    }
+    app.exit(0);
+    Ok(())
+}
+
+/// Starts the downloaded Windows installer the way Tauri's own updater does:
+/// passive (a progress bar, no questions), as an update (shortcuts and data
+/// stay), restarting the app when done. Windows asks for consent because the
+/// app is installed for all users.
+#[cfg(windows)]
+fn run_installer(path: &std::path::Path) -> Result<(), String> {
+    use std::ffi::OsStr;
+    use std::os::windows::ffi::OsStrExt;
+    #[link(name = "shell32")]
+    extern "system" {
+        fn ShellExecuteW(h: *mut std::ffi::c_void, op: *const u16, f: *const u16, p: *const u16, d: *const u16, s: i32) -> isize;
+    }
+    let wide = |s: &OsStr| s.encode_wide().chain(Some(0)).collect::<Vec<u16>>();
+    let verb = wide(OsStr::new("open"));
+    let file = wide(path.as_os_str());
+    let params = wide(OsStr::new("/P /R /UPDATE"));
+    let ret = unsafe { ShellExecuteW(std::ptr::null_mut(), verb.as_ptr(), file.as_ptr(), params.as_ptr(), std::ptr::null(), 1) };
+    if ret <= 32 {
+        return Err(format!(
+            "the installer did not start (code {ret}); if you declined the Windows prompt, try again. \
+             It was saved to {}",
+            path.display()
+        ));
+    }
+    unlock_single_instance();
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn run_installer(_path: &std::path::Path) -> Result<(), String> {
+    Err("the installer is for Windows only".into())
+}
+
+/// Starts the new app. It waits for this one to let go of the single-instance
+/// lock instead of reporting "already running".
+fn relaunch(exe: &std::path::Path) -> Result<(), String> {
+    unlock_single_instance();
+    std::process::Command::new(exe)
+        .env(RELAUNCH_ENV, "1")
+        .spawn()
+        .map_err(|e| format!("the update is installed, but the new app did not start ({e}); start it by hand"))?;
+    Ok(())
+}
+
 #[derive(serde::Deserialize)]
 struct ProberRequest {
     server: String,
@@ -1416,12 +1498,37 @@ fn show_error_dialog(msg: &str) {
     println!("ERROR: {}", msg);
 }
 
-static SINGLE_INSTANCE_LOCK: std::sync::OnceLock<std::net::TcpListener> = std::sync::OnceLock::new();
+static SINGLE_INSTANCE_LOCK: std::sync::Mutex<Option<std::net::TcpListener>> = std::sync::Mutex::new(None);
+/// Set on the app started by an update, which may start before the old one has quit.
+const RELAUNCH_ENV: &str = "OSTP_RELAUNCHED";
+
+fn unlock_single_instance() {
+    if let Ok(mut lock) = SINGLE_INSTANCE_LOCK.lock() {
+        lock.take();
+    }
+}
+
+fn lock_single_instance() -> bool {
+    let tries = if std::env::var_os(RELAUNCH_ENV).is_some() { 50 } else { 1 };
+    for i in 0..tries {
+        if let Ok(listener) = std::net::TcpListener::bind("127.0.0.1:49153") {
+            if let Ok(mut lock) = SINGLE_INSTANCE_LOCK.lock() {
+                *lock = Some(listener);
+            }
+            return true;
+        }
+        if i + 1 < tries {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+    }
+    false
+}
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    if let Ok(listener) = std::net::TcpListener::bind("127.0.0.1:49153") {
-        let _ = SINGLE_INSTANCE_LOCK.set(listener);
+    ostp_client::updates::remove_update_leftovers();
+    if lock_single_instance() {
+        std::env::remove_var(RELAUNCH_ENV);
     } else {
         #[cfg(not(debug_assertions))]
         {
@@ -1537,7 +1644,7 @@ pub fn run() {
             }
             _ => {}
         })
-        .invoke_handler(tauri::generate_handler![start_tunnel, stop_tunnel, reload_tunnel, get_tunnel_status, get_metrics, get_config, save_config, get_wintun_install_path, set_autostart, get_autostart, list_running_processes, generate_qr, decode_qr, fetch_subscription, run_prober_matrix, run_prober_ttl, run_dpi_battery, app_build_tag, check_updates, servers::servers_list, servers::server_add, servers::server_rename, servers::server_remove, servers::server_probe, servers::server_install, servers::server_manage, servers::server_action, servers::server_open_panel])
+        .invoke_handler(tauri::generate_handler![start_tunnel, stop_tunnel, reload_tunnel, get_tunnel_status, get_metrics, get_config, save_config, get_wintun_install_path, set_autostart, get_autostart, list_running_processes, generate_qr, decode_qr, fetch_subscription, run_prober_matrix, run_prober_ttl, run_dpi_battery, app_build_tag, check_updates, install_update, servers::servers_list, servers::server_add, servers::server_rename, servers::server_remove, servers::server_probe, servers::server_install, servers::server_manage, servers::server_action, servers::server_open_panel])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

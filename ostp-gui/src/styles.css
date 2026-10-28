@@ -803,6 +803,7 @@ a { text-decoration: none; }
 }
 .compact-btn { padding: 5px 10px; font-size: 0.72rem; }
 .update-warning { color: var(--c-amber); }
+#update-status.error-text { color: var(--c-red); }
 
 /* ── Welcome (first run) ─────────────────────────────────────────────── */
 .welcome-title { font-size: 1.35rem; font-weight: 800; color: var(--c-txt-1); margin: 10px 0 6px; }
