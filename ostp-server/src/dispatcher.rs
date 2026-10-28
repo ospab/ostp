@@ -396,6 +396,9 @@ impl Dispatcher {
                     self.addr_to_session.insert(peer, session_id);
                     self.trials.mark_known(peer.ip());
                     self.roaming.mark_known(peer.ip());
+                    // What the server learned about the old path does not
+                    // describe the new one, as on the client's side of a move.
+                    peer_state.machine.on_path_change();
                 }
                 if peer_state.last_addr == peer {
                     peer_state.last_seen = std::time::Instant::now();

@@ -8,6 +8,10 @@ use std::time::{Duration, Instant};
 /// is applied to the adaptive RTO. Past this the session is dead from the
 /// user's point of view, and waiting longer only delays recovery.
 const MAX_EFFECTIVE_RTO: Duration = Duration::from_secs(8);
+/// No authenticated datagram for this long while data is in flight means an
+/// outage rather than congestion. Keepalives go out every few seconds, and an
+/// idle session (nothing in flight) is not affected.
+const OUTAGE_SILENCE: Duration = Duration::from_secs(3);
 /// On a reliable carrier (TCP, TLS) a frame is resent on a timer only when it
 /// has gone unacknowledged this long: far above any queueing delay, so the
 /// timer no longer duplicates frames that are merely queued.
@@ -166,6 +170,8 @@ pub struct ProtocolMachine {
     /// cannot be advanced by a peer that does not hold the session keys, so it
     /// is what callers use as proof the path is alive.
     authenticated_recv_count: u64,
+    /// When the last authenticated datagram arrived (see OUTAGE_SILENCE).
+    last_authenticated_recv: Option<Instant>,
     /// Congestion controller (BBR-inspired adaptive window)
     cc: CongestionController,
     /// The datagrams ride a reliable byte stream (UDP-over-TCP, TLS): nothing
@@ -274,6 +280,7 @@ impl ProtocolMachine {
             last_recv_advance: Instant::now(),
             highest_authenticated_recv_nonce: None,
             authenticated_recv_count: 0,
+            last_authenticated_recv: None,
             cc: CongestionController::new(mtu as u64),
             reliable_carrier: false,
             path_changed_at: None,
@@ -687,6 +694,17 @@ impl ProtocolMachine {
         let session_id_bytes = self.session_id.to_be_bytes();
         let plaintext = cipher.decrypt(nonce, ciphertext, &session_id_bytes)?;
         self.authenticated_recv_count = self.authenticated_recv_count.wrapping_add(1);
+        // The peer is heard again after silence while data was in flight: the
+        // path was down (or came back by itself on the same address), which
+        // is not congestion. Without this the window that the outage's lost
+        // retransmits shrank to 2 packets climbs back slowly for tens of
+        // seconds; start over on this path instead, retransmitting at once.
+        let now = Instant::now();
+        let was_silent = self.last_authenticated_recv.is_some_and(|t| now.duration_since(t) >= OUTAGE_SILENCE);
+        self.last_authenticated_recv = Some(now);
+        if was_silent && self.in_flight_count() > 0 {
+            self.on_path_change();
+        }
         if self.highest_authenticated_recv_nonce < Some(nonce) {
             self.highest_authenticated_recv_nonce = Some(nonce);
         }
