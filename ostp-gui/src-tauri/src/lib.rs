@@ -10,80 +10,10 @@ use tauri::Emitter;
 
 // ── Config types ─────────────────────────────────────────────────────────────
 
-#[derive(Debug, Deserialize, Serialize, Clone)]
-#[serde(tag = "mode", rename_all = "lowercase")]
-enum AppMode {
-    Server(serde_json::Value),
-    Client(ClientConfigRaw),
-}
-
-#[derive(Debug, Deserialize, Serialize, Clone)]
-struct UnifiedConfig {
-    #[serde(flatten)]
-    mode: AppMode,
-    log_level: Option<String>,
-}
-
-#[derive(Debug, Deserialize, Serialize, Clone)]
-struct ClientConfigRaw {
-    server: String,
-    access_key: String,
-    socks5_bind: Option<String>,
-    tun: Option<TunConfig>,
-    transport: Option<TransportConfigRaw>,
-    debug: Option<bool>,
-    exclude: Option<ExcludeConfig>,
-    mux: Option<MuxConfig>,
-    gui: Option<GuiConfig>,
-}
-
-#[derive(Debug, Deserialize, Serialize, Clone)]
-struct GuiConfig {
-    autoconnect: Option<bool>,
-    launch_startup: Option<bool>,
-}
-
-#[derive(Debug, Deserialize, Serialize, Clone)]
-struct TunConfig {
-    enable: bool,
-    wintun_path: Option<String>,
-    ipv4_address: Option<String>,
-    dns: Option<String>,
-    stack: Option<String>,
-    kill_switch: Option<bool>,
-}
-
-
-#[derive(Debug, Deserialize, Serialize, Clone)]
-struct TransportConfigRaw {
-    mode: Option<String>,
-    tcp_fragmentation: Option<bool>,
-    frag_chunk: Option<usize>,
-    frag_sleep: Option<u64>,
-    junk_pc: Option<[usize; 2]>,
-    junk_ps: Option<[usize; 2]>,
-    ttl_desync: Option<bool>,
-    ttl_desync_ttl: Option<u8>,
-    ttl_desync_count: Option<u8>,
-    ttl_desync_auto: Option<bool>,
-    tls: Option<bool>,
-    tls_sni: Option<String>,
-    tls_insecure: Option<bool>,
-    ws_path: Option<String>,
-}
-
-#[derive(Debug, Deserialize, Serialize, Clone)]
-struct ExcludeConfig {
-    domains: Option<Vec<String>>,
-    ips: Option<Vec<String>>,
-    processes: Option<Vec<String>>,
-}
-
-#[derive(Debug, Deserialize, Serialize, Clone)]
-struct MuxConfig {
-    enabled: Option<bool>,
-    sessions: Option<usize>,
-}
+// The GUI reads the file the CLI reads, through the ostp-client structs, and turns
+// it into the runtime config with the same `ClientFileConfig::to_runtime`. It only
+// parses: config.json is written by the front end, so no field can be dropped here.
+use ostp_client::config::{AppMode, ClientFileConfig, UnifiedConfig};
 
 #[derive(Serialize)]
 struct UIMetrics {
@@ -220,56 +150,6 @@ fn is_dir_writable(dir: &std::path::Path) -> bool {
             true
         }
         Err(_) => false,
-    }
-}
-
-fn map_to_client_config(raw: &ClientConfigRaw, mode: &str) -> ostp_client::config::ClientConfig {
-    ostp_client::config::ClientConfig {
-        mode: mode.to_string(),
-        debug: raw.debug.unwrap_or(false),
-        ostp: ostp_client::config::OstpConfig {
-            server_addr: raw.server.clone(),
-            local_bind_addr: "0.0.0.0:0".to_string(),
-            access_key: raw.access_key.clone(),
-            handshake_timeout_ms: 5000,
-            io_timeout_ms: 5000,
-            mtu: 1350,
-            keepalive_interval_sec: 5,
-        },
-        local_proxy: ostp_client::config::LocalProxyConfig {
-            bind_addr: raw.socks5_bind.clone().unwrap_or_else(|| "127.0.0.1:1088".to_string()),
-            connect_timeout_ms: 5000,
-        },
-
-        transport: ostp_client::config::TransportConfig {
-            mode: raw.transport.as_ref().and_then(|t| t.mode.clone()).unwrap_or_else(|| "udp".to_string()),
-            tcp_fragmentation: raw.transport.as_ref().and_then(|t| t.tcp_fragmentation).unwrap_or(false),
-            frag_chunk: raw.transport.as_ref().and_then(|t| t.frag_chunk).unwrap_or(2),
-            frag_sleep: raw.transport.as_ref().and_then(|t| t.frag_sleep).unwrap_or(2),
-            junk_pc: raw.transport.as_ref().and_then(|t| t.junk_pc).unwrap_or([2, 5]),
-            junk_ps: raw.transport.as_ref().and_then(|t| t.junk_ps).unwrap_or([100, 1000]),
-            ttl_desync: raw.transport.as_ref().and_then(|t| t.ttl_desync).unwrap_or(false),
-            ttl_desync_ttl: raw.transport.as_ref().and_then(|t| t.ttl_desync_ttl).unwrap_or(8),
-            ttl_desync_count: raw.transport.as_ref().and_then(|t| t.ttl_desync_count).unwrap_or(2),
-            ttl_desync_auto: raw.transport.as_ref().and_then(|t| t.ttl_desync_auto).unwrap_or(true),
-            tls: raw.transport.as_ref().and_then(|t| t.tls).unwrap_or(false),
-            tls_sni: raw.transport.as_ref().and_then(|t| t.tls_sni.clone()).filter(|s| !s.is_empty()),
-            tls_insecure: raw.transport.as_ref().and_then(|t| t.tls_insecure).unwrap_or(false),
-            ws_path: raw.transport.as_ref().and_then(|t| t.ws_path.clone()).filter(|s| !s.is_empty()),
-        },
-        exclusions: ostp_client::config::ExclusionConfig {
-            domains: raw.exclude.as_ref().and_then(|e| e.domains.clone()).unwrap_or_default(),
-            ips: raw.exclude.as_ref().and_then(|e| e.ips.clone()).unwrap_or_default(),
-            processes: raw.exclude.as_ref().and_then(|e| e.processes.clone()).unwrap_or_default(),
-        },
-        multiplex: ostp_client::config::MultiplexConfig {
-            enabled: raw.mux.as_ref().and_then(|m| m.enabled).unwrap_or(false),
-            sessions: raw.mux.as_ref().and_then(|m| m.sessions).unwrap_or(1),
-        },
-        dns_server: raw.tun.as_ref().and_then(|t| t.dns.clone()),
-        tun_stack: raw.tun.as_ref().and_then(|t| t.stack.clone()).unwrap_or_else(|| "system".to_string()),
-        kill_switch: raw.tun.as_ref().and_then(|t| t.kill_switch).unwrap_or(false),
-        gui: raw.gui.as_ref().map(|g| serde_json::to_value(g).unwrap()),
     }
 }
 
@@ -606,10 +486,9 @@ async fn reload_tunnel(state: tauri::State<'_, AppState>) -> Result<bool, String
         .map_err(|e| format!("Parse config error: {}", e))?;
     let client_cfg = match unified.mode {
         AppMode::Client(c) => c,
-        AppMode::Server(_) => return Err("GUI only supports Client mode.".into()),
+        _ => return Err("GUI only supports Client mode.".into()),
     };
-    let mode_str = if client_cfg.tun.as_ref().map(|t| t.enable).unwrap_or(false) { "tun" } else { "proxy" };
-    let core_cfg = map_to_client_config(&client_cfg, mode_str);
+    let core_cfg = client_cfg.to_runtime();
     let config_str = serde_json::to_string(&core_cfg).unwrap();
 
     match &guard.tunnel {
@@ -984,7 +863,7 @@ async fn start_tunnel(state: tauri::State<'_, AppState>, app: tauri::AppHandle) 
 
     let client_cfg = match unified.mode {
         AppMode::Client(c) => c,
-        AppMode::Server(_) => return Err("GUI only supports Client mode.".into()),
+        _ => return Err("GUI only supports Client mode.".into()),
     };
 
     let is_tun_enabled = client_cfg.tun.as_ref().map(|t| t.enable).unwrap_or(false);
@@ -1027,10 +906,10 @@ async fn start_tunnel(state: tauri::State<'_, AppState>, app: tauri::AppHandle) 
 
 async fn start_proxy_in_process(
     guard: &mut AppStateInner,
-    raw: &ClientConfigRaw,
+    raw: &ClientFileConfig,
     app: tauri::AppHandle,
 ) -> Result<bool, String> {
-    let mapped = map_to_client_config(raw, "proxy");
+    let mapped = raw.to_runtime();
     let metrics = Arc::new(BridgeMetrics {
         bytes_sent: portable_atomic::AtomicU64::new(0),
         bytes_recv: portable_atomic::AtomicU64::new(0),
@@ -1071,7 +950,7 @@ async fn start_proxy_in_process(
 
 async fn start_tun_via_helper(
     guard: &mut AppStateInner,
-    raw: &ClientConfigRaw,
+    raw: &ClientFileConfig,
     app: tauri::AppHandle,
 ) -> Result<bool, String> {
     // TUN goes through a privileged helper. Elevation is implemented for
@@ -1100,7 +979,7 @@ async fn start_tun_via_helper(
      .map_err(|e| e.to_string())?;
 
     // Send the correctly MAPPED config
-    let mapped = map_to_client_config(raw, "tun");
+    let mapped = raw.to_runtime();
     let start_cmd = serde_json::json!({
         "cmd": "start",
         "config": serde_json::to_string(&mapped).unwrap_or_default(),

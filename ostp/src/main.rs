@@ -238,6 +238,7 @@ fn parse_ostp_link(link: &str) -> Result<ClientConfig> {
             wintun_path: Some("./wintun.dll".to_string()),
             ipv4_address: Some("10.1.0.2/24".to_string()),
             dns: l.dns.clone(),
+            stack: None,
             kill_switch: Some(false),
         }),
 
@@ -2124,37 +2125,9 @@ async fn run_client_directly(client_cfg: ClientConfig) -> Result<()> {
         ensure_elevated_for_tun()?;
     }
 
-    let client_conf = ostp_client::config::ClientConfig {
-        mode: if is_tun_enabled { "tun".to_string() } else { "proxy".to_string() },
-        tun_stack: "native".to_string(),
-        debug: client_cfg.debug.unwrap_or(false),
-        ostp: ostp_client::config::OstpConfig {
-            server_addr: client_cfg.server.clone(),
-            local_bind_addr: "0.0.0.0:0".to_string(),
-            access_key: client_cfg.access_key.clone(),
-            handshake_timeout_ms: 5000,
-            io_timeout_ms: 2500,
-            mtu: client_cfg.mtu.unwrap_or(1350),
-            keepalive_interval_sec: 5,
-        },
-        local_proxy: ostp_client::config::LocalProxyConfig {
-            bind_addr: client_cfg.socks5_bind.clone().unwrap_or_else(|| "127.0.0.1:1088".to_string()),
-            connect_timeout_ms: 5000,
-        },
-        exclusions: ostp_client::config::ExclusionConfig {
-            domains: client_cfg.exclude.as_ref().and_then(|e| e.domains.clone()).unwrap_or_default(),
-            ips: client_cfg.exclude.as_ref().and_then(|e| e.ips.clone()).unwrap_or_default(),
-            processes: client_cfg.exclude.as_ref().and_then(|e| e.processes.clone()).unwrap_or_default(),
-        },
-        multiplex: ostp_client::config::MultiplexConfig {
-            enabled: client_cfg.mux.as_ref().and_then(|m| m.enabled).unwrap_or(false),
-            sessions: client_cfg.mux.as_ref().and_then(|m| m.sessions).unwrap_or(1),
-        },
-        transport: client_cfg.transport.clone().unwrap_or_default().to_runtime(),
-        dns_server: client_cfg.tun.as_ref().and_then(|t| t.dns.clone()),
-        kill_switch: client_cfg.tun.as_ref().and_then(|t| t.kill_switch).unwrap_or(false),
-        gui: None,
-    };
+    // One conversion for every front end; the CLI has no GUI section to pass on.
+    let mut client_conf = client_cfg.to_runtime();
+    client_conf.gui = None;
 
     ostp_client::runner::run_client(client_conf).await?;
     Ok(())

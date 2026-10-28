@@ -202,62 +202,10 @@ impl Default for MultiplexConfig {
     }
 }
 
-/// `config.json` as the client reads it on hot reload (`BridgeCommand::ReloadConfig`).
-#[derive(Debug, Deserialize)]
-struct RawUnifiedConfig {
-    debug: Option<bool>,
-    server: Option<String>,
-    access_key: Option<String>,
-    mtu: Option<usize>,
-    socks5_bind: Option<String>,
-    tun: Option<RawTunSection>,
-    exclude: Option<RawExcludeSection>,
-    mux: Option<RawMuxSection>,
-    transport: Option<RawTransportSection>,
-    gui: Option<serde_json::Value>,
-}
-
-#[derive(Debug, Deserialize)]
-struct RawTransportSection {
-    mode: Option<String>,
-    tcp_fragmentation: Option<bool>,
-    frag_chunk: Option<usize>,
-    frag_sleep: Option<u64>,
-    junk_pc: Option<[usize; 2]>,
-    junk_ps: Option<[usize; 2]>,
-    ttl_desync: Option<bool>,
-    ttl_desync_ttl: Option<u8>,
-    ttl_desync_count: Option<u8>,
-    ttl_desync_auto: Option<bool>,
-    tls: Option<bool>,
-    tls_sni: Option<String>,
-    tls_insecure: Option<bool>,
-    ws_path: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct RawTunSection {
-    enable: Option<bool>,
-    dns: Option<String>,
-    stack: Option<String>,
-    kill_switch: Option<bool>,
-}
-
-#[derive(Debug, Deserialize)]
-struct RawExcludeSection {
-    domains: Option<Vec<String>>,
-    ips: Option<Vec<String>>,
-    processes: Option<Vec<String>>,
-}
-
-#[derive(Debug, Deserialize)]
-struct RawMuxSection {
-    enabled: Option<bool>,
-    sessions: Option<usize>,
-}
-
 impl ClientConfig {
-    /// Reads `config.json` next to the running binary.
+    /// Reads `config.json` next to the running binary (hot reload). Goes through the
+    /// same `ClientFileConfig::to_runtime` as the CLI and the GUI, so a reload cannot
+    /// disagree with a fresh start about any default.
     pub fn reload_from_json_near_binary() -> Result<Self> {
         let exe = std::env::current_exe().context("cannot resolve binary path")?;
         let dir = exe.parent().context("cannot resolve binary directory")?;
@@ -266,70 +214,54 @@ impl ClientConfig {
         let raw = std::fs::read_to_string(&path)
             .with_context(|| format!("failed to read {}", path.display()))?;
         let mut stripped = json_comments::StripComments::new(raw.as_bytes());
-        let raw: RawUnifiedConfig = serde_json::from_reader(&mut stripped)
+        let unified: UnifiedConfig = serde_json::from_reader(&mut stripped)
             .with_context(|| format!("failed to parse {}", path.display()))?;
+        match unified.mode {
+            AppMode::Client(client) => Ok(client.to_runtime()),
+            _ => anyhow::bail!("{} is not a client config", path.display()),
+        }
+    }
+}
 
-        let is_tun = raw.tun.as_ref().and_then(|t| t.enable).unwrap_or(false);
-        let server = raw.server.unwrap_or_else(|| "127.0.0.1:50000".to_string());
-        let key = raw.access_key.unwrap_or_default();
-        let mtu = raw.mtu.unwrap_or(default_mtu());
-        let socks5 = raw.socks5_bind.unwrap_or_else(|| "127.0.0.1:1088".to_string());
-        let exclusions = raw.exclude.unwrap_or(RawExcludeSection {
-            domains: None,
-            ips: None,
-            processes: None,
-        });
-        let mux = raw.mux.unwrap_or(RawMuxSection {
-            enabled: None,
-            sessions: None,
-        });
-
-        Ok(ClientConfig {
-            mode: if is_tun { "tun".to_string() } else { "proxy".to_string() },
-            debug: raw.debug.unwrap_or(false),
-            ostp: OstpConfig {
-                server_addr: server,
-                local_bind_addr: "0.0.0.0:0".to_string(),
-                access_key: key,
-                handshake_timeout_ms: 5000,
-                io_timeout_ms: 2500,
-                mtu,
-                keepalive_interval_sec: default_keepalive(),
-            },
-            local_proxy: LocalProxyConfig {
-                bind_addr: socks5,
-                connect_timeout_ms: 15000,
-            },
-            transport: TransportConfig {
-                mode: raw.transport.as_ref().and_then(|t| t.mode.clone()).unwrap_or_else(default_transport_mode),
-                tcp_fragmentation: raw.transport.as_ref().and_then(|t| t.tcp_fragmentation).unwrap_or(false),
-                frag_chunk: raw.transport.as_ref().and_then(|t| t.frag_chunk).unwrap_or_else(default_frag_chunk),
-                frag_sleep: raw.transport.as_ref().and_then(|t| t.frag_sleep).unwrap_or_else(default_frag_sleep),
-                junk_pc: raw.transport.as_ref().and_then(|t| t.junk_pc).unwrap_or_else(default_junk_count),
-                junk_ps: raw.transport.as_ref().and_then(|t| t.junk_ps).unwrap_or_else(default_junk_size),
-                ttl_desync: raw.transport.as_ref().and_then(|t| t.ttl_desync).unwrap_or(false),
-                ttl_desync_ttl: raw.transport.as_ref().and_then(|t| t.ttl_desync_ttl).unwrap_or_else(default_ttl_desync_ttl),
-                ttl_desync_count: raw.transport.as_ref().and_then(|t| t.ttl_desync_count).unwrap_or_else(default_ttl_desync_count),
-                ttl_desync_auto: raw.transport.as_ref().and_then(|t| t.ttl_desync_auto).unwrap_or(true),
-                tls: raw.transport.as_ref().and_then(|t| t.tls).unwrap_or(false),
-                tls_sni: raw.transport.as_ref().and_then(|t| t.tls_sni.clone()).filter(|s| !s.is_empty()),
-                tls_insecure: raw.transport.as_ref().and_then(|t| t.tls_insecure).unwrap_or(false),
-                ws_path: raw.transport.as_ref().and_then(|t| t.ws_path.clone()).filter(|s| !s.is_empty()),
-            },
+impl ClientFileConfig {
+    /// The one place the file's client section becomes the runtime config, and so the
+    /// one set of defaults: CLI, GUI and hot reload all call it and override only what
+    /// they deliberately set.
+    pub fn to_runtime(&self) -> ClientConfig {
+        let tun = self.tun.as_ref();
+        let ostp = OstpConfig {
+            server_addr: self.server.clone(),
+            access_key: self.access_key.clone(),
+            mtu: self.mtu.unwrap_or_else(default_mtu),
+            ..OstpConfig::default()
+        };
+        let local_proxy = LocalProxyConfig {
+            bind_addr: self.socks5_bind.clone().unwrap_or_else(|| LocalProxyConfig::default().bind_addr),
+            ..LocalProxyConfig::default()
+        };
+        ClientConfig {
+            mode: if tun.map_or(false, |t| t.enable) { "tun" } else { "proxy" }.to_string(),
+            debug: self.debug.unwrap_or(false),
+            ostp,
+            local_proxy,
+            transport: self.transport.clone().unwrap_or_default().to_runtime(),
             exclusions: ExclusionConfig {
-                domains: exclusions.domains.unwrap_or_default(),
-                ips: exclusions.ips.unwrap_or_default(),
-                processes: exclusions.processes.unwrap_or_default(),
+                domains: self.exclude.as_ref().and_then(|e| e.domains.clone()).unwrap_or_default(),
+                ips: self.exclude.as_ref().and_then(|e| e.ips.clone()).unwrap_or_default(),
+                processes: self.exclude.as_ref().and_then(|e| e.processes.clone()).unwrap_or_default(),
             },
             multiplex: MultiplexConfig {
-                enabled: mux.enabled.unwrap_or(false),
-                sessions: mux.sessions.unwrap_or(1),
+                enabled: self.mux.as_ref().and_then(|m| m.enabled).unwrap_or(false),
+                sessions: self.mux.as_ref().and_then(|m| m.sessions).unwrap_or(1),
             },
-            dns_server: raw.tun.as_ref().and_then(|t| t.dns.clone()),
-            tun_stack: raw.tun.as_ref().and_then(|t| t.stack.clone()).unwrap_or_else(|| "system".to_string()),
-            kill_switch: raw.tun.as_ref().and_then(|t| t.kill_switch).unwrap_or(false),
-            gui: raw.gui,
-        })
+            dns_server: tun.and_then(|t| t.dns.clone()),
+            tun_stack: tun
+                .and_then(|t| t.stack.clone())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(default_tun_stack),
+            kill_switch: tun.and_then(|t| t.kill_switch).unwrap_or(false),
+            gui: self.gui.clone(),
+        }
     }
 }
 
@@ -775,6 +707,9 @@ pub struct TunConfig {
     pub wintun_path: Option<String>,
     pub ipv4_address: Option<String>,
     pub dns: Option<String>,
+    /// TUN packet stack; "system" when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stack: Option<String>,
     pub kill_switch: Option<bool>,
 }
 
@@ -902,6 +837,55 @@ mod tests {
             "debug": false
         }"#;
         load(json).expect("a stale api_url must be tolerated, not rejected");
+    }
+
+    fn client_file(json: &str) -> ClientFileConfig {
+        match serde_json::from_str::<UnifiedConfig>(json).expect("parses").mode {
+            AppMode::Client(c) => c,
+            _ => panic!("not a client config"),
+        }
+    }
+
+    /// Every front end gets these defaults from the single conversion.
+    #[test]
+    fn client_to_runtime_defaults() {
+        let rt = client_file(r#"{"mode":"client","server":"example.org:443","access_key":"k"}"#).to_runtime();
+        assert_eq!(rt.mode, "proxy");
+        assert_eq!(rt.ostp.server_addr, "example.org:443");
+        assert_eq!(rt.ostp.mtu, 1140);
+        assert_eq!(rt.ostp.io_timeout_ms, 2500);
+        assert_eq!(rt.ostp.handshake_timeout_ms, 5000);
+        assert_eq!(rt.local_proxy.connect_timeout_ms, 15000);
+        assert_eq!(rt.local_proxy.bind_addr, "127.0.0.1:1088");
+        assert_eq!(rt.tun_stack, "system");
+        assert!(!rt.kill_switch && !rt.multiplex.enabled);
+        assert_eq!(rt.multiplex.sessions, 1);
+        assert_eq!(rt.transport.mode, "udp");
+    }
+
+    /// The file's own values win over the defaults, including `mtu` and `tun.stack`.
+    #[test]
+    fn client_to_runtime_honours_file_values() {
+        let rt = client_file(
+            r#"{"mode":"client","server":"s:1","access_key":"k","mtu":1280,"socks5_bind":"127.0.0.1:9",
+                "tun":{"enable":true,"dns":"1.1.1.1","stack":"gvisor","kill_switch":true},
+                "mux":{"enabled":true,"sessions":3},
+                "exclude":{"domains":["a.b"]},
+                "transport":{"mode":"uot","tls":true,"tls_sni":""}}"#,
+        )
+        .to_runtime();
+        assert_eq!(rt.mode, "tun");
+        assert_eq!(rt.ostp.mtu, 1280);
+        assert_eq!(rt.local_proxy.bind_addr, "127.0.0.1:9");
+        assert_eq!(rt.tun_stack, "gvisor");
+        assert_eq!(rt.dns_server.as_deref(), Some("1.1.1.1"));
+        assert!(rt.kill_switch);
+        assert!(rt.multiplex.enabled);
+        assert_eq!(rt.multiplex.sessions, 3);
+        assert_eq!(rt.exclusions.domains, vec!["a.b".to_string()]);
+        assert_eq!(rt.transport.mode, "uot");
+        assert!(rt.transport.tls);
+        assert_eq!(rt.transport.tls_sni, None, "an empty SNI means unset");
     }
 
     /// The minimal client and server shapes the template emits must also load,
