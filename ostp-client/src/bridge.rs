@@ -265,6 +265,10 @@ pub struct Bridge {
     last_sample_at: Instant,
 
     last_inbound_error_log: Option<Instant>,
+    /// New sessions from a handshake that got through during an outage, held
+    /// while the kept session is moved: if it answers they are closed and no
+    /// app connection is lost, otherwise they replace it.
+    standby: Option<Established>,
 
     link: Link,
     sessions: Vec<SessionState>,
@@ -319,6 +323,7 @@ impl Bridge {
             last_sample_at: Instant::now(),
 
             last_inbound_error_log: None,
+            standby: None,
 
             link: Link::Idle,
             sessions: Vec::new(),
@@ -641,6 +646,7 @@ impl Bridge {
             }
         }
         self.sessions.clear();
+        self.standby = None;
         self.udp_rx = None;
         self.stream_map.clear();
         self.proxy_guard = None;
@@ -679,6 +685,15 @@ impl Bridge {
             }
             Link::Moving { started, outage } => {
                 if self.sessions.iter().all(|s| s.last_recv >= started) {
+                    if let Some(mut standby) = self.standby.take() {
+                        // Not needed after all: free them on the server now
+                        // rather than at its idle timeout.
+                        for session in standby.sessions.iter_mut() {
+                            if let Ok(ProtocolAction::SendDatagram(frame)) = session.machine.on_event(OstpEvent::Close) {
+                                let _ = send_datagram(&session.socket, &frame, false).await;
+                            }
+                        }
+                    }
                     self.link = Link::Up;
                     self.metrics.connection_state.store(2, Ordering::Relaxed);
                     let msg = match outage {
@@ -702,6 +717,10 @@ impl Bridge {
                     // "session expired" and "path blocked" look the same here.
                     // A full handshake tells them apart: it gets through only
                     // when the server is reachable.
+                    if let Some(standby) = self.standby.take() {
+                        self.install_sessions(standby, tx, proxy_tx, None).await;
+                        return;
+                    }
                     if let Some((since, attempt)) = outage {
                         self.link = Link::Down { since, attempt, next_try: Instant::now(), handshake_next: true };
                         return;
@@ -798,6 +817,7 @@ impl Bridge {
         tx: &mpsc::Sender<UiEvent>,
         proxy_tx: &mpsc::UnboundedSender<(u16, ProxyToClientMsg)>,
     ) {
+        self.standby = None;
         if self.sessions.is_empty() {
             return;
         }
@@ -871,7 +891,14 @@ impl Bridge {
             }
             Err(Interrupt::Command(cmd)) => self.handle_bridge_cmd(cmd, bridge_rx, tx, proxy_tx).await,
             Ok(Ok(established)) => {
-                self.install_sessions(established, tx, proxy_tx, proxy_rx).await;
+                // The server answers again. The kept session may still be
+                // alive there: moving it keeps every app connection.
+                if !self.sessions.is_empty() && self.start_migration(tx).await.is_ok() {
+                    self.standby = Some(established);
+                    self.link = Link::Moving { started: Instant::now(), outage: Some((since, attempt)) };
+                    return true;
+                }
+                self.install_sessions(established, tx, proxy_tx, Some(proxy_rx)).await;
                 true
             }
             Ok(Err(err)) => {
@@ -940,8 +967,9 @@ impl Bridge {
         established: Established,
         tx: &mpsc::Sender<UiEvent>,
         proxy_tx: &mpsc::UnboundedSender<(u16, ProxyToClientMsg)>,
-        proxy_rx: &mut mpsc::Receiver<ProxyEvent>,
+        proxy_rx: Option<&mut mpsc::Receiver<ProxyEvent>>,
     ) {
+        self.standby = None;
         self.sessions = established.sessions;
         self.udp_rx = Some(established.udp_rx);
         self.last_rtt_ms = established.rtt_ms;
@@ -953,9 +981,11 @@ impl Bridge {
             // Streams of the lost session are gone, and so are the requests
             // queued for it while the attempt blocked the loop.
             self.reset_proxy_streams(tx, proxy_tx, "reconnect");
-            while let Ok(stale) = proxy_rx.try_recv() {
-                if let ProxyEvent::NewStream { stream_id, .. } = stale {
-                    let _ = proxy_tx.send((stream_id, ProxyToClientMsg::Error("connection reset".into())));
+            if let Some(proxy_rx) = proxy_rx {
+                while let Ok(stale) = proxy_rx.try_recv() {
+                    if let ProxyEvent::NewStream { stream_id, .. } = stale {
+                        let _ = proxy_tx.send((stream_id, ProxyToClientMsg::Error("connection reset".into())));
+                    }
                 }
             }
         }
