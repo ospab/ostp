@@ -126,32 +126,17 @@ fn build_probe_handshake(
     mtu: usize,
 ) -> Vec<u8> {
     let session_id: u32 = rand::random();
-    let timestamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    let mut handshake_payload = Vec::with_capacity(8 + 4 + access_key.len());
-    handshake_payload.extend_from_slice(&timestamp.to_be_bytes());
-    handshake_payload.extend_from_slice(&session_id.to_be_bytes());
-    handshake_payload.extend_from_slice(access_key);
+    let handshake_payload = ostp_core::build_handshake_payload(access_key, session_id);
 
     let mut machine = match ProtocolMachine::new(ProtocolConfig {
-        role: NoiseRole::Initiator,
         psk: secrets.psk,
         session_id,
         handshake_payload,
         padding_strategy: PaddingStrategy::Profile(profile),
         obfuscation_key: secrets.obfuscation_key,
-        max_reorder: 16384,
-        max_reorder_buffer: 8192,
-        ack_delay_ms: 5,
-        rto_ms: 100,
-        max_retries: 8,
-        max_sent_history: 32768,
         handshake_pad_min: secrets.handshake_pad_min,
         handshake_pad_max: secrets.handshake_pad_max,
-        mtu,
-        max_padding: mtu.saturating_sub(48).max(256),
+        ..ProtocolConfig::with_defaults(NoiseRole::Initiator, mtu)
     }) {
         Ok(m) => m,
         Err(_) => return Vec::new(),
@@ -1119,15 +1104,7 @@ impl Bridge {
         tx: &mpsc::Sender<UiEvent>,
         session_id: u32,
     ) -> Result<(crate::transport::Transport, ProtocolMachine, f64)> {
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-
-        let mut handshake_payload = Vec::with_capacity(8 + 4 + self.access_key.len());
-        handshake_payload.extend_from_slice(&timestamp.to_be_bytes());
-        handshake_payload.extend_from_slice(&session_id.to_be_bytes());
-        handshake_payload.extend_from_slice(&self.access_key);
+        let handshake_payload = ostp_core::build_handshake_payload(&self.access_key, session_id);
 
         let secrets = ostp_core::crypto::derive_all_secrets(&self.access_key);
 
@@ -1182,22 +1159,14 @@ impl Bridge {
             };
 
             let mut machine = ProtocolMachine::new(ProtocolConfig {
-                role: NoiseRole::Initiator,
                 psk: secrets.psk,
                 session_id,
                 handshake_payload: handshake_payload.clone(),
                 padding_strategy: PaddingStrategy::Profile(self.profile),
                 obfuscation_key: secrets.obfuscation_key,
-                max_reorder: 16384,
-                max_reorder_buffer: 8192,
-                ack_delay_ms: 5,
-                rto_ms: 100,
-                max_retries: 8,
-                max_sent_history: 32768,
                 handshake_pad_min: secrets.handshake_pad_min,
                 handshake_pad_max: secrets.handshake_pad_max,
-                mtu: self.mtu,
-                max_padding: self.mtu.saturating_sub(48).max(256),
+                ..ProtocolConfig::with_defaults(NoiseRole::Initiator, self.mtu)
             })?;
             // UoT and TLS ride TCP: no timer-driven resends (TCP over TCP).
             machine.set_reliable_carrier(self.transport_mode != "udp");

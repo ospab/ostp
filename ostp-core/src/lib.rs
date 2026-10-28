@@ -10,4 +10,4 @@ pub mod subscription;
 
 pub use crypto::NoiseRole;
 pub use framing::{TrafficProfile, PaddingStrategy};
-pub use protocol::{OstpEvent, OstpState, ProtocolAction, ProtocolConfig, ProtocolMachine};
+pub use protocol::{build_handshake_payload, OstpEvent, OstpState, ProtocolAction, ProtocolConfig, ProtocolMachine};

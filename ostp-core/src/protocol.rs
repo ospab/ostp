@@ -49,6 +49,47 @@ pub struct ProtocolConfig {
     pub mtu: usize,
 }
 
+impl ProtocolConfig {
+    /// The ARQ and padding parameters every OSTP endpoint uses. Keys, session id,
+    /// payload and padding strategy are placeholders for the caller to override
+    /// (`..ProtocolConfig::with_defaults(role, mtu)`). One copy, because both
+    /// ends must agree on RTO and retry counts.
+    pub fn with_defaults(role: NoiseRole, mtu: usize) -> Self {
+        Self {
+            role,
+            psk: [0u8; 32],
+            session_id: 0,
+            handshake_payload: Vec::new(),
+            max_padding: mtu.saturating_sub(48).max(256),
+            padding_strategy: PaddingStrategy::Adaptive,
+            obfuscation_key: [0u8; 8],
+            max_reorder: 16384,
+            max_reorder_buffer: 8192,
+            ack_delay_ms: 5,
+            rto_ms: 100,
+            max_retries: 8,
+            max_sent_history: 32768,
+            handshake_pad_min: 32,
+            handshake_pad_max: 128,
+            mtu,
+        }
+    }
+}
+
+/// The client's handshake payload: `timestamp(8) | session_id(4) | access_key`,
+/// big-endian, timestamp in unix seconds.
+pub fn build_handshake_payload(access_key: &[u8], session_id: u32) -> Vec<u8> {
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let mut payload = Vec::with_capacity(8 + 4 + access_key.len());
+    payload.extend_from_slice(&timestamp.to_be_bytes());
+    payload.extend_from_slice(&session_id.to_be_bytes());
+    payload.extend_from_slice(access_key);
+    payload
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OstpState {
     Init,
@@ -1219,6 +1260,19 @@ fn nonce_in_ranges(nonce: u64, ranges: &[(u64, u64)]) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn defaults_and_handshake_payload_layout() {
+        let c = ProtocolConfig::with_defaults(NoiseRole::Initiator, 1350);
+        assert_eq!((c.rto_ms, c.max_retries, c.ack_delay_ms), (100, 8, 5));
+        assert_eq!((c.max_reorder, c.max_reorder_buffer, c.max_sent_history), (16384, 8192, 32768));
+        assert_eq!(c.max_padding, 1302);
+        assert_eq!(ProtocolConfig::with_defaults(NoiseRole::Initiator, 100).max_padding, 256);
+        let p = build_handshake_payload(b"key", 0x0102_0304);
+        assert_eq!(p.len(), 8 + 4 + 3);
+        assert_eq!(&p[8..12], &[1, 2, 3, 4]);
+        assert_eq!(&p[12..], b"key");
+    }
+
     use super::*;
 
     #[test]

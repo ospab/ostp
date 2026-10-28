@@ -15,6 +15,10 @@ use crate::{RemoteState, SessionBackpressure, UiEvent};
 /// per three datagrams plus a short fourth one; 64 KiB fills whole frames.
 const READ_BUF: usize = 64 * 1024;
 
+/// Datagrams from the client waiting to go out of one UDP-associate stream;
+/// past this they are dropped, as UDP may.
+const UDP_STREAM_QUEUE: usize = 256;
+
 fn clean_ipv6_mapped_v4(addr: std::net::SocketAddr) -> std::net::SocketAddr {
     match addr {
         std::net::SocketAddr::V6(v6) => {
@@ -39,7 +43,7 @@ pub async fn handle_relay_message(
     remotes: &mut HashMap<(u32, u16), RemoteState>,
     ui_event_tx: &mpsc::UnboundedSender<UiEvent>,
     stream_tx: mpsc::UnboundedSender<(u32, u16, Vec<u8>)>,
-    udp_reply_tx: mpsc::UnboundedSender<(u32, u16, String, Vec<u8>)>,
+    udp_reply_tx: mpsc::Sender<(u32, u16, String, Vec<u8>)>,
     connect_tx: mpsc::UnboundedSender<(u32, u16, String, Result<(tokio::net::tcp::OwnedWriteHalf, mpsc::Sender<()>), String>)>,
     router: std::sync::Arc<crate::router::Router>,
     tcp_map: &std::sync::Arc<tokio::sync::RwLock<HashMap<std::net::SocketAddr, tokio::sync::mpsc::Sender<Bytes>>>>,
@@ -199,7 +203,7 @@ pub async fn handle_relay_message(
                 }
             };
             
-            let (udp_tx, mut udp_rx) = mpsc::unbounded_channel::<(String, Bytes)>();
+            let (udp_tx, mut udp_rx) = mpsc::channel::<(String, Bytes)>(UDP_STREAM_QUEUE);
             let (cancel_tx, mut cancel_rx) = mpsc::channel::<()>(1);
             let (dummy_data_tx, _) = mpsc::unbounded_channel::<Bytes>();
 
@@ -237,12 +241,12 @@ pub async fn handle_relay_message(
                             _ = cancel_rx.recv() => break,
                             res = rx_sock.recv_from(&mut direct_buf) => {
                                 if let Ok((len, addr)) = res {
-                                    let _ = udp_reply_clone.send((session_id, stream_id, clean_ipv6_mapped_v4(addr).to_string(), direct_buf[..len].to_vec()));
+                                    let _ = udp_reply_clone.try_send((session_id, stream_id, clean_ipv6_mapped_v4(addr).to_string(), direct_buf[..len].to_vec()));
                                 } else { break; }
                             }
                             res = p.recv_from(&mut proxy_buf) => {
                                 if let Ok((len, target_str)) = res {
-                                    let _ = udp_reply_clone.send((session_id, stream_id, target_str, proxy_buf[..len].to_vec()));
+                                    let _ = udp_reply_clone.try_send((session_id, stream_id, target_str, proxy_buf[..len].to_vec()));
                                 }
                             }
                         }
@@ -251,7 +255,7 @@ pub async fn handle_relay_message(
                             _ = cancel_rx.recv() => break,
                             res = rx_sock.recv_from(&mut direct_buf) => {
                                 if let Ok((len, addr)) = res {
-                                    let _ = udp_reply_clone.send((session_id, stream_id, clean_ipv6_mapped_v4(addr).to_string(), direct_buf[..len].to_vec()));
+                                    let _ = udp_reply_clone.try_send((session_id, stream_id, clean_ipv6_mapped_v4(addr).to_string(), direct_buf[..len].to_vec()));
                                 } else { break; }
                             }
                         }
@@ -277,7 +281,7 @@ pub async fn handle_relay_message(
                     // `.ov` is answered here whatever the DNS settings: a fake
                     // address for the overnet gateway, never a public resolver.
                     if let Some(response) = router.overnet().answer_dns(&data) {
-                        let _ = udp_reply_tx.send((session_id, stream_id, target, response));
+                        let _ = udp_reply_tx.try_send((session_id, stream_id, target, response));
                         return Ok(());
                     }
                     let should_intercept = router.dns_server.intercepts();
@@ -294,7 +298,7 @@ pub async fn handle_relay_message(
                         tokio::spawn(async move {
                             match router.route_dns(client_ip, &data).await {
                                 Some(response) => {
-                                    let _ = udp_reply_tx.send((session_id, stream_id, target, response));
+                                    let _ = udp_reply_tx.try_send((session_id, stream_id, target, response));
                                 }
                                 None => {
                                     // route_dns вернул None — значит DoH упал и enabled=true
@@ -330,7 +334,7 @@ pub async fn handle_relay_message(
                 }
 
                 if let Some(ref udp_tx) = remote.udp_tx {
-                    let _ = udp_tx.send((target, Bytes::from(data)));
+                    let _ = udp_tx.try_send((target, Bytes::from(data)));
                 }
             } else {
                 let _ = ui_event_tx.send(UiEvent::Log(format!("Relay UDP DATA for unknown stream [{session_id}:{stream_id}]")));

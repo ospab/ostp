@@ -813,29 +813,15 @@ fn track_user_bytes_down(
 #[cfg(test)]
 mod roaming_tests {
     use super::*;
-    use ostp_core::{NoiseRole, PaddingStrategy};
+    use ostp_core::{NoiseRole};
 
     const KEY: &str = "roaming-test-key";
     const SID: u32 = 0x1234_5678;
 
     fn base_config(role: NoiseRole) -> ProtocolConfig {
         ProtocolConfig {
-            role,
-            psk: [0u8; 32],
-            session_id: 0,
-            handshake_payload: vec![],
             max_padding: 256,
-            padding_strategy: PaddingStrategy::Adaptive,
-            obfuscation_key: [0u8; 8],
-            max_reorder: 16384,
-            max_reorder_buffer: 8192,
-            ack_delay_ms: 5,
-            rto_ms: 100,
-            max_retries: 8,
-            max_sent_history: 32768,
-            handshake_pad_min: 32,
-            handshake_pad_max: 128,
-            mtu: 1350,
+            ..ProtocolConfig::with_defaults(role, 1350)
         }
     }
 

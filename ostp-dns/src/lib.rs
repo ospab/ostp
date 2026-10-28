@@ -159,12 +159,50 @@ struct CacheEntry {
     ttl: u32,
 }
 
+/// Answer cache evicting the oldest entry first. The insertion-order queue
+/// makes a miss on a full cache O(1) amortized; scanning the whole map for
+/// expired entries on every miss, under the mutex, was O(cache size).
+#[derive(Default)]
+struct Cache {
+    map: HashMap<(String, u16), CacheEntry>,
+    /// Keys in insertion order with the time they were stored. An entry whose
+    /// key was since replaced (different `stored`) is stale and skipped.
+    order: VecDeque<((String, u16), Instant)>,
+}
+
+impl Cache {
+    fn get(&self, key: &(String, u16)) -> Option<&CacheEntry> {
+        self.map.get(key)
+    }
+
+    fn clear(&mut self) {
+        self.map.clear();
+        self.order.clear();
+    }
+
+    fn insert(&mut self, key: (String, u16), entry: CacheEntry, capacity: usize) {
+        while self.map.len() >= capacity && !self.map.contains_key(&key) {
+            let Some((old, stored)) = self.order.pop_front() else { break };
+            if self.map.get(&old).is_some_and(|e| e.stored == stored) {
+                self.map.remove(&old);
+            }
+        }
+        // Replacements leave stale queue entries behind; keep them bounded.
+        if self.order.len() > capacity.saturating_mul(2) + 16 {
+            let map = &self.map;
+            self.order.retain(|(k, t)| map.get(k).is_some_and(|e| e.stored == *t));
+        }
+        self.order.push_back((key.clone(), entry.stored));
+        self.map.insert(key, entry);
+    }
+}
+
 pub struct Dns {
     settings: RwLock<Arc<DnsSettings>>,
     filter: RwLock<Arc<Filter>>,
     rewrites: RwLock<Arc<Vec<(String, Answer)>>>,
     upstreams: RwLock<Arc<Upstreams>>,
-    cache: Mutex<HashMap<(String, u16), CacheEntry>>,
+    cache: Mutex<Cache>,
     counters: Mutex<Counters>,
     log: Mutex<VecDeque<LogEntry>>,
     data_dir: Option<PathBuf>,
@@ -307,7 +345,7 @@ impl Dns {
             filter: RwLock::new(Arc::new(filter)),
             upstreams: RwLock::new(Arc::new(upstreams)),
             settings: RwLock::new(Arc::new(settings)),
-            cache: Mutex::new(HashMap::new()),
+            cache: Mutex::new(Cache::default()),
             counters: Mutex::new(counters),
             log: Mutex::new(log),
             data_dir,
@@ -597,15 +635,7 @@ impl Dns {
             let rcode_ok = answer.len() > 3 && matches!(answer[3] & 0x0F, 0 | 3);
             if rcode_ok {
                 let mut cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
-                if cache.len() >= s.cache_size {
-                    cache.retain(|_, e| e.stored.elapsed().as_secs() < e.ttl as u64);
-                    if cache.len() >= s.cache_size {
-                        if let Some(k) = cache.keys().next().cloned() {
-                            cache.remove(&k);
-                        }
-                    }
-                }
-                cache.insert((name.to_string(), qtype), CacheEntry { answer: answer.clone(), stored: Instant::now(), ttl });
+                cache.insert((name.to_string(), qtype), CacheEntry { answer: answer.clone(), stored: Instant::now(), ttl }, s.cache_size);
             }
         }
         Ok((answer, Some(label), false, Some(ms)))
@@ -789,6 +819,22 @@ fn write_private(path: &std::path::Path, body: &[u8]) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn cache_evicts_oldest_and_stays_bounded() {
+        let entry = || CacheEntry { answer: vec![], stored: Instant::now(), ttl: 60 };
+        let mut c = Cache::default();
+        for i in 0..10u16 {
+            c.insert((format!("n{i}"), 1), entry(), 3);
+        }
+        assert_eq!(c.map.len(), 3);
+        assert!(c.get(&("n9".into(), 1)).is_some() && c.get(&("n0".into(), 1)).is_none());
+        for _ in 0..100 {
+            c.insert(("n9".into(), 1), entry(), 3);
+        }
+        assert_eq!(c.map.len(), 3);
+        assert!(c.order.len() <= 3 * 2 + 16 + 1);
+    }
+
     use super::*;
     use simple_dns::TYPE;
 
