@@ -101,6 +101,12 @@ const CUBIC_C: f64 = 0.4;
 const RTT_INFLATION_EXIT_SLOW_START: f64 = 2.0;
 /// SRTT/min_rtt ratio treated as a standing queue that must be actively drained.
 const RTT_INFLATION_BACKOFF: f64 = 4.0;
+/// The delay signal compares SRTT with at least this much. Every RTT sample
+/// includes the receiver's ACK delay (5 ms) and the sender's 10 ms tick, so
+/// on a path with a 1 ms floor SRTT sits at 10-15 ms with no queue at all: a
+/// ratio of 10+ that kept halving the window down to 2 packets and held a
+/// LAN or same-city server to a few Mbit/s. Above 20 ms the real floor is used.
+const DELAY_SIGNAL_FLOOR: Duration = Duration::from_millis(20);
 /// How much pacing allowance may accumulate, expressed as time-at-rate.
 const PACING_BURST: Duration = Duration::from_millis(10);
 const RTO_MIN: Duration = Duration::from_millis(50);
@@ -317,7 +323,7 @@ impl CongestionController {
         // reconnects. Treat sustained RTT inflation as congestion in its own
         // right, exactly as it is.
         let inflation = if self.rtt_initialized && !self.min_rtt.is_zero() {
-            self.srtt.as_secs_f64() / self.min_rtt.as_secs_f64()
+            self.srtt.as_secs_f64() / self.min_rtt.max(DELAY_SIGNAL_FLOOR).as_secs_f64()
         } else {
             1.0
         };
@@ -670,6 +676,23 @@ mod tests {
             cwnd_before,
             cc.cwnd()
         );
+    }
+
+    /// A LAN or same-city path: the ping floor is 1 ms, but data is acked after
+    /// the receiver's ACK delay and the sender's tick, so samples read 12 ms.
+    /// That is no queue; the window must grow instead of collapsing to 2 packets.
+    #[test]
+    fn a_short_path_is_not_taken_for_a_standing_queue() {
+        let mut cc = CongestionController::new(1200);
+        cc.on_send(1200);
+        cc.on_ack(1200, Duration::from_millis(1));
+        let start = cc.cwnd();
+        for _ in 0..50 {
+            cc.on_send(1200);
+            cc.on_ack(1200, Duration::from_millis(12));
+        }
+        assert_eq!(cc.phase, Phase::SlowStart, "ACK delay and the tick ended slow start on a 1 ms path");
+        assert_eq!(cc.cwnd(), start + 50 * 1200, "the window grows by what was acknowledged");
     }
 
     /// Pacing must actually bound the release rate: draining the bucket has to
