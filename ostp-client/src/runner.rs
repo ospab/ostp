@@ -211,10 +211,18 @@ pub async fn run_client_core(
 
         if *shutdown_rx_ext.borrow() {
             // Shutdown was requested during (or right after) this attempt — honor it, don't retry.
-            return result;
+            return match result {
+                Err(RunError::Startup(e) | RunError::Crashed(e)) => Err(e),
+                Ok(()) => Ok(()),
+            };
         }
-        if let Err(ref e) = result {
-            tracing::warn!("client run ended unexpectedly, will auto-reconnect: {e}");
+        match result {
+            Ok(()) => {}
+            // Never retry a start that failed: the user fixes the cause and starts again.
+            Err(RunError::Startup(e)) => return Err(e),
+            Err(RunError::Crashed(e)) => {
+                tracing::warn!("client run ended unexpectedly, will auto-reconnect: {e}");
+            }
         }
 
         if attempt_start.elapsed() >= STABLE_UPTIME {
@@ -236,23 +244,34 @@ pub async fn run_client_core(
     }
 }
 
+/// Why one run ended. The split decides whether `run_client_core` starts again.
+enum RunError {
+    /// The client never got going: bad address, no privileges, the first
+    /// connection refused. Retrying would fail the same way, so the user decides.
+    Startup(anyhow::Error),
+    /// A task died after the link had been up: worth a restart.
+    Crashed(anyhow::Error),
+}
+
 async fn run_client_once(
     mut config: crate::config::ClientConfig,
     metrics: Arc<BridgeMetrics>,
     mut shutdown_rx_ext: watch::Receiver<bool>,
     mut config_rx: Option<watch::Receiver<crate::config::ClientConfig>>,
-) -> Result<()> {
+) -> std::result::Result<(), RunError> {
     #[cfg(target_os = "windows")]
     if config.mode == "tun" && !is_admin() {
-        return Err(anyhow::anyhow!("Administrator privileges are required to initialize TUN mode. Please run the application as Administrator."));
+        return Err(RunError::Startup(anyhow::anyhow!("Administrator privileges are required to initialize TUN mode. Please run the application as Administrator.")));
     }
 
     #[cfg(target_os = "linux")]
     if config.mode == "tun" && !is_root() {
-        return Err(anyhow::anyhow!("Root privileges are required to initialize TUN mode on Linux. Please run with sudo."));
+        return Err(RunError::Startup(anyhow::anyhow!("Root privileges are required to initialize TUN mode on Linux. Please run with sudo.")));
     }
 
     log_to_core_file(&format!("[core] Starting run_client_core in mode: {}", config.mode));
+    // The name as configured, for error messages (server_addr is replaced by an IP below).
+    let server_name = config.ostp.server_addr.clone();
 
     // Resolve the server IP before we override system routing and DNS.
     // This prevents DNS deadlock if the VPN disconnects and tries to reconnect,
@@ -260,13 +279,16 @@ async fn run_client_once(
     #[allow(unused_mut)]
     let mut resolved_addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host(&config.ostp.server_addr)
         .await
-        .map_err(|e| anyhow::anyhow!("Failed to resolve server address {}: {}", config.ostp.server_addr, e))?
+        .map_err(|e| RunError::Startup(anyhow::anyhow!("Failed to resolve server address {}: {}", config.ostp.server_addr, e)))?
         .collect();
-        
+    // IPv4 first (stable sort keeps the resolver's order within a family): a
+    // blackholed IPv6 route would otherwise make the only address we hand to the
+    // bridge a dead one, and IPv4 would never be tried.
+    resolved_addrs.sort_by_key(|a| a.is_ipv6());
 
     let target_addr = resolved_addrs.first()
-        .ok_or_else(|| anyhow::anyhow!("No IP addresses resolved for {}", config.ostp.server_addr))?;
-        
+        .ok_or_else(|| RunError::Startup(anyhow::anyhow!("No IP addresses resolved for {}", config.ostp.server_addr)))?;
+
     log_to_core_file(&format!("[core] Resolved server address to {}", target_addr));
     // The bridge derives the TLS SNI and the upgrade's Host header from
     // server_addr when tls_sni is unset. Pin the name before replacing it with
@@ -288,7 +310,7 @@ async fn run_client_once(
     // Setup exclusions hot-reload channel
     let (reload_tx, reload_rx) = watch::channel(config.exclusions.clone());
 
-    let mut bridge = Bridge::new(&config, metrics)?;
+    let mut bridge = Bridge::new(&config, metrics).map_err(RunError::Startup)?;
     bridge.reload_tx = Some(reload_tx.clone());
 
     let (ui_tx, mut ui_rx) = mpsc::channel(512);
@@ -302,18 +324,33 @@ async fn run_client_once(
 
     let debug_enabled = config.debug;
 
+    // The bridge reports a first connection that failed as "Connection failed:"
+    // followed by TunnelStopped, and then idles. Nobody toggles the tunnel here,
+    // so an unrequested TunnelStopped before the link was up ends this run.
+    let was_up = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let was_up_logger = was_up.clone();
+    let (first_fail_tx, mut first_fail_rx) = tokio::sync::oneshot::channel::<String>();
+
     // Headless event logger
     tokio::spawn(async move {
         let mut last_status = None;
+        let mut last_failure = String::new();
+        let mut first_fail_tx = Some(first_fail_tx);
         while let Some(msg) = ui_rx.recv().await {
             match msg {
                 crate::app::UiEvent::Log(text) => {
+                    if let Some(reason) = text.strip_prefix("Connection failed:") {
+                        last_failure = reason.trim().to_string();
+                    }
                     if debug_enabled || is_essential_log(&text) {
                         log_to_core_file(&format!("[ostp] {text}"));
                         println!("[ostp] {text}");
                     }
                 }
                 crate::app::UiEvent::Metrics { status, rtt_ms, .. } => {
+                    if matches!(status, crate::app::ConnectionStatus::Established) {
+                        was_up_logger.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
                     let status_str = status.as_str().to_string();
                     if last_status != Some(status_str.clone()) {
                         last_status = Some(status_str.clone());
@@ -328,6 +365,11 @@ async fn run_client_once(
                 }
                 crate::app::UiEvent::TunnelStopped => {
                     println!("[ostp] Tunnel stopped");
+                    if !was_up_logger.load(std::sync::atomic::Ordering::Relaxed) {
+                        if let Some(tx) = first_fail_tx.take() {
+                            let _ = tx.send(std::mem::take(&mut last_failure));
+                        }
+                    }
                 }
             }
         }
@@ -397,24 +439,35 @@ async fn run_client_once(
     });
 
     // Wait for either external shutdown OR any task to fail
+    let mut outcome: std::result::Result<(), anyhow::Error> = Ok(());
+    let mut first_connect_failed = false;
     tokio::select! {
         _ = shutdown_rx_ext.changed() => {
             let _ = cmd_tx.send(BridgeCommand::Shutdown).await;
             let _ = shutdown_tx.send(true);
         }
+        Ok(reason) = &mut first_fail_rx => {
+            let _ = shutdown_tx.send(true);
+            first_connect_failed = true;
+            outcome = Err(if reason.is_empty() {
+                anyhow::anyhow!("the first connection to {} failed", server_name)
+            } else {
+                anyhow::anyhow!("the first connection to {} failed: {}", server_name, reason)
+            });
+        }
         res = &mut bridge_task => {
             let _ = shutdown_tx.send(true);
-            res.map_err(|e| anyhow::anyhow!("Bridge task panicked: {}", e))??;
+            outcome = res.map_err(|e| anyhow::anyhow!("Bridge task panicked: {}", e)).and_then(|r| r);
         }
         res = &mut proxy_task => {
             let _ = shutdown_tx.send(true);
-            res.map_err(|e| anyhow::anyhow!("Proxy task panicked: {}", e))??;
+            outcome = res.map_err(|e| anyhow::anyhow!("Proxy task panicked: {}", e)).and_then(|r| r);
         }
         res = async {
             if let Some(t) = wintun_task.as_mut() { t.await } else { std::future::pending().await }
         } => {
             let _ = shutdown_tx.send(true);
-            res.map_err(|e| anyhow::anyhow!("TUN task panicked: {}", e))??;
+            outcome = res.map_err(|e| anyhow::anyhow!("TUN task panicked: {}", e)).and_then(|r| r);
         }
     }
 
@@ -425,7 +478,11 @@ async fn run_client_once(
         let _ = task.await;
     }
 
-    Ok(())
+    match outcome {
+        Ok(()) => Ok(()),
+        Err(e) if first_connect_failed || !was_up.load(std::sync::atomic::Ordering::Relaxed) => Err(RunError::Startup(e)),
+        Err(e) => Err(RunError::Crashed(e)),
+    }
 }
 
 #[allow(dead_code)]
