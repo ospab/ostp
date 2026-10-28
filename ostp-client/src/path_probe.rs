@@ -354,12 +354,7 @@ fn parse_txt_answer(msg: &[u8], id: u16) -> Option<String> {
     None
 }
 
-fn is_public(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(v4) => !(v4.is_private() || v4.is_loopback() || v4.is_link_local() || v4.is_unspecified() || v4.octets()[0] == 100 && (v4.octets()[1] & 0xC0) == 64),
-        IpAddr::V6(v6) => !(v6.is_loopback() || v6.is_unspecified() || (v6.segments()[0] & 0xfe00) == 0xfc00 || (v6.segments()[0] & 0xffc0) == 0xfe80),
-    }
-}
+use ostp_core::net::is_public;
 
 /// (ASN, AS name) of a public IPv4 address.
 async fn asn_of(ip: IpAddr) -> Option<(u32, Option<String>)> {

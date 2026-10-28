@@ -611,15 +611,9 @@ async fn main() -> Result<()> {
 
 #[cfg(not(target_os = "windows"))]
 fn is_private_ip(ip: &str) -> bool {
-    let mut parts = ip.split('.');
-    let first = parts.next().and_then(|p| p.parse::<u8>().ok());
-    let second = parts.next().and_then(|p| p.parse::<u8>().ok());
-    match (first, second) {
-        (Some(10 | 127), _) => true,
-        (Some(192), Some(168)) => true,
-        (Some(172), Some(16..=31)) => true,
-        _ => false,
-    }
+    // Anything not public (private, CGNAT, link-local, loopback...) is not an
+    // address to offer as the server's own; an unparsable string is skipped too.
+    ip.parse::<std::net::IpAddr>().map_or(true, |ip| !ostp_core::net::is_public(ip))
 }
 
 /// Global IPv4 addresses of this machine (Linux only; empty elsewhere). More than one
@@ -1956,17 +1950,19 @@ fn cmd_update(branch: String, version: Option<String>) -> Result<()> {
 
     println!("[ostp] Updating (branch={branch})");
 
-    let mut script_args = vec!["-c".to_string()];
+    // Branch and version go in as arguments, not into the shell text. The script
+    // checks the downloaded archive against the SHA-256 GitHub publishes for it;
+    // -f makes an HTTP error fail instead of feeding an error page to bash.
+    let mut script_args = vec![
+        "-c".to_string(),
+        "bash <(curl -fLs --proto '=https' https://raw.githubusercontent.com/ospab/ostp/master/scripts/install.sh) \"$@\"".to_string(),
+        "ostp-update".to_string(),
+        "--branch".to_string(),
+        branch,
+    ];
     if let Some(v) = version {
-        script_args.push(format!(
-            "bash <(curl -Ls https://raw.githubusercontent.com/ospab/ostp/master/scripts/install.sh) --branch {} -v {}",
-            branch, v
-        ));
-    } else {
-        script_args.push(format!(
-            "bash <(curl -Ls https://raw.githubusercontent.com/ospab/ostp/master/scripts/install.sh) --branch {}",
-            branch
-        ));
+        script_args.push("-v".to_string());
+        script_args.push(v);
     }
 
     let status = Command::new("bash")
