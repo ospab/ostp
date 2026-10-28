@@ -1425,7 +1425,7 @@ pub fn run() {
     } else {
         #[cfg(not(debug_assertions))]
         {
-            show_error_dialog("Приложение OSTP GUI уже запущено!");
+            show_error_dialog("OSTP is already running.");
             return;
         }
         #[cfg(debug_assertions)]
@@ -1464,12 +1464,12 @@ pub fn run() {
                 }
             }
 
-            let connect_i = MenuItem::with_id(app, "connect", "Подключиться", true, None::<&str>)?;
-            let disconnect_i = MenuItem::with_id(app, "disconnect", "Отключиться", true, None::<&str>)?;
-            let server_i = MenuItem::with_id(app, "server", format!("Сервер: {}", masked_ip), false, None::<&str>)?;
+            let connect_i = MenuItem::with_id(app, "connect", "Connect", true, None::<&str>)?;
+            let disconnect_i = MenuItem::with_id(app, "disconnect", "Disconnect", true, None::<&str>)?;
+            let server_i = MenuItem::with_id(app, "server", format!("Server: {}", masked_ip), false, None::<&str>)?;
             let version_i = MenuItem::with_id(app, "version", format!("OSTP v{}", env!("CARGO_PKG_VERSION")), false, None::<&str>)?;
-            let show_i = MenuItem::with_id(app, "show", "Показать окно", true, None::<&str>)?;
-            let exit_i = MenuItem::with_id(app, "exit", "Выход", true, None::<&str>)?;
+            let show_i = MenuItem::with_id(app, "show", "Show window", true, None::<&str>)?;
+            let exit_i = MenuItem::with_id(app, "exit", "Quit", true, None::<&str>)?;
             
             let menu = Menu::with_items(app, &[
                 &server_i,

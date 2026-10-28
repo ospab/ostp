@@ -8,6 +8,9 @@ Older history is on the [Releases](https://github.com/ospab/ostp/releases) page 
 
 ## [Unreleased]
 
+### Fixed
+- Desktop app: the tray menu and the "already running" message were in Russian while the rest of the app is in English; they are in English now.
+
 ## [0.4.7-beta.9] - 2026-10-28
 
 ### Fixed
