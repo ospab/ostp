@@ -81,6 +81,9 @@ where
                 }
                 Err(e) => {
                     tracing::debug!("tun_read error: {e}");
+                    // A failing descriptor fails again at once; without a pause
+                    // this loop would hold a core until the tunnel is stopped.
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
                 }
             }
         }
@@ -470,8 +473,7 @@ impl tokio::io::AsyncRead for FdIo {
             let mut guard = match this.0.poll_read_ready(cx) {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(Ok(g)) => g,
-                // Readiness error: report EOF, the reader loop stops.
-                Poll::Ready(Err(_)) => return Poll::Ready(Ok(())),
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
             };
             let unfilled = buf.initialize_unfilled();
             match guard.try_io(|inner| {
@@ -483,24 +485,22 @@ impl tokio::io::AsyncRead for FdIo {
                     )
                 };
                 if res < 0 {
-                    let err = std::io::Error::last_os_error();
-                    if err.kind() == std::io::ErrorKind::WouldBlock {
-                        Err(err)
-                    } else {
-                        Ok(0_isize)
-                    }
+                    Err(std::io::Error::last_os_error())
                 } else {
-                    Ok(res)
+                    Ok(res as usize)
                 }
             }) {
-                Ok(Ok(n)) if n > 0 => {
-                    buf.advance(n as usize);
+                // 0 is end of stream: the descriptor was closed (the VPN was
+                // stopped or revoked) and the reader loop ends.
+                Ok(Ok(n)) => {
+                    buf.advance(n);
                     return Poll::Ready(Ok(()));
                 }
-                // Empty read or read error: try again (never ends the stream).
-                Ok(_) => continue,
-                // Would block: readiness was cleared, wait for the next one.
-                Err(_) => continue,
+                // A real error goes to the reader loop, which pauses on it; looping
+                // here would spin, because readiness stays set for a broken fd.
+                Ok(Err(e)) => return Poll::Ready(Err(e)),
+                // Would block: try_io cleared readiness, wait for the next one.
+                Err(_would_block) => continue,
             }
         }
     }
