@@ -1,3 +1,7 @@
+param(
+    [Alias("b")][string]$Branch = "stable",
+    [Alias("v")][string]$Version = ""
+)
 $ErrorActionPreference = "Stop"
 $repo = "ospab/ostp"
 
@@ -66,8 +70,25 @@ if ([System.Environment]::Is64BitOperatingSystem -and ($Env:PROCESSOR_ARCHITECTU
 Write-Host "Fetching latest release..."
 try {
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-    $api = Invoke-RestMethod -Uri "https://api.github.com/repos/$repo/releases/latest" -UseBasicParsing
-    $tag = $api.tag_name
+    if ($Version) {
+        # Pre-release channels use bare tag names; only stable tags get the "v".
+        $tag = $Version
+        if ($Branch -eq "stable" -and $tag -notlike "v*") { $tag = "v$tag" }
+    } elseif ($Branch -eq "alpha" -or $Branch -eq "beta") {
+        # No floating alpha/beta release exists and /releases/latest skips
+        # pre-releases: take the highest version among the channel's tags
+        # (the API does not order by version).
+        $list = Invoke-RestMethod -Uri "https://api.github.com/repos/$repo/releases?per_page=100" -UseBasicParsing
+        $tag = $list | Where-Object { $_.tag_name -like "*-$Branch.*" } | Sort-Object {
+            $t = $_.tag_name -replace '^v', ''
+            $core, $pre = $t -split '-', 2
+            [version]"$core.$($pre -replace '.*\.', '')"
+        } -Descending | Select-Object -First 1 -ExpandProperty tag_name
+        if (-not $tag) { throw "no $Branch release found" }
+    } else {
+        $api = Invoke-RestMethod -Uri "https://api.github.com/repos/$repo/releases/latest" -UseBasicParsing
+        $tag = $api.tag_name
+    }
 } catch {
     Write-Host "[notice] Could not determine latest release automatically."
     $tag = Read-Host "Enter release tag (e.g. v0.1.60)"
@@ -79,6 +100,18 @@ $url = "https://github.com/$repo/releases/download/$tag/$archive"
 $zipPath = Join-Path $env:TEMP "ostp_temp_$($PID).zip"
 $extractPath = Join-Path $env:TEMP "ostp_extract_$($PID)"
 
+# The SHA-256 GitHub computed for this exact asset, from the API response for this tag.
+$expected = $null
+try {
+    $rel = Invoke-RestMethod -Uri "https://api.github.com/repos/$repo/releases/tags/$tag" -UseBasicParsing
+    $expected = ($rel.assets | Where-Object { $_.name -eq $archive } | Select-Object -First 1).digest
+} catch { }
+if (-not $expected -or $expected -notmatch '^sha256:([0-9a-fA-F]{64})$') {
+    Write-Error "GitHub published no SHA-256 for $archive in release $tag. Nothing was installed."
+    exit 1
+}
+$expected = $Matches[1].ToLower()
+
 Write-Host "Downloading: $archive ($tag)"
 Invoke-WebRequest -Uri $url -OutFile $zipPath -UseBasicParsing
 
@@ -86,6 +119,14 @@ if (-not (Test-Path $zipPath)) {
     Write-Error "Download failed."
     exit 1
 }
+
+$actual = (Get-FileHash -Path $zipPath -Algorithm SHA256).Hash.ToLower()
+if ($actual -ne $expected) {
+    Remove-Item $zipPath -Force -ErrorAction SilentlyContinue
+    Write-Error "SHA-256 mismatch: expected $expected, got $actual. Nothing was installed."
+    exit 1
+}
+Write-Host "SHA-256 verified: $actual"
 
 if (Test-Path $extractPath) { Remove-Item $extractPath -Recurse -Force }
 Expand-Archive -Path $zipPath -DestinationPath $extractPath -Force

@@ -2,6 +2,7 @@ pub mod congestion;
 pub mod crypto;
 pub mod framing;
 pub mod http_upgrade;
+pub mod net;
 pub mod protocol;
 pub mod relay;
 pub mod share_link;
