@@ -64,13 +64,21 @@ pub async fn run(action: CertAction, config_path: &Path) -> Result<()> {
 
 pub(crate) fn read_json(config_path: &Path) -> Result<serde_json::Value> {
     let raw = std::fs::read_to_string(config_path).with_context(|| format!("cannot read {}", config_path.display()))?;
-    let mut stripped = json_comments::StripComments::new(raw.as_bytes());
-    let v: serde_json::Value = serde_json::from_reader(&mut stripped)
+    let text = ostp_server::config_io::strip_comments(&raw).map_err(|e| anyhow!(e))?;
+    let v: serde_json::Value = serde_json::from_str(&text)
         .with_context(|| format!("cannot parse {}", config_path.display()))?;
     if v.get("mode").and_then(|m| m.as_str()) != Some("server") {
         bail!("{} is not a server config", config_path.display());
     }
     Ok(v)
+}
+
+/// Writes config.json the one way the server does: atomically, readable by
+/// root only, the previous version kept in `config.json.bak`. Callers validate
+/// what they change first.
+pub(crate) fn save_json(config_path: &Path, v: &serde_json::Value) -> Result<()> {
+    let text = serde_json::to_string_pretty(v)?;
+    ostp_server::config_io::save_config(config_path, &text, true).map_err(|e| anyhow!(e))
 }
 
 fn server_cfg(config_path: &Path) -> Result<ostp_client::config::ServerConfig> {
@@ -238,7 +246,7 @@ pub async fn issue_interactive(config_path: &Path, a: IssueArgs) -> Result<()> {
     }
 
     print_links(config_path)?;
-    restart_service(a.no_restart);
+    crate::service_cmd::restart_service(a.no_restart);
     Ok(())
 }
 
@@ -371,35 +379,6 @@ fn print_links(config_path: &Path) -> Result<()> {
         }
     }
     Ok(())
-}
-
-/// Applies a config change to the running service: restarts it if it is
-/// running (a stopped service stays stopped), then checks it came back.
-pub(crate) fn restart_service(skip: bool) {
-    let has_unit = Path::new("/etc/systemd/system/ostp.service").exists() || Path::new("/lib/systemd/system/ostp.service").exists();
-    if skip || !has_unit {
-        println!("\n  Restart OSTP to apply this: {}", "sudo systemctl restart ostp".bold());
-        return;
-    }
-    let active = |unit: &str| {
-        std::process::Command::new("systemctl").args(["is-active", "--quiet", unit]).status().is_ok_and(|s| s.success())
-    };
-    if !active("ostp") {
-        println!("\n  The ostp service is not running; the change applies when it starts.");
-        return;
-    }
-    match std::process::Command::new("systemctl").args(["restart", "ostp"]).status() {
-        Ok(s) if s.success() => {
-            std::thread::sleep(std::time::Duration::from_secs(2));
-            if active("ostp") {
-                crate::wizard_ok("ostp restarted with the new settings");
-            } else {
-                crate::wizard_warn("ostp did not stay up after the restart; last log lines:");
-                let _ = std::process::Command::new("journalctl").args(["-u", "ostp", "-n", "15", "--no-pager"]).status();
-            }
-        }
-        _ => crate::wizard_warn("could not restart ostp; run: sudo systemctl restart ostp"),
-    }
 }
 
 async fn status(config_path: &Path) -> Result<()> {

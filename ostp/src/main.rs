@@ -768,6 +768,18 @@ fn wizard_section(title: &str) {
     println!("\n  {}", title.bold().underline());
 }
 
+/// Atomic and private (see `ostp_server::config_io`), no backup: callers that
+/// overwrite a config keep their own.
+fn write_config_file(path: &std::path::Path, json_value: &serde_json::Value) -> Result<()> {
+    let text = serde_json::to_string_pretty(json_value)?;
+    ostp_server::config_io::save_config(path, &text, false).map_err(|e| anyhow!(e))
+}
+
+/// Port of a `host:port` or `[v6]:port` listen address.
+fn listen_addr_port(listen: &str) -> u16 {
+    listen.rsplit_once(':').and_then(|(_, p)| p.parse().ok()).unwrap_or(50000)
+}
+
 fn wizard_save_config(config_path: &std::path::Path, json_value: &serde_json::Value) -> Result<std::path::PathBuf> {
     let current_path = config_path.to_path_buf();
     
@@ -777,7 +789,7 @@ fn wizard_save_config(config_path: &std::path::Path, json_value: &serde_json::Va
         }
     }
     
-    match fs::write(&current_path, serde_json::to_string_pretty(json_value)?) {
+    match write_config_file(&current_path, json_value) {
         Ok(_) => {
             wizard_ok(&format!("Saved {:?}", current_path));
             return Ok(current_path);
@@ -787,7 +799,7 @@ fn wizard_save_config(config_path: &std::path::Path, json_value: &serde_json::Va
             let fallback = std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")).join("config.json");
             wizard_warn(&format!("Trying {:?} instead", fallback));
             
-            match fs::write(&fallback, serde_json::to_string_pretty(json_value)?) {
+            match write_config_file(&fallback, json_value) {
                 Ok(_) => {
                     wizard_ok(&format!("Saved {:?}", fallback));
                     return Ok(fallback);
@@ -1002,11 +1014,11 @@ fn run_setup_wizard(config_path: &std::path::Path) -> Result<Option<PathBuf>> {
             wizard_register_windows_service(&actual_path)?;
 
             let host = get_or_ask_public_ip(config_path);
-            let port = listen.split(':').last().unwrap_or("50000");
+            let port = listen_addr_port(&listen);
             println!();
             wizard_section("Share links for clients:");
             for (i, key) in access_keys.iter().enumerate() {
-                println!("  [{}] ostp://{}@{}:{}", i + 1, key, host, port);
+                println!("  [{}] {}", i + 1, ostp_core::share_link::ShareLink::new(key, &host, port).to_uri());
             }
 
             println!();
@@ -1104,11 +1116,11 @@ fn run_setup_wizard(config_path: &std::path::Path) -> Result<Option<PathBuf>> {
             wizard_register_systemd(&actual_path)?;
 
             let host = get_or_ask_public_ip(config_path);
-            let port = listen.split(':').last().unwrap_or("50000");
+            let port = listen_addr_port(&listen);
             println!();
             wizard_section("Share links for clients:");
             for (i, key) in access_keys.iter().enumerate() {
-                println!("  [{}] ostp://{}@{}:{}", i + 1, key, host, port);
+                println!("  [{}] {}", i + 1, ostp_core::share_link::ShareLink::new(key, &host, port).to_uri());
             }
 
             println!();
@@ -1171,26 +1183,14 @@ fn run_setup_wizard(config_path: &std::path::Path) -> Result<Option<PathBuf>> {
 
 #[cfg(unix)]
 fn wizard_register_systemd(config_path: &std::path::Path) -> Result<()> {
-    use std::process::Command;
     let reg = wizard_yn("Register as systemd service (auto-start on boot)?", true);
     if !reg { return Ok(()); }
 
-    let binary = std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("/opt/ostp/ostp"));
-    let service = format!(
-        "[Unit]\nDescription=OSTP Stealth Transport Protocol\nAfter=network.target\nWants=network-online.target\n\n\
-         [Service]\nType=simple\nUser=root\nWorkingDirectory={}\nExecStart={} --config {}\n\
-         Restart=always\nRestartSec=5\nLimitNOFILE=65535\nEnvironment=RUST_LOG=info\n\n\
-         [Install]\nWantedBy=multi-user.target\n",
-        binary.parent().map(|p| p.display().to_string()).unwrap_or_else(|| "/opt/ostp".to_string()),
-        binary.display(),
-        config_path.display()
-    );
-
-    let unit_path = "/etc/systemd/system/ostp.service";
-    match fs::write(unit_path, &service) {
+    let unit_path = service_cmd::UNIT;
+    match service_cmd::write_unit(config_path) {
         Ok(_) => {
-            let _ = Command::new("systemctl").arg("daemon-reload").status();
-            let _ = Command::new("systemctl").args(["enable", "ostp"]).status();
+            service_cmd::systemctl_visible(&["daemon-reload"]);
+            service_cmd::systemctl_visible(&["enable", "ostp"]);
             wizard_ok(&format!("Wrote {}; start with `systemctl start ostp`, logs: `journalctl -u ostp -f`", unit_path));
         }
         Err(e) => {
@@ -1392,7 +1392,7 @@ async fn run_app() -> Result<()> {
                                         access_keys.push(serde_json::Value::String(key));
                                     }
                                     if let Ok(new_content) = serde_json::to_string_pretty(&json_val) {
-                                        let _ = fs::write(&args.config, new_content);
+                                        let _ = ostp_server::config_io::save_config(&args.config, &new_content, false);
                                         println!("[ostp] Added to access_keys in {:?}", args.config);
                                     }
                                 }
@@ -1444,7 +1444,7 @@ async fn run_app() -> Result<()> {
                 fs::create_dir_all(parent)?;
             }
         }
-        fs::write(&args.config, content)?;
+        ostp_server::config_io::save_config(&args.config, &content, false).map_err(|e| anyhow!(e))?;
         println!("{} Saved to {:?}", "[ostp]".green().bold(), args.config);
         return Ok(());
     }
@@ -1690,7 +1690,7 @@ async fn run_app() -> Result<()> {
                 fs::create_dir_all(parent)?;
             }
         }
-        fs::write(&args.config, &content)?;
+        ostp_server::config_io::save_config(&args.config, &content, false).map_err(|e| anyhow!(e))?;
         println!("[ostp] Configuration written to {:?}", args.config);
         
         if is_server {
@@ -1699,16 +1699,9 @@ async fn run_app() -> Result<()> {
                 if let AppMode::Server(s) = &config.mode {
                     let key = &s.access_keys[0];
                     let host = get_or_ask_public_ip(&args.config);
-                    let mut query_params = Vec::<String>::new();
-                    query_params.push("type=udp".to_string());
-
-                    let mut link = format!("ostp://{}@{}:50000", key.key(), host);
-                    if !query_params.is_empty() {
-                        link.push('?');
-                        link.push_str(&query_params.join("&"));
-                    }
+                    let link = ostp_core::share_link::ShareLink::new(key.key(), &host, listen_addr_port(&s.listen.primary()));
                     println!("\n  Share link for client distribution:");
-                    println!("  {}", link);
+                    println!("  {}", link.to_uri());
                 }
             }
         }
@@ -1891,26 +1884,11 @@ async fn run_app() -> Result<()> {
 
 #[cfg(unix)]
 fn cmd_uninstall() -> Result<()> {
-    use std::process::Command;
 
     println!("[ostp] Uninstalling");
 
-    // 1. Stop and disable systemd service (best-effort)
-    for action in &["stop", "disable"] {
-        let _ = Command::new("systemctl")
-            .args([action, "ostp"])
-            .status();
-    }
-
-    // 2. Remove the systemd unit file
-    let unit_path = std::path::Path::new("/etc/systemd/system/ostp.service");
-    if unit_path.exists() {
-        fs::remove_file(unit_path)?;
-        println!("[ostp] Removed {}", unit_path.display());
-        let _ = Command::new("systemctl")
-            .args(["daemon-reload"])
-            .status();
-    }
+    // 1-2. Stop and disable the systemd service, remove its unit (best-effort)
+    service_cmd::remove_unit()?;
 
     // 3. Remove binary
     let bin_path = std::path::Path::new("/opt/ostp/ostp");
@@ -2045,7 +2023,7 @@ fn cmd_migrate(config_path: &std::path::Path, dry_run: bool) -> Result<()> {
     fs::copy(config_path, &backup_path)?;
     let mut out = serde_json::to_string_pretty(&m.output)?;
     out.push('\n');
-    fs::write(config_path, out)?;
+    ostp_server::config_io::save_config(config_path, &out, false).map_err(|e| anyhow!(e))?;
     println!("\n{tag} Migrated {:?}; the original is in {:?}.", config_path, backup_path);
     println!("{tag} Check it with `ostp check`.");
     Ok(())

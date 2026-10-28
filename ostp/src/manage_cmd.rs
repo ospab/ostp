@@ -12,6 +12,8 @@ use std::process::Command;
 
 use ostp_client::config::{AppMode, ServerConfig, UnifiedConfig};
 
+use crate::service_cmd::{self, journal_tail, service_active, systemctl, Restarted, UNIT};
+
 #[derive(clap::Subcommand, Debug)]
 pub enum ManageAction {
     /// First install: write a server config, register and start the service.
@@ -85,20 +87,7 @@ fn load(config_path: &Path) -> Result<(Value, ServerConfig)> {
 fn save(config_path: &Path, v: &Value) -> Result<()> {
     let parsed: UnifiedConfig = serde_json::from_value(v.clone()).context("the resulting config does not parse")?;
     parsed.validate()?;
-    if config_path.exists() {
-        std::fs::copy(config_path, config_path.with_extension("json.bak"))
-            .with_context(|| format!("cannot back up {}", config_path.display()))?;
-    }
-    write_private(config_path, serde_json::to_string_pretty(v)?.as_bytes())
-}
-
-fn write_private(path: &Path, body: &[u8]) -> Result<()> {
-    let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    std::os::unix::fs::OpenOptionsExt::mode(&mut opts, 0o600);
-    let mut f = opts.open(path).with_context(|| format!("cannot write {}", path.display()))?;
-    std::io::Write::write_all(&mut f, body).with_context(|| format!("cannot write {}", path.display()))
+    crate::cert_cmd::save_json(config_path, v)
 }
 
 /// Index into `access_keys` for a number (1-based), a name or a key.
@@ -125,28 +114,8 @@ fn key_and_name(u: &Value) -> (String, String) {
     }
 }
 
-pub(crate) const UNIT: &str = "/etc/systemd/system/ostp.service";
-
-pub(crate) fn systemctl(args: &[&str]) -> bool {
-    Command::new("systemctl").args(args).output().is_ok_and(|o| o.status.success())
-}
-
-pub(crate) fn service_active() -> bool {
-    systemctl(&["is-active", "--quiet", "ostp"])
-}
-
 fn register_service(config_path: &Path) -> Result<()> {
-    let binary = std::env::current_exe().unwrap_or_else(|_| "/opt/ostp/ostp".into());
-    let dir = binary.parent().map(|p| p.display().to_string()).unwrap_or_else(|| "/opt/ostp".into());
-    let unit = format!(
-        "[Unit]\nDescription=OSTP Stealth Transport Protocol\nAfter=network.target\nWants=network-online.target\n\n\
-         [Service]\nType=simple\nUser=root\nWorkingDirectory={dir}\nExecStart={} --config {}\n\
-         Restart=always\nRestartSec=5\nLimitNOFILE=65535\nEnvironment=RUST_LOG=info\n\n\
-         [Install]\nWantedBy=multi-user.target\n",
-        binary.display(),
-        config_path.display()
-    );
-    std::fs::write(UNIT, unit).with_context(|| format!("cannot write {UNIT} (not root?)"))?;
+    service_cmd::write_unit(config_path).with_context(|| format!("cannot write {UNIT} (not root?)"))?;
     systemctl(&["daemon-reload"]);
     if !systemctl(&["enable", "ostp"]) {
         bail!("systemctl enable ostp failed");
@@ -156,20 +125,15 @@ fn register_service(config_path: &Path) -> Result<()> {
 
 /// Restarts (or starts) the service and reports whether it stayed up.
 fn restart() -> Result<bool> {
-    if !Path::new(UNIT).exists() && !Path::new("/lib/systemd/system/ostp.service").exists() {
+    if !service_cmd::unit_registered() {
         bail!("the ostp service is not registered");
     }
-    systemctl(&["restart", "ostp"]);
-    std::thread::sleep(std::time::Duration::from_secs(2));
-    Ok(service_active())
-}
-
-pub(crate) fn journal_tail(lines: usize) -> Vec<String> {
-    Command::new("journalctl")
-        .args(["-u", "ostp", "-n", &lines.to_string(), "--no-pager", "-o", "short-iso"])
-        .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).lines().map(str::to_string).collect())
-        .unwrap_or_default()
+    Ok(match service_cmd::restart_and_check(false) {
+        Restarted::Up => true,
+        Restarted::Down => false,
+        // systemctl refused: report what is running now.
+        Restarted::Failed => service_active(),
+    })
 }
 
 /// Opens the port in ufw or firewalld when one of them is active. A firewall

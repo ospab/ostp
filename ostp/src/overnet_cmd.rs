@@ -11,7 +11,8 @@ use anyhow::{Context, Result};
 use colored::Colorize;
 use std::path::Path;
 
-use crate::cert_cmd::{read_json, restart_service};
+use crate::cert_cmd::read_json;
+use crate::service_cmd::{restart_service, unit_state};
 use ostp_server::OvernetConfig;
 
 #[cfg(unix)]
@@ -61,8 +62,7 @@ fn save(config_path: &Path, mut v: serde_json::Value, cfg: &OvernetConfig, no_re
     cfg.validate()?;
     v["overnet"] = serde_json::to_value(cfg)?;
     let backup = config_path.with_extension("json.bak");
-    std::fs::copy(config_path, &backup).with_context(|| format!("cannot back up {}", config_path.display()))?;
-    std::fs::write(config_path, serde_json::to_string_pretty(&v)?).with_context(|| format!("cannot write {}", config_path.display()))?;
+    crate::cert_cmd::save_json(config_path, &v)?;
     println!("  {} Saved {} (previous: {})", "✓".green(), config_path.display(), backup.display());
     restart_service(no_restart);
     Ok(())
@@ -78,12 +78,6 @@ fn overnet_installed() -> Option<String> {
     let out = std::process::Command::new("overnet").arg("--version").output().ok()?;
     let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
     Some(if text.is_empty() { "installed".into() } else { text })
-}
-
-fn unit_state(unit: &str) -> Option<String> {
-    let out = std::process::Command::new("systemctl").args(["is-active", unit]).output().ok()?;
-    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    (!s.is_empty()).then_some(s)
 }
 
 fn status(config_path: &Path) -> Result<()> {

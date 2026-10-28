@@ -11,7 +11,8 @@ use colored::Colorize;
 use std::io::{IsTerminal, Write};
 use std::path::Path;
 
-use crate::cert_cmd::{listen_port, panel_route, read_json, restart_service, subscription_prefix, tls_settings};
+use crate::cert_cmd::{listen_port, panel_route, read_json, subscription_prefix, tls_settings};
+use crate::service_cmd::restart_service;
 use crate::sub_cmd::{vhost_forwards, web_kind};
 use crate::webserver::{self, Kind, VhostParams};
 use ostp_client::config::UnifiedConfig;
@@ -199,9 +200,7 @@ fn save(config_path: &Path, v: &serde_json::Value) -> Result<()> {
     let parsed: UnifiedConfig = serde_json::from_value(v.clone()).context("the resulting config does not parse")?;
     parsed.validate()?;
     let backup = config_path.with_extension("json.bak");
-    std::fs::copy(config_path, &backup).with_context(|| format!("cannot back up {}", config_path.display()))?;
-    std::fs::write(config_path, serde_json::to_string_pretty(v)?)
-        .with_context(|| format!("cannot write {}", config_path.display()))?;
+    crate::cert_cmd::save_json(config_path, v)?;
     println!("  {} Saved {} (previous: {})", "✓".green(), config_path.display(), backup.display());
     Ok(())
 }

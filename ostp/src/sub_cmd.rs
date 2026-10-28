@@ -106,9 +106,7 @@ fn change(config_path: &Path, enabled: Option<bool>, o: SubOpts) -> Result<()> {
 
     let after = current(&v);
     let backup = config_path.with_extension("json.bak");
-    std::fs::copy(config_path, &backup).with_context(|| format!("cannot back up {}", config_path.display()))?;
-    std::fs::write(config_path, serde_json::to_string_pretty(&v)?)
-        .with_context(|| format!("cannot write {}", config_path.display()))?;
+    crate::cert_cmd::save_json(config_path, &v)?;
     println!("  {} Saved {} (previous: {})", "✓".green(), config_path.display(), backup.display());
     print_settings(&after);
 
@@ -144,7 +142,7 @@ fn change(config_path: &Path, enabled: Option<bool>, o: SubOpts) -> Result<()> {
         }
     }
 
-    crate::cert_cmd::restart_service(o.no_restart);
+    crate::service_cmd::restart_service(o.no_restart);
     Ok(())
 }
 

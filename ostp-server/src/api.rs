@@ -570,46 +570,7 @@ fn check_limit(limit: Option<u64>) -> Result<(), &'static str> {
 
 // ── config.json ──────────────────────────────────────────────────────────────
 
-/// Every change to config.json goes through this lock: two requests at once
-/// would otherwise each read the old file and the second write would drop the
-/// first one's change.
-static CONFIG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-/// Replaces the file in one step, so the hot-reloader and a crash see either
-/// the old content or the new, never half of it.
-fn write_config_atomic(path: &std::path::Path, text: &str) -> Result<(), String> {
-    use std::io::Write;
-    // Through a symlink the real file is replaced, not the link.
-    let path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    let mut tmp = path.as_os_str().to_owned();
-    tmp.push(".tmp");
-    let tmp = std::path::PathBuf::from(tmp);
-    let written = (|| -> std::io::Result<()> {
-        let mut f = std::fs::File::create(&tmp)?;
-        f.write_all(text.as_bytes())?;
-        f.sync_all()?;
-        // The file holds the password hash and every key: keep its mode.
-        if let Ok(meta) = std::fs::metadata(&path) {
-            let _ = std::fs::set_permissions(&tmp, meta.permissions());
-        }
-        std::fs::rename(&tmp, &path)
-    })();
-    if let Err(e) = written {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(format!("failed to write config file: {e}"));
-    }
-    Ok(())
-}
-
-fn parse_config(path: &std::path::Path) -> Result<serde_json::Value, String> {
-    use std::io::Read;
-    let content = std::fs::read_to_string(path).map_err(|e| format!("failed to read config file: {e}"))?;
-    let mut text = String::new();
-    json_comments::StripComments::new(content.as_bytes())
-        .read_to_string(&mut text)
-        .map_err(|e| format!("failed to strip comments from config: {e}"))?;
-    serde_json::from_str(&text).map_err(|e| format!("failed to parse config JSON: {e}"))
-}
+use crate::config_io::{parse_config, write_config_atomic, CONFIG_LOCK};
 
 /// Reads config.json, lets `change` edit it and writes it back, all under the
 /// lock. A config that cannot be parsed is left untouched.
