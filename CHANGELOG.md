@@ -8,6 +8,8 @@ Older history is on the [Releases](https://github.com/ospab/ostp/releases) page 
 
 ## [Unreleased]
 
+## [0.4.7-beta.10] - 2026-10-28
+
 ### Added
 - Desktop app: "Update now" in the update dialog downloads the new release, checks it against the SHA-256 GitHub publishes for the file, stops the tunnel, installs it and restarts the app. An app installed with the setup program updates through the new setup as an update (one Windows consent prompt, shortcuts and settings kept); the portable Windows app and the Linux and macOS apps replace their files in place. Nothing is downloaded until the button is pressed. If the install fails, the dialog says why and offers the release page.
 
