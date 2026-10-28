@@ -2,88 +2,44 @@ use anyhow::{anyhow, Result};
 use tokio::sync::watch;
 
 // ──────────────────────────────────────────────────────────────────────────────
-// Windows / Linux desktop TUN
+// Shared part: smoltcp stack over an already opened TUN (desktop and Android)
 // ──────────────────────────────────────────────────────────────────────────────
 
-#[cfg(any(target_os = "windows", target_os = "linux"))]
-pub async fn run_native_tunnel(
+/// What differs between the desktop and the Android callers of `run_stack_over_tun`.
+#[cfg(any(target_os = "windows", target_os = "linux", target_os = "android"))]
+struct StackParams {
+    /// "Desktop" / "Android": used in the exclusions hot-reload log line.
+    name: &'static str,
+    /// Logged once the stack is up.
+    active_msg: &'static str,
+    /// Physical interface index for bypass sockets and the UDP NAT (Windows only).
+    phys_if_for_bypass: Option<u32>,
+    /// Physical interface name for SO_BINDTODEVICE (Linux only).
+    linux_phys_name: Option<String>,
+}
+
+/// Builds the netstack, wires it to the TUN halves and runs the UDP NAT and the TCP
+/// acceptor until shutdown or until any of the tasks ends.
+#[cfg(any(target_os = "windows", target_os = "linux", target_os = "android"))]
+async fn run_stack_over_tun<R, W>(
     config: crate::config::ClientConfig,
     mut shutdown: watch::Receiver<bool>,
     mut exclusions_rx: watch::Receiver<crate::config::ExclusionConfig>,
-) -> Result<()> {
-    use std::net::ToSocketAddrs;
+    mut tun_read: R,
+    mut tun_write: W,
+    params: StackParams,
+) -> Result<()>
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+    W: tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
     use netstack_smoltcp::StackBuilder;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use futures::{StreamExt, SinkExt};
 
     let debug = config.debug;
-    tracing::info!("Initializing NATIVE TUN tunnel (smoltcp)...");
-
-    // Capture physical interface index for bypass BEFORE we create the TUN device and alter routes.
-    #[cfg(target_os = "windows")]
-    let phys_if_for_bypass: Option<u32> = ostp_tun::windows::windows_route::sys::get_default_ipv4_route().map(|(_, idx)| idx);
-    #[cfg(not(target_os = "windows"))]
-    let phys_if_for_bypass: Option<u32> = None;
-
-    // ── 1. Resolve server IP ──────────────────────────────────────────────────
-    let server_ip = config
-        .ostp
-        .server_addr
-        .to_socket_addrs()
-        .map_err(|e| anyhow!("Failed to resolve server IP: {}", e))?
-        .next()
-        .map(|a| a.ip())
-        .ok_or_else(|| anyhow!("Could not resolve server host"))?;
-    #[allow(unused_variables)]
-    let server_ip_str = server_ip.to_string();
-
-    // ── 2. Resolve excluded domains → IP addresses for bypass routing ─────────
-    let mut bypass_ips: Vec<std::net::IpAddr> = Vec::new();
-
-    // Server IP always bypasses TUN
-    bypass_ips.push(server_ip);
-
-    for ip_str in &config.exclusions.ips {
-        let host = ip_str.split('/').next().unwrap_or(ip_str);
-        if let Ok(ip) = host.parse() {
-            bypass_ips.push(ip);
-        }
-    }
-
-    for domain in &config.exclusions.domains {
-        let domain = crate::tunnel::exclusion::normalize_domain(domain.trim_start_matches(['.', '*']));
-        match tokio::net::lookup_host((domain.as_str(), 443u16)).await {
-            Ok(addrs) => {
-                for addr in addrs {
-                    bypass_ips.push(addr.ip());
-                }
-            }
-            Err(e) => {
-                tracing::warn!("Failed to pre-resolve excluded domain {domain}: {e}");
-            }
-        };
-    }
-
-
-    // ── 3. Create TUN device via ostp-tun crate ───────────────────────────────
-    let opts = ostp_tun::OstpTunOptions {
-        server_ip,
-        bypass_ips,
-        dns_server: config.dns_server.clone(),
-        kill_switch: config.kill_switch,
-        mtu: config.ostp.mtu as u16,
-        wintun_path: None,
-    };
-
-    let tun_interface = ostp_tun::OstpTunInterface::create(opts)
-        .await
-        .map_err(|e| anyhow!("Failed to create the TUN interface: {}", e))?;
-    // Printed only now: the server connection is reported separately, and
-    // "established" used to appear before the TUN device existed.
-    println!("[ostp] TUN interface is up: all traffic goes through the tunnel");
-
-    let dev = tun_interface.device;
-    let _route_guard = tun_interface.guard;
+    let StackParams { name, active_msg, phys_if_for_bypass, linux_phys_name } = params;
+    let _ = (&phys_if_for_bypass, &linux_phys_name); // not every platform uses both
 
     // ── 7. Build smoltcp network stack ────────────────────────────────────────
     let (stack, tcp_runner, udp_socket, tcp_listener) = StackBuilder::default()
@@ -103,7 +59,6 @@ pub async fn run_native_tunnel(
 
     // ── 8. Wire TUN ↔ smoltcp stack ───────────────────────────────────────────
     let (mut stack_sink, mut stack_stream) = stack.split();
-    let (mut tun_read, mut tun_write) = tokio::io::split(dev);
 
     let mut tun_to_stack = tokio::spawn(async move {
         // Reassemble IPv4 fragments before the netstack sees them: smoltcp drops
@@ -133,7 +88,7 @@ pub async fn run_native_tunnel(
 
     let mut stack_to_tun = tokio::spawn(async move {
         while let Some(Ok(frame)) = stack_stream.next().await {
-            if let Err(e) = tun_write.write(&frame).await {
+            if let Err(e) = tun_write.write_all(&frame).await {
                 tracing::debug!("tun_write error: {e}");
             }
         }
@@ -153,37 +108,24 @@ pub async fn run_native_tunnel(
     let current_exclusions = exclusions_rx.borrow().clone();
     let matcher = crate::tunnel::exclusion::ExclusionMatcher::new(&current_exclusions, None, None);
     let matcher_arc = std::sync::Arc::new(tokio::sync::RwLock::new(matcher));
-    
+
     let matcher_clone = matcher_arc.clone();
     tokio::spawn(async move {
         while let Ok(_) = exclusions_rx.changed().await {
             let current = exclusions_rx.borrow().clone();
             let new_matcher = crate::tunnel::exclusion::ExclusionMatcher::new(&current, None, None);
             *matcher_clone.write().await = new_matcher;
-            if true {
-                tracing::debug!("Desktop TUN exclusions hot-reloaded");
-            }
+            tracing::debug!("{name} TUN exclusions hot-reloaded");
         }
     });
 
-    // Linux: physical interface name for SO_BINDTODEVICE
-    #[cfg(target_os = "linux")]
-    let linux_phys_name = crate::tunnel::proxy::get_linux_physical_if_name();
-    #[cfg(not(target_os = "linux"))]
-    let linux_phys_name: Option<String> = None;
-    let _ = &linux_phys_name; // suppress unused warning on Windows
-
     let debug_udp = debug;
     let udp_matcher = matcher_arc.clone();
-    #[cfg(target_os = "linux")]
     let udp_lin_name = linux_phys_name.clone();
 
     let mut udp_proxy_task = tokio::spawn(async move {
         if let Some(udp_sock) = udp_socket {
-            #[cfg(target_os = "linux")]
             super::udp_nat::run_udp_nat(udp_sock, udp_proxy_addr, debug_udp, udp_matcher, phys_if_for_bypass, udp_lin_name).await;
-            #[cfg(not(target_os = "linux"))]
-            super::udp_nat::run_udp_nat(udp_sock, udp_proxy_addr, debug_udp, udp_matcher, phys_if_for_bypass, None).await;
         }
     });
 
@@ -196,7 +138,8 @@ pub async fn run_native_tunnel(
     //     the IP wasn't known at startup.
     //
     //   For bypassed connections we bind the outgoing socket to the physical interface
-    //   (IP_UNICAST_IF) so it goes out via the real NIC, not TUN.
+    //   (IP_UNICAST_IF) so it goes out via the real NIC, not TUN. On Android the
+    //   VpnService already protects the socket from re-entering the TUN.
 
     let proxy_addr_tcp = {
         let mut a = config.local_proxy.bind_addr.clone();
@@ -205,8 +148,6 @@ pub async fn run_native_tunnel(
         }
         a
     };
-
-    // Physical interface index was captured at the start of the function.
 
     let mut tcp_accept_task = tokio::spawn(async move {
         let Some(mut listener) = tcp_listener else { return; };
@@ -367,7 +308,7 @@ pub async fn run_native_tunnel(
         }
     });
 
-    tracing::info!("NATIVE TUN tunnel active.");
+    tracing::info!("{active_msg}");
 
     tokio::select! {
         _ = shutdown.changed() => {}
@@ -378,12 +319,117 @@ pub async fn run_native_tunnel(
         _ = &mut tcp_accept_task => {}
     }
 
+    Ok(())
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Windows / Linux desktop TUN
+// ──────────────────────────────────────────────────────────────────────────────
+
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+pub async fn run_native_tunnel(
+    config: crate::config::ClientConfig,
+    shutdown: watch::Receiver<bool>,
+    exclusions_rx: watch::Receiver<crate::config::ExclusionConfig>,
+) -> Result<()> {
+    use std::net::ToSocketAddrs;
+
+    tracing::info!("Initializing NATIVE TUN tunnel (smoltcp)...");
+
+    // Capture physical interface index for bypass BEFORE we create the TUN device and alter routes.
+    #[cfg(target_os = "windows")]
+    let phys_if_for_bypass: Option<u32> = ostp_tun::windows::windows_route::sys::get_default_ipv4_route().map(|(_, idx)| idx);
+    #[cfg(not(target_os = "windows"))]
+    let phys_if_for_bypass: Option<u32> = None;
+
+    // ── 1. Resolve server IP ──────────────────────────────────────────────────
+    let server_ip = config
+        .ostp
+        .server_addr
+        .to_socket_addrs()
+        .map_err(|e| anyhow!("Failed to resolve server IP: {}", e))?
+        .next()
+        .map(|a| a.ip())
+        .ok_or_else(|| anyhow!("Could not resolve server host"))?;
+    #[allow(unused_variables)]
+    let server_ip_str = server_ip.to_string();
+
+    // ── 2. Resolve excluded domains → IP addresses for bypass routing ─────────
+    let mut bypass_ips: Vec<std::net::IpAddr> = Vec::new();
+
+    // Server IP always bypasses TUN
+    bypass_ips.push(server_ip);
+
+    for ip_str in &config.exclusions.ips {
+        let host = ip_str.split('/').next().unwrap_or(ip_str);
+        if let Ok(ip) = host.parse() {
+            bypass_ips.push(ip);
+        }
+    }
+
+    for domain in &config.exclusions.domains {
+        let domain = crate::tunnel::exclusion::normalize_domain(domain.trim_start_matches(['.', '*']));
+        match tokio::net::lookup_host((domain.as_str(), 443u16)).await {
+            Ok(addrs) => {
+                for addr in addrs {
+                    bypass_ips.push(addr.ip());
+                }
+            }
+            Err(e) => {
+                tracing::warn!("Failed to pre-resolve excluded domain {domain}: {e}");
+            }
+        };
+    }
+
+
+    // ── 3. Create TUN device via ostp-tun crate ───────────────────────────────
+    let opts = ostp_tun::OstpTunOptions {
+        server_ip,
+        bypass_ips,
+        dns_server: config.dns_server.clone(),
+        kill_switch: config.kill_switch,
+        mtu: config.ostp.mtu as u16,
+        wintun_path: None,
+    };
+
+    let tun_interface = ostp_tun::OstpTunInterface::create(opts)
+        .await
+        .map_err(|e| anyhow!("Failed to create the TUN interface: {}", e))?;
+    // Printed only now: the server connection is reported separately, and
+    // "established" used to appear before the TUN device existed.
+    println!("[ostp] TUN interface is up: all traffic goes through the tunnel");
+
+    let dev = tun_interface.device;
+    let _route_guard = tun_interface.guard;
+
+    // Linux: physical interface name for SO_BINDTODEVICE
+    #[cfg(target_os = "linux")]
+    let linux_phys_name = crate::tunnel::proxy::get_linux_physical_if_name();
+    #[cfg(not(target_os = "linux"))]
+    let linux_phys_name: Option<String> = None;
+
+    let (tun_read, tun_write) = tokio::io::split(dev);
+    let result = run_stack_over_tun(
+        config,
+        shutdown,
+        exclusions_rx,
+        tun_read,
+        tun_write,
+        StackParams {
+            name: "Desktop",
+            active_msg: "NATIVE TUN tunnel active.",
+            phys_if_for_bypass,
+            linux_phys_name,
+        },
+    )
+    .await;
+
     tracing::info!("Deactivating NATIVE TUN tunnel...");
 
     // ── Cleanup ───────────────────────────────────────────────────────────────
     // Cleanup is handled automatically by the _route_guard Drop trait in ostp-tun
 
-    Ok(())
+    result
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -403,19 +449,124 @@ pub async fn run_native_tunnel(
 // Android: TUN from file-descriptor (opened by VpnService)
 // ──────────────────────────────────────────────────────────────────────────────
 
+/// One dup of the VpnService TUN fd as a tokio reader and writer. Every read and
+/// write is a single `libc::read`/`libc::write` on the non-blocking descriptor,
+/// driven by `AsyncFd` readiness.
+#[cfg(target_os = "android")]
+struct FdIo(tokio::io::unix::AsyncFd<std::fs::File>);
+
+#[cfg(target_os = "android")]
+impl tokio::io::AsyncRead for FdIo {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        use std::os::unix::io::AsRawFd;
+        use std::task::Poll;
+
+        let this = self.get_mut();
+        loop {
+            let mut guard = match this.0.poll_read_ready(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Ok(g)) => g,
+                // Readiness error: report EOF, the reader loop stops.
+                Poll::Ready(Err(_)) => return Poll::Ready(Ok(())),
+            };
+            let unfilled = buf.initialize_unfilled();
+            match guard.try_io(|inner| {
+                let res = unsafe {
+                    libc::read(
+                        inner.as_raw_fd(),
+                        unfilled.as_mut_ptr() as *mut libc::c_void,
+                        unfilled.len(),
+                    )
+                };
+                if res < 0 {
+                    let err = std::io::Error::last_os_error();
+                    if err.kind() == std::io::ErrorKind::WouldBlock {
+                        Err(err)
+                    } else {
+                        Ok(0_isize)
+                    }
+                } else {
+                    Ok(res)
+                }
+            }) {
+                Ok(Ok(n)) if n > 0 => {
+                    buf.advance(n as usize);
+                    return Poll::Ready(Ok(()));
+                }
+                // Empty read or read error: try again (never ends the stream).
+                Ok(_) => continue,
+                // Would block: readiness was cleared, wait for the next one.
+                Err(_) => continue,
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "android")]
+impl tokio::io::AsyncWrite for FdIo {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        use std::os::unix::io::AsRawFd;
+        use std::task::Poll;
+
+        let this = self.get_mut();
+        loop {
+            let mut guard = match this.0.poll_write_ready(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Ok(g)) => g,
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+            };
+            match guard.try_io(|inner| {
+                let res = unsafe {
+                    libc::write(
+                        inner.as_raw_fd(),
+                        buf.as_ptr() as *const libc::c_void,
+                        buf.len(),
+                    )
+                };
+                if res < 0 {
+                    Err(std::io::Error::last_os_error())
+                } else {
+                    Ok(res as usize)
+                }
+            }) {
+                Ok(r) => return Poll::Ready(r),
+                Err(_would_block) => continue,
+            }
+        }
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+}
+
 #[cfg(target_os = "android")]
 pub async fn run_native_tunnel_from_fd(
     config: crate::config::ClientConfig,
-    mut shutdown: watch::Receiver<bool>,
-    mut exclusions_rx: watch::Receiver<crate::config::ExclusionConfig>,
+    shutdown: watch::Receiver<bool>,
+    exclusions_rx: watch::Receiver<crate::config::ExclusionConfig>,
     fd: i32,
 ) -> Result<()> {
-    use netstack_smoltcp::StackBuilder;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use futures::{StreamExt, SinkExt};
-    use std::os::unix::io::{FromRawFd, AsRawFd};
+    use std::os::unix::io::FromRawFd;
 
-    let debug = config.debug;
     tracing::info!("Initializing NATIVE TUN tunnel on Android (FD {})", fd);
 
     unsafe {
@@ -431,70 +582,7 @@ pub async fn run_native_tunnel_from_fd(
     }
 
     let file = unsafe { std::fs::File::from_raw_fd(read_fd) };
-    let tun_stream = tokio::io::unix::AsyncFd::new(file)?;
-
-    let (stack, tcp_runner, udp_socket, tcp_listener) = StackBuilder::default()
-        .stack_buffer_size(1024)
-        .tcp_buffer_size(1024)
-        .udp_buffer_size(1024)
-        .enable_tcp(true)
-        .enable_udp(true)
-        .mtu(config.ostp.mtu)
-        .build()?;
-
-    let mut runner_task = tokio::spawn(async move {
-        if let Some(runner) = tcp_runner {
-            let _ = runner.await;
-        }
-    });
-
-    let (mut stack_sink, mut stack_stream) = stack.split();
-
-    let _tun_to_stack = tokio::spawn(async move {
-        // See the Windows path above: reassemble IPv4 fragments so smoltcp does
-        // not drop >MTU UDP datagrams.
-        let mut reasm = super::ip_reasm::Reassembler::new();
-        let mut buf = vec![0u8; 65536];
-        loop {
-            let mut guard = match tun_stream.readable().await {
-                Ok(g) => g,
-                Err(_) => break,
-            };
-            let n = match guard.try_io(|inner| {
-                let res = unsafe {
-                    libc::read(
-                        inner.as_raw_fd(),
-                        buf.as_mut_ptr() as *mut libc::c_void,
-                        buf.len(),
-                    )
-                };
-                if res < 0 {
-                    let err = std::io::Error::last_os_error();
-                    if err.kind() == std::io::ErrorKind::WouldBlock {
-                        Err(err)
-                    } else {
-                        Ok(0_isize)
-                    }
-                } else {
-                    Ok(res)
-                }
-            }) {
-                Ok(Ok(n)) if n > 0 => n as usize,
-                Ok(Ok(_)) => continue,
-                Ok(Err(_)) => continue,
-                Err(_) => continue,
-            };
-
-            let Some(frame) = reasm.process(&buf[..n]) else {
-                continue; // fragment buffered; nothing to forward yet
-            };
-            if let Err(e) = stack_sink.send(frame).await {
-                if e.kind() == std::io::ErrorKind::BrokenPipe {
-                    break;
-                }
-            }
-        }
-    });
+    let tun_read = FdIo(tokio::io::unix::AsyncFd::new(file)?);
 
     let write_fd = unsafe { libc::dup(fd) };
     if write_fd < 0 {
@@ -507,211 +595,25 @@ pub async fn run_native_tunnel_from_fd(
         }
     }
     let write_file = unsafe { std::fs::File::from_raw_fd(write_fd) };
-    let tun_write_stream = tokio::io::unix::AsyncFd::new(write_file)?;
+    let tun_write = FdIo(tokio::io::unix::AsyncFd::new(write_file)?);
 
-    let _stack_to_tun = tokio::spawn(async move {
-        while let Some(Ok(frame)) = stack_stream.next().await {
-            let mut written = 0;
-            while written < frame.len() {
-                let mut guard = match tun_write_stream.writable().await {
-                    Ok(g) => g,
-                    Err(_) => break,
-                };
-                let res = guard.try_io(|inner| {
-                    let res = unsafe {
-                        libc::write(
-                            inner.as_raw_fd(),
-                            frame[written..].as_ptr() as *const libc::c_void,
-                            frame.len() - written,
-                        )
-                    };
-                    if res < 0 {
-                        let err = std::io::Error::last_os_error();
-                        if err.kind() == std::io::ErrorKind::WouldBlock {
-                            Err(err)
-                        } else {
-                            Ok(res)
-                        }
-                    } else {
-                        Ok(res)
-                    }
-                });
-                match res {
-                    Ok(Ok(n)) if n > 0 => written += n as usize,
-                    Ok(Ok(_)) => break,
-                    Ok(Err(_)) => break,
-                    Err(_) => continue,
-                }
-            }
-        }
-    });
-
-    let mut proxy_addr = config.local_proxy.bind_addr.clone();
-    if proxy_addr.starts_with("0.0.0.0:") {
-        proxy_addr = proxy_addr.replace("0.0.0.0:", "127.0.0.1:");
-    }
-
-    let current_exclusions = exclusions_rx.borrow().clone();
-    let matcher = crate::tunnel::exclusion::ExclusionMatcher::new(&current_exclusions, None, None);
-    let matcher_arc = std::sync::Arc::new(tokio::sync::RwLock::new(matcher));
-    
-    let matcher_clone = matcher_arc.clone();
-    tokio::spawn(async move {
-        while let Ok(_) = exclusions_rx.changed().await {
-            let current = exclusions_rx.borrow().clone();
-            let new_matcher = crate::tunnel::exclusion::ExclusionMatcher::new(&current, None, None);
-            *matcher_clone.write().await = new_matcher;
-            if true {
-                tracing::debug!("Android TUN exclusions hot-reloaded");
-            }
-        }
-    });
-
-    let udp_proxy_addr = proxy_addr.clone();
-    let debug_udp = debug;
-    let udp_matcher = matcher_arc.clone();
-    let mut udp_proxy_task = tokio::spawn(async move {
-        if let Some(udp_sock) = udp_socket {
-            super::udp_nat::run_udp_nat(udp_sock, udp_proxy_addr, debug_udp, udp_matcher, None, None).await;
-        }
-    });
-
-
-
-    let mut tcp_accept_task = tokio::spawn(async move {
-        let Some(mut listener) = tcp_listener else { return; };
-
-        while let Some((mut stream, local, remote)) = listener.next().await {
-            let proxy_addr = proxy_addr.clone();
-            let matcher_arc = matcher_arc.clone();
-
-            tokio::spawn(async move {
-                let matcher = matcher_arc.read().await.clone();
-
-                if true {
-                    tracing::debug!("Android TUN TCP {local} → {remote}");
-                }
-
-                // Sniff SNI
-                let mut sniff_buf = [0u8; 2048];
-                let sniff_len =
-                    match tokio::time::timeout(
-                        std::time::Duration::from_millis(100),
-                        stream.read(&mut sniff_buf),
-                    )
-                    .await
-                    {
-                        Ok(Ok(n)) => n,
-                        _ => 0,
-                    };
-
-                let mut should_bypass = false;
-
-                // 1. SNI domain
-                if sniff_len > 0 {
-                    if let Some(sni) =
-                        crate::tunnel::sni_sniff::extract_sni(&sniff_buf[..sniff_len])
-                    {
-                        if true { tracing::debug!("Android TUN SNI: {sni}"); }
-                        if matcher.match_domain(&sni) {
-                            should_bypass = true;
-                        }
-                    }
-                }
-
-                // 2. The program that opened the connection.
-                if !should_bypass
-                    && matcher
-                        .excluded_process(crate::tunnel::process_lookup::Proto::Tcp, local)
-                        .await
-                        .is_some()
-                {
-                    should_bypass = true;
-                }
-
-                // 3. IP CIDR
-                if !should_bypass && matcher.match_ip(&remote.ip()) {
-                    should_bypass = true;
-                }
-
-                // Bypass: connect directly (Android VPN service already protects the socket
-                // from re-entering the TUN through VpnService.protect())
-                if should_bypass {
-                    if true {
-                        tracing::debug!("Android TUN BYPASS: {remote}");
-                    }
-                    let socket = match remote {
-                        std::net::SocketAddr::V4(_) => tokio::net::TcpSocket::new_v4(),
-                        std::net::SocketAddr::V6(_) => tokio::net::TcpSocket::new_v6(),
-                    };
-                    let Ok(socket) = socket else { return; };
-
-                    match tokio::time::timeout(
-                        std::time::Duration::from_secs(10),
-                        socket.connect(remote),
-                    )
-                    .await
-                    {
-                        Ok(Ok(mut direct)) => {
-                            if sniff_len > 0 {
-                                if direct.write_all(&sniff_buf[..sniff_len]).await.is_err() {
-                                    return;
-                                }
-                            }
-                            let _ = tokio::io::copy_bidirectional(&mut stream, &mut direct).await;
-                        }
-                        _ => {
-                            tracing::debug!("Android bypass connect to {remote} failed");
-                        }
-                    }
-                    return;
-                }
-
-                // Tunnel via SOCKS5 proxy
-                let Ok(mut socks) = tokio::net::TcpStream::connect(&proxy_addr).await else {
-                    return;
-                };
-                if socks.write_all(&[5, 1, 0]).await.is_err() { return; }
-                let mut buf2 = [0u8; 2];
-                if socks.read_exact(&mut buf2).await.is_err() || buf2[0] != 5 || buf2[1] != 0 {
-                    return;
-                }
-                let mut req = vec![5u8, 1, 0];
-                match remote.ip() {
-                    std::net::IpAddr::V4(v4) => {
-                        req.push(1);
-                        req.extend_from_slice(&v4.octets());
-                    }
-                    std::net::IpAddr::V6(v6) => {
-                        req.push(4);
-                        req.extend_from_slice(&v6.octets());
-                    }
-                }
-                req.extend_from_slice(&remote.port().to_be_bytes());
-                if socks.write_all(&req).await.is_err() { return; }
-                let mut rep = [0u8; 10];
-                if socks.read_exact(&mut rep).await.is_err() || rep[1] != 0 { return; }
-                if sniff_len > 0 && socks.write_all(&sniff_buf[..sniff_len]).await.is_err() {
-                    return;
-                }
-                let _ = tokio::io::copy_bidirectional(&mut stream, &mut socks).await;
-            });
-        }
-    });
-
-    tracing::info!("NATIVE TUN (Android) tunnel active.");
-
-    tokio::select! {
-        _ = shutdown.changed() => {}
-        _ = &mut runner_task => {}
-        _ = _tun_to_stack => {}
-        _ = _stack_to_tun => {}
-        _ = &mut udp_proxy_task => {}
-        _ = &mut tcp_accept_task => {}
-    }
+    let result = run_stack_over_tun(
+        config,
+        shutdown,
+        exclusions_rx,
+        tun_read,
+        tun_write,
+        StackParams {
+            name: "Android",
+            active_msg: "NATIVE TUN (Android) tunnel active.",
+            phys_if_for_bypass: None,
+            linux_phys_name: None,
+        },
+    )
+    .await;
 
     tracing::info!("NATIVE TUN (Android) deactivated.");
-    Ok(())
+    result
 }
 
 #[cfg(not(target_os = "android"))]
