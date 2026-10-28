@@ -1956,17 +1956,19 @@ fn cmd_update(branch: String, version: Option<String>) -> Result<()> {
 
     println!("[ostp] Updating (branch={branch})");
 
-    let mut script_args = vec!["-c".to_string()];
+    // Branch and version go in as arguments, not into the shell text. The script
+    // checks the downloaded archive against the SHA-256 GitHub publishes for it;
+    // -f makes an HTTP error fail instead of feeding an error page to bash.
+    let mut script_args = vec![
+        "-c".to_string(),
+        "bash <(curl -fLs --proto '=https' https://raw.githubusercontent.com/ospab/ostp/master/scripts/install.sh) \"$@\"".to_string(),
+        "ostp-update".to_string(),
+        "--branch".to_string(),
+        branch,
+    ];
     if let Some(v) = version {
-        script_args.push(format!(
-            "bash <(curl -Ls https://raw.githubusercontent.com/ospab/ostp/master/scripts/install.sh) --branch {} -v {}",
-            branch, v
-        ));
-    } else {
-        script_args.push(format!(
-            "bash <(curl -Ls https://raw.githubusercontent.com/ospab/ostp/master/scripts/install.sh) --branch {}",
-            branch
-        ));
+        script_args.push("-v".to_string());
+        script_args.push(v);
     }
 
     let status = Command::new("bash")

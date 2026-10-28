@@ -129,6 +129,73 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+# -- Release integrity ------------------------------------------------
+
+# SHA-256 of a file, whichever tool the system has.
+sha256_of() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$1" | cut -d' ' -f1
+    elif command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 "$1" | cut -d' ' -f1
+    elif command -v sha256 >/dev/null 2>&1; then
+        sha256 -q "$1"
+    elif command -v openssl >/dev/null 2>&1; then
+        openssl dgst -sha256 "$1" | sed 's/.*= *//'
+    else
+        return 1
+    fi
+}
+
+# The digest GitHub computed for one asset of one release, taken from the API
+# response for exactly that tag ("digest": "sha256:<hex>" next to the asset name).
+release_digest() {
+    curl -s --proto '=https' "https://api.github.com/repos/${GITHUB_REPO}/releases/tags/$1" \
+        | tr ',' '\n' \
+        | awk -v n="\"$2\"" '
+            /"name": *"/ { in_asset = (index($0, n) > 0) }
+            in_asset && /"digest": *"sha256:[0-9a-fA-F]+"/ {
+                s = $0; sub(/.*sha256:/, "", s); sub(/".*/, "", s); print s; exit
+            }'
+}
+
+# verify_sha256 FILE EXPECTED: fails (and says why) unless the file matches.
+verify_sha256() {
+    local actual
+    if ! actual=$(sha256_of "$1") || [ -z "$actual" ]; then
+        echo "[error] No SHA-256 tool (sha256sum, shasum, sha256 or openssl) to verify the download. Nothing was installed."
+        return 1
+    fi
+    actual=$(printf '%s' "$actual" | tr 'A-F' 'a-f')
+    if [ "$actual" != "$(printf '%s' "$2" | tr 'A-F' 'a-f')" ]; then
+        echo "[error] SHA-256 mismatch: expected $2, got $actual. The file was not installed."
+        return 1
+    fi
+    echo "SHA-256 verified: $actual"
+}
+
+# fetch_verified TAG ASSET OUT: downloads the release asset and checks it against
+# the digest GitHub publishes for it; on any failure OUT is removed and nothing
+# gets extracted.
+fetch_verified() {
+    local tag="$1" asset="$2" out="$3" expected code
+    expected=$(release_digest "$tag" "$asset")
+    if ! [[ "$expected" =~ ^[0-9a-fA-F]{64}$ ]]; then
+        echo "[error] GitHub published no SHA-256 for $asset in release $tag. Nothing was installed."
+        return 1
+    fi
+    echo "Downloading: $asset ($tag)"
+    code=$(curl -sL --proto '=https' --proto-redir '=https' -w "%{http_code}" \
+        "https://github.com/${GITHUB_REPO}/releases/download/${tag}/${asset}" -o "$out") || code=000
+    if [ "$code" != "200" ]; then
+        echo "[error] Download failed (HTTP $code)."
+        echo "Verify that $tag is published at:"
+        echo "  https://github.com/$GITHUB_REPO/releases"
+        rm -f "$out"
+        return 1
+    fi
+    verify_sha256 "$out" "$expected" || { rm -f "$out"; return 1; }
+}
+
 # -- Download binary --------------------------------------------------
 
 if [ -n "$TARGET_VERSION" ]; then
@@ -173,29 +240,20 @@ if [ -z "$LATEST_RELEASE" ] || [[ "$LATEST_RELEASE" == *"null"* ]]; then
     echo "or press Enter if the binary is already in $INSTALL_DIR/ostp."
     read -p "URL: " DIRECT_URL
     if [ -n "$DIRECT_URL" ]; then
+        # No API to ask here, so the checksum comes from the person installing.
+        read -p "Expected SHA-256 of the archive: " DIRECT_SHA
         TEMP_TAR="$WORK_DIR/ostp.tar.gz"
         curl -fL --proto '=https' "$DIRECT_URL" -o "$TEMP_TAR"
+        verify_sha256 "$TEMP_TAR" "$DIRECT_SHA" || exit 1
         tar -xzf "$TEMP_TAR" -C "$INSTALL_DIR" ostp 2>/dev/null || tar -xzf "$TEMP_TAR" -C "$INSTALL_DIR"
         rm -f "$TEMP_TAR"
     fi
 else
     ARCHIVE_NAME="ostp-linux-${ARCH}.tar.gz"
-    DOWNLOAD_URL="https://github.com/${GITHUB_REPO}/releases/download/${LATEST_RELEASE}/${ARCHIVE_NAME}"
-    echo "Downloading: $ARCHIVE_NAME ($LATEST_RELEASE)"
-
     TEMP_TAR="$WORK_DIR/ostp.tar.gz"
-    HTTP_CODE=$(curl -sL --proto '=https' --proto-redir '=https' -w "%{http_code}" "$DOWNLOAD_URL" -o "$TEMP_TAR")
-
-    if [ "$HTTP_CODE" -eq 200 ]; then
-        tar -xzf "$TEMP_TAR" -C "$INSTALL_DIR" ostp 2>/dev/null || tar -xzf "$TEMP_TAR" -C "$INSTALL_DIR"
-        rm -f "$TEMP_TAR"
-    else
-        echo "[error] Download failed (HTTP $HTTP_CODE)."
-        echo "Verify that $LATEST_RELEASE is published at:"
-        echo "  https://github.com/$GITHUB_REPO/releases"
-        rm -f "$TEMP_TAR"
-        exit 1
-    fi
+    fetch_verified "$LATEST_RELEASE" "$ARCHIVE_NAME" "$TEMP_TAR" || exit 1
+    tar -xzf "$TEMP_TAR" -C "$INSTALL_DIR" ostp 2>/dev/null || tar -xzf "$TEMP_TAR" -C "$INSTALL_DIR"
+    rm -f "$TEMP_TAR"
 fi
 
 if [ -f "$INSTALL_DIR/ostp" ]; then
