@@ -92,9 +92,138 @@ Future<void> checkForUpdates(BuildContext context, SharedPreferences prefs, {req
         TextButton(
           onPressed: () {
             Navigator.pop(context);
-            launchUrl(Uri.parse(offer['url'] as String), mode: LaunchMode.externalApplication);
+            _openReleasePage(offer['url'] as String);
           },
-          child: const Text('Download'),
+          child: const Text('Release page'),
+        ),
+        TextButton(
+          onPressed: () {
+            Navigator.pop(context);
+            _updateNow(context, offer['tag'] as String, offer['url'] as String);
+          },
+          child: const Text('Update now'),
+        ),
+      ],
+    ),
+  );
+}
+
+void _openReleasePage(String url) => launchUrl(Uri.parse(url), mode: LaunchMode.externalApplication);
+
+String _reason(Object e) {
+  if (e is PlatformException) return e.message ?? e.code;
+  return e.toString().replaceFirst('Exception: ', '');
+}
+
+/// Downloads the APK of [tag] (checked against the SHA-256 GitHub publishes),
+/// then hands it to the system installer. Runs only after the user tapped
+/// "Update now"; on any failure it says why and offers the release page.
+Future<void> _updateNow(BuildContext context, String tag, String releaseUrl) async {
+  final progress = ValueNotifier<double?>(null);
+  var cancelled = false;
+  final navigator = Navigator.of(context, rootNavigator: true);
+  // Dialog state, not awaited: the download below runs while it is open.
+  showDialog<void>(
+    context: context,
+    barrierDismissible: false,
+    builder: (context) => AlertDialog(
+      title: Text('Downloading $tag'),
+      content: ValueListenableBuilder<double?>(
+        valueListenable: progress,
+        builder: (context, value, _) => Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            LinearProgressIndicator(value: value),
+            const SizedBox(height: 8),
+            Text(value == null ? 'Starting...' : '${(value * 100).round()}%'),
+          ],
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () {
+            cancelled = true;
+            _channel.invokeMethod('cancelUpdate');
+          },
+          child: const Text('Cancel'),
+        ),
+      ],
+    ),
+  );
+
+  final poll = Timer.periodic(const Duration(milliseconds: 400), (_) async {
+    try {
+      final p = await _channel.invokeMapMethod<String, dynamic>('updateProgress');
+      final total = (p?['total'] as num?)?.toInt() ?? 0;
+      if (total > 0) progress.value = ((p!['downloaded'] as num).toInt() / total).clamp(0.0, 1.0);
+    } catch (_) {}
+  });
+
+  String? path;
+  String? failure;
+  try {
+    path = await _channel.invokeMethod<String>('downloadUpdate', {'tag': tag});
+  } catch (e) {
+    failure = _reason(e);
+  }
+  poll.cancel();
+  navigator.pop();
+  if (cancelled) return;
+  if (!context.mounted) return;
+  if (path == null) {
+    await _showFailure(context, failure ?? 'The download returned no file', releaseUrl);
+    return;
+  }
+  await _install(context, path, releaseUrl);
+}
+
+Future<void> _install(BuildContext context, String path, String releaseUrl) async {
+  bool started;
+  try {
+    started = await _channel.invokeMethod<bool>('installUpdate', {'path': path}) ?? false;
+  } catch (e) {
+    if (context.mounted) await _showFailure(context, _reason(e), releaseUrl);
+    return;
+  }
+  if (started || !context.mounted) return;
+  // Android opened the settings screen for "install unknown apps".
+  await showDialog<void>(
+    context: context,
+    builder: (dialogContext) => AlertDialog(
+      title: const Text('Allow installing updates'),
+      content: const Text(
+        'Android needs your permission to install apps from OSTP. Turn on "Allow from this source" '
+        'in the settings screen that just opened, come back and press Install.',
+      ),
+      actions: [
+        TextButton(onPressed: () => Navigator.pop(dialogContext), child: const Text('Cancel')),
+        TextButton(
+          onPressed: () {
+            Navigator.pop(dialogContext);
+            _install(context, path, releaseUrl);
+          },
+          child: const Text('Install'),
+        ),
+      ],
+    ),
+  );
+}
+
+Future<void> _showFailure(BuildContext context, String reason, String releaseUrl) {
+  return showDialog<void>(
+    context: context,
+    builder: (context) => AlertDialog(
+      title: const Text('The update was not installed'),
+      content: Text(reason),
+      actions: [
+        TextButton(onPressed: () => Navigator.pop(context), child: const Text('Close')),
+        TextButton(
+          onPressed: () {
+            Navigator.pop(context);
+            _openReleasePage(releaseUrl);
+          },
+          child: const Text('Release page'),
         ),
       ],
     ),

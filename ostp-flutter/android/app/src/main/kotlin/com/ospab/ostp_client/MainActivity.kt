@@ -22,6 +22,8 @@ class MainActivity : FlutterActivity() {
     private var pendingStartResult: MethodChannel.Result? = null
     // A config larger than this is a bug or garbage, not a profile; it would not fit an Intent extra either.
     private val MAX_CONFIG_BYTES = 256 * 1024
+    private val updater by lazy { AppUpdater(applicationContext) }
+    private var updateInProgress = false
 
     private fun getAppIconBase64(pm: PackageManager, appInfo: ApplicationInfo): String? {
         try {
@@ -160,6 +162,45 @@ class MainActivity : FlutterActivity() {
                             runOnUiThread { result.error("ERROR", e.message, null) }
                         }
                     }.start()
+                }
+                "downloadUpdate" -> {
+                    // Only on the user's tap on "Update now". Tens of MB: never on the UI thread.
+                    val tag = call.argument<String>("tag") ?: ""
+                    if (updateInProgress) {
+                        result.error("BUSY", "An update is already downloading", null)
+                    } else {
+                        updateInProgress = true
+                        Thread {
+                            try {
+                                val file = updater.download(tag)
+                                runOnUiThread { updateInProgress = false; result.success(file.absolutePath) }
+                            } catch (e: Throwable) {
+                                runOnUiThread { updateInProgress = false; result.error("UPDATE_FAILED", e.message ?: e.javaClass.simpleName, null) }
+                            }
+                        }.start()
+                    }
+                }
+                "updateProgress" -> {
+                    result.success(mapOf("downloaded" to updater.downloaded.get(), "total" to updater.total.get()))
+                }
+                "cancelUpdate" -> {
+                    updater.cancel()
+                    result.success(true)
+                }
+                "installUpdate" -> {
+                    try {
+                        val path = call.argument<String>("path") ?: ""
+                        val file = java.io.File(path)
+                        // Only the file the updater verified, never an arbitrary path from Dart.
+                        if (file.parentFile?.canonicalFile != java.io.File(cacheDir, "updates").canonicalFile || !file.isFile) {
+                            result.error("UPDATE_FAILED", "The downloaded file is gone; download it again", null)
+                        } else {
+                            // false: Android first needs "install unknown apps" allowed for this app.
+                            result.success(updater.install(file, this))
+                        }
+                    } catch (e: Throwable) {
+                        result.error("UPDATE_FAILED", e.message ?: e.javaClass.simpleName, null)
+                    }
                 }
                 "addLog" -> {
                     val message = call.argument<String>("message") ?: ""

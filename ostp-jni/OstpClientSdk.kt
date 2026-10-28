@@ -226,31 +226,33 @@ class OstpClientSdk private constructor(private val context: Context) {
 
     private fun startPolling() {
         pollingJob = scope.launch {
-            var wasConnected = false
+            // The core reports 0 until it starts connecting; that must not read as "stopped".
+            var seenActive = false
             while (isActive) {
                 delay(1000L)
 
-                // Drain and relay logs
-                drainLogs().forEach { line ->
-                    emitLog(line)
-                    // Detect state transitions from log content
-                    when {
-                        line.contains("Connection established") ||
-                        line.contains("TUN tunnel established") -> {
-                            wasConnected = true
-                        }
-                        line.contains("Bridge stopped") ||
-                        line.contains("TUN tunnel stopped") ||
-                        line.contains("Connection failed") -> {
-                            wasConnected = false
+                // Log lines are for display only; state comes from the core's connection_state.
+                drainLogs().forEach { emitLog(it) }
+
+                val snapshot = readSnapshot()
+                when (snapshot.connectionState) {
+                    CORE_CONNECTED -> {
+                        seenActive = true
+                        _state.value = TunnelState.Connected(snapshot.metrics)
+                    }
+                    CORE_CONNECTING -> {
+                        seenActive = true
+                        val was = _state.value
+                        _state.value = if (was is TunnelState.Connected || was is TunnelState.Reconnecting) {
+                            TunnelState.Reconnecting("Connection lost, recovering", 0)
+                        } else {
+                            TunnelState.Connecting
                         }
                     }
-                }
-
-                // Update state based on metrics availability
-                val metrics = parseMetrics(getMetrics())
-                if (wasConnected) {
-                    _state.value = TunnelState.Connected(metrics)
+                    CORE_STOPPED -> if (seenActive && _state.value !is TunnelState.Failed) {
+                        _state.value = TunnelState.Failed("Tunnel stopped")
+                    }
+                    // Anything else is an unreadable snapshot: keep the last state.
                 }
             }
         }
@@ -301,17 +303,29 @@ class OstpClientSdk private constructor(private val context: Context) {
         networkCallbackJob?.cancel()
     }
 
+    private class Snapshot(val metrics: Metrics, val connectionState: Int)
+
+    private fun readSnapshot(): Snapshot {
+        return try {
+            val obj = JSONObject(getMetrics())
+            Snapshot(metricsOf(obj), obj.optInt("connection_state", -1))
+        } catch (_: Exception) {
+            Snapshot(Metrics(), -1)
+        }
+    }
+
     private fun parseMetrics(json: String): Metrics {
         return try {
-            val obj = JSONObject(json)
-            Metrics(
-                bytesSent = obj.optLong("bytes_sent", 0L),
-                bytesRecv = obj.optLong("bytes_recv", 0L),
-            )
+            metricsOf(JSONObject(json))
         } catch (_: Exception) {
             Metrics()
         }
     }
+
+    private fun metricsOf(obj: JSONObject) = Metrics(
+        bytesSent = obj.optLong("bytes_sent", 0L),
+        bytesRecv = obj.optLong("bytes_recv", 0L),
+    )
 
     private fun emitLog(msg: String) {
         scope.launch { _logs.tryEmit(msg) }
@@ -320,6 +334,11 @@ class OstpClientSdk private constructor(private val context: Context) {
     // ── Singleton ─────────────────────────────────────────────────────────────
 
     companion object {
+        // connection_state values in the core's metrics.
+        private const val CORE_STOPPED = 0
+        private const val CORE_CONNECTING = 1
+        private const val CORE_CONNECTED = 2
+
         init {
             System.loadLibrary("ostp_jni")
         }
