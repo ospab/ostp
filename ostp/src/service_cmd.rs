@@ -11,7 +11,12 @@ use std::path::Path;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-use crate::manage_cmd::{journal_tail, service_active, systemctl, UNIT};
+// The one place that knows the unit: its path and text, systemctl, the journal.
+
+/// Where `ostp setup` writes the unit.
+pub(crate) const UNIT: &str = "/etc/systemd/system/ostp.service";
+/// Where a distribution package would put it.
+const PACKAGED_UNIT: &str = "/lib/systemd/system/ostp.service";
 
 #[derive(Clone, Copy, Debug)]
 pub enum Action {
@@ -24,9 +29,118 @@ pub enum Action {
 /// a bad config makes it exit within a second, then systemd restarts it after 5.
 const SETTLE: Duration = Duration::from_secs(3);
 
+/// Whether a unit file exists, on any OS.
+pub(crate) fn unit_registered() -> bool {
+    Path::new(UNIT).exists() || Path::new(PACKAGED_UNIT).exists()
+}
+
 fn has_systemd_unit() -> bool {
-    cfg!(target_os = "linux")
-        && (Path::new(UNIT).exists() || Path::new("/lib/systemd/system/ostp.service").exists())
+    cfg!(target_os = "linux") && unit_registered()
+}
+
+pub(crate) fn systemctl(args: &[&str]) -> bool {
+    Command::new("systemctl").args(args).output().is_ok_and(|o| o.status.success())
+}
+
+/// Like `systemctl`, but with the terminal attached, so polkit can ask for a
+/// password and systemctl's own messages show.
+pub(crate) fn systemctl_visible(args: &[&str]) -> bool {
+    Command::new("systemctl").args(args).status().is_ok_and(|s| s.success())
+}
+
+pub(crate) fn service_active() -> bool {
+    systemctl(&["is-active", "--quiet", "ostp"])
+}
+
+/// `systemctl is-active` text of any unit ("active", "inactive", ...).
+pub(crate) fn unit_state(unit: &str) -> Option<String> {
+    let out = Command::new("systemctl").args(["is-active", unit]).output().ok()?;
+    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!s.is_empty()).then_some(s)
+}
+
+pub(crate) fn journal_tail(lines: usize) -> Vec<String> {
+    Command::new("journalctl")
+        .args(["-u", "ostp", "-n", &lines.to_string(), "--no-pager", "-o", "short-iso"])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).lines().map(str::to_string).collect())
+        .unwrap_or_default()
+}
+
+/// The unit that runs this binary on `config_path`.
+fn unit_text(config_path: &Path) -> String {
+    let binary = std::env::current_exe().unwrap_or_else(|_| "/opt/ostp/ostp".into());
+    let dir = binary.parent().map(|p| p.display().to_string()).unwrap_or_else(|| "/opt/ostp".into());
+    format!(
+        "[Unit]\nDescription=OSTP Stealth Transport Protocol\nAfter=network.target\nWants=network-online.target\n\n\
+         [Service]\nType=simple\nUser=root\nWorkingDirectory={dir}\nExecStart={} --config {}\n\
+         Restart=always\nRestartSec=5\nLimitNOFILE=65535\nEnvironment=RUST_LOG=info\n\n\
+         [Install]\nWantedBy=multi-user.target\n",
+        binary.display(),
+        config_path.display()
+    )
+}
+
+/// Writes the unit file; reloading and enabling are the caller's call.
+pub(crate) fn write_unit(config_path: &Path) -> std::io::Result<()> {
+    std::fs::write(UNIT, unit_text(config_path))
+}
+
+/// Stops and disables the service and removes the unit (`ostp uninstall`).
+#[cfg(unix)]
+pub(crate) fn remove_unit() -> Result<()> {
+    for action in ["stop", "disable"] {
+        let _ = Command::new("systemctl").args([action, "ostp"]).status();
+    }
+    let unit_path = Path::new(UNIT);
+    if unit_path.exists() {
+        std::fs::remove_file(unit_path)?;
+        println!("[ostp] Removed {}", unit_path.display());
+        let _ = Command::new("systemctl").args(["daemon-reload"]).status();
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Restarted {
+    /// systemctl refused (no rights, no such unit).
+    Failed,
+    /// Restarted but not active two seconds later.
+    Down,
+    Up,
+}
+
+/// Restarts the service and checks it stayed up. `visible` attaches the
+/// terminal to systemctl; `ostp manage` keeps stdout clean instead.
+pub(crate) fn restart_and_check(visible: bool) -> Restarted {
+    let ok = if visible { systemctl_visible(&["restart", "ostp"]) } else { systemctl(&["restart", "ostp"]) };
+    if !ok {
+        return Restarted::Failed;
+    }
+    std::thread::sleep(Duration::from_secs(2));
+    if service_active() { Restarted::Up } else { Restarted::Down }
+}
+
+/// Applies a config change to the running service: restarts it if it is
+/// running (a stopped service stays stopped), then checks it came back.
+pub(crate) fn restart_service(skip: bool) {
+    use colored::Colorize;
+    if skip || !unit_registered() {
+        println!("\n  Restart OSTP to apply this: {}", "sudo systemctl restart ostp".bold());
+        return;
+    }
+    if !service_active() {
+        println!("\n  The ostp service is not running; the change applies when it starts.");
+        return;
+    }
+    match restart_and_check(true) {
+        Restarted::Up => crate::wizard_ok("ostp restarted with the new settings"),
+        Restarted::Down => {
+            crate::wizard_warn("ostp did not stay up after the restart; last log lines:");
+            let _ = Command::new("journalctl").args(["-u", "ostp", "-n", "15", "--no-pager"]).status();
+        }
+        Restarted::Failed => crate::wizard_warn("could not restart ostp; run: sudo systemctl restart ostp"),
+    }
 }
 
 fn require_unit() -> Result<()> {
@@ -59,8 +173,7 @@ pub fn run(action: Action) -> Result<()> {
     }
 
     // Inherit stdio so systemctl can ask for a password through polkit and show its own errors.
-    let ok = Command::new("systemctl").args([verb, "ostp"]).status().is_ok_and(|s| s.success());
-    if !ok {
+    if !systemctl_visible(&[verb, "ostp"]) {
         bail!("systemctl {verb} ostp failed (run it with sudo?)");
     }
     if matches!(action, Action::Stop) {

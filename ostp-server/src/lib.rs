@@ -20,6 +20,7 @@ pub(crate) type SessionBackpressure = Arc<RwLock<HashMap<u32, Arc<send_gate::Sen
 mod dispatcher;
 pub mod outbound;
 pub mod api;
+pub mod config_io;
 pub mod fallback;
 pub mod transport;
 pub mod tls;
