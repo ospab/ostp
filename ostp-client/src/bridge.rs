@@ -52,6 +52,12 @@ const RESOLVE_TIMEOUT: Duration = Duration::from_secs(8);
 /// which can be interrupted; the move itself runs on the bridge loop.
 const MIGRATION_CONNECT_BUDGET: Duration = Duration::from_secs(20);
 
+/// How long a session is kept through an outage. The server keeps an idle
+/// session for 10 minutes; while ours is kept, coming back means moving it to
+/// a new path with every app connection intact, instead of a new session that
+/// resets them all.
+const KEEP_SESSION_THROUGH_OUTAGE: Duration = Duration::from_secs(300);
+
 /// Pause after a failed full-handshake attempt, by attempt number; the last
 /// value repeats until the user stops the tunnel.
 const RETRY_BACKOFF_SECS: [u64; 6] = [1, 2, 5, 10, 20, 30];
@@ -193,9 +199,13 @@ enum Link {
     Idle,
     Up,
     /// Sockets are swapped; done once every session has had an authenticated
-    /// datagram after `started`.
-    Moving { started: Instant },
-    Down { since: Instant, attempt: u32, next_try: Instant },
+    /// datagram after `started`. `outage` is set when the move is one of the
+    /// tries of an outage that is still going: (since, attempt) to go back to.
+    Moving { started: Instant, outage: Option<(Instant, u32)> },
+    /// No working path. The sessions are kept (see KEEP_SESSION_THROUGH_OUTAGE):
+    /// a try moves them to a new path, or, with `handshake_next`, does a full
+    /// handshake to learn whether the server answers at all.
+    Down { since: Instant, attempt: u32, next_try: Instant, handshake_next: bool },
 }
 
 /// Sessions that finished their handshake, not yet installed.
@@ -441,7 +451,7 @@ impl Bridge {
             self.udp_rx = None;
             match self.link {
                 Link::Up => self.recover_now("Connection to the server closed", tx, proxy_tx).await,
-                Link::Moving { .. } => self.begin_reconnect("The new connection closed", tx, proxy_tx).await,
+                Link::Moving { .. } => self.begin_reconnect("The new connection closed", true, tx, proxy_tx).await,
                 Link::Idle | Link::Down { .. } => {}
             }
             return;
@@ -559,7 +569,7 @@ impl Bridge {
                     self.metrics.connection_state.store(1, Ordering::Relaxed);
                     self.last_sample_at = Instant::now();
                     let now = Instant::now();
-                    self.link = Link::Down { since: now, attempt: 0, next_try: now };
+                    self.link = Link::Down { since: now, attempt: 0, next_try: now, handshake_next: true };
                 }
             }
             Some(BridgeCommand::NextProfile) => {
@@ -605,7 +615,7 @@ impl Bridge {
                         } else {
                             tx.send(UiEvent::Log("Runtime config reloaded. Reconnecting with the new settings.".to_string())).await.ok();
                             if self.link != Link::Idle {
-                                self.begin_reconnect("Settings changed", tx, proxy_tx).await;
+                                self.begin_reconnect("Settings changed", false, tx, proxy_tx).await;
                             }
                         }
                     }
@@ -667,14 +677,21 @@ impl Bridge {
                     self.recover_now(&reason, tx, proxy_tx).await;
                 }
             }
-            Link::Moving { started } => {
+            Link::Moving { started, outage } => {
                 if self.sessions.iter().all(|s| s.last_recv >= started) {
                     self.link = Link::Up;
                     self.metrics.connection_state.store(2, Ordering::Relaxed);
-                    tx.send(UiEvent::Log(format!(
-                        "Session moved to the new path in {} ms, no connection was dropped",
-                        started.elapsed().as_millis()
-                    ))).await.ok();
+                    let msg = match outage {
+                        Some((since, _)) => format!(
+                            "Connection restored after {} s, no connection was dropped",
+                            since.elapsed().as_secs()
+                        ),
+                        None => format!(
+                            "Session moved to the new path in {} ms, no connection was dropped",
+                            started.elapsed().as_millis()
+                        ),
+                    };
+                    tx.send(UiEvent::Log(msg)).await.ok();
                     return;
                 }
                 let deadline = MIGRATION_TIMEOUT_MIN
@@ -683,16 +700,31 @@ impl Bridge {
                 if started.elapsed() >= deadline {
                     // The server stays silent to unknown sessions on purpose, so
                     // "session expired" and "path blocked" look the same here.
-                    // Either way only a new handshake can help.
+                    // A full handshake tells them apart: it gets through only
+                    // when the server is reachable.
+                    if let Some((since, attempt)) = outage {
+                        self.link = Link::Down { since, attempt, next_try: Instant::now(), handshake_next: true };
+                        return;
+                    }
                     let reason = format!(
                         "The server did not answer on the new path within {} s (session expired, or this \
                          transport is blocked on this network)",
                         deadline.as_secs()
                     );
-                    self.begin_reconnect(&reason, tx, proxy_tx).await;
+                    self.begin_reconnect(&reason, true, tx, proxy_tx).await;
                 }
             }
             Link::Down { since, .. } => {
+                // The old path came back by itself and the kept session answered.
+                if !self.sessions.is_empty() && self.sessions.iter().all(|s| s.last_recv >= since) {
+                    self.link = Link::Up;
+                    self.metrics.connection_state.store(2, Ordering::Relaxed);
+                    tx.send(UiEvent::Log(format!(
+                        "Connection restored after {} s, no connection was dropped",
+                        since.elapsed().as_secs()
+                    ))).await.ok();
+                    return;
+                }
                 // The system proxy points at our listener, which cannot carry
                 // anything now: without a kill switch give the machine its own
                 // internet back while we keep retrying.
@@ -722,35 +754,57 @@ impl Bridge {
         match self.link {
             Link::Idle => {}
             Link::Down { since, attempt, .. } => {
-                self.link = Link::Down { since, attempt, next_try: Instant::now() };
+                self.link = Link::Down { since, attempt, next_try: Instant::now(), handshake_next: false };
             }
             Link::Up | Link::Moving { .. } => {
                 if !self.try_migrate(reason, tx).await {
-                    self.begin_reconnect(reason, tx, proxy_tx).await;
+                    self.begin_reconnect(reason, true, tx, proxy_tx).await;
                 }
             }
         }
     }
 
-    /// Recovery, step two: drop the sessions and handshake again with the same
-    /// server and transport. The old streams cannot continue on a new session.
+    /// Recovery, step two: no path works. With `keep_session` (the path was
+    /// lost) the sessions and their app connections are kept, and the tries
+    /// alternate between moving them and a full handshake; without it (new
+    /// settings, a protocol error) they are dropped now.
     async fn begin_reconnect(
         &mut self,
         reason: &str,
+        keep_session: bool,
         tx: &mpsc::Sender<UiEvent>,
         proxy_tx: &mpsc::UnboundedSender<(u16, ProxyToClientMsg)>,
     ) {
-        if matches!(self.link, Link::Idle | Link::Down { .. }) {
-            return;
+        if !keep_session {
+            self.drop_sessions(tx, proxy_tx);
+        }
+        let now = Instant::now();
+        match self.link {
+            Link::Idle => return,
+            Link::Down { since, attempt, .. } => {
+                self.link = Link::Down { since, attempt, next_try: now, handshake_next: true };
+                return;
+            }
+            Link::Up | Link::Moving { .. } => {}
         }
         tx.send(UiEvent::Log(format!("{reason}: reconnecting to the server"))).await.ok();
+        self.metrics.connection_state.store(1, Ordering::Relaxed);
+        self.link = Link::Down { since: now, attempt: 0, next_try: now, handshake_next: true };
+    }
+
+    /// The sessions cannot continue: their app connections are reset.
+    fn drop_sessions(
+        &mut self,
+        tx: &mpsc::Sender<UiEvent>,
+        proxy_tx: &mpsc::UnboundedSender<(u16, ProxyToClientMsg)>,
+    ) {
+        if self.sessions.is_empty() {
+            return;
+        }
         self.sessions.clear();
         self.udp_rx = None;
         self.stream_map.clear();
         self.reset_proxy_streams(tx, proxy_tx, "reconnect");
-        self.metrics.connection_state.store(1, Ordering::Relaxed);
-        let now = Instant::now();
-        self.link = Link::Down { since: now, attempt: 0, next_try: now };
     }
 
     /// One full-handshake attempt while `Down`. Stays responsive: a stop,
@@ -764,8 +818,28 @@ impl Bridge {
         proxy_tx: &mpsc::UnboundedSender<(u16, ProxyToClientMsg)>,
         proxy_rx: &mut mpsc::Receiver<ProxyEvent>,
     ) -> bool {
-        let Link::Down { since, attempt, .. } = self.link else { return true };
+        let Link::Down { since, attempt, handshake_next, .. } = self.link else { return true };
         refresh_routes(tx).await;
+
+        if !self.sessions.is_empty() && since.elapsed() >= KEEP_SESSION_THROUGH_OUTAGE {
+            tx.send(UiEvent::Log(format!(
+                "No connection for {} s: giving up the old session",
+                since.elapsed().as_secs()
+            ))).await.ok();
+            self.drop_sessions(tx, proxy_tx);
+        }
+        // Cheap and keeps every app connection: try it before a handshake.
+        if !handshake_next && !self.sessions.is_empty() {
+            match self.start_migration(tx).await {
+                Ok(()) => {
+                    self.link = Link::Moving { started: Instant::now(), outage: Some((since, attempt)) };
+                    return true;
+                }
+                Err(e) => {
+                    tx.send(UiEvent::Log(format!("Could not move the session: {e}"))).await.ok();
+                }
+            }
+        }
 
         let outcome = {
             let establish = self.establish_sessions(tx);
@@ -792,7 +866,7 @@ impl Bridge {
             Err(Interrupt::Shutdown) => false,
             Err(Interrupt::NetworkChanged) => {
                 self.ttl_desync_measured = None;
-                self.link = Link::Down { since, attempt, next_try: Instant::now() };
+                self.link = Link::Down { since, attempt, next_try: Instant::now(), handshake_next: false };
                 true
             }
             Err(Interrupt::Command(cmd)) => self.handle_bridge_cmd(cmd, bridge_rx, tx, proxy_tx).await,
@@ -818,10 +892,13 @@ impl Bridge {
                 tx.send(UiEvent::Log(format!(
                     "Reconnect attempt {} failed: {err}. Next try in {wait}s", attempt + 1
                 ))).await.ok();
+                // The server did not answer a handshake: the network is down,
+                // so the kept session may still be moved when it comes back.
                 self.link = Link::Down {
                     since,
                     attempt: attempt + 1,
                     next_try: Instant::now() + Duration::from_secs(wait),
+                    handshake_next: false,
                 };
                 true
             }
@@ -946,7 +1023,7 @@ impl Bridge {
 
         if let Some(e) = fatal_err {
             let _ = tx.send(UiEvent::Log(format!("Protocol tick fatal error: {e}"))).await;
-            self.begin_reconnect("Protocol error", tx, proxy_tx).await;
+            self.begin_reconnect("Protocol error", false, tx, proxy_tx).await;
         }
     }
 
@@ -1447,7 +1524,7 @@ impl Bridge {
         }
         self.udp_rx = Some(udp_rx);
 
-        self.link = Link::Moving { started: Instant::now() };
+        self.link = Link::Moving { started: Instant::now(), outage: None };
         self.metrics.connection_state.store(1, Ordering::Relaxed);
         tx.send(UiEvent::Log(
             "Moving the session to a new connection (no reconnect, streams kept)...".to_string(),
