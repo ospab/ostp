@@ -8,6 +8,9 @@ Older history is on the [Releases](https://github.com/ospab/ostp/releases) page 
 
 ## [Unreleased]
 
+### Fixed
+- Speed on short paths: with a server close by (a LAN, the same city, a nearby data centre) a connection stayed at a few Mbit/s. Every RTT sample includes the receiver's ACK delay and the sender's 10 ms tick, so with a 1 ms ping the smoothed RTT read 10 to 15 times the minimum, which the congestion control took for a standing queue and kept halving the window down to 2 packets. The delay signal now compares with at least 20 ms. Measured on loopback with 0.4.7-beta.13: 4.8 Mbit/s.
+
 ## [0.4.7-beta.13] - 2026-10-28
 
 ### Fixed
