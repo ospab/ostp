@@ -8,6 +8,8 @@ Older history is on the [Releases](https://github.com/ospab/ostp/releases) page 
 
 ## [Unreleased]
 
+## [0.4.7-beta.13] - 2026-10-28
+
 ### Fixed
 - TUN mode on Windows and Linux did not recover by itself after a network change (another Wi-Fi, a cable, a new gateway after sleep): the route to the server and the sockets of excluded traffic stayed on the network the tunnel started on, so every reconnect attempt went nowhere and only pressing Disconnect and Connect helped. Before each recovery step the client now moves those routes to the current gateway, and excluded connections use the current interface.
 - Server: a UoT connection the server had already answered was closed 20 seconds after it opened if the client sent nothing in between.
