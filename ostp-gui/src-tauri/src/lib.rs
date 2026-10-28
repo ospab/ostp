@@ -397,6 +397,19 @@ fn write_config_file(path: &std::path::Path, data: &[u8]) -> std::io::Result<()>
     }
 }
 
+/// A new file only the owner can read, private from the first byte: no window
+/// in which another user could open it before a chmod. Used for the tunnel
+/// helper's auth token.
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+fn write_new_private_file(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut opts, 0o600);
+    opts.open(path)?.write_all(data)
+}
+
 #[tauri::command]
 async fn save_config(json_content: String) -> Result<bool, String> {
     if json_content.len() > MAX_CONFIG_BYTES {
@@ -1276,8 +1289,8 @@ fn launch_as_admin_direct(exe: &std::path::PathBuf, token: &str, port: u16) -> a
     // Write token to temp file for security instead of passing via cmdline
     let temp_dir = std::env::temp_dir();
     let token_file = temp_dir.join(format!("ostp_auth_{}.tmp", rand::random::<u32>()));
-    std::fs::write(&token_file, token)?;
-    
+    write_new_private_file(&token_file, token.as_bytes())?;
+
     let params_str = format!("--port {} --token-file \"{}\"", port, token_file.display());
     let params_wstr: Vec<u16> = OsStr::new(&params_str).encode_wide().chain(Some(0)).collect();
     #[link(name = "shell32")] extern "system" { fn ShellExecuteW(h: *mut std::ffi::c_void, op: *const u16, f: *const u16, p: *const u16, d: *const u16, s: i32) -> isize; }
@@ -1320,16 +1333,14 @@ fn launch_as_admin_direct(exe: &std::path::PathBuf, token: &str, port: u16) -> a
 
 #[cfg(target_os = "linux")]
 fn launch_as_admin(exe: &PathBuf, token: &str, port: u16) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
     use std::process::Command;
 
     // Same shape as the Windows path: the token goes through a file rather than
     // argv, so it never shows up in the process list.
     let token_file = std::env::temp_dir().join(format!("ostp_auth_{}.tmp", rand::random::<u32>()));
-    std::fs::write(&token_file, token)?;
     // Unlike Windows, /tmp is world-readable here, and this token authenticates
-    // control of the privileged tunnel helper — restrict it to the owner.
-    let _ = std::fs::set_permissions(&token_file, std::fs::Permissions::from_mode(0o600));
+    // control of the privileged tunnel helper: the file is owner-only from creation.
+    write_new_private_file(&token_file, token.as_bytes())?;
 
     // pkexec is polkit's front-end: in a desktop session it raises a graphical
     // authentication dialog. sudo is not an option from a GUI process, which has

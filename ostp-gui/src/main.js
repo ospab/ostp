@@ -37,6 +37,7 @@ function invoke(cmd, args) {
 // Profile shape:
 // { id: string, name: string, server: string, key: string, transport: 'udp'|'uot',
 //   tls?: bool, tls_sni?: string, tls_insecure?: bool, ws_path?: string,
+//   tun?: bool, dns?: string, owndns?: bool,   // carried by share links, kept for export
 //   sub_id?: string }   // set on profiles owned by a subscription
 
 const PROFILES_KEY  = 'ostp_profiles_v1';
@@ -117,6 +118,7 @@ let activeId  = loadActiveId();
 
 // editor state
 let editingProfileId = null; // null = new profile
+let pendingLinkExtras = null; // tun/dns/owndns of a link opened in the editor, kept until Save
 
 // ── DOM ───────────────────────────────────────────────────────────────
 const $ = id => document.getElementById(id);
@@ -823,6 +825,7 @@ function escHtml(str) {
 // ── PROFILE EDITOR ────────────────────────────────────────────────────
 function openProfileEditor(id) {
   editingProfileId = id || null;
+  pendingLinkExtras = null;
   if (id) {
     const p = profiles.find(p => p.id === id);
     if (!p) return;
@@ -884,7 +887,9 @@ function saveProfileFromEditor() {
       key,
       transport: pmTransport.value,
       ...tlsFieldsFromEditor(),
+      ...pendingLinkExtras,
     };
+    pendingLinkExtras = null;
     profiles.push(p);
     if (!activeId) { activeId = p.id; saveActiveId(activeId); }
   }
@@ -976,6 +981,9 @@ function parseOstpLink(raw) {
     else if (k === 'sni') out.tls_sni = v;
     else if (k === 'insecure') out.tls_insecure = truthy(v);
     else if (k === 'path') out.ws_path = v;
+    else if (k === 'tun') { if (truthy(v)) out.tun = true; }
+    else if (k === 'dns') { if (v.trim()) out.dns = v.trim().slice(0, LIMITS.server); }
+    else if (k === 'owndns') { if (truthy(v)) out.owndns = true; }
     else if (k === 'name' && cleanName(v)) out.name = cleanName(v);
   }
   out.tls_sni = out.tls_sni.trim().slice(0, LIMITS.sni);
@@ -993,6 +1001,8 @@ function importFromLink(raw) {
     const parsed = parseOstpLink(raw);
     // Pre-fill editor
     editingProfileId = null;
+    pendingLinkExtras = {};
+    for (const k of ['tun', 'dns', 'owndns']) if (parsed[k]) pendingLinkExtras[k] = parsed[k];
     profileModalTitle.textContent = 'New profile';
     pmName.value = parsed.name;
     pmServer.value = parsed.server;
@@ -1018,6 +1028,9 @@ function buildShareLink(p) {
   if (tls && p.tls_sni) params.push(`sni=${linkEncode(p.tls_sni)}`);
   if (tls && p.tls_insecure) params.push('insecure=1');
   if (uot && p.ws_path) params.push(`path=${linkEncode(p.ws_path)}`);
+  if (p.tun) params.push('tun=true');
+  if (p.dns) params.push(`dns=${linkEncode(p.dns)}`);
+  if (p.owndns) params.push('owndns=true');
   if (p.name) params.push(`name=${linkEncode(p.name)}`);
   return `ostp://${linkEncode(p.key)}@${p.server}?${params.join('&')}`;
 }

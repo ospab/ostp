@@ -485,17 +485,6 @@ async fn run_client_once(
     }
 }
 
-#[allow(dead_code)]
-fn format_bytes(bps: u64) -> String {
-    if bps >= 1_000_000 {
-        format!("{:.1}MB", bps as f64 / 1_000_000.0)
-    } else if bps >= 1_000 {
-        format!("{:.1}KB", bps as f64 / 1_000.0)
-    } else {
-        format!("{bps}B")
-    }
-}
-
 fn is_essential_log(text: &str) -> bool {
     matches!(
         text,
