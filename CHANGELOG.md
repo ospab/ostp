@@ -8,6 +8,8 @@ Older history is on the [Releases](https://github.com/ospab/ostp/releases) page 
 
 ## [Unreleased]
 
+## [0.4.7-beta.12] - 2026-10-28
+
 ## [0.4.7-beta.11] - 2026-10-28
 
 ### Added
