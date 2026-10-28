@@ -1,10 +1,10 @@
 //! `access_keys` entries in a server config come in two forms: a bare key
 //! string, or an object `{ "access_key", "name", "limit_bytes" }`.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(untagged)]
 pub enum AccessKeyEntry {
     Detailed { access_key: String, name: Option<String>, limit_bytes: Option<u64> },
@@ -12,6 +12,27 @@ pub enum AccessKeyEntry {
 }
 
 impl AccessKeyEntry {
+    pub fn key(&self) -> String {
+        match self {
+            AccessKeyEntry::KeyOnly(k) => k.clone(),
+            AccessKeyEntry::Detailed { access_key, .. } => access_key.clone(),
+        }
+    }
+
+    pub fn name(&self) -> Option<String> {
+        match self {
+            AccessKeyEntry::KeyOnly(_) => None,
+            AccessKeyEntry::Detailed { name, .. } => name.clone(),
+        }
+    }
+
+    pub fn limit(&self) -> Option<u64> {
+        match self {
+            AccessKeyEntry::KeyOnly(_) => None,
+            AccessKeyEntry::Detailed { limit_bytes, .. } => *limit_bytes,
+        }
+    }
+
     /// `(key, name, limit_bytes)`.
     pub fn into_parts(self) -> (String, Option<String>, Option<u64>) {
         match self {

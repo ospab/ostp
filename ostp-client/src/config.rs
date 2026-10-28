@@ -333,37 +333,8 @@ impl UnifiedConfig {
     }
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone)]
-#[serde(untagged)]
-pub enum UserConfig {
-    Detailed {
-        access_key: String,
-        name: Option<String>,
-        limit_bytes: Option<u64>,
-    },
-    KeyOnly(String),
-}
-
-impl UserConfig {
-    pub fn key(&self) -> String {
-        match self {
-            UserConfig::KeyOnly(k) => k.clone(),
-            UserConfig::Detailed { access_key, .. } => access_key.clone(),
-        }
-    }
-    pub fn name(&self) -> Option<String> {
-        match self {
-            UserConfig::KeyOnly(_) => None,
-            UserConfig::Detailed { name, .. } => name.clone(),
-        }
-    }
-    pub fn limit(&self) -> Option<u64> {
-        match self {
-            UserConfig::KeyOnly(_) => None,
-            UserConfig::Detailed { limit_bytes, .. } => *limit_bytes,
-        }
-    }
-}
+/// An `access_keys` entry: a bare key or `{ access_key, name, limit_bytes }`.
+pub use ostp_core::access_keys::AccessKeyEntry as UserConfig;
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct ServerConfig {
