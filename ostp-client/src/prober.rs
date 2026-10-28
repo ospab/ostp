@@ -13,7 +13,7 @@
 
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use rand::Rng;
@@ -125,30 +125,17 @@ pub async fn attempt_handshake(
 ) -> AttemptOutcome {
     let secrets = ostp_core::crypto::derive_all_secrets(access_key);
     let session_id: u32 = rand::thread_rng().gen();
-    let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
-
-    let mut handshake_payload = Vec::with_capacity(8 + 4 + access_key.len());
-    handshake_payload.extend_from_slice(&timestamp.to_be_bytes());
-    handshake_payload.extend_from_slice(&session_id.to_be_bytes());
-    handshake_payload.extend_from_slice(access_key);
+    let handshake_payload = ostp_core::build_handshake_payload(access_key, session_id);
 
     let mut machine = match ProtocolMachine::new(ProtocolConfig {
-        role: NoiseRole::Initiator,
         psk: secrets.psk,
         session_id,
         handshake_payload,
         padding_strategy: PaddingStrategy::Profile(TrafficProfile::JsonRpc),
         obfuscation_key: secrets.obfuscation_key,
-        max_reorder: 16384,
-        max_reorder_buffer: 8192,
-        ack_delay_ms: 5,
-        rto_ms: 100,
-        max_retries: 8,
-        max_sent_history: 32768,
         handshake_pad_min: secrets.handshake_pad_min,
         handshake_pad_max: secrets.handshake_pad_max,
-        mtu: PROBE_MTU,
-        max_padding: PROBE_MTU.saturating_sub(48).max(256),
+        ..ProtocolConfig::with_defaults(NoiseRole::Initiator, PROBE_MTU)
     }) {
         Ok(m) => m,
         Err(e) => return AttemptOutcome { success: false, rtt_ms: None, error: Some(format!("protocol init error: {e}")), foreign_bytes: None },

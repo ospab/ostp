@@ -77,7 +77,7 @@ pub(crate) struct RemoteState {
     pub data_tx: mpsc::UnboundedSender<Bytes>,
     /// Bytes in `data_tx` not yet written to the target.
     pub queued: Arc<std::sync::atomic::AtomicUsize>,
-    pub udp_tx: Option<mpsc::UnboundedSender<(String, Bytes)>>,
+    pub udp_tx: Option<mpsc::Sender<(String, Bytes)>>,
     pub cancel_tx: mpsc::Sender<()>,
     #[allow(dead_code)]
     pub is_dns: bool,
@@ -146,25 +146,21 @@ pub async fn run_server(params: ServerParams) -> Result<()> {
     }
     if sockets.is_empty() { anyhow::bail!("no bind addresses specified"); }
 
-    use ostp_core::{NoiseRole, PaddingStrategy, ProtocolConfig};
+    use ostp_core::{NoiseRole, ProtocolConfig};
+    // Keys and handshake padding are overridden per session by the dispatcher
+    // (derive_all_secrets).
+    // Per-session buffers are capped lower than the client's: with up to 1024
+    // sessions the defaults (32768 sent frames + 8192 reordered, ~1.4 KiB each)
+    // were tens of GB in theory. Both are local state the peer never learns of:
+    // an evicted frame is simply not retransmittable (the receiver skips the
+    // gap and TCP inside the tunnel resends), and a frame beyond the reorder
+    // buffer is dropped and NACKed again. Only paths with more than ~5.7 MB
+    // in flight (about 900 Mbit/s at 50 ms) feel the first limit.
     let protocol_config = ProtocolConfig {
-        role: NoiseRole::Responder,
-        psk: [0u8; 32],
-        session_id: 0,
-        handshake_payload: vec![],
+        max_sent_history: SERVER_SENT_HISTORY,
+        max_reorder_buffer: SERVER_REORDER_BUFFER,
         max_padding: 256,
-        padding_strategy: PaddingStrategy::Adaptive,
-        obfuscation_key: [0u8; 8],
-        max_reorder: 16384,
-        max_reorder_buffer: 8192,
-        ack_delay_ms: 5,
-        rto_ms: 100,
-        max_retries: 8,
-        max_sent_history: 32768,
-        // Defaults -- overridden per-session by dispatcher using derive_all_secrets()
-        handshake_pad_min: 32,
-        handshake_pad_max: 128,
-        mtu: 1350,
+        ..ProtocolConfig::with_defaults(NoiseRole::Responder, 1350)
     };
 
     let dispatcher = Dispatcher::new(protocol_config, shared_keys.clone());
@@ -503,7 +499,7 @@ pub async fn run_server(params: ServerParams) -> Result<()> {
 
     let key_count = shared_keys.read().unwrap_or_else(|e| e.into_inner()).len();
     tracing::info!(listeners = bind_addrs.len(), keys = key_count, "server started");
-    tracing::info!("ARQ config: max_reorder=16384, reorder_buf=8192, sent_history=32768, rto=100ms");
+    tracing::info!("ARQ config: max_reorder=16384, reorder_buf=1024, sent_history=4096, rto=100ms");
     tokio::select! {
         res = run_server_loop(sniff, sockets, dispatcher, ui_cmd_rx, ui_event_tx, shared_keys, router, stats_file.clone()) => {
             if let Err(e) = res {
@@ -621,7 +617,7 @@ async fn run_server_loop(
 ) -> Result<()> {
     let mut remotes: HashMap<(u32, u16), RemoteState> = HashMap::new();
     let (stream_tx, mut stream_rx) = mpsc::unbounded_channel::<(u32, u16, Vec<u8>)>();
-    let (udp_reply_tx, mut udp_reply_rx) = mpsc::unbounded_channel::<(u32, u16, String, Vec<u8>)>();
+    let (udp_reply_tx, mut udp_reply_rx) = mpsc::channel::<(u32, u16, String, Vec<u8>)>(UDP_REPLY_QUEUE);
     let (connect_tx, mut connect_rx) = mpsc::unbounded_channel::<(u32, u16, String, Result<(tokio::net::tcp::OwnedWriteHalf, mpsc::Sender<()>), String>)>();
 
     let tcp_map = std::sync::Arc::new(tokio::sync::RwLock::new(HashMap::new()));
@@ -630,7 +626,7 @@ async fn run_server_loop(
     // transport::udp), not a fixed "primary" one.
     let socket = std::sync::Arc::new(transport::udp::UdpSockets::new(sockets));
     // Spawn a recv task for each socket, all feeding into the same channel
-    let (udp_tx, mut udp_rx) = mpsc::channel(100000);
+    let (udp_tx, mut udp_rx) = mpsc::channel(UDP_INBOUND_QUEUE);
     for (index, sock) in socket.sockets().iter().enumerate() {
         let sock_clone = sock.clone();
         let sockets = socket.clone();
@@ -642,8 +638,10 @@ async fn run_server_loop(
                     Ok((size, peer)) => {
                         sockets.received(index, peer);
                         let packet = Bytes::copy_from_slice(&buf[..size]);
-                        if tx.send((packet, peer)).await.is_err() {
-                            break;
+                        match tx.try_send((packet, peer)) {
+                            Ok(()) => {}
+                            Err(mpsc::error::TrySendError::Full(_)) => note_inbound_drop(),
+                            Err(mpsc::error::TrySendError::Closed(_)) => break,
                         }
                     }
                     Err(_) => break,
@@ -842,6 +840,28 @@ async fn run_server_loop(
 pub const STATS_FILE: &str = ".ostp_stats.json";
 const STATS_INTERVAL: Duration = Duration::from_secs(30);
 
+const SERVER_SENT_HISTORY: usize = 4096;
+const SERVER_REORDER_BUFFER: usize = 1024;
+
+/// Datagrams waiting for the server loop. A datagram can be 64 KiB, so the old
+/// 100000 slots were gigabytes in theory; 2048 is 3 MiB of ordinary (~1.4 KiB)
+/// datagrams and 128 MiB at worst. UDP may drop: past this the datagram is
+/// counted and discarded instead of buffered (the socket buffer behind it
+/// would have dropped it anyway).
+const UDP_INBOUND_QUEUE: usize = 2048;
+/// Replies from UDP-associate sockets (full-cone: anyone may send to them)
+/// waiting for the server loop.
+const UDP_REPLY_QUEUE: usize = 1024;
+static UDP_INBOUND_DROPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn note_inbound_drop() {
+    let n = UDP_INBOUND_DROPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    // First drop and then every 10000th: a flood must not flood the log too.
+    if n == 1 || n % 10_000 == 0 {
+        tracing::warn!("UDP inbound queue full, {n} datagrams dropped so far");
+    }
+}
+
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct StatsFile {
     pub written_at: u64,
@@ -947,7 +967,7 @@ async fn handle_udp_packet(
     remotes: &mut HashMap<(u32, u16), RemoteState>,
     ui_event_tx: &mpsc::UnboundedSender<UiEvent>,
     stream_tx: mpsc::UnboundedSender<(u32, u16, Vec<u8>)>,
-    udp_reply_tx: mpsc::UnboundedSender<(u32, u16, String, Vec<u8>)>,
+    udp_reply_tx: mpsc::Sender<(u32, u16, String, Vec<u8>)>,
     connect_tx: mpsc::UnboundedSender<(u32, u16, String, Result<(tokio::net::tcp::OwnedWriteHalf, mpsc::Sender<()>), String>)>,
     router: std::sync::Arc<crate::router::Router>,
     peer_last_seen: &mut HashMap<IpAddr, Instant>,
