@@ -951,21 +951,7 @@ async fn handle_proxy_client(
 }
 
 
-fn split_host_port(target: &str) -> Option<(String, u16)> {
-    if let Some((host, port)) = target.rsplit_once(':') {
-        if host.starts_with('[') && host.ends_with(']') {
-            let host = host.trim_start_matches('[').trim_end_matches(']').to_string();
-            let port = port.parse().ok()?;
-            return Some((host, port));
-        }
-        if host.contains(':') {
-            return None;
-        }
-        let port = port.parse().ok()?;
-        return Some((host.to_string(), port));
-    }
-    None
-}
+use ostp_core::net::split_host_port;
 
 async fn direct_connect_socks5(
     mut client: TcpStream,

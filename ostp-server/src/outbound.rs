@@ -2,6 +2,7 @@ use anyhow::Result;
 use tokio::net::TcpStream;
 use tokio::time::Duration;
 use serde::{Serialize, Deserialize};
+use ostp_core::net::{parse_cidr, split_host_port, Cidr};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -212,14 +213,7 @@ pub async fn select_outbound_action(
 }
 
 fn match_domain_rule(host: &str, suffixes: &[String]) -> bool {
-    if suffixes.is_empty() {
-        return false;
-    }
-    let host = host.trim_end_matches('.').to_lowercase();
-    suffixes.iter().any(|suffix| {
-        let suffix = suffix.trim().trim_start_matches('.').to_lowercase();
-        !suffix.is_empty() && (host == suffix || host.ends_with(&format!(".{suffix}")))
-    })
+    suffixes.iter().any(|suffix| ostp_core::net::domain_matches_suffix(host, suffix))
 }
 
 async fn match_ip_rule(host: &str, _port: u16, cidrs: &[String]) -> bool {
@@ -643,71 +637,6 @@ async fn connect_udp_via_socks5_inner(
         udp_sock: server_udp,
         proxy_bnd_addr,
     })
-}
-
-// ── CIDR utilities ───────────────────────────────────────────────────────────
-
-
-enum Cidr {
-    V4(u32, u8),
-    V6(u128, u8),
-}
-
-impl Cidr {
-    fn contains(&self, ip: &std::net::IpAddr) -> bool {
-        match (self, ip) {
-            (Cidr::V4(net, bits), std::net::IpAddr::V4(addr)) => {
-                let mask = if *bits == 0 { 0 } else { u32::MAX << (32 - bits) };
-                let ip = u32::from_be_bytes(addr.octets());
-                (ip & mask) == (*net & mask)
-            }
-            (Cidr::V6(net, bits), std::net::IpAddr::V6(addr)) => {
-                let mask = if *bits == 0 { 0 } else { u128::MAX << (128 - bits) };
-                let ip = u128::from_be_bytes(addr.octets());
-                (ip & mask) == (*net & mask)
-            }
-            _ => false,
-        }
-    }
-}
-
-fn parse_cidr(value: &str) -> Option<Cidr> {
-    let value = value.trim();
-    if value.is_empty() {
-        return None;
-    }
-    if let Some((addr_str, bits_str)) = value.split_once('/') {
-        let bits: u8 = bits_str.parse().ok()?;
-        if let Ok(addr) = addr_str.parse::<std::net::IpAddr>() {
-            return match addr {
-                std::net::IpAddr::V4(v4) => Some(Cidr::V4(u32::from_be_bytes(v4.octets()), bits.min(32))),
-                std::net::IpAddr::V6(v6) => Some(Cidr::V6(u128::from_be_bytes(v6.octets()), bits.min(128))),
-            };
-        }
-    }
-    if let Ok(addr) = value.parse::<std::net::IpAddr>() {
-        return match addr {
-            std::net::IpAddr::V4(v4) => Some(Cidr::V4(u32::from_be_bytes(v4.octets()), 32)),
-            std::net::IpAddr::V6(v6) => Some(Cidr::V6(u128::from_be_bytes(v6.octets()), 128)),
-        };
-    }
-    None
-}
-
-pub fn split_host_port(target: &str) -> Option<(String, u16)> {
-    if let Some((host, port)) = target.rsplit_once(':') {
-        if host.starts_with('[') && host.ends_with(']') {
-            let host = host.trim_start_matches('[').trim_end_matches(']').to_string();
-            let port = port.parse().ok()?;
-            return Some((host, port));
-        }
-        if host.contains(':') {
-            return None;
-        }
-        let port = port.parse().ok()?;
-        return Some((host.to_string(), port));
-    }
-    None
 }
 
 #[cfg(test)]

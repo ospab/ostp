@@ -74,10 +74,7 @@ impl ExclusionMatcher {
         if self.domain_suffix.is_empty() {
             return false;
         }
-        let host = normalize_domain(host);
-        self.domain_suffix.iter().any(|suffix| {
-            host == *suffix || host.ends_with(&format!(".{suffix}"))
-        })
+        self.domain_suffix.iter().any(|suffix| ostp_core::net::domain_matches_suffix(host, suffix))
     }
 
     pub fn match_ip(&self, ip: &std::net::IpAddr) -> bool {
@@ -123,64 +120,8 @@ impl ExclusionMatcher {
     }
 }
 
-/// The form a domain has on the wire: lower case, no trailing dot, and an
-/// internationalized name (`пример.рф`) in punycode (`xn--e1afmkfd.xn--p1ai`),
-/// which is what DNS, SNI and SOCKS requests carry. A string that is not a
-/// valid domain is only lower-cased, so it still matches itself.
-pub fn normalize_domain(domain: &str) -> String {
-    let domain = domain.trim().trim_end_matches('.');
-    if domain.is_ascii() {
-        return domain.to_ascii_lowercase();
-    }
-    idna::domain_to_ascii(domain).unwrap_or_else(|_| domain.to_lowercase())
-}
-
-#[derive(Clone)]
-pub enum Cidr {
-    V4(u32, u8),
-    V6(u128, u8),
-}
-
-impl Cidr {
-    pub fn contains(&self, ip: &std::net::IpAddr) -> bool {
-        match (self, ip) {
-            (Cidr::V4(net, bits), std::net::IpAddr::V4(addr)) => {
-                let mask = if *bits == 0 { 0 } else { u32::MAX << (32 - bits) };
-                let ip = u32::from_be_bytes(addr.octets());
-                (ip & mask) == (*net & mask)
-            }
-            (Cidr::V6(net, bits), std::net::IpAddr::V6(addr)) => {
-                let mask = if *bits == 0 { 0 } else { u128::MAX << (128 - bits) };
-                let ip = u128::from_be_bytes(addr.octets());
-                (ip & mask) == (*net & mask)
-            }
-            _ => false,
-        }
-    }
-}
-
-pub fn parse_cidr(s: &str) -> Option<Cidr> {
-    let parts: Vec<&str> = s.split('/').collect();
-    if parts.is_empty() || parts.len() > 2 {
-        return None;
-    }
-    if let Ok(ip) = parts[0].parse::<std::net::IpAddr>() {
-        let bits = if parts.len() == 2 {
-            parts[1].parse::<u8>().ok()?
-        } else {
-            match ip {
-                std::net::IpAddr::V4(_) => 32,
-                std::net::IpAddr::V6(_) => 128,
-            }
-        };
-        match ip {
-            std::net::IpAddr::V4(v4) => Some(Cidr::V4(u32::from_be_bytes(v4.octets()), bits)),
-            std::net::IpAddr::V6(v6) => Some(Cidr::V6(u128::from_be_bytes(v6.octets()), bits)),
-        }
-    } else {
-        None
-    }
-}
+// Shared with the server so a rule means the same on both sides.
+pub use ostp_core::net::{normalize_domain, parse_cidr, Cidr};
 
 #[cfg(test)]
 mod tests {

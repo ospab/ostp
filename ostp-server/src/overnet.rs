@@ -276,36 +276,15 @@ impl Overnet {
 /// Is this an address an overnet user must not reach through the exit: the
 /// server itself, its tunnel network, private and special ranges.
 fn forbidden_for_exit(ip: IpAddr) -> bool {
-    let ip = match ip {
-        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
-            Some(v4) => IpAddr::V4(v4),
-            None => IpAddr::V6(v6),
-        },
-        v4 => v4,
-    };
-    match ip {
-        IpAddr::V4(v4) => {
-            let o = v4.octets();
-            v4.is_loopback()
-                || v4.is_private()
-                || v4.is_link_local()
-                || v4.is_unspecified()
-                || v4.is_broadcast()
-                || v4.is_multicast()
-                || v4.is_documentation()
-                || o[0] == 0
-                || (o[0] == 100 && (64..128).contains(&o[1])) // CGNAT
-                || is_fake(ip)
-                || o[0] >= 240
-        }
-        IpAddr::V6(v6) => {
-            let s = v6.segments();
-            v6.is_loopback()
-                || v6.is_unspecified()
-                || v6.is_multicast()
-                || (s[0] & 0xfe00) == 0xfc00 // unique local
-                || (s[0] & 0xffc0) == 0xfe80 // link local
-        }
+    use ostp_core::net;
+    // The shared classes (loopback, private, CGNAT, link-local, reserved...)
+    // plus what only the exit refuses: documentation and our own fake range.
+    if net::is_special(ip) || net::is_private(ip) || net::is_loopback(ip) {
+        return true;
+    }
+    match net::canonical(ip) {
+        IpAddr::V4(v4) => v4.is_documentation() || is_fake(IpAddr::V4(v4)),
+        IpAddr::V6(_) => false,
     }
 }
 

@@ -611,15 +611,9 @@ async fn main() -> Result<()> {
 
 #[cfg(not(target_os = "windows"))]
 fn is_private_ip(ip: &str) -> bool {
-    let mut parts = ip.split('.');
-    let first = parts.next().and_then(|p| p.parse::<u8>().ok());
-    let second = parts.next().and_then(|p| p.parse::<u8>().ok());
-    match (first, second) {
-        (Some(10 | 127), _) => true,
-        (Some(192), Some(168)) => true,
-        (Some(172), Some(16..=31)) => true,
-        _ => false,
-    }
+    // Anything not public (private, CGNAT, link-local, loopback...) is not an
+    // address to offer as the server's own; an unparsable string is skipped too.
+    ip.parse::<std::net::IpAddr>().map_or(true, |ip| !ostp_core::net::is_public(ip))
 }
 
 /// Global IPv4 addresses of this machine (Linux only; empty elsewhere). More than one

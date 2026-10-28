@@ -10,7 +10,7 @@
 //! Checked on the address actually dialled, after name resolution, so a name
 //! pointing at 127.0.0.1 or 169.254.169.254 is refused like the address is.
 
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 
 #[derive(Debug, Clone, Default)]
 pub struct TargetPolicy {
@@ -20,46 +20,8 @@ pub struct TargetPolicy {
     pub loopback_ports: Vec<u16>,
 }
 
-fn canonical(ip: IpAddr) -> IpAddr {
-    match ip {
-        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
-            Some(v4) => IpAddr::V4(v4),
-            None => IpAddr::V6(v6),
-        },
-        v4 => v4,
-    }
-}
-
-/// Never a destination: unspecified, broadcast, multicast, link-local
-/// (cloud metadata), "this network" and reserved ranges.
-pub fn is_special(ip: IpAddr) -> bool {
-    match canonical(ip) {
-        IpAddr::V4(v4) => {
-            let o = v4.octets();
-            v4.is_unspecified() || v4.is_broadcast() || v4.is_multicast() || v4.is_link_local() || o[0] == 0 || o[0] >= 240
-        }
-        IpAddr::V6(v6) => {
-            let s = v6.segments();
-            v6.is_unspecified() || v6.is_multicast() || (s[0] & 0xffc0) == 0xfe80
-        }
-    }
-}
-
-/// Private and carrier-grade NAT networks, IPv6 unique-local. Alibaba's
-/// metadata (100.100.100.200) and AWS's IPv6 one (fd00:ec2::254) are here.
-pub fn is_private(ip: IpAddr) -> bool {
-    match canonical(ip) {
-        IpAddr::V4(v4) => {
-            let o = v4.octets();
-            v4.is_private() || (o[0] == 100 && (64..128).contains(&o[1]))
-        }
-        IpAddr::V6(v6) => (v6.segments()[0] & 0xfe00) == 0xfc00,
-    }
-}
-
-pub fn is_loopback(ip: IpAddr) -> bool {
-    canonical(ip).is_loopback()
-}
+// One classification for the whole workspace (client, CLI, overnet exit).
+use ostp_core::net::{is_loopback, is_private, is_special};
 
 impl TargetPolicy {
     /// The strictest policy: the public internet only (the overnet exit).
