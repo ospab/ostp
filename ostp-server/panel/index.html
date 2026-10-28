@@ -938,7 +938,12 @@ $('login-form').addEventListener('submit', async e => {
     }
   });
 });
-$('btn-logout').addEventListener('click', () => { token = ''; sessionStorage.removeItem('ostp_panel_token'); location.reload(); });
+// The server drops the session first, so a copied token stops working too. A failed call
+// (offline, already expired) must not keep the person signed in on this device.
+$('btn-logout').addEventListener('click', async () => {
+  try { await api('logout', { method: 'POST' }); } catch (e) { /* signed out locally anyway */ }
+  token = ''; sessionStorage.removeItem('ostp_panel_token'); location.reload();
+});
 
 // ── navigation ────────────────────────────────────────────────────────
 function go(p) {

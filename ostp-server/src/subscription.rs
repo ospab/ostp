@@ -6,14 +6,48 @@
 //! clear. Unknown tokens get the same decoy as any other path.
 
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::net::IpAddr;
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::{Duration, Instant};
 
 use ostp_core::share_link::{LinkTransport, ShareLink};
 use ostp_core::subscription::{token_for_key, SubscriptionDoc, SubscriptionUsage};
-use subtle::ConstantTimeEq;
 
 use crate::api::{TlsLink, UserMeta};
 use crate::dispatcher::UserStats;
+use crate::transport::limiter::FailureLimiter;
+
+/// Lookups that found no key, allowed per source per window. A client with a
+/// removed key retries a few times at most; 30 leaves room for many users
+/// behind one carrier-grade NAT address. Beyond it the source gets the decoy
+/// for the rest of the window.
+const MAX_FAILED_LOOKUPS: u32 = 30;
+const FAILED_LOOKUP_WINDOW: Duration = Duration::from_secs(600);
+/// The token index is rebuilt on a miss no more often than this, so a flood of
+/// unknown tokens costs one pass over the keys per interval, not per request.
+const INDEX_MIN_AGE: Duration = Duration::from_secs(5);
+
+/// Token-to-key index and the failed-lookup budget of `SubscriptionService`.
+pub struct Lookups {
+    failures: FailureLimiter,
+    index: Mutex<TokenIndex>,
+}
+
+#[derive(Default)]
+struct TokenIndex {
+    by_token: HashMap<String, String>,
+    built: Option<Instant>,
+    keys_at_build: usize,
+}
+
+impl Default for Lookups {
+    fn default() -> Self {
+        Self {
+            failures: FailureLimiter::new(FAILED_LOOKUP_WINDOW, MAX_FAILED_LOOKUPS),
+            index: Mutex::new(TokenIndex::default()),
+        }
+    }
+}
 
 /// Resolved `subscription` section.
 #[derive(Debug, Clone)]
@@ -34,6 +68,7 @@ pub struct SubscriptionService {
     pub dns: Arc<crate::dns::DnsServer>,
     pub keys: Arc<RwLock<HashMap<String, UserMeta>>>,
     pub stats: Arc<RwLock<HashMap<String, Arc<UserStats>>>>,
+    pub lookups: Lookups,
 }
 
 /// What the request asked for.
@@ -85,17 +120,27 @@ impl SubscriptionService {
         Some(Request { token: token.to_ascii_lowercase(), json, html, ru, head_only })
     }
 
-    /// The access key a token belongs to. Every key is checked so the time
-    /// taken does not depend on where (or whether) the match is.
+    /// The access key a token belongs to. Tokens are hashes of the keys, so
+    /// they come from an index instead of hashing every key per request. The
+    /// index is trusted only while its key still exists; on a miss it is
+    /// rebuilt when the key count changed or it is older than `INDEX_MIN_AGE`
+    /// (a key replaced by another in under that time is picked up on the next
+    /// miss after it).
     fn key_for(&self, token: &str) -> Option<String> {
         let keys = self.keys.read().unwrap_or_else(|e| e.into_inner());
-        let mut found = None;
-        for key in keys.keys() {
-            if bool::from(token_for_key(key).as_bytes().ct_eq(token.as_bytes())) {
-                found = Some(key.clone());
-            }
+        let mut index = self.lookups.index.lock().unwrap_or_else(|e| e.into_inner());
+        let hit = |index: &TokenIndex| index.by_token.get(token).filter(|k| keys.contains_key(*k)).cloned();
+        if let Some(key) = hit(&index) {
+            return Some(key);
         }
-        found
+        let stale = index.built.is_none_or(|t| t.elapsed() >= INDEX_MIN_AGE) || index.keys_at_build != keys.len();
+        if !stale {
+            return None;
+        }
+        index.by_token = keys.keys().map(|k| (token_for_key(k), k.clone())).collect();
+        index.built = Some(Instant::now());
+        index.keys_at_build = keys.len();
+        hit(&index)
     }
 
     pub async fn document(&self, key: &str) -> SubscriptionDoc {
@@ -144,9 +189,15 @@ impl SubscriptionService {
 
     /// A complete HTTP response, or `None` when the request is not a valid
     /// subscription fetch (the caller then serves the decoy).
-    pub async fn respond(&self, head: &[u8]) -> Option<Vec<u8>> {
+    pub async fn respond(&self, head: &[u8], client: IpAddr) -> Option<Vec<u8>> {
         let req = self.parse(head)?;
-        let key = self.key_for(&req.token)?;
+        if !self.lookups.failures.allowed(client) {
+            return None;
+        }
+        let Some(key) = self.key_for(&req.token) else {
+            self.lookups.failures.record_failure(client);
+            return None;
+        };
         let doc = self.document(&key).await;
 
         let (content_type, body) = if req.json {
@@ -348,7 +399,12 @@ mod tests {
             dns: crate::dns::DnsServer::new(Default::default(), None),
             keys: Arc::new(RwLock::new(keys)),
             stats: Arc::new(RwLock::new(stats)),
+            lookups: Lookups::default(),
         }
+    }
+
+    fn client() -> IpAddr {
+        "203.0.113.5".parse().unwrap()
     }
 
     fn get(path: &str, accept: &str) -> Vec<u8> {
@@ -358,7 +414,7 @@ mod tests {
     #[tokio::test]
     async fn serves_links_for_a_known_token() {
         let svc = service();
-        let resp = svc.respond(&get(&format!("/sub/{}", token_for_key("key-a")), "*/*")).await.unwrap();
+        let resp = svc.respond(&get(&format!("/sub/{}", token_for_key("key-a")), "*/*"), client()).await.unwrap();
         let resp = String::from_utf8(resp).unwrap();
         assert!(resp.starts_with("HTTP/1.1 200 OK\r\n"), "{resp}");
         assert!(resp.contains("Profile-Update-Interval: 6\r\n"));
@@ -374,10 +430,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_source_that_keeps_missing_is_refused_even_with_a_valid_token() {
+        let svc = service();
+        let bad = get(&format!("/sub/{}", token_for_key("nope")), "*/*");
+        for _ in 0..MAX_FAILED_LOOKUPS {
+            assert!(svc.respond(&bad, client()).await.is_none());
+        }
+        let good = get(&format!("/sub/{}", token_for_key("key-a")), "*/*");
+        assert!(svc.respond(&good, client()).await.is_none(), "the budget is spent");
+        let other: IpAddr = "198.51.100.1".parse().unwrap();
+        assert!(svc.respond(&good, other).await.is_some(), "other sources are unaffected");
+    }
+
+    #[tokio::test]
+    async fn a_key_added_later_is_found() {
+        let svc = service();
+        assert!(svc.key_for(&token_for_key("key-a")).is_some());
+        svc.keys.write().unwrap().insert("key-c".into(), UserMeta { name: None, limit_bytes: None });
+        assert_eq!(svc.key_for(&token_for_key("key-c")).as_deref(), Some("key-c"));
+        svc.keys.write().unwrap().remove("key-a");
+        assert!(svc.key_for(&token_for_key("key-a")).is_none(), "a removed key stops working at once");
+    }
+
+    #[tokio::test]
     async fn json_form_carries_usage() {
         let svc = service();
         let path = format!("/sub/{}?format=json", token_for_key("key-a"));
-        let resp = String::from_utf8(svc.respond(&get(&path, "*/*")).await.unwrap()).unwrap();
+        let resp = String::from_utf8(svc.respond(&get(&path, "*/*"), client()).await.unwrap()).unwrap();
         assert!(resp.contains("Content-Type: application/json"));
         let doc = SubscriptionDoc::parse(resp.splitn(2, "\r\n\r\n").nth(1).unwrap()).unwrap();
         assert_eq!(doc.usage, Some(SubscriptionUsage { used_bytes: 42, limit_bytes: Some(1000) }));
@@ -387,11 +466,11 @@ mod tests {
     #[tokio::test]
     async fn unknown_tokens_and_other_requests_are_refused() {
         let svc = service();
-        assert!(svc.respond(&get(&format!("/sub/{}", token_for_key("nope")), "*/*")).await.is_none());
-        assert!(svc.respond(&get("/sub/key-a", "*/*")).await.is_none());
-        assert!(svc.respond(&get(&format!("/other/{}", token_for_key("key-a")), "*/*")).await.is_none());
+        assert!(svc.respond(&get(&format!("/sub/{}", token_for_key("nope")), "*/*"), client()).await.is_none());
+        assert!(svc.respond(&get("/sub/key-a", "*/*"), client()).await.is_none());
+        assert!(svc.respond(&get(&format!("/other/{}", token_for_key("key-a")), "*/*"), client()).await.is_none());
         let post = format!("POST /sub/{} HTTP/1.1\r\n\r\n", token_for_key("key-a"));
-        assert!(svc.respond(post.as_bytes()).await.is_none());
+        assert!(svc.respond(post.as_bytes(), client()).await.is_none());
     }
 
     #[tokio::test]
@@ -411,7 +490,7 @@ mod tests {
         let browser = format!(
             "GET {path} HTTP/1.1\r\nHost: vpn.example.com\r\nAccept: text/html,application/xhtml+xml,*/*;q=0.8\r\nAccept-Language: ru-RU,ru;q=0.9\r\n\r\n"
         );
-        let resp = String::from_utf8(svc.respond(browser.as_bytes()).await.unwrap()).unwrap();
+        let resp = String::from_utf8(svc.respond(browser.as_bytes(), client()).await.unwrap()).unwrap();
         assert!(resp.contains("Content-Type: text/html"));
         assert!(resp.contains("Content-Security-Policy: default-src 'none'"));
         assert!(resp.contains("X-Robots-Tag: noindex"));
@@ -426,10 +505,10 @@ mod tests {
 
         // Apps and subscription managers keep getting links.
         let app = format!("GET {path} HTTP/1.1\r\nAccept: */*\r\n\r\n");
-        let resp = String::from_utf8(svc.respond(app.as_bytes()).await.unwrap()).unwrap();
+        let resp = String::from_utf8(svc.respond(app.as_bytes(), client()).await.unwrap()).unwrap();
         assert!(resp.contains("Content-Type: text/plain"));
         let json = format!("GET {path} HTTP/1.1\r\nAccept: application/json, text/html\r\n\r\n");
-        let resp = String::from_utf8(svc.respond(json.as_bytes()).await.unwrap()).unwrap();
+        let resp = String::from_utf8(svc.respond(json.as_bytes(), client()).await.unwrap()).unwrap();
         assert!(resp.contains("Content-Type: application/json"));
     }
 
