@@ -12,6 +12,11 @@ const MAX_EFFECTIVE_RTO: Duration = Duration::from_secs(8);
 /// outage rather than congestion. Keepalives go out every few seconds, and an
 /// idle session (nothing in flight) is not affected.
 const OUTAGE_SILENCE: Duration = Duration::from_secs(3);
+/// A frame is given up only after this long unacknowledged, and a receiver
+/// waits as long for a missing one. It matches how long the client keeps a
+/// session through an outage (and is well under the server's 10 minutes), so
+/// a session that survives an outage has lost nothing on the way.
+const FRAME_GIVE_UP: Duration = Duration::from_secs(300);
 /// On a reliable carrier (TCP, TLS) a frame is resent on a timer only when it
 /// has gone unacknowledged this long: far above any queueing delay, so the
 /// timer no longer duplicates frames that are merely queued.
@@ -172,6 +177,8 @@ pub struct ProtocolMachine {
     authenticated_recv_count: u64,
     /// When the last authenticated datagram arrived (see OUTAGE_SILENCE).
     last_authenticated_recv: Option<Instant>,
+    /// FRAME_GIVE_UP; a field so tests can shorten it.
+    frame_give_up: Duration,
     /// Congestion controller (BBR-inspired adaptive window)
     cc: CongestionController,
     /// The datagrams ride a reliable byte stream (UDP-over-TCP, TLS): nothing
@@ -225,6 +232,8 @@ const ANSWER_MIN_INTERVAL: Duration = Duration::from_millis(10);
 struct SentFrame {
     nonce: u64,
     bytes: Bytes,
+    /// When it was first sent; a frame is given up only after FRAME_GIVE_UP.
+    first_sent: Instant,
     last_sent: Instant,
     retries: u8,
     is_retransmittable: bool,
@@ -281,6 +290,7 @@ impl ProtocolMachine {
             highest_authenticated_recv_nonce: None,
             authenticated_recv_count: 0,
             last_authenticated_recv: None,
+            frame_give_up: FRAME_GIVE_UP,
             cc: CongestionController::new(mtu as u64),
             reliable_carrier: false,
             path_changed_at: None,
@@ -908,7 +918,9 @@ impl ProtocolMachine {
     /// configuration, so the receiver uses its own estimate of it.
     fn sender_gives_up_after(&self) -> Duration {
         let base = self.base_rto();
-        (0..=self.retry_limit()).map(|retries| retransmit_wait(base, retries, self.reliable_carrier)).sum()
+        let schedule: Duration =
+            (0..=self.retry_limit()).map(|retries| retransmit_wait(base, retries, self.reliable_carrier)).sum();
+        schedule.max(self.frame_give_up)
     }
 
     /// How long a gap waits before it counts as a loss; see REORDER_WINDOW_MIN.
@@ -969,17 +981,22 @@ impl ProtocolMachine {
         let base_rto = self.base_rto();
 
         // ── Zombie frame eviction ────────────────────────────────────
-        // Evict frames that exceeded max_retries + 2 grace retries.
+        // Past max_retries + 2 attempts AND FRAME_GIVE_UP since it was first
+        // sent. A count alone gave up within ~30 s on a short path (small RTO),
+        // inside an outage the session was about to survive.
         let grace = self.retry_limit();
+        let give_up = self.frame_give_up;
+        let given_up_frame =
+            |f: &SentFrame| f.is_retransmittable && f.retries > grace && now.duration_since(f.first_sent) >= give_up;
         let before = self.sent_history.len();
         let given_up: u64 = self
             .sent_history
             .iter()
-            .filter(|f| f.is_retransmittable && f.retries > grace)
+            .filter(|f| given_up_frame(f))
             .map(|f| f.bytes.len() as u64)
             .sum();
         self.cc.on_discard(given_up);
-        self.sent_history.retain(|f| !f.is_retransmittable || f.retries <= grace);
+        self.sent_history.retain(|f| !given_up_frame(f));
         let evicted = before - self.sent_history.len();
         if evicted > 0 {
             tracing::debug!("Evicted {} zombie frames from sent_history (remaining={})", evicted, self.sent_history.len());
@@ -1147,6 +1164,7 @@ impl ProtocolMachine {
         self.sent_history.push_back(SentFrame {
             nonce,
             bytes,
+            first_sent: Instant::now(),
             last_sent: Instant::now(),
             retries: 0,
             is_retransmittable,
@@ -1675,6 +1693,8 @@ mod tests {
 
         // Stand in for "the sender exhausted its retries and dropped frame 1":
         // the sequence has not advanced for longer than the recovery timeout.
+        // A short give-up time keeps the subtraction valid on a fresh machine.
+        server.frame_give_up = Duration::from_secs(5);
         server.last_recv_advance = Instant::now() - server.sender_gives_up_after() - Duration::from_secs(1);
 
         // The next inbound frame (a retransmitted duplicate, which is exactly what
