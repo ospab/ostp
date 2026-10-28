@@ -95,26 +95,34 @@ where
             // halfway through one is as dead as one that sends nothing.
             // Until the server has replied, the deadline is fixed: frames do
             // not extend it.
-            let limit = if authenticated.load(Ordering::Relaxed) {
-                idle
-            } else {
-                auth_deadline.saturating_duration_since(tokio::time::Instant::now()).min(idle)
-            };
-            let frame = tokio::time::timeout(limit, async {
+            let frame = async {
                 read_half.read_exact(&mut len_buf).await?;
                 let mut data = vec![0u8; u16::from_be_bytes(len_buf) as usize];
                 read_half.read_exact(&mut data).await?;
                 Ok::<_, std::io::Error>(data)
-            })
-            .await;
-            let data = match frame {
-                Ok(Ok(data)) => data,
-                Ok(Err(_)) => break,
-                Err(_) => {
-                    tracing::debug!("UoT client {} idle or unauthenticated for {:?}, closing", peer_addr, limit);
-                    break;
+            };
+            tokio::pin!(frame);
+            let data = loop {
+                let authed = authenticated.load(Ordering::Relaxed);
+                let limit = if authed {
+                    idle
+                } else {
+                    auth_deadline.saturating_duration_since(tokio::time::Instant::now()).min(idle)
+                };
+                // Timing out on `&mut frame` keeps a half-read frame intact.
+                match tokio::time::timeout(limit, &mut frame).await {
+                    Ok(Ok(data)) => break Some(data),
+                    Ok(Err(_)) => break None,
+                    // The server answered while this frame was awaited: the
+                    // deadline no longer applies, only `idle` does.
+                    Err(_) if !authed && authenticated.load(Ordering::Relaxed) => continue,
+                    Err(_) => {
+                        tracing::debug!("UoT client {} idle or unauthenticated for {:?}, closing", peer_addr, limit);
+                        break None;
+                    }
                 }
             };
+            let Some(data) = data else { break };
             if udp_tx.send((Bytes::from(data), peer_addr)).await.is_err() { break; }
         }
     };

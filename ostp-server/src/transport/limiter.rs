@@ -258,7 +258,9 @@ mod tests {
         assert!(slots.try_acquire_max(a, 3).is_none(), "the fourth is refused");
         assert!(slots.try_acquire_max(ip("203.0.113.2"), 3).is_some(), "another source is not");
         drop(held);
-        assert!(slots.try_acquire_max(a, 3).is_some(), "slots come back");
+        let again = slots.try_acquire_max(a, 3);
+        assert!(again.is_some(), "slots come back");
+        // The other source's guard was dropped at once, so only `a` is left.
         assert_eq!(slots.held.lock().unwrap().len(), 1, "empty entries are removed");
     }
 
