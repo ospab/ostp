@@ -209,16 +209,10 @@ pub async fn run_server(params: ServerParams) -> Result<()> {
                         match std::fs::read_to_string(&path_to_watch) {
                             Ok(content) => {
                                 #[derive(serde::Deserialize)]
-                                #[serde(untagged)]
-                                enum ReloadUser {
-                                    Detailed { access_key: String, name: Option<String>, limit_bytes: Option<u64> },
-                                    KeyOnly(String),
-                                }
-                                #[derive(serde::Deserialize)]
                                 struct ServerReloadConfig {
                                     mode: String,
                                     #[serde(default)]
-                                    access_keys: Vec<ReloadUser>,
+                                    access_keys: Vec<ostp_core::access_keys::AccessKeyEntry>,
                                 }
                                 
                                 let mut stripped = json_comments::StripComments::new(content.as_bytes());
@@ -234,11 +228,8 @@ pub async fn run_server(params: ServerParams) -> Result<()> {
                                         if cfg.mode == "server" {
                                             let mut new_keys = HashMap::new();
                                             for uc in cfg.access_keys {
-                                                let (k, m) = match uc {
-                                                    ReloadUser::Detailed { access_key, name, limit_bytes } => (access_key, crate::api::UserMeta { name, limit_bytes }),
-                                                    ReloadUser::KeyOnly(k) => (k, crate::api::UserMeta { name: None, limit_bytes: None }),
-                                                };
-                                                new_keys.insert(k, m);
+                                                let (k, name, limit_bytes) = uc.into_parts();
+                                                new_keys.insert(k, crate::api::UserMeta { name, limit_bytes });
                                             }
                                             
                                             // 1. Update shared_keys

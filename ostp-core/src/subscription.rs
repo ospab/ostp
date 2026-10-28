@@ -13,6 +13,12 @@ pub fn token_for_key(access_key: &str) -> String {
     digest[..16].iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// `https://<host>[:port]<prefix>/<token>`; the port is left out on 443.
+pub fn subscription_url(host: &str, port: u16, prefix: &str, token: &str) -> String {
+    let port = if port == 443 { String::new() } else { format!(":{port}") };
+    format!("https://{host}{port}{prefix}/{token}")
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SubscriptionUsage {
     /// Traffic used so far (both directions).
@@ -75,6 +81,12 @@ impl SubscriptionDoc {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn url_leaves_out_port_443() {
+        assert_eq!(subscription_url("vpn.example.com", 443, "/sub", "tok"), "https://vpn.example.com/sub/tok");
+        assert_eq!(subscription_url("vpn.example.com", 8443, "/sub", "tok"), "https://vpn.example.com:8443/sub/tok");
+    }
 
     #[test]
     fn token_is_stable_hex_and_hides_the_key() {

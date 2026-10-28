@@ -338,12 +338,7 @@ async fn run_order(account: &Account, req: &IssueRequest<'_>, tokens: &mut Vec<S
 /// Proves that `http://domain/.well-known/acme-challenge/` reaches this
 /// store before asking the CA, whose failed validations are rate limited.
 pub async fn preflight(domain: &str, store: &ChallengeStore) -> Result<()> {
-    let token: String = (0..32)
-        .map(|_| {
-            const A: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
-            A[rand::random::<usize>() % A.len()] as char
-        })
-        .collect();
+    let token = ostp_core::keys::random_alnum(32);
     let value = format!("ostp-preflight-{}", hex::encode(rand::random::<[u8; 8]>()));
     store.put(&token, &value)?;
     let res = tokio::time::timeout(

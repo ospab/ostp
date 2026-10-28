@@ -894,12 +894,7 @@ async fn handle_create_user(
             }
             k
         }
-        None => {
-            use rand::RngCore;
-            let mut buf = [0u8; 16];
-            rand::thread_rng().fill_bytes(&mut buf);
-            buf.iter().map(|b| format!("{:02x}", b)).collect()
-        }
+        None => ostp_core::keys::access_key_hex(),
     };
 
     {
@@ -1086,28 +1081,25 @@ async fn handle_user_share(
     };
     let owndns = state.dns_server.enabled();
 
-    use ostp_core::share_link::{LinkTransport, ShareLink};
+    use ostp_core::share_link::ShareLink;
     let title = |kind: &str| match &name {
         Some(n) => format!("{n} · {kind}"),
         None => format!("{} · {kind}", state.server_host),
     };
-    let mut udp = ShareLink::new(&key, &state.server_host, state.server_port);
-    udp.owndns = owndns;
+    let mut udp = ShareLink::udp_for(&key, &state.server_host, state.server_port, owndns);
     udp.name = Some(title("UDP"));
     let tls = state.tls_link.as_ref().map(|t| {
-        let mut l = ShareLink::new(&key, &t.host, t.port);
-        l.transport = LinkTransport::Uot;
-        l.tls = true;
-        l.path = t.path.clone();
-        l.owndns = owndns;
+        let mut l = ShareLink::tls_for(&key, &t.host, t.port, t.path.clone(), owndns);
         l.name = Some(title("TLS"));
         l.to_uri()
     });
     let subscription = match (&state.subscription_prefix, &state.tls_link) {
-        (Some(prefix), Some(t)) => {
-            let port = if t.port == 443 { String::new() } else { format!(":{}", t.port) };
-            Some(format!("https://{}{port}{prefix}/{}", t.host, ostp_core::subscription::token_for_key(&key)))
-        }
+        (Some(prefix), Some(t)) => Some(ostp_core::subscription::subscription_url(
+            &t.host,
+            t.port,
+            prefix,
+            &ostp_core::subscription::token_for_key(&key),
+        )),
         _ => None,
     };
     (StatusCode::OK, ApiResponse::success(UserShare { tls, udp: udp.to_uri(), subscription }))
@@ -1191,18 +1183,10 @@ async fn handle_subscribe(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("application/json");
 
-    use ostp_core::share_link::{LinkTransport, ShareLink};
+    use ostp_core::share_link::ShareLink;
     let dns_enabled = state.dns_server.enabled();
-    let mut udp = ShareLink::new(&key, &state.server_host, state.server_port);
-    udp.owndns = dns_enabled;
-    let tls = state.tls_link.as_ref().map(|t| {
-        let mut l = ShareLink::new(&key, &t.host, t.port);
-        l.transport = LinkTransport::Uot;
-        l.tls = true;
-        l.path = t.path.clone();
-        l.owndns = dns_enabled;
-        l
-    });
+    let udp = ShareLink::udp_for(&key, &state.server_host, state.server_port, dns_enabled);
+    let tls = state.tls_link.as_ref().map(|t| ShareLink::tls_for(&key, &t.host, t.port, t.path.clone(), dns_enabled));
     let chosen = match (query.transport.as_deref(), &tls) {
         (Some("udp"), _) | (_, None) => udp.clone(),
         (_, Some(t)) => t.clone(),
@@ -1602,7 +1586,7 @@ async fn handle_bulk_create_users(
         // 128 random bits, like a single created key: the access key is the
         // handshake's pre-shared key, so a captured handshake can be guessed
         // against offline. (Sixteen hex digits of a UUIDv4 are only 60 bits.)
-        let key: String = rand::random::<[u8; 16]>().iter().map(|b| format!("{b:02x}")).collect();
+        let key = ostp_core::keys::access_key_hex();
         keys.insert(key.clone(), UserMeta {
             name: None,
             limit_bytes: payload.limit_bytes,

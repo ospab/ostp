@@ -61,6 +61,23 @@ impl ShareLink {
         }
     }
 
+    /// Plain UDP link; `owndns` when the server runs its own resolver.
+    pub fn udp_for(key: impl Into<String>, host: impl Into<String>, port: u16, owndns: bool) -> Self {
+        let mut l = Self::new(key, host, port);
+        l.owndns = owndns;
+        l
+    }
+
+    /// TLS link (OSTP over TLS, optionally behind a web server's upgrade `path`).
+    pub fn tls_for(key: impl Into<String>, host: impl Into<String>, port: u16, path: Option<String>, owndns: bool) -> Self {
+        let mut l = Self::new(key, host, port);
+        l.transport = LinkTransport::Uot;
+        l.tls = true;
+        l.path = path;
+        l.owndns = owndns;
+        l
+    }
+
     /// `host:port`, bracketing IPv6 literals.
     pub fn server(&self) -> String {
         if self.host.contains(':') {
@@ -184,6 +201,31 @@ fn non_empty(v: String) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The hand-built forms the constructors replaced.
+    #[test]
+    fn constructors_match_the_old_hand_built_links() {
+        for (key, host, port, path, owndns) in [
+            ("0123456789abcdef0123456789abcdef", "vpn.example.com", 443u16, Some("/s3cr3t".to_string()), false),
+            ("k e/y+1", "2001:db8::1", 8443, None, true),
+            ("a%b", "1.2.3.4", 50000, Some("/p ath/\u{43f}".to_string()), true),
+        ] {
+            let mut old = ShareLink::new(key, host, port);
+            old.transport = LinkTransport::Uot;
+            old.tls = true;
+            old.path = path.clone();
+            old.owndns = owndns;
+            assert_eq!(ShareLink::tls_for(key, host, port, path, owndns), old);
+
+            let mut old = ShareLink::new(key, host, port);
+            old.owndns = owndns;
+            assert_eq!(ShareLink::udp_for(key, host, port, owndns), old);
+        }
+        assert_eq!(
+            ShareLink::tls_for("k e", "2001:db8::1", 443, Some("/x".into()), true).to_uri(),
+            "ostp://k%20e@[2001:db8::1]:443?type=uot&tls=1&path=%2Fx&owndns=true"
+        );
+    }
 
     #[test]
     fn legacy_link_defaults_to_udp() {

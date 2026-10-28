@@ -102,9 +102,7 @@ pub(crate) fn tls_settings(config_path: &Path) -> Result<TlsSettings> {
 }
 
 pub(crate) fn random_path() -> String {
-    const A: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
-    let s: String = (0..24).map(|_| A[rand::random::<usize>() % A.len()] as char).collect();
-    format!("/{s}")
+    format!("/{}", ostp_core::keys::random_alnum(24))
 }
 
 pub(crate) fn listen_port(v: &serde_json::Value) -> u16 {
@@ -493,9 +491,7 @@ async fn self_test(config_path: &Path, t: &TlsSettings) {
 
     // 3. Subscriptions, when they are on.
     let sub = subscription_prefix(&v);
-    let first_key = v["access_keys"].as_array().and_then(|a| a.first()).and_then(|k| {
-        k.as_str().map(str::to_string).or_else(|| k.get("access_key").and_then(|x| x.as_str()).map(str::to_string))
-    });
+    let first_key = v["access_keys"].as_array().and_then(|a| a.first()).and_then(ostp_core::access_keys::key_of);
     if let (Some(prefix), Some(key)) = (sub, first_key) {
         let token = ostp_core::subscription::token_for_key(&key);
         let got = async {

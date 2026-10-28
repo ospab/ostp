@@ -10,6 +10,7 @@ use serde_json::{json, Value};
 use std::path::Path;
 use std::process::Command;
 
+use ostp_core::access_keys::key_and_name;
 use ostp_client::config::{AppMode, ServerConfig, UnifiedConfig};
 
 use crate::service_cmd::{self, journal_tail, service_active, systemctl, Restarted, UNIT};
@@ -102,16 +103,6 @@ fn find_user(v: &Value, who: &str) -> Result<usize> {
         })
         .map(|(i, _)| i)
         .ok_or_else(|| anyhow!("no user matches {who}"))
-}
-
-fn key_and_name(u: &Value) -> (String, String) {
-    match u {
-        Value::String(k) => (k.clone(), String::new()),
-        _ => (
-            u["access_key"].as_str().unwrap_or_default().to_string(),
-            u["name"].as_str().unwrap_or_default().to_string(),
-        ),
-    }
 }
 
 fn register_service(config_path: &Path) -> Result<()> {

@@ -255,7 +255,7 @@ fn share_links_for(
     key: &str,
     config_path: &std::path::Path,
 ) -> Vec<(&'static str, ostp_core::share_link::ShareLink)> {
-    use ostp_core::share_link::{LinkTransport, ShareLink};
+    use ostp_core::share_link::ShareLink;
     let listen = server_cfg.listen.primary();
     let (listen_host, port) = match listen.rsplit_once(':') {
         Some((h, p)) => (h.trim_matches(['[', ']']).to_string(), p.parse().unwrap_or(50000)),
@@ -272,13 +272,8 @@ fn share_links_for(
 
     let mut links = Vec::new();
     if let (Some(tls), Some(domain)) = (server_cfg.tls.as_ref().filter(|t| t.is_enabled()), &domain) {
-        let mut l = ShareLink::new(key, domain, tls.public_port.unwrap_or(443));
-        l.transport = LinkTransport::Uot;
-        l.tls = true;
-        if tls.frontend() != "builtin" {
-            l.path = tls.ws_path.clone();
-        }
-        links.push(("TLS", l));
+        let path = if tls.frontend() != "builtin" { tls.ws_path.clone() } else { None };
+        links.push(("TLS", ShareLink::tls_for(key, domain, tls.public_port.unwrap_or(443), path, false)));
     }
     links.push(("UDP", ShareLink::new(key, &host, port)));
     links
@@ -289,11 +284,12 @@ fn subscription_url_for(server_cfg: &ostp_client::config::ServerConfig, key: &st
     let sub = server_cfg.subscription.as_ref().filter(|s| s.is_enabled())?;
     let tls = server_cfg.tls.as_ref().filter(|t| t.is_enabled())?;
     let domain = server_cfg.domain.as_deref().filter(|d| !d.is_empty())?;
-    let port = match tls.public_port.unwrap_or(443) {
-        443 => String::new(),
-        p => format!(":{p}"),
-    };
-    Some(format!("https://{domain}{port}{}/{}", sub.path(), ostp_core::subscription::token_for_key(key)))
+    Some(ostp_core::subscription::subscription_url(
+        domain,
+        tls.public_port.unwrap_or(443),
+        &sub.path(),
+        &ostp_core::subscription::token_for_key(key),
+    ))
 }
 
 /// Terminal QR code; light modules drawn as blocks so it scans on the usual
@@ -493,17 +489,6 @@ fn qr_browser(clients: &[QrClient]) -> Result<()> {
     Ok(())
 }
 
-fn format_bytes(n: u64) -> String {
-    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
-    let mut v = n as f64;
-    let mut i = 0;
-    while v >= 1024.0 && i < UNITS.len() - 1 {
-        v /= 1024.0;
-        i += 1;
-    }
-    if i == 0 { format!("{n} B") } else { format!("{v:.1} {}", UNITS[i]) }
-}
-
 fn link_transport(l: &ostp_core::share_link::ShareLink) -> TransportConfigRaw {
     TransportConfigRaw {
         mode: Some(l.transport.as_str().to_string()),
@@ -516,15 +501,9 @@ fn link_transport(l: &ostp_core::share_link::ShareLink) -> TransportConfigRaw {
 }
 
 fn generate_secure_key(format_type: &str) -> String {
-    use rand::RngCore;
-    let mut key = [0u8; 16];
-    rand::thread_rng().fill_bytes(&mut key);
     match format_type.to_lowercase().as_str() {
-        "base64" => {
-            use base64::Engine;
-            base64::engine::general_purpose::STANDARD_NO_PAD.encode(key)
-        }
-        _ => key.iter().map(|b| format!("{:02x}", b)).collect(),
+        "base64" => ostp_core::keys::access_key_base64(),
+        _ => ostp_core::keys::access_key_hex(),
     }
 }
 
@@ -1051,22 +1030,11 @@ fn run_setup_wizard(config_path: &std::path::Path) -> Result<Option<PathBuf>> {
             wizard_ok(&format!("Generated {} key(s)", key_count));
 
             wizard_step(3, TOTAL, "Web panel settings");
-            use rand::Rng;
             let panel_port = wizard_prompt("Panel port", "9090");
-            let rand_path: String = (0..8).map(|_| {
-                let idx = rand::thread_rng().gen_range(0..36u8);
-                (if idx < 10 { b'0' + idx } else { b'a' + idx - 10 }) as char
-            }).collect();
+            let rand_path = ostp_core::keys::random_lower_alnum(8);
             let webpath  = wizard_prompt("Secret URL path (leave blank for random)", &rand_path);
             let username = wizard_prompt("Admin username", "admin");
-            let rand_pass: String = (0..12).map(|_| {
-                let idx = rand::thread_rng().gen_range(0..62u8);
-                (match idx {
-                    0..=9   => b'0' + idx,
-                    10..=35 => b'a' + idx - 10,
-                    _       => b'A' + idx - 36,
-                }) as char
-            }).collect();
+            let rand_pass = ostp_core::keys::random_alnum(12);
             let password  = wizard_prompt("Admin password (blank for random)", &rand_pass);
             // The same format api.rs checks at sign-in.
             let pass_hash = ostp_server::password::hash(&password);
@@ -1414,8 +1382,8 @@ async fn run_app() -> Result<()> {
             let links = doc.valid_links();
             println!("  {} — {} link(s), refresh every {} h", doc.name.bold(), links.len(), doc.update_interval_hours);
             if let Some(u) = &doc.usage {
-                let limit = u.limit_bytes.map(format_bytes).unwrap_or_else(|| "unlimited".into());
-                println!("  Traffic: {} of {limit}", format_bytes(u.used_bytes));
+                let limit = u.limit_bytes.map(ostp_core::fmt_bytes).unwrap_or_else(|| "unlimited".into());
+                println!("  Traffic: {} of {limit}", ostp_core::fmt_bytes(u.used_bytes));
             }
             for (i, l) in links.iter().enumerate() {
                 println!("  [{}] {}", i + 1, l.name.clone().unwrap_or_else(|| l.server()));

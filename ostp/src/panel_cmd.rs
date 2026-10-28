@@ -152,7 +152,7 @@ pub fn run(action: PanelAction, config_path: &Path) -> Result<()> {
             if clear {
                 api.as_object_mut().map(|o| o.remove("token"));
             } else {
-                let token: String = (0..32).map(|_| format!("{:x}", rand::random::<u8>() & 0xf)).collect();
+                let token: String = ostp_core::keys::random_hex(32);
                 api["token"] = token.clone().into();
                 println!("  New API token: {token}");
             }

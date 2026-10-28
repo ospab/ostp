@@ -10,6 +10,7 @@ use std::net::IpAddr;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
+use ostp_core::fmt_bytes;
 use ostp_core::share_link::{LinkTransport, ShareLink};
 use ostp_core::subscription::{token_for_key, SubscriptionDoc, SubscriptionUsage};
 
@@ -159,17 +160,12 @@ impl SubscriptionService {
 
         let mut links = Vec::new();
         if let (true, Some(t)) = (self.settings.include_tls, &self.tls) {
-            let mut l = ShareLink::new(key, &t.host, t.port);
-            l.transport = LinkTransport::Uot;
-            l.tls = true;
-            l.path = t.path.clone();
-            l.owndns = owndns;
+            let mut l = ShareLink::tls_for(key, &t.host, t.port, t.path.clone(), owndns);
             l.name = Some(title("TLS"));
             links.push(l.to_uri());
         }
         if self.settings.include_udp {
-            let mut l = ShareLink::new(key, &self.udp.0, self.udp.1);
-            l.owndns = owndns;
+            let mut l = ShareLink::udp_for(key, &self.udp.0, self.udp.1, owndns);
             l.name = Some(title("UDP"));
             links.push(l.to_uri());
         }
@@ -241,10 +237,7 @@ impl SubscriptionService {
     /// The subscription's own address, as a person would paste it.
     fn url(&self, token: &str) -> String {
         match &self.tls {
-            Some(t) => {
-                let port = if t.port == 443 { String::new() } else { format!(":{}", t.port) };
-                format!("https://{}{port}{}/{token}", t.host, self.settings.prefix)
-            }
+            Some(t) => ostp_core::subscription::subscription_url(&t.host, t.port, &self.settings.prefix, token),
             None => format!("{}/{token}", self.settings.prefix),
         }
     }
@@ -351,17 +344,6 @@ fn prefers_russian(accept_language: &str) -> bool {
 
 fn html_escape(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;").replace('\'', "&#39;")
-}
-
-fn fmt_bytes(n: u64) -> String {
-    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
-    let mut v = n as f64;
-    let mut i = 0;
-    while v >= 1024.0 && i < UNITS.len() - 1 {
-        v /= 1024.0;
-        i += 1;
-    }
-    if i == 0 { format!("{n} B") } else { format!("{v:.1} {}", UNITS[i]) }
 }
 
 /// Header-safe title: plain ASCII as is, anything else as `base64:...`,
