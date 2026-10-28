@@ -110,8 +110,9 @@ async fn start_udp_bypass_session(
         SocketAddr::V6(_) => UdpSocket::bind("[::]:0").await?,
     };
 
+    // The current interface (ostp_tun moves it on a network change).
     #[cfg(target_os = "windows")]
-    if let Some(idx) = phys_if_index {
+    if let Some(idx) = ostp_tun::physical_if_index().or(phys_if_index) {
         if let Err(e) = crate::tunnel::proxy::bind_socket_to_interface(&socket, client_src.is_ipv6(), idx) {
             tracing::error!("TUN UDP BYPASS failed to bind to physical interface {}: {}", idx, e);
         } else {
@@ -122,7 +123,7 @@ async fn start_udp_bypass_session(
     }
     
     #[cfg(target_os = "linux")]
-    if let Some(ref name) = _phys_if_name {
+    if let Some(ref name) = ostp_tun::physical_if_name().or_else(|| _phys_if_name.clone()) {
         let _ = crate::tunnel::proxy::bind_socket_to_interface(&socket, name);
     }
 

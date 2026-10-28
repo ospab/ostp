@@ -41,6 +41,42 @@ pub mod linux;
 #[cfg(target_os = "macos")]
 pub mod macos;
 
+/// The physical interface that bypass routes and bypass sockets go through. It is
+/// set when the TUN is created and moved by `refresh_bypass_routes` when the
+/// network changes (another Wi-Fi, a cable, a new gateway after sleep).
+static PHYSICAL_IF: std::sync::Mutex<(Option<u32>, Option<String>)> = std::sync::Mutex::new((None, None));
+
+#[allow(dead_code)]
+pub(crate) fn set_physical_if(index: Option<u32>, name: Option<String>) {
+    if let Ok(mut p) = PHYSICAL_IF.lock() {
+        *p = (index, name);
+    }
+}
+
+/// Index of the physical interface (Windows), as of the last route refresh.
+pub fn physical_if_index() -> Option<u32> {
+    PHYSICAL_IF.lock().ok().and_then(|p| p.0)
+}
+
+/// Name of the physical interface (Linux), as of the last route refresh.
+pub fn physical_if_name() -> Option<String> {
+    PHYSICAL_IF.lock().ok().and_then(|p| p.1.clone())
+}
+
+/// Points the bypass routes (the server and the excluded addresses) at the
+/// current physical default gateway if it changed since they were added.
+/// Without this, after a network change the route to the server still leads to
+/// the old gateway and every reconnect attempt goes nowhere. Returns true when
+/// the routes were moved. Blocking: it reads the routing table.
+pub fn refresh_bypass_routes() -> bool {
+    #[cfg(target_os = "windows")]
+    return windows::refresh_bypass_routes();
+    #[cfg(target_os = "linux")]
+    return linux::refresh_bypass_routes();
+    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+    false
+}
+
 impl OstpTunInterface {
     #[allow(unused_variables)]
     pub async fn create(opts: OstpTunOptions) -> Result<Self> {

@@ -5,10 +5,51 @@ use std::process::Command;
 struct LinuxRouteGuard {
     server_ip: String,
     bypass_routes: Vec<String>,
-    real_gw: Option<String>,
-    real_dev: Option<String>,
     kill_switch: bool,
     ipv6: bool,
+}
+
+/// The bypass routes in place, so a network change can move them.
+struct BypassRoutes {
+    /// "a.b.c.d/32" for the server and every excluded address.
+    routes: Vec<String>,
+    gw: String,
+    dev: String,
+    kill_switch: bool,
+}
+
+static ROUTES: std::sync::Mutex<Option<BypassRoutes>> = std::sync::Mutex::new(None);
+
+/// (gateway, device) of the physical default route; the TUN's own is skipped.
+fn physical_default() -> Option<(String, String)> {
+    let out = Command::new("ip").args(["route", "show", "default"]).output().ok()?;
+    let text = String::from_utf8(out.stdout).ok()?;
+    text.lines().filter(|l| !l.contains("dev ostp_tun")).find_map(|l| {
+        let gw = l.split_whitespace().skip_while(|w| *w != "via").nth(1)?;
+        let dev = l.split_whitespace().skip_while(|w| *w != "dev").nth(1)?;
+        Some((gw.to_string(), dev.to_string()))
+    })
+}
+
+pub(crate) fn refresh_bypass_routes() -> bool {
+    let Some((gw, dev)) = physical_default() else { return false };
+    let Ok(mut routes) = ROUTES.lock() else { return false };
+    let Some(r) = routes.as_mut() else { return false };
+    if r.gw == gw && r.dev == dev {
+        return false;
+    }
+    for route in &r.routes {
+        let _ = Command::new("ip").args(["route", "replace", route, "via", &gw, "dev", &dev]).output();
+    }
+    if r.kill_switch {
+        // The new network brought its own default route: drop it as at start.
+        let _ = Command::new("ip").args(["route", "del", "default", "via", &gw, "dev", &dev]).output();
+    }
+    tracing::info!("Network changed: bypass routes moved from {} dev {} to {} dev {}", r.gw, r.dev, gw, dev);
+    r.gw = gw;
+    r.dev = dev.clone();
+    crate::set_physical_if(None, Some(dev));
+    true
 }
 
 impl Drop for LinuxRouteGuard {
@@ -25,10 +66,14 @@ impl Drop for LinuxRouteGuard {
         }
         tracing::info!("Removed Linux bypass routes.");
 
+        // The default route to restore is the latest physical one, which a
+        // network change may have moved since the tunnel started.
+        let latest = ROUTES.lock().ok().and_then(|mut r| r.take());
+        crate::set_physical_if(None, None);
         if self.kill_switch {
-            if let (Some(ref gw), Some(ref dev)) = (&self.real_gw, &self.real_dev) {
-                let _ = Command::new("ip").args(["route", "add", "default", "via", gw, "dev", dev]).output();
-                tracing::info!("Restored original default route via {} dev {}", gw, dev);
+            if let Some(r) = latest {
+                let _ = Command::new("ip").args(["route", "add", "default", "via", &r.gw, "dev", &r.dev]).output();
+                tracing::info!("Restored original default route via {} dev {}", r.gw, r.dev);
             }
         }
     }
@@ -48,18 +93,10 @@ pub async fn create(opts: OstpTunOptions) -> Result<OstpTunInterface> {
     let dev = tun::AsyncDevice::new(dev).map_err(|e| anyhow!("TUN device async failed: {}", e))?;
     tracing::info!("TUN device 'ostp_tun' created.");
 
-    let gw_out = Command::new("ip")
-        .args(["route", "show", "default"])
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok());
-
-    let real_gw = gw_out.as_deref().and_then(|s| {
-        s.split_whitespace().skip_while(|w| *w != "via").nth(1).map(|s| s.to_string())
-    });
-    let real_dev = gw_out.as_deref().and_then(|s| {
-        s.split_whitespace().skip_while(|w| *w != "dev").nth(1).map(|s| s.to_string())
-    });
+    let (real_gw, real_dev) = match physical_default() {
+        Some((gw, dev)) => (Some(gw), Some(dev)),
+        None => (None, None),
+    };
 
     let mut bypass_routes = Vec::new();
 
@@ -82,6 +119,13 @@ pub async fn create(opts: OstpTunOptions) -> Result<OstpTunInterface> {
             tracing::info!("Kill Switch: deleting original default route to prevent leakage.");
             let _ = Command::new("ip").args(["route", "del", "default", "via", gw, "dev", dev_name]).output();
         }
+
+        let mut routes = vec![format!("{server_ip_str}/32")];
+        routes.extend(bypass_routes.iter().cloned());
+        if let Ok(mut r) = ROUTES.lock() {
+            *r = Some(BypassRoutes { routes, gw: gw.clone(), dev: dev_name.clone(), kill_switch: opts.kill_switch });
+        }
+        crate::set_physical_if(None, Some(dev_name.clone()));
     } else {
         tracing::warn!("Could not detect physical default gateway. Tunnel routing might not work correctly.");
     }
@@ -117,8 +161,6 @@ pub async fn create(opts: OstpTunOptions) -> Result<OstpTunInterface> {
         guard: Box::new(LinuxRouteGuard {
             server_ip: opts.server_ip.to_string(),
             bypass_routes,
-            real_gw,
-            real_dev,
             kill_switch: opts.kill_switch,
             ipv6,
         }),

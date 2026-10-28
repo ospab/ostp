@@ -7,8 +7,36 @@ pub mod windows_route {
     include!("windows_route.rs");
 }
 
+/// The bypass routes in place, so a network change can move them.
+struct BypassRoutes {
+    ips: Vec<std::net::Ipv4Addr>,
+    gw: std::net::Ipv4Addr,
+    if_index: u32,
+    added: Vec<(std::net::Ipv4Addr, std::net::Ipv4Addr, u32)>,
+}
+
+static ROUTES: std::sync::Mutex<Option<BypassRoutes>> = std::sync::Mutex::new(None);
+
+pub(crate) fn refresh_bypass_routes() -> bool {
+    let Some((gw, if_index)) = windows_route::sys::get_default_ipv4_route() else { return false };
+    let Ok(mut routes) = ROUTES.lock() else { return false };
+    let Some(r) = routes.as_mut() else { return false };
+    if r.gw == gw && r.if_index == if_index {
+        return false;
+    }
+    windows_route::sys::remove_bypass_routes(&r.added);
+    r.added = windows_route::sys::add_bypass_routes(&r.ips, gw, if_index, 1);
+    tracing::info!(
+        "Network changed: bypass routes moved from {} (if_index={}) to {} (if_index={})",
+        r.gw, r.if_index, gw, if_index
+    );
+    r.gw = gw;
+    r.if_index = if_index;
+    crate::set_physical_if(Some(if_index), None);
+    true
+}
+
 struct WindowsRouteGuard {
-    bypass_routes: Vec<(std::net::Ipv4Addr, std::net::Ipv4Addr, u32)>,
     kill_switch: bool,
     /// The TUN interface index when IPv6 routes were added through it.
     ipv6_if: Option<u32>,
@@ -18,8 +46,11 @@ impl Drop for WindowsRouteGuard {
     fn drop(&mut self) {
         const CREATE_NO_WINDOW: u32 = 0x08000000;
         
-        windows_route::sys::remove_bypass_routes(&self.bypass_routes);
-        tracing::info!("Removed {} bypass routes.", self.bypass_routes.len());
+        if let Some(r) = ROUTES.lock().ok().and_then(|mut r| r.take()) {
+            windows_route::sys::remove_bypass_routes(&r.added);
+            tracing::info!("Removed {} bypass routes.", r.added.len());
+        }
+        crate::set_physical_if(None, None);
 
         let is_kill_switch = self.kill_switch;
         let ipv6_if = self.ipv6_if;
@@ -73,6 +104,10 @@ pub async fn create(opts: OstpTunOptions) -> Result<OstpTunInterface> {
 
     let bypass_routes = windows_route::sys::add_bypass_routes(&bypass_v4, phys_gw, phys_if, 1);
     tracing::info!("Added {} bypass routes via {} (if_index={})", bypass_routes.len(), phys_gw, phys_if);
+    if let Ok(mut r) = ROUTES.lock() {
+        *r = Some(BypassRoutes { ips: bypass_v4, gw: phys_gw, if_index: phys_if, added: bypass_routes });
+    }
+    crate::set_physical_if(Some(phys_if), None);
 
     let mut tun_cfg = tun::Configuration::default();
     tun_cfg
@@ -216,7 +251,6 @@ pub async fn create(opts: OstpTunOptions) -> Result<OstpTunInterface> {
     Ok(OstpTunInterface {
         device: dev,
         guard: Box::new(WindowsRouteGuard {
-            bypass_routes,
             kill_switch: opts.kill_switch,
             ipv6_if,
         }),

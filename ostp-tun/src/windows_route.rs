@@ -63,6 +63,10 @@ pub mod sys {
                             continue;
                         }
                     }
+                    // and the kill switch's blackhole through 127.0.0.1.
+                    if dword_to_ipv4(row.dwForwardNextHop).is_loopback() {
+                        continue;
+                    }
                     let metric = row.dwForwardMetric1;
                     if metric < best_metric {
                         best_metric = metric;

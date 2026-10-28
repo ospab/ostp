@@ -229,8 +229,10 @@ where
 
                     // Bind to physical interface so packets don't loop back into TUN
 
+                    // The current interface: a network change moves it (ostp_tun
+                    // keeps it up to date), the one from the start may be gone.
                     #[cfg(target_os = "windows")]
-                    if let Some(idx) = phys_if_for_bypass {
+                    if let Some(idx) = ostp_tun::physical_if_index().or(phys_if_for_bypass) {
                         if let Err(e) = crate::tunnel::proxy::bind_socket_to_interface(
                             &socket,
                             remote.is_ipv6(),
@@ -246,7 +248,7 @@ where
                         tracing::warn!("TUN TCP BYPASS has no physical interface index!");
                     }
                     #[cfg(target_os = "linux")]
-                    if let Some(ref name) = lin_name {
+                    if let Some(ref name) = ostp_tun::physical_if_name().or_else(|| lin_name.clone()) {
                         let _ = crate::tunnel::proxy::bind_socket_to_interface(&socket, name);
                     }
 

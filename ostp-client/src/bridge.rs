@@ -765,6 +765,7 @@ impl Bridge {
         proxy_rx: &mut mpsc::Receiver<ProxyEvent>,
     ) -> bool {
         let Link::Down { since, attempt, .. } = self.link else { return true };
+        refresh_routes(tx).await;
 
         let outcome = {
             let establish = self.establish_sessions(tx);
@@ -1405,6 +1406,8 @@ impl Bridge {
             anyhow::bail!("a session is not established");
         }
 
+        refresh_routes(tx).await;
+
         // Connect everything before touching the sessions, so a failure leaves
         // them as they were.
         let mut sockets = Vec::with_capacity(count);
@@ -1654,6 +1657,18 @@ async fn udp_failure_diagnosis(server_addr: &str) -> String {
             addr.port()
         ),
         Err(e) => format!("No answer on TCP {addr} either ({e}): the server is down or unreachable from this network."),
+    }
+}
+
+
+/// In TUN mode the server is reached through a route via the physical gateway
+/// set up at start. After a network change that gateway is gone and every new
+/// socket would go nowhere, which only a manual restart used to fix: move the
+/// routes to the current gateway before each recovery step.
+async fn refresh_routes(tx: &mpsc::Sender<UiEvent>) {
+    let moved = tokio::task::spawn_blocking(ostp_tun::refresh_bypass_routes).await.unwrap_or(false);
+    if moved {
+        tx.send(UiEvent::Log("Network changed: routes to the server now use the new network".to_string())).await.ok();
     }
 }
 
