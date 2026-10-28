@@ -66,6 +66,49 @@ pub fn begin_connection() {
     append_line(&format!("{CONNECTION_MARK} started ====="));
 }
 
+/// `ostp.log` is cut down once it passes this size...
+const MAX_LOG_BYTES: u64 = 10 * 1024 * 1024;
+/// ...to roughly this much of its end.
+const KEPT_LOG_BYTES: u64 = 5 * 1024 * 1024;
+
+/// Keeps the end of an oversized `ostp.log` and drops the rest. `begin_connection`
+/// only trims when a connection starts, which a long-running server or client
+/// never does again.
+///
+/// Cut in place for the same reason as in [`begin_connection`]: other processes
+/// hold the file open for appending.
+pub fn cap_log_size() {
+    use std::io::{Read, Seek, SeekFrom};
+    let path = log_file_path();
+    let len = match std::fs::metadata(&path) {
+        Ok(m) if m.len() > MAX_LOG_BYTES => m.len(),
+        _ => return,
+    };
+    let Ok(mut file) = OpenOptions::new().read(true).write(true).open(&path) else {
+        return;
+    };
+    // One byte before the kept part, to tell whether it starts on a line boundary.
+    let mut tail = Vec::new();
+    if file.seek(SeekFrom::Start(len - KEPT_LOG_BYTES - 1)).is_err()
+        || file.read_to_end(&mut tail).is_err()
+    {
+        return;
+    }
+    let kept = from_line_boundary(&tail);
+    let _ = file
+        .set_len(0)
+        .and_then(|_| file.seek(SeekFrom::Start(0)))
+        .and_then(|_| file.write_all(kept));
+}
+
+/// `buf` without its leading partial line.
+fn from_line_boundary(buf: &[u8]) -> &[u8] {
+    match buf.iter().position(|&b| b == b'\n') {
+        Some(i) => &buf[i + 1..],
+        None => &[],
+    }
+}
+
 /// Offset of the line holding the last connection mark.
 fn last_mark(text: &[u8]) -> Option<usize> {
     let mark = CONNECTION_MARK.as_bytes();
@@ -119,8 +162,9 @@ pub fn setup_panic_hook() {
 /// trace; `RUST_LOG` overrides it.
 ///
 /// `new_connection` keeps only the previous connection's log (see [`begin_connection`]).
-/// It applies on Windows only; Linux servers keep their history. Only the daemon passes
-/// `true`; the GUI calls `begin_connection` itself.
+/// It applies on Windows only; Linux servers keep their history (under systemd the
+/// output also goes to the journal), but the file is capped at [`MAX_LOG_BYTES`] everywhere.
+/// Only the daemon passes `true`; the GUI calls `begin_connection` itself.
 pub fn init_tracing(
     level: &str,
     app_name: &str,
@@ -144,6 +188,7 @@ pub fn init_tracing(
     if new_connection && cfg!(windows) {
         begin_connection();
     }
+    cap_log_size();
     // Always append: several processes write this file, and a handle that
     // writes at its own offset would overwrite what the others wrote.
     let mut open_opts = OpenOptions::new();
@@ -163,6 +208,12 @@ pub fn init_tracing(
         );
 
         let (file_writer, guard) = tracing_appender::non_blocking(file);
+
+        // A server or client that runs for weeks keeps writing to the same file.
+        let _ = std::thread::Builder::new().name("log-cap".into()).spawn(|| loop {
+            std::thread::sleep(std::time::Duration::from_secs(60));
+            cap_log_size();
+        });
 
         let fmt_layer = tracing_subscriber::fmt::layer()
             .with_target(true)
@@ -198,7 +249,14 @@ pub fn init_tracing(
 
 #[cfg(test)]
 mod tests {
-    use super::last_mark;
+    use super::{from_line_boundary, last_mark};
+
+    #[test]
+    fn cap_starts_on_a_whole_line() {
+        assert_eq!(from_line_boundary(b"rt of a line\nnext\nlast\n"), b"next\nlast\n");
+        assert_eq!(from_line_boundary(b"\nnext\n"), b"next\n");
+        assert_eq!(from_line_boundary(b"no newline"), b"");
+    }
 
     #[test]
     fn finds_the_last_connection() {
