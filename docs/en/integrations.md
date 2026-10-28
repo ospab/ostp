@@ -23,6 +23,8 @@ The app checks GitHub for a newer stable or beta release when it opens (this can
 
 If the install fails, the dialog shows why and offers the release page instead.
 
+The Android app does the same with its APK: it downloads the build for the phone's architecture, checks the size and the SHA-256, and opens the system installer, which installs it over the current app because both are signed with the same key. If the app may not install apps yet, it opens that setting first.
+
 ## Your own server from the apps
 
 Both apps can install OSTP on a VPS and manage it afterwards, for people who have bought a server and do not want to learn Linux. The SSH work is done by the `ostp-ssh` crate, shared by the desktop app (Tauri commands in `ostp-gui/src-tauri/src/servers.rs`) and Android (`serversCall` in `ostp-jni`).

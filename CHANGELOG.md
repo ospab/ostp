@@ -8,6 +8,27 @@ Older history is on the [Releases](https://github.com/ospab/ostp/releases) page 
 
 ## [Unreleased]
 
+### Added
+- Android: "Update now" in the update dialog downloads the APK for the phone's architecture from the GitHub release, checks its size and the SHA-256 GitHub publishes for it, and opens the system installer. If installing apps from this source is not allowed yet, the app opens that setting. Nothing is downloaded until the button is pressed.
+- Web panel: "Sign out" now ends the session on the server too. A panel session ends after 12 hours without activity and at most 7 days after sign-in.
+
+### Fixed
+- Desktop app: the MTU set in the settings was ignored (always 1350). The CLI, the desktop app and a config reload now turn the config file into the same settings with the same defaults (MTU 1140, I/O timeout 2.5 s, connect timeout 15 s); before, a reload changed the MTU and the timeouts of a running tunnel.
+- Client without a GUI (`ostp` as a service): a first connection that failed (wrong key, a name that does not resolve) was retried forever; it now stops with the error, like the apps. When the server name has IPv4 and IPv6 addresses, IPv4 is tried first, so a broken IPv6 route no longer blocks the connection.
+- Client: an exclusion like `10.0.0.0/33` crashed the client; prefixes are capped. Routing rules on the server with Cyrillic and other non-Latin domains (`пример.рф`) never matched; they do now.
+- `ostp setup` could offer a carrier-grade NAT (100.64.0.0/10) or link-local address as the server's public address for links. The same complete check for private addresses is now used everywhere.
+- CLI: every command that changes `config.json` writes it atomically and private (0600); a crash in the middle of a write no longer leaves an empty config without keys. Links printed by the setup wizard percent-encode the key and handle IPv6; `ostp init` uses the configured port instead of 50000.
+- TUN on Android: a closed or revoked TUN descriptor made the tunnel spin a CPU core until it was stopped.
+- Server: UoT connections that do not complete a handshake within 20 seconds are closed, at most 64 of them per source address. The fallback (decoy) connection closes after 120 seconds of silence and no longer blocks new connections. Unauthenticated queues are bounded; the plain HTTP port times out slow requests. The DNS cache no longer scans itself on every miss.
+- Server: subscription links are looked up through an index instead of trying every key, and a source with 30 wrong subscription links in 10 minutes is refused for the rest of that time.
+- Android: the app's state no longer depends on the wording of log lines.
+- Desktop app: share links keep the `tun`, `dns` and `owndns` options on import and export. Temporary token files are created private instead of being made private after writing.
+- Byte sizes are shown in binary units everywhere (KiB, MiB, GiB, TiB); the Android home screen showed a terabyte as "1024 GB".
+
+### Security
+- `install.sh`, `install.ps1` and `ostp update` check the downloaded archive against the SHA-256 GitHub publishes for it; without a hash or with a different one nothing is installed. `install.ps1` can install beta and alpha releases (`-Branch`, `-Version`), like `install.sh`.
+- `ostp.log` is kept under 10 MB.
+
 ## [0.4.7-beta.10] - 2026-10-28
 
 ### Added
