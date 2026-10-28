@@ -149,16 +149,11 @@ pub async fn run_server(params: ServerParams) -> Result<()> {
     use ostp_core::{NoiseRole, ProtocolConfig};
     // Keys and handshake padding are overridden per session by the dispatcher
     // (derive_all_secrets).
-    // Per-session buffers are capped lower than the client's: with up to 1024
-    // sessions the defaults (32768 sent frames + 8192 reordered, ~1.4 KiB each)
-    // were tens of GB in theory. Both are local state the peer never learns of:
-    // an evicted frame is simply not retransmittable (the receiver skips the
-    // gap and TCP inside the tunnel resends), and a frame beyond the reorder
-    // buffer is dropped and NACKed again. Only paths with more than ~5.7 MB
-    // in flight (about 900 Mbit/s at 50 ms) feel the first limit.
+    // The sent history is not lowered here to save memory: the tunnel's TCP
+    // streams end at this server, so OSTP's ARQ is their only delivery
+    // guarantee, and a frame evicted before it was acknowledged is lost for
+    // good and silently corrupts its stream.
     let protocol_config = ProtocolConfig {
-        max_sent_history: SERVER_SENT_HISTORY,
-        max_reorder_buffer: SERVER_REORDER_BUFFER,
         max_padding: 256,
         ..ProtocolConfig::with_defaults(NoiseRole::Responder, 1350)
     };
@@ -499,7 +494,7 @@ pub async fn run_server(params: ServerParams) -> Result<()> {
 
     let key_count = shared_keys.read().unwrap_or_else(|e| e.into_inner()).len();
     tracing::info!(listeners = bind_addrs.len(), keys = key_count, "server started");
-    tracing::info!("ARQ config: max_reorder=16384, reorder_buf=1024, sent_history=4096, rto=100ms");
+    tracing::info!("ARQ config: max_reorder=16384, reorder_buf=8192, sent_history=32768, rto=100ms");
     tokio::select! {
         res = run_server_loop(sniff, sockets, dispatcher, ui_cmd_rx, ui_event_tx, shared_keys, router, stats_file.clone()) => {
             if let Err(e) = res {
@@ -840,15 +835,12 @@ async fn run_server_loop(
 pub const STATS_FILE: &str = ".ostp_stats.json";
 const STATS_INTERVAL: Duration = Duration::from_secs(30);
 
-const SERVER_SENT_HISTORY: usize = 4096;
-const SERVER_REORDER_BUFFER: usize = 1024;
-
 /// Datagrams waiting for the server loop. A datagram can be 64 KiB, so the old
-/// 100000 slots were gigabytes in theory; 2048 is 3 MiB of ordinary (~1.4 KiB)
-/// datagrams and 128 MiB at worst. UDP may drop: past this the datagram is
+/// 100000 slots were gigabytes in theory; 8192 is 11 MiB of ordinary (~1.4 KiB)
+/// datagrams, enough for a burst on a fast link, and 512 MiB at worst. UDP may drop: past this the datagram is
 /// counted and discarded instead of buffered (the socket buffer behind it
 /// would have dropped it anyway).
-const UDP_INBOUND_QUEUE: usize = 2048;
+const UDP_INBOUND_QUEUE: usize = 8192;
 /// Replies from UDP-associate sockets (full-cone: anyone may send to them)
 /// waiting for the server loop.
 const UDP_REPLY_QUEUE: usize = 1024;
