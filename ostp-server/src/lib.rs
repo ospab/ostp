@@ -835,7 +835,7 @@ const UDP_INBOUND_QUEUE: usize = 8192;
 /// Replies from UDP-associate sockets (full-cone: anyone may send to them)
 /// waiting for the server loop.
 const UDP_REPLY_QUEUE: usize = 1024;
-static UDP_INBOUND_DROPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static UDP_INBOUND_DROPPED: portable_atomic::AtomicU64 = portable_atomic::AtomicU64::new(0);
 
 fn note_inbound_drop() {
     let n = UDP_INBOUND_DROPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
