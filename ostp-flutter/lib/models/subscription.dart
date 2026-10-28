@@ -76,7 +76,8 @@ List<OstpSubscription> decodeSubscriptions(String? json) {
 String encodeSubscriptions(List<OstpSubscription> subs) =>
     jsonEncode(subs.map((e) => e.toJson()).toList());
 
-String formatBytes(int n) {
+/// Binary units (1 KiB = 1024 B), the one byte formatter of the app.
+String formatBytes(num n) {
   const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB'];
   var v = n.toDouble();
   var i = 0;
@@ -84,7 +85,7 @@ String formatBytes(int n) {
     v /= 1024;
     i++;
   }
-  return i == 0 ? '$n B' : '${v.toStringAsFixed(1)} ${units[i]}';
+  return i == 0 ? '${n.toInt()} B' : '${v.toStringAsFixed(1)} ${units[i]}';
 }
 
 bool isSubscriptionUrl(String s) => s.trim().toLowerCase().startsWith('https://');

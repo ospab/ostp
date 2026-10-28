@@ -698,12 +698,7 @@ fn server_lines_since(since: u64) -> serde_json::Value {
 }
 
 fn decode_master_key(hex: &str) -> Option<[u8; 32]> {
-    let hex = hex.trim();
-    if hex.len() != 64 {
-        return None;
-    }
-    let bytes: Option<Vec<u8>> = (0..64).step_by(2).map(|i| u8::from_str_radix(&hex[i..i + 2], 16).ok()).collect();
-    bytes?.try_into().ok()
+    ostp_ssh::store::Vault::key_from_hex(hex)
 }
 
 /// One request to the server manager as JSON (see

@@ -234,17 +234,7 @@ class ServerError implements Exception {
   String toString() => message;
 }
 
-String fmtBytes(num? b) {
-  if (b == null) return '—';
-  const units = ['B', 'KB', 'MB', 'GB', 'TB'];
-  var v = b.toDouble();
-  var i = 0;
-  while (v >= 1024 && i < units.length - 1) {
-    v /= 1024;
-    i++;
-  }
-  return '${v.toStringAsFixed(i == 0 ? 0 : 1)} ${units[i]}';
-}
+String fmtBytes(num? b) => b == null ? '—' : formatBytes(b);
 
 String fmtDuration(num? secs) {
   if (secs == null) return '—';

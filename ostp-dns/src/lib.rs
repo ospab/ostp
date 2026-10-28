@@ -403,10 +403,7 @@ impl Dns {
         if !s.enabled || !s.block_doh_bypass {
             return false;
         }
-        match target.parse::<std::net::SocketAddr>() {
-            Ok(addr) => addr.port() == 853 || (addr.port() == 443 && services::is_public_resolver(addr.ip())),
-            Err(_) => target.rsplit_once(':').is_some_and(|(_, p)| p == "853"),
-        }
+        is_encrypted_dns_target(target)
     }
 
     /// Whether the server should answer its clients' port-53 queries.
@@ -806,15 +803,35 @@ fn read_activity(path: &std::path::Path) -> Option<Activity> {
     }
 }
 
-/// Written to a temporary file and renamed, readable by root only.
+/// Encrypted DNS: anything to port 853 (DoT, DoQ), port 443 on a public
+/// resolver's address (DoH, DoH over QUIC), or a name with `:853`.
+pub fn is_encrypted_dns_target(target: &str) -> bool {
+    match target.parse::<std::net::SocketAddr>() {
+        Ok(addr) => addr.port() == 853 || (addr.port() == 443 && services::is_public_resolver(addr.ip())),
+        Err(_) => target.rsplit_once(':').is_some_and(|(_, p)| p == "853"),
+    }
+}
+
+/// Created private from the first byte, flushed to disk, then renamed over the
+/// target so a crash leaves either the old file or the new one.
 fn write_private(path: &std::path::Path, body: &[u8]) -> std::io::Result<()> {
     let tmp = path.with_extension("json.tmp");
+    // A leftover temp file keeps its old mode; start from a fresh one.
+    let _ = std::fs::remove_file(&tmp);
     let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
+    opts.write(true).create_new(true);
     #[cfg(unix)]
     std::os::unix::fs::OpenOptionsExt::mode(&mut opts, 0o600);
-    std::io::Write::write_all(&mut opts.open(&tmp)?, body)?;
-    std::fs::rename(&tmp, path)
+    let mut f = opts.open(&tmp)?;
+    std::io::Write::write_all(&mut f, body)?;
+    f.sync_all()?;
+    drop(f);
+    std::fs::rename(&tmp, path)?;
+    #[cfg(unix)]
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::File::open(dir).and_then(|d| d.sync_all());
+    }
+    Ok(())
 }
 
 #[cfg(test)]

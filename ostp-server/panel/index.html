@@ -1281,7 +1281,7 @@ $('f-user').addEventListener('submit', async e => {
   if (limit_bytes === undefined) { toast(t('limit_bad'), true); $('mu-limit').focus(); return; }
   // The server refuses an existing key too; checking here saves the round trip.
   const key = editing ? null : ($('mu-key').value.trim() || null);
-  if (key && !/^[^\s\/?#%\\]{8,128}$/.test(key)) { toast(t('key_bad'), true); $('mu-key').focus(); return; }
+  if (key && !/^[^\p{White_Space}\p{Cc}\/?#%\\]{8,128}$/u.test(key)) { toast(t('key_bad'), true); $('mu-key').focus(); return; }
   if (key && users.some(x => x.access_key === key)) { toast(t('key_exists'), true); $('mu-key').focus(); return; }
   await busy($('f-user').querySelector('.btn.primary'), async () => {
     try {

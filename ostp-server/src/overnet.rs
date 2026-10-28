@@ -210,10 +210,7 @@ impl Overnet {
         if !(self.entry() && self.gateway_up()) {
             return false;
         }
-        match target.parse::<SocketAddr>() {
-            Ok(addr) => addr.port() == 853 || (addr.port() == 443 && ostp_dns::services::is_public_resolver(addr.ip())),
-            Err(_) => target.rsplit_once(':').is_some_and(|(_, p)| p == "853"),
-        }
+        ostp_dns::is_encrypted_dns_target(target)
     }
 
     /// Classifies a client's `host:port` target. Errors when the target is

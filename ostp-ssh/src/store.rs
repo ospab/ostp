@@ -100,6 +100,23 @@ impl Vault {
         rand::random()
     }
 
+    /// The master key as the platform credential store keeps it: 64 hex digits.
+    pub fn key_from_hex(hex: &str) -> Option<[u8; 32]> {
+        let hex = hex.trim();
+        if hex.len() != 64 || !hex.is_ascii() {
+            return None;
+        }
+        let mut key = [0u8; 32];
+        for (i, b) in key.iter_mut().enumerate() {
+            *b = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).ok()?;
+        }
+        Some(key)
+    }
+
+    pub fn key_to_hex(key: &[u8; 32]) -> String {
+        key.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
     fn seal(&self, plain: &str) -> Option<String> {
         let cipher = self.cipher.as_ref()?;
         let nonce: [u8; 12] = rand::random();
@@ -122,6 +139,28 @@ impl Vault {
     }
 }
 
+/// Created private from the first byte, flushed to disk, then renamed over the
+/// target so a crash leaves either the old file or the new one.
+fn write_private(path: &Path, body: &[u8]) -> std::io::Result<()> {
+    let tmp = path.with_extension("json.tmp");
+    // A leftover temp file keeps its old mode; start from a fresh one.
+    let _ = std::fs::remove_file(&tmp);
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut opts, 0o600);
+    let mut f = opts.open(&tmp)?;
+    std::io::Write::write_all(&mut f, body)?;
+    f.sync_all()?;
+    drop(f);
+    std::fs::rename(&tmp, path)?;
+    #[cfg(unix)]
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::File::open(dir).and_then(|d| d.sync_all());
+    }
+    Ok(())
+}
+
 /// The saved servers.
 pub struct Store {
     path: PathBuf,
@@ -142,13 +181,7 @@ impl Store {
         if let Some(dir) = self.path.parent() {
             std::fs::create_dir_all(dir)?;
         }
-        let tmp = self.path.with_extension("json.tmp");
-        let mut opts = std::fs::OpenOptions::new();
-        opts.write(true).create(true).truncate(true);
-        #[cfg(unix)]
-        std::os::unix::fs::OpenOptionsExt::mode(&mut opts, 0o600);
-        std::io::Write::write_all(&mut opts.open(&tmp)?, &serde_json::to_vec_pretty(&self.servers)?)?;
-        std::fs::rename(&tmp, &self.path)?;
+        write_private(&self.path, &serde_json::to_vec_pretty(&self.servers)?)?;
         Ok(())
     }
 

@@ -492,14 +492,14 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin, 
       }
 
       setState(() {
-        _download = _formatBytes(bytesRecv);
-        _upload = _formatBytes(bytesSent);
+        _download = formatBytes(bytesRecv);
+        _upload = formatBytes(bytesSent);
         final dRecv = bytesRecv > _prevBytesRecv ? bytesRecv - _prevBytesRecv : 0;
         final dSent = bytesSent > _prevBytesSent ? bytesSent - _prevBytesSent : 0;
         _prevBytesRecv = bytesRecv;
         _prevBytesSent = bytesSent;
-        _downSpeed = '${_formatBytes(dRecv)}/s';
-        _upSpeed = '${_formatBytes(dSent)}/s';
+        _downSpeed = '${formatBytes(dRecv)}/s';
+        _upSpeed = '${formatBytes(dSent)}/s';
         if (rttMs > 0) {
           _pingText = '$rttMs ms';
           if (rttMs < 100) {
@@ -516,13 +516,6 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin, 
     } finally {
       _polling = false;
     }
-  }
-
-  String _formatBytes(int bytes) {
-    if (bytes < 1024) return '$bytes B';
-    if (bytes < 1024 * 1024) return '${(bytes / 1024).toStringAsFixed(1)} KB';
-    if (bytes < 1024 * 1024 * 1024) return '${(bytes / (1024 * 1024)).toStringAsFixed(1)} MB';
-    return '${(bytes / (1024 * 1024 * 1024)).toStringAsFixed(1)} GB';
   }
 
   void _setDisconnected() {

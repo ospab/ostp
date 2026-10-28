@@ -58,18 +58,11 @@ const KEYRING_ENTRY: &str = "servers-master-key";
 /// the system has no usable store: then nothing secret is saved.
 fn master_key() -> Option<[u8; 32]> {
     let entry = keyring::Entry::new(KEYRING_SERVICE, KEYRING_ENTRY).ok()?;
-    let decode = |hex: &str| -> Option<[u8; 32]> {
-        let bytes: Vec<u8> = (0..hex.len())
-            .step_by(2)
-            .map(|i| hex.get(i..i + 2).and_then(|b| u8::from_str_radix(b, 16).ok()))
-            .collect::<Option<_>>()?;
-        bytes.try_into().ok()
-    };
     match entry.get_password() {
-        Ok(hex) => decode(hex.trim()),
+        Ok(hex) => ostp_ssh::store::Vault::key_from_hex(&hex),
         Err(keyring::Error::NoEntry) => {
             let key = ostp_ssh::store::Vault::random_key();
-            let hex: String = key.iter().map(|b| format!("{b:02x}")).collect();
+            let hex = ostp_ssh::store::Vault::key_to_hex(&key);
             entry.set_password(&hex).ok()?;
             // Read back: some stores accept a write they cannot keep.
             (entry.get_password().ok()?.trim() == hex).then_some(key)
