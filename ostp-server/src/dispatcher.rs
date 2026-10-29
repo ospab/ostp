@@ -290,10 +290,10 @@ impl Dispatcher {
     /// session can carry. Over the whole tick, not "is the pacing bucket
     /// empty this instant": that read zero after every burst and stopped
     /// sending until the next tick.
-    pub fn snapshot_backpressure(&self) -> Vec<(u32, i64)> {
+    pub fn snapshot_backpressure(&self) -> Vec<(u32, SocketAddr, i64)> {
         self.peer_machines
             .iter()
-            .map(|(&sid, ps)| (sid, ps.machine.send_budget(SEND_BUDGET_HORIZON) as i64))
+            .map(|(&sid, ps)| (sid, ps.last_addr, ps.machine.send_budget(SEND_BUDGET_HORIZON) as i64))
             .collect()
     }
 

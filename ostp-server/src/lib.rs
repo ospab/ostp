@@ -915,6 +915,24 @@ static TCP_QUEUE_DROPS: portable_atomic::AtomicU64 = portable_atomic::AtomicU64:
 /// frame; the client then NACKs the gap. That used to happen silently, which
 /// hid the cause of stalls on TLS: now it is logged (the first time, then at
 /// every power of two).
+/// Slots kept free in a TCP/TLS client's send queue for ACKs and retransmits.
+const TCP_QUEUE_RESERVE: usize = 1024;
+
+/// How many new data frames a client on TCP or TLS can take now. The readers
+/// are throttled by this as well as by the congestion window: a byte stream
+/// drains at its own pace, and frames that overflowed its queue used to be
+/// dropped and then waited out the long reliable-carrier RTO, which held a
+/// TLS download to a few Mbit/s. UDP clients are not limited here.
+async fn tcp_headroom(
+    tcp_map: &Arc<tokio::sync::RwLock<HashMap<std::net::SocketAddr, mpsc::Sender<Bytes>>>>,
+    addr: std::net::SocketAddr,
+) -> i64 {
+    match tcp_map.read().await.get(&addr) {
+        Some(tx) => tx.capacity().saturating_sub(TCP_QUEUE_RESERVE) as i64,
+        None => i64::MAX,
+    }
+}
+
 pub(crate) fn queue_to_tcp(tx: &tokio::sync::mpsc::Sender<bytes::Bytes>, frame: bytes::Bytes) {
     if let Err(tokio::sync::mpsc::error::TrySendError::Full(_)) = tx.try_send(frame) {
         let n = TCP_QUEUE_DROPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
@@ -973,6 +991,7 @@ async fn handle_udp_packet(
             // An ACK may have opened the window: the readers learn it now, not
             // at the next tick.
             if let Some((sid, available)) = dispatcher.budget_for_addr(peer_addr) {
+                let available = available.min(tcp_headroom(tcp_map, peer_addr).await);
                 if let Some(gate) = session_backpressure.read().unwrap_or_else(|e| e.into_inner()).get(&sid) {
                     gate.set(available);
                 }
@@ -1077,9 +1096,12 @@ async fn handle_tick(
     // entry created here on their first tick after the handshake; entries for
     // sessions that no longer exist are pruned below alongside dropped_sessions.
     {
-        let snapshot = dispatcher.snapshot_backpressure();
+        let mut snapshot = dispatcher.snapshot_backpressure();
+        for (_, addr, available) in snapshot.iter_mut() {
+            *available = (*available).min(tcp_headroom(tcp_map, *addr).await);
+        }
         let mut map = session_backpressure.write().unwrap_or_else(|e| e.into_inner());
-        for (sid, available) in snapshot {
+        for (sid, _, available) in snapshot {
             match map.get(&sid) {
                 Some(gate) => gate.set(available),
                 None => { map.insert(sid, Arc::new(send_gate::SendGate::new(available))); }
