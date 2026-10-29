@@ -8,7 +8,12 @@ Older history is on the [Releases](https://github.com/ospab/ostp/releases) page 
 
 ## [Unreleased]
 
+### Added
+- Per-stream flow control: a large upload to a site that takes it slowly no longer breaks (the server used to reset the connection once 32 MB waited for the site), and a program on the client that reads a download slowly no longer makes the server buffer it. Each stream gets an 8 MiB window in each direction; the receiver grants more as data reaches the site or the program. The client offers it after the handshake and both sides use it only if the server answers, so 0.4.5 servers and clients work as before. Checked: a 100 MB upload to a site taking 1 MB/s arrives whole with the server at 25 MB of memory.
+
 ### Fixed
+- Server: a client on TCP or TLS that drained its connection slower than the server sent had frames dropped from its queue, and they then waited out the long retransmit timer of a reliable carrier: TLS downloads crawled. The server now reads from sites only as fast as that connection drains.
+- A frame was given up after 10 retransmits, about 30 seconds on a short path, so an outage that the session would otherwise survive lost data. Frames are now given up only after 5 minutes, and a receiver waits as long for a missing one.
 - Outages longer than about 15 seconds reset every app connection (a download broke even though the server still kept the session for 10 minutes). The client now keeps the session and its connections while the server does not answer at all, and moves the session when the network comes back; connections are reset only when the server no longer knows the session. Checked with a 30-second cut in the middle of a 100 MB download, over UDP and UoT: the file arrives intact.
 - After an outage the connection crawled for tens of seconds: the window that the lost retransmits had shrunk to 2 packets grew back slowly. Both ends now start over on the path and resend what was lost at once, the server also when a client comes back from a new address.
 - Speed on short paths: with a server close by (a LAN, the same city, a nearby data centre) a connection stayed at a few Mbit/s. Every RTT sample includes the receiver's ACK delay and the sender's 10 ms tick, so with a 1 ms ping the smoothed RTT read 10 to 15 times the minimum, which the congestion control took for a standing queue and kept halving the window down to 2 packets. The delay signal now compares with at least 20 ms. Measured on loopback with 0.4.7-beta.13: 4.8 Mbit/s.

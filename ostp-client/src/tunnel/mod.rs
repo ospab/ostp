@@ -39,6 +39,12 @@ pub enum ProxyEvent {
     Close {
         stream_id: u16,
     },
+    /// Flow control: this many bytes of the stream reached the local program,
+    /// so the server may send as much more.
+    Consumed {
+        stream_id: u16,
+        bytes: u32,
+    },
 }
 
 #[derive(Debug)]
@@ -48,6 +54,9 @@ pub enum ProxyToClientMsg {
     UdpData(String, bytes::Bytes),
     Close,
     Error(String),
+    /// Flow control: the server allows this many more bytes on the stream.
+    /// The first one switches the stream to flow control.
+    Window(u32),
 }
 
 

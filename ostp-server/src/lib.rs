@@ -81,6 +81,8 @@ pub(crate) struct RemoteState {
     pub cancel_tx: mpsc::Sender<()>,
     #[allow(dead_code)]
     pub is_dns: bool,
+    /// Flow control toward the client (see `send_gate::StreamWindow`).
+    pub window: Option<Arc<send_gate::StreamWindow>>,
 }
 
 // ── Public API ───────────────────────────────────────────────────────────────
@@ -604,7 +606,10 @@ async fn run_server_loop(
     let mut remotes: HashMap<(u32, u16), RemoteState> = HashMap::new();
     let (stream_tx, mut stream_rx) = mpsc::unbounded_channel::<(u32, u16, Vec<u8>)>();
     let (udp_reply_tx, mut udp_reply_rx) = mpsc::channel::<(u32, u16, String, Vec<u8>)>(UDP_REPLY_QUEUE);
-    let (connect_tx, mut connect_rx) = mpsc::unbounded_channel::<(u32, u16, String, Result<(tokio::net::tcp::OwnedWriteHalf, mpsc::Sender<()>), String>)>();
+    // Flow control: bytes of a stream written to its target, to be granted
+    // back to the client as a `Window`.
+    let (grant_tx, mut grant_rx) = mpsc::unbounded_channel::<(u32, u16, u32)>();
+    let (connect_tx, mut connect_rx) = mpsc::unbounded_channel::<(u32, u16, String, Result<(tokio::net::tcp::OwnedWriteHalf, mpsc::Sender<()>, Option<Arc<send_gate::StreamWindow>>), String>)>();
 
     let tcp_map = std::sync::Arc::new(tokio::sync::RwLock::new(HashMap::new()));
 
@@ -777,26 +782,47 @@ async fn run_server_loop(
                     let _ = relay::send_relay_to_stream(session_id, stream_id, RelayMessage::Data(data), &mut dispatcher, &socket, &ui_event_tx, &tcp_map).await;
                 }
             }
+            Some((session_id, stream_id, bytes)) = grant_rx.recv() => {
+                if remotes.contains_key(&(session_id, stream_id)) {
+                    let _ = relay::send_relay_to_stream(session_id, stream_id, RelayMessage::Window(bytes), &mut dispatcher, &socket, &ui_event_tx, &tcp_map).await;
+                }
+            }
             Some((session_id, stream_id, target, data)) = udp_reply_rx.recv() => {
                 let _ = relay::send_relay_to_stream(session_id, stream_id, RelayMessage::UdpData(target, data), &mut dispatcher, &socket, &ui_event_tx, &tcp_map).await;
             }
             Some((session_id, stream_id, target, res)) = connect_rx.recv() => {
                 match res {
-                    Ok((writer, cancel_tx)) => {
+                    Ok((writer, cancel_tx, window)) => {
                         let (data_tx, mut data_rx) = mpsc::unbounded_channel::<Bytes>();
                         let queued = Arc::new(std::sync::atomic::AtomicUsize::new(0));
                         let writer_queued = queued.clone();
                         let mut writer_task = writer;
+                        let flow_control = window.is_some();
+                        let grants = grant_tx.clone();
                         tokio::spawn(async move {
+                            // Written to the target since the last grant.
+                            let mut written: u32 = 0;
                             while let Some(data) = data_rx.recv().await {
                                 if tokio::io::AsyncWriteExt::write_all(&mut writer_task, &data).await.is_err() {
                                     break;
                                 }
                                 writer_queued.fetch_sub(data.len(), std::sync::atomic::Ordering::Relaxed);
+                                if flow_control {
+                                    written = written.saturating_add(data.len() as u32);
+                                    if written >= ostp_core::relay::WINDOW_UPDATE_STEP {
+                                        let _ = grants.send((session_id, stream_id, written));
+                                        written = 0;
+                                    }
+                                }
                             }
                         });
-                        remotes.insert((session_id, stream_id), RemoteState { data_tx, queued, udp_tx: None, cancel_tx, is_dns: false });
+                        remotes.insert((session_id, stream_id), RemoteState { data_tx, queued, udp_tx: None, cancel_tx, is_dns: false, window });
                         let _ = relay::send_relay_to_stream(session_id, stream_id, RelayMessage::ConnectOk, &mut dispatcher, &socket, &ui_event_tx, &tcp_map).await;
+                        if flow_control {
+                            // The client's upload on this stream: its first window. It
+                            // also tells the client that this stream uses flow control.
+                            let _ = relay::send_relay_to_stream(session_id, stream_id, RelayMessage::Window(ostp_core::relay::INITIAL_STREAM_WINDOW), &mut dispatcher, &socket, &ui_event_tx, &tcp_map).await;
+                        }
                         let _ = ui_event_tx.send(UiEvent::Log(format!("Relay CONNECT ok for [{session_id}:{stream_id}] -> {target}")));
                     }
                     Err(err) => {
@@ -969,7 +995,7 @@ async fn handle_udp_packet(
     ui_event_tx: &mpsc::UnboundedSender<UiEvent>,
     stream_tx: mpsc::UnboundedSender<(u32, u16, Vec<u8>)>,
     udp_reply_tx: mpsc::Sender<(u32, u16, String, Vec<u8>)>,
-    connect_tx: mpsc::UnboundedSender<(u32, u16, String, Result<(tokio::net::tcp::OwnedWriteHalf, mpsc::Sender<()>), String>)>,
+    connect_tx: mpsc::UnboundedSender<(u32, u16, String, Result<(tokio::net::tcp::OwnedWriteHalf, mpsc::Sender<()>, Option<Arc<send_gate::StreamWindow>>), String>)>,
     router: std::sync::Arc<crate::router::Router>,
     peer_last_seen: &mut HashMap<IpAddr, Instant>,
     peer_available: &mut HashMap<IpAddr, bool>,

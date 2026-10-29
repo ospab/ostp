@@ -79,6 +79,8 @@ pub struct PeerState {
     pub obfuscation_key: [u8; 8],
     pub last_seen: std::time::Instant,
     pub access_key: String,
+    /// The client announced FEATURE_FLOW_CONTROL: its new streams get windows.
+    pub flow_control: bool,
 }
 
 pub struct Dispatcher {
@@ -603,6 +605,7 @@ impl Dispatcher {
                                 obfuscation_key: secrets.obfuscation_key,
                                 last_seen: std::time::Instant::now(),
                                 access_key: candidate_key.clone(),
+                                flow_control: false,
                             });
                             self.addr_to_session.insert(peer, candidate_session_id);
                             user_stats.connections.fetch_add(1, Ordering::Relaxed);
@@ -628,6 +631,16 @@ impl Dispatcher {
     }
 
     /// The largest payload one datagram of this session carries.
+    pub fn flow_control(&self, session_id: u32) -> bool {
+        self.peer_machines.get(&session_id).is_some_and(|ps| ps.flow_control)
+    }
+
+    pub fn set_flow_control(&mut self, session_id: u32) {
+        if let Some(ps) = self.peer_machines.get_mut(&session_id) {
+            ps.flow_control = true;
+        }
+    }
+
     pub fn max_payload(&self, session_id: u32) -> Option<usize> {
         self.peer_machines.get(&session_id).map(|ps| ps.machine.max_payload())
     }

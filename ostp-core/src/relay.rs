@@ -12,7 +12,27 @@ pub enum RelayMessage {
     Pong(u64),
     UdpAssociate,
     UdpData(String, Vec<u8>),
+    /// Stream 0, once per session: the FEATURE_* bits the sender supports.
+    /// The client sends it after the handshake and the server answers with
+    /// the bits both support. A 0.4.5 peer does not know the message and
+    /// drops it, so nothing changes with it.
+    Features(u32),
+    /// Flow control: the receiver of a stream allows its sender this many more
+    /// bytes of `Data` on it. Only after both sides announced
+    /// FEATURE_FLOW_CONTROL.
+    Window(u32),
 }
+
+/// Per-stream flow control (`Window`).
+pub const FEATURE_FLOW_CONTROL: u32 = 1;
+/// What a stream's sender may send before the first `Window`, in each
+/// direction. It bounds the memory a slow destination (a site that takes an
+/// upload slowly, an app that reads slowly) can make the other side hold,
+/// and the throughput of one stream: 8 MiB per round trip is ~670 Mbit/s at
+/// 100 ms.
+pub const INITIAL_STREAM_WINDOW: u32 = 8 << 20;
+/// The receiver grants more once this much has reached the destination.
+pub const WINDOW_UPDATE_STEP: u32 = 1 << 20;
 
 impl RelayMessage {
     pub fn encode(&self) -> Vec<u8> {
@@ -26,6 +46,8 @@ impl RelayMessage {
             RelayMessage::Ping(ts) => encode_with_len(7, &ts.to_be_bytes()),
             RelayMessage::Pong(ts) => encode_with_len(8, &ts.to_be_bytes()),
             RelayMessage::UdpAssociate => vec![9],
+            RelayMessage::Features(bits) => encode_with_len(11, &bits.to_be_bytes()),
+            RelayMessage::Window(bytes) => encode_with_len(12, &bytes.to_be_bytes()),
             RelayMessage::UdpData(addr, data) => {
                 let addr_bytes = addr.as_bytes();
                 let mut buf = Vec::with_capacity(1 + 2 + addr_bytes.len() + 2 + data.len());
@@ -91,6 +113,11 @@ impl RelayMessage {
                 let data = input[data_offset+2..data_offset+2+data_len].to_vec();
                 Ok(RelayMessage::UdpData(addr, data))
             }
+            11 | 12 => {
+                let payload = decode_with_len(&input[1..])?;
+                let value = u32::from_be_bytes(payload.try_into().map_err(|_| anyhow!("invalid flow control payload"))?);
+                Ok(if input[0] == 11 { RelayMessage::Features(value) } else { RelayMessage::Window(value) })
+            }
             _ => Err(anyhow!("unknown relay message type {}", input[0])),
         }
     }
@@ -137,6 +164,15 @@ fn decode_with_len(input: &[u8]) -> Result<&[u8]> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn flow_control_messages_round_trip() {
+        for msg in [RelayMessage::Features(FEATURE_FLOW_CONTROL), RelayMessage::Window(INITIAL_STREAM_WINDOW)] {
+            let back = RelayMessage::decode(&msg.encode()).unwrap();
+            assert_eq!(format!("{back:?}"), format!("{msg:?}"));
+        }
+        assert!(RelayMessage::decode(&[12, 0, 2, 1, 2]).is_err(), "a short window is refused");
+    }
+
     use super::*;
 
     #[test]

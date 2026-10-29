@@ -183,6 +183,19 @@ Everything the client and server exchange after the handshake — proxied TCP co
 | 8 | `Pong(timestamp)` | Echo of the `Ping` timestamp |
 | 9 | `UdpAssociate` | No payload — requests a UDP relay association |
 | 10 | `UdpData(addr, bytes)` | Length-prefixed target address plus a UDP datagram payload |
+| 11 | `Features(bits)` | 4-byte big-endian bit set; stream 0, once per session (see below) |
+| 12 | `Window(bytes)` | 4-byte big-endian byte count; flow-control grant for the stream |
+
+### 8.1 Per-stream flow control
+
+Without it, a stream's sender is held back only by the session's congestion window, so a slow destination (a site that takes an upload at 1 MB/s, a program that reads a download slowly) makes the other side buffer what it cannot pass on. Flow control bounds that per stream.
+
+- After the handshake the client sends `Features(1)` (bit 0: flow control) on stream 0. A server that supports it answers `Features(1)` and marks the session; a 0.4.5 server does not know tag 11, drops that message and carries on, so both sides keep the old behaviour.
+- For each stream opened after that, the server sends `Window(8 MiB)` right after `ConnectOk`. It is the client's allowance for that stream's upload, and it also tells the client that the stream uses flow control: the client never switches a stream on its own, so both ends agree even if `Features` and the first `Connect` cross.
+- On such a stream each direction starts with 8 MiB. The sender stops reading from its source (the program on the client, the target on the server) when the allowance is used up. The receiver sends `Window(n)` each time `n` >= 1 MiB has reached the destination (written to the target, or to the program).
+- The server still resets a stream that has more than 32 MiB waiting for its target, which a sender that respects the window never reaches.
+
+One stream's throughput is bounded by 8 MiB per round trip, about 670 Mbit/s at 100 ms.
 
 This is the layer that lets a single OSTP session carry an arbitrary number of concurrent proxied TCP connections and UDP flows: each is identified by its own sequence of `Connect`/`Data`/`Close` (or `UdpAssociate`/`UdpData`) messages multiplexed over the one encrypted nonce sequence, with the client's local SOCKS5/HTTP proxy or TUN adapter as the demultiplexing point on the client side.
 

@@ -534,6 +534,14 @@ impl Bridge {
                                 RelayMessage::UdpData(target, data) => {
                                     let _ = proxy_tx.send((stream_id, ProxyToClientMsg::UdpData(target, Bytes::from(data))));
                                 }
+                                RelayMessage::Window(bytes) => {
+                                    let _ = proxy_tx.send((stream_id, ProxyToClientMsg::Window(bytes)));
+                                }
+                                RelayMessage::Features(bits) => {
+                                    // Which streams use flow control the server says
+                                    // per stream, with its first `Window`.
+                                    tracing::debug!("server features: {bits:#x}");
+                                }
                                 RelayMessage::KeepAlive | RelayMessage::Ping(_) | RelayMessage::Connect(_) => {}
                             }
                         }
@@ -1010,11 +1018,25 @@ impl Bridge {
         }).await.ok();
         self.metrics.connection_state.store(2, Ordering::Relaxed);
         tx.send(UiEvent::Log("Connection established".to_string())).await.ok();
+        self.send_features().await;
         self.send_keepalives().await;
     }
 
     /// A ping and a keepalive per session. The ping's answer is the liveness
     /// signal the stall detection relies on.
+    /// Tells each new session what this client supports. A 0.4.5 server drops
+    /// the message; a newer one answers and from then on gives each stream a
+    /// window (see `ostp_core::relay::INITIAL_STREAM_WINDOW`).
+    async fn send_features(&mut self) {
+        let payload = Bytes::from(RelayMessage::Features(ostp_core::relay::FEATURE_FLOW_CONTROL).encode());
+        for session in self.sessions.iter_mut() {
+            if let Ok(ProtocolAction::SendDatagram(frame)) = session.machine.on_event(OstpEvent::Outbound(0, payload.clone())) {
+                let _ = send_datagram(&session.socket, &frame, false).await;
+                self.metrics.bytes_sent.fetch_add(frame.len() as u64, Ordering::Relaxed);
+            }
+        }
+    }
+
     async fn send_keepalives(&mut self) {
         for session in self.sessions.iter_mut() {
             let ts = SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
@@ -1065,6 +1087,12 @@ impl Bridge {
         proxy_tx: &mpsc::UnboundedSender<(u16, ProxyToClientMsg)>,
     ) {
         let Some(ev) = proxy_ev else { return };
+        // A grant for a stream that is gone has nobody to go to.
+        if let ProxyEvent::Consumed { stream_id, .. } = &ev {
+            if !self.stream_map.contains_key(stream_id) {
+                return;
+            }
+        }
         // No session while reconnecting: fail new streams at once so the apps
         // retry instead of waiting on a tunnel that cannot carry them.
         if self.sessions.is_empty() {
@@ -1090,6 +1118,7 @@ impl Bridge {
                 let _ = tx.send(UiEvent::Log(format!("Proxy CLOSE stream_id={stream_id}"))).await;
                 (stream_id, RelayMessage::Close, true)
             }
+            ProxyEvent::Consumed { stream_id, bytes } => (stream_id, RelayMessage::Window(bytes), false),
         };
         let len = self.sessions.len();
         let session_index = *self.stream_map.entry(stream_id).or_insert_with(|| {

@@ -8,7 +8,7 @@ use tokio::io::AsyncReadExt;
 use tokio::sync::mpsc;
 
 use crate::dispatcher::Dispatcher;
-use crate::send_gate::SendGate;
+use crate::send_gate::{SendGate, StreamWindow};
 use crate::{RemoteState, SessionBackpressure, UiEvent};
 
 /// Largest read from a target at once. 4 KiB meant a syscall and a message
@@ -44,7 +44,7 @@ pub async fn handle_relay_message(
     ui_event_tx: &mpsc::UnboundedSender<UiEvent>,
     stream_tx: mpsc::UnboundedSender<(u32, u16, Vec<u8>)>,
     udp_reply_tx: mpsc::Sender<(u32, u16, String, Vec<u8>)>,
-    connect_tx: mpsc::UnboundedSender<(u32, u16, String, Result<(tokio::net::tcp::OwnedWriteHalf, mpsc::Sender<()>), String>)>,
+    connect_tx: mpsc::UnboundedSender<(u32, u16, String, Result<(tokio::net::tcp::OwnedWriteHalf, mpsc::Sender<()>, Option<Arc<StreamWindow>>), String>)>,
     router: std::sync::Arc<crate::router::Router>,
     tcp_map: &std::sync::Arc<tokio::sync::RwLock<HashMap<std::net::SocketAddr, tokio::sync::mpsc::Sender<Bytes>>>>,
     session_backpressure: &SessionBackpressure,
@@ -96,6 +96,11 @@ pub async fn handle_relay_message(
                 .unwrap_or(1300)
                 .saturating_sub(ostp_core::relay::DATA_OVERHEAD)
                 .max(1);
+            // The client grants this stream's download as its program reads it.
+            let window = dispatcher
+                .flow_control(session_id)
+                .then(|| Arc::new(StreamWindow::new(ostp_core::relay::INITIAL_STREAM_WINDOW as i64)));
+            let reader_window = window.clone();
             tokio::spawn(async move {
                 let stream_res = router_clone.route_tcp(&target_clone, peer_addr.ip()).await;
                 // Held by the reader below: released when the connection ends,
@@ -115,7 +120,14 @@ pub async fn handle_relay_message(
                                 // The budget is updated on every ACK and tick and
                                 // wakes this task at once.
                                 let budget = gate.acquire().await;
-                                let want = (budget as usize).saturating_mul(frame_payload).clamp(1, READ_BUF);
+                                let mut want = (budget as usize).saturating_mul(frame_payload).clamp(1, READ_BUF);
+                                if let Some(window) = &reader_window {
+                                    let credit = tokio::select! {
+                                        _ = cancel_rx.recv() => break,
+                                        credit = window.acquire() => credit,
+                                    };
+                                    want = want.min(credit as usize).max(1);
+                                }
                                 tokio::select! {
                                     _ = cancel_rx.recv() => break,
                                     read_res = reader.read(&mut buf[..want]) => {
@@ -126,6 +138,9 @@ pub async fn handle_relay_message(
                                             }
                                             Ok(n) => {
                                                 gate.spend(n.div_ceil(frame_payload) as i64);
+                                                if let Some(window) = &reader_window {
+                                                    window.spend(n as i64);
+                                                }
                                                 if stream_tx_clone.send((session_id, stream_id, buf[..n].to_vec())).is_err() {
                                                     break;
                                                 }
@@ -135,7 +150,7 @@ pub async fn handle_relay_message(
                                 }
                             }
                         });
-                        let _ = connect_tx_clone.send((session_id, stream_id, target_clone, Ok((writer, cancel_tx))));
+                        let _ = connect_tx_clone.send((session_id, stream_id, target_clone, Ok((writer, cancel_tx, window))));
                     }
                     Err(e) => {
                         let _ = connect_tx_clone.send((session_id, stream_id, target_clone, Err(e.to_string())));
@@ -163,6 +178,18 @@ pub async fn handle_relay_message(
             }
         }
         RelayMessage::KeepAlive => {}
+        RelayMessage::Features(bits) => {
+            let both = bits & ostp_core::relay::FEATURE_FLOW_CONTROL;
+            if both != 0 {
+                dispatcher.set_flow_control(session_id);
+            }
+            send_relay_to_stream(session_id, stream_id, RelayMessage::Features(both), dispatcher, socket, ui_event_tx, tcp_map).await?;
+        }
+        RelayMessage::Window(bytes) => {
+            if let Some(window) = remotes.get(&(session_id, stream_id)).and_then(|r| r.window.as_ref()) {
+                window.grant(bytes as i64);
+            }
+        }
         RelayMessage::Close => {
             if let Some(state) = remotes.remove(&(session_id, stream_id)) {
                 let _ = state.cancel_tx.try_send(());
@@ -270,6 +297,7 @@ pub async fn handle_relay_message(
                 udp_tx: Some(udp_tx),
                 cancel_tx,
                 is_dns: false,
+                window: None,
             });
 
             send_relay_to_stream(session_id, stream_id, RelayMessage::ConnectOk, dispatcher, socket, ui_event_tx, tcp_map).await?;

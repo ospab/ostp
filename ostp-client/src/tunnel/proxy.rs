@@ -897,9 +897,16 @@ async fn handle_proxy_client(
 
     // ── Bidirectional raw data forwarding ─────────────────────────────
     let mut tcp_buf = vec![0_u8; 65536];
+    // Flow control, once the server sent the first `Window` for the stream:
+    // `credit` is what may still be read from the program and sent, and
+    // `consumed` what reached the program since the last grant to the server.
+    let mut flow_control = false;
+    let mut credit: i64 = i64::MAX;
+    let mut consumed: u32 = 0;
     loop {
+        let read_limit = credit.clamp(0, tcp_buf.len() as i64) as usize;
         tokio::select! {
-            read_res = client.read(&mut tcp_buf) => {
+            read_res = client.read(&mut tcp_buf[..read_limit]), if read_limit > 0 => {
                 match read_res {
                     Ok(0) => {
                         let _ = event_tx.send(ProxyEvent::Close { stream_id }).await;
@@ -909,6 +916,9 @@ async fn handle_proxy_client(
                         break;
                     }
                     Ok(n) => {
+                        if flow_control {
+                            credit -= n as i64;
+                        }
                         let mut offset = 0;
                         while offset < n {
                             let end = (offset + max_chunk).min(n);
@@ -935,6 +945,22 @@ async fn handle_proxy_client(
                         if client.write_all(&data).await.is_err() {
                             let _ = event_tx.send(ProxyEvent::Close { stream_id }).await;
                             break;
+                        }
+                        if flow_control {
+                            consumed = consumed.saturating_add(data.len() as u32);
+                            if consumed >= ostp_core::relay::WINDOW_UPDATE_STEP {
+                                let _ = event_tx.send(ProxyEvent::Consumed { stream_id, bytes: consumed }).await;
+                                consumed = 0;
+                            }
+                        }
+                    }
+                    Some(ProxyToClientMsg::Window(bytes)) => {
+                        if flow_control {
+                            credit = credit.saturating_add(bytes as i64);
+                        } else {
+                            // The server's first grant: what it allows from now on.
+                            flow_control = true;
+                            credit = bytes as i64;
                         }
                     }
                     Some(ProxyToClientMsg::Close) | Some(ProxyToClientMsg::Error(_)) | None => {

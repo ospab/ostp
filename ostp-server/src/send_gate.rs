@@ -64,6 +64,44 @@ impl SendGate {
     }
 }
 
+/// One stream's flow-control window toward the client: what the server may
+/// still send on it before the client grants more (`RelayMessage::Window`).
+/// The reader of the target waits on it, so a program on the client that
+/// reads slowly holds the target back instead of the server's memory.
+pub struct StreamWindow {
+    credit: AtomicI64,
+    notify: Notify,
+}
+
+impl StreamWindow {
+    pub fn new(initial: i64) -> Self {
+        Self { credit: AtomicI64::new(initial), notify: Notify::new() }
+    }
+
+    pub fn grant(&self, bytes: i64) {
+        self.credit.fetch_add(bytes, Ordering::Relaxed);
+        self.notify.notify_waiters();
+    }
+
+    /// Bytes that may be sent now; waits while there are none.
+    pub async fn acquire(&self) -> i64 {
+        loop {
+            let notified = self.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let c = self.credit.load(Ordering::Relaxed);
+            if c > 0 {
+                return c;
+            }
+            notified.await;
+        }
+    }
+
+    pub fn spend(&self, bytes: i64) {
+        self.credit.fetch_sub(bytes, Ordering::Relaxed);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

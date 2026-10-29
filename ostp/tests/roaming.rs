@@ -308,6 +308,8 @@ impl Client {
             let left = deadline.saturating_duration_since(tokio::time::Instant::now());
             match timeout(left, self.to_app.recv()).await {
                 Ok(Some((STREAM, ProxyToClientMsg::Data(chunk)))) => got.extend_from_slice(&chunk),
+                // Flow control grants: not data, and not a sign of a broken stream.
+                Ok(Some((STREAM, ProxyToClientMsg::Window(_)))) => {}
                 Ok(Some((id, msg))) => panic!(
                     "stream did not survive: got {} on stream {id}; log:\n{}",
                     describe(&msg),
@@ -340,6 +342,7 @@ fn describe(msg: &ProxyToClientMsg) -> String {
         ProxyToClientMsg::UdpData(t, d) => format!("UdpData({t}, {} bytes)", d.len()),
         ProxyToClientMsg::Close => "Close".into(),
         ProxyToClientMsg::Error(e) => format!("Error({e})"),
+        ProxyToClientMsg::Window(n) => format!("Window({n})"),
     }
 }
 
@@ -382,7 +385,11 @@ async fn uot_session_moves_to_a_new_connection_and_keeps_its_streams() {
 
 /// Waits for the apps' side to be told that every stream is gone.
 async fn expect_streams_reset(client: &mut Client) {
-    match timeout(Duration::from_secs(5), client.to_app.recv()).await {
+    let mut next = timeout(Duration::from_secs(5), client.to_app.recv()).await;
+    while let Ok(Some((_, ProxyToClientMsg::Window(_)))) = next {
+        next = timeout(Duration::from_secs(5), client.to_app.recv()).await;
+    }
+    match next {
         Ok(Some((_, ProxyToClientMsg::Close))) => {}
         other => panic!(
             "expected a stream reset, got {:?}; log:\n{}",
