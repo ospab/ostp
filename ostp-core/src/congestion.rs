@@ -534,6 +534,18 @@ impl CongestionController {
     // ── Private ──────────────────────────────────────────────────────────────
 
     fn update_rtt(&mut self, rtt: Duration, now: Instant) {
+        // So little in flight cannot have built a queue: a sample far above
+        // the floor means the path itself got slower (a new route, or a path
+        // that changed while the session sat idle). Taken for a queue, it
+        // ended slow start at the initial window and left CUBIC to climb from
+        // there for tens of seconds. A later, lower sample lowers it again.
+        if self.rtt_initialized
+            && rtt > self.min_rtt.saturating_mul(2)
+            && self.bytes_in_flight <= INITIAL_CWND_PACKETS * self.mtu
+        {
+            self.min_rtt = rtt;
+            self.min_rtt_stamp = now;
+        }
         // Update windowed minimum RTT (for pacing)
         if rtt < self.min_rtt || now.duration_since(self.min_rtt_stamp) >= MIN_RTT_EXPIRY {
             self.min_rtt = rtt;
@@ -692,7 +704,11 @@ mod tests {
         }
         let cwnd_before = cc.cwnd();
 
-        // Queue builds: RTT climbs far above the floor, still zero loss.
+        // Queue builds: RTT climbs far above the floor, still zero loss. A
+        // queue that deep needs a lot in flight, more than the initial window.
+        for _ in 0..100 {
+            cc.on_send(1200);
+        }
         for _ in 0..20 {
             cc.on_send(1200);
             cc.on_ack(1200, Duration::from_millis(400));
@@ -704,6 +720,24 @@ mod tests {
             cwnd_before,
             cc.cwnd()
         );
+    }
+
+    /// The path got slower while the session sat idle (1 ms floor, then
+    /// 35 ms): with next to nothing in flight that is not a queue, and slow
+    /// start goes on instead of ending at the initial window.
+    #[test]
+    fn a_path_that_got_slower_is_not_taken_for_a_queue() {
+        let mut cc = CongestionController::new(1200);
+        cc.on_send(1200);
+        cc.on_ack(1200, Duration::from_millis(1));
+        let start = cc.cwnd();
+        for _ in 0..20 {
+            cc.on_send(1200);
+            cc.on_ack(1200, Duration::from_millis(35));
+        }
+        assert_eq!(cc.phase, Phase::SlowStart, "slow start ended on the new path's first ACKs");
+        assert_eq!(cc.cwnd(), start + 20 * 1200);
+        assert_eq!(cc.min_rtt, Duration::from_millis(35));
     }
 
     /// A LAN or same-city path: the ping floor is 1 ms, but data is acked after
