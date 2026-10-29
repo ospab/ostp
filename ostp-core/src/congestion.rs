@@ -94,6 +94,11 @@ pub const MAX_CWND_PACKETS: u64 = 8192;
 /// CUBIC constants (RFC 9438 §5): multiplicative decrease and the scaling
 /// constant, in packets and seconds.
 const CUBIC_BETA: f64 = 0.7;
+/// A loss while SRTT is below this multiple of the path's floor is taken for
+/// random rather than congestion (see on_loss).
+const RANDOM_LOSS_INFLATION: f64 = 1.25;
+/// The window kept after a random loss.
+const RANDOM_LOSS_BETA: f64 = 0.85;
 const CUBIC_C: f64 = 0.4;
 /// SRTT/min_rtt ratio at which slow start stops. Doubling is what fills a deep
 /// buffer fastest, so growth must end when the queue starts building rather
@@ -322,11 +327,7 @@ impl CongestionController {
         // and stalls video until the buffer finally drains or the user
         // reconnects. Treat sustained RTT inflation as congestion in its own
         // right, exactly as it is.
-        let inflation = if self.rtt_initialized && !self.min_rtt.is_zero() {
-            self.srtt.as_secs_f64() / self.min_rtt.max(DELAY_SIGNAL_FLOOR).as_secs_f64()
-        } else {
-            1.0
-        };
+        let inflation = self.rtt_inflation();
 
         if inflation >= RTT_INFLATION_BACKOFF {
             // Standing queue is severe — actively drain it. Once per congestion
@@ -361,6 +362,16 @@ impl CongestionController {
         }
 
         self.clamp_cwnd();
+    }
+
+    /// SRTT over the path's floor (at least DELAY_SIGNAL_FLOOR): how much of
+    /// the round trip is queue. 1.0 before the first sample.
+    fn rtt_inflation(&self) -> f64 {
+        if self.rtt_initialized && !self.min_rtt.is_zero() {
+            self.srtt.as_secs_f64() / self.min_rtt.max(DELAY_SIGNAL_FLOOR).as_secs_f64()
+        } else {
+            1.0
+        }
     }
 
     fn cwnd_packets_f(&self) -> f64 {
@@ -485,8 +496,16 @@ impl CongestionController {
                 }
             }
             Phase::ProbeBandwidth => {
-                if self.reduce(CUBIC_BETA) {
-                    tracing::debug!(cwnd = self.cwnd, "congestion: loss, cwnd reduced");
+                // A loss with no queue behind it (RTT at its floor) is the
+                // link's own: radio, a lossy hop. Cutting to 0.7 for each of
+                // those, at 0.01% loss and hundreds of Mbit/s several times a
+                // second, kept the window far below the path. As in TCP Veno,
+                // such a loss costs less; one with a queue built up is
+                // congestion and costs the full CUBIC decrease.
+                let random = self.rtt_inflation() < RANDOM_LOSS_INFLATION;
+                let factor = if random { RANDOM_LOSS_BETA } else { CUBIC_BETA };
+                if self.reduce(factor) {
+                    tracing::debug!(cwnd = self.cwnd, random, "congestion: loss, cwnd reduced");
                 }
             }
         }
@@ -607,6 +626,7 @@ mod tests {
     #[test]
     fn several_losses_in_one_rtt_are_one_reduction() {
         let mut cc = in_avoidance(1000, Duration::from_millis(40));
+        cc.srtt = Duration::from_millis(60); // a queue: congestion, not a random loss
         cc.on_loss(1200);
         let once = cc.cwnd();
         assert_eq!(once, 700 * 1200);
@@ -614,6 +634,14 @@ mod tests {
             cc.on_loss(1200);
         }
         assert_eq!(cc.cwnd(), once, "a burst of losses within one RTT cut the window again");
+    }
+
+    /// A loss with RTT at its floor is the link's, not a queue's: a milder cut.
+    #[test]
+    fn a_loss_without_a_queue_costs_less() {
+        let mut cc = in_avoidance(1000, Duration::from_millis(40));
+        cc.on_loss(1200);
+        assert_eq!(cc.cwnd(), 850 * 1200);
     }
 
     /// CUBIC climbs back towards the window it had before a loss far faster
