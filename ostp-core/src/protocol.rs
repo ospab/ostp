@@ -343,6 +343,7 @@ impl ProtocolMachine {
     /// any time, the peer is not affected.
     pub fn set_reliable_carrier(&mut self, reliable: bool) {
         self.reliable_carrier = reliable;
+        self.cc.set_delay_signal(!reliable);
     }
 
     pub fn in_flight_count(&self) -> usize {
