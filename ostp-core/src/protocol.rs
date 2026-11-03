@@ -64,6 +64,38 @@ pub struct ProtocolConfig {
     pub mtu: usize,
 }
 
+impl ProtocolConfig {
+    pub fn with_defaults(role: NoiseRole, mtu: usize) -> Self {
+        Self {
+            role,
+            psk: [0u8; 32],
+            session_id: 0,
+            handshake_payload: alloc::vec::Vec::new(),
+            max_padding: mtu.saturating_sub(48).max(256),
+            padding_strategy: PaddingStrategy::Adaptive,
+            obfuscation_key: [0u8; 8],
+            max_reorder: 16384,
+            max_reorder_buffer: 8192,
+            ack_delay_ms: 5,
+            rto_ms: 100,
+            max_retries: 8,
+            max_sent_history: 32768,
+            handshake_pad_min: 32,
+            handshake_pad_max: 128,
+            mtu,
+        }
+    }
+}
+
+pub fn build_handshake_payload(access_key: &[u8], session_id: u32) -> alloc::vec::Vec<u8> {
+    let timestamp = crate::sys::unix_secs();
+    let mut payload = alloc::vec::Vec::with_capacity(8 + 4 + access_key.len());
+    payload.extend_from_slice(&timestamp.to_be_bytes());
+    payload.extend_from_slice(&session_id.to_be_bytes());
+    payload.extend_from_slice(access_key);
+    payload
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OstpState {
     Init,
