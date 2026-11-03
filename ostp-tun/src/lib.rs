@@ -41,6 +41,9 @@ pub mod linux;
 #[cfg(target_os = "macos")]
 pub mod macos;
 
+#[cfg(target_os = "oos")]
+pub mod oos;
+
 /// The physical interface that bypass routes and bypass sockets go through. It is
 /// set when the TUN is created and moved by `refresh_bypass_routes` when the
 /// network changes (another Wi-Fi, a cable, a new gateway after sleep).
@@ -73,7 +76,9 @@ pub fn refresh_bypass_routes() -> bool {
     return windows::refresh_bypass_routes();
     #[cfg(target_os = "linux")]
     return linux::refresh_bypass_routes();
-    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+    #[cfg(target_os = "oos")]
+    return oos::refresh_bypass_routes();
+    #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "oos")))]
     false
 }
 
@@ -89,7 +94,10 @@ impl OstpTunInterface {
         #[cfg(target_os = "macos")]
         return macos::create(opts).await;
 
-        #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
+        #[cfg(target_os = "oos")]
+        return oos::create(opts).await;
+
+        #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos", target_os = "oos")))]
         anyhow::bail!("Unsupported OS for ostp-tun");
     }
 }

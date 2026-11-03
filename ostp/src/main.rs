@@ -18,7 +18,7 @@ mod webserver;
 #[command(author, version, about = "OSTP: encrypted tunnel for filtered networks", long_about = None)]
 struct Args {
     /// Path to the JSON configuration file
-    #[cfg_attr(unix, arg(short, long, default_value = "/etc/ostp/config.json", global = true))]
+    #[cfg_attr(any(unix, target_os = "oos"), arg(short, long, default_value = "/etc/ostp/config.json", global = true))]
     #[cfg_attr(windows, arg(short, long, default_value = "config.json", global = true))]
     config: PathBuf,
 
