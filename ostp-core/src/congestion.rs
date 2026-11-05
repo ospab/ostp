@@ -21,6 +21,8 @@ use std::time::{Duration, Instant};
 pub struct CongestionController {
     /// Current congestion window in bytes (how much can be in-flight)
     cwnd: u64,
+    /// Whether RTT inflation counts as congestion (see set_delay_signal).
+    delay_signal: bool,
     /// Slow-start threshold in bytes
     ssthresh: u64,
     /// Current phase
@@ -163,6 +165,7 @@ impl CongestionController {
             slow_start_losses: 0,
             slow_start_loss_window_start: now,
             pacing_tokens: (INITIAL_CWND_PACKETS * mtu) as f64,
+            delay_signal: true,
             pacing_last_refill: now,
             w_max: 0.0,
             epoch_start: None,
@@ -181,9 +184,21 @@ impl CongestionController {
     pub fn reset_path(&mut self) {
         let bytes_in_flight = self.bytes_in_flight;
         let total_acked = self.total_acked;
+        let delay_signal = self.delay_signal;
         *self = Self::new(self.mtu);
         self.bytes_in_flight = bytes_in_flight;
         self.total_acked = total_acked;
+        self.delay_signal = delay_signal;
+    }
+
+    /// Off on a reliable carrier (UDP-over-TCP, TLS). TCP underneath runs its
+    /// own congestion control and, being loss-based, fills a deep buffer
+    /// anyway: backing off on the RTT that queue causes only left TCP with
+    /// less to send (a TLS download at a quarter of the path) without making
+    /// the queue any shorter. The server's readers follow that connection's
+    /// send queue instead.
+    pub fn set_delay_signal(&mut self, on: bool) {
+        self.delay_signal = on;
     }
 
     /// Bytes of pacing allowance available right now, without consuming any.
@@ -327,7 +342,7 @@ impl CongestionController {
         // and stalls video until the buffer finally drains or the user
         // reconnects. Treat sustained RTT inflation as congestion in its own
         // right, exactly as it is.
-        let inflation = self.rtt_inflation();
+        let inflation = if self.delay_signal { self.rtt_inflation() } else { 1.0 };
 
         if inflation >= RTT_INFLATION_BACKOFF {
             // Standing queue is severe — actively drain it. Once per congestion
@@ -534,6 +549,18 @@ impl CongestionController {
     // ── Private ──────────────────────────────────────────────────────────────
 
     fn update_rtt(&mut self, rtt: Duration, now: Instant) {
+        // So little in flight cannot have built a queue: a sample far above
+        // the floor means the path itself got slower (a new route, or a path
+        // that changed while the session sat idle). Taken for a queue, it
+        // ended slow start at the initial window and left CUBIC to climb from
+        // there for tens of seconds. A later, lower sample lowers it again.
+        if self.rtt_initialized
+            && rtt > self.min_rtt.saturating_mul(2)
+            && self.bytes_in_flight <= INITIAL_CWND_PACKETS * self.mtu
+        {
+            self.min_rtt = rtt;
+            self.min_rtt_stamp = now;
+        }
         // Update windowed minimum RTT (for pacing)
         if rtt < self.min_rtt || now.duration_since(self.min_rtt_stamp) >= MIN_RTT_EXPIRY {
             self.min_rtt = rtt;
@@ -667,6 +694,7 @@ mod tests {
     #[test]
     fn a_standing_queue_halves_the_window_once_per_rtt() {
         let mut cc = in_avoidance(1000, Duration::from_millis(20));
+        cc.bytes_in_flight = 1000 * 1200; // a queue needs data in flight
         cc.srtt = Duration::from_millis(100); // 5x the minimum
         cc.on_ack(1200, Duration::from_millis(100));
         let once = cc.cwnd();
@@ -692,7 +720,11 @@ mod tests {
         }
         let cwnd_before = cc.cwnd();
 
-        // Queue builds: RTT climbs far above the floor, still zero loss.
+        // Queue builds: RTT climbs far above the floor, still zero loss. A
+        // queue that deep needs a lot in flight, more than the initial window.
+        for _ in 0..100 {
+            cc.on_send(1200);
+        }
         for _ in 0..20 {
             cc.on_send(1200);
             cc.on_ack(1200, Duration::from_millis(400));
@@ -704,6 +736,24 @@ mod tests {
             cwnd_before,
             cc.cwnd()
         );
+    }
+
+    /// The path got slower while the session sat idle (1 ms floor, then
+    /// 35 ms): with next to nothing in flight that is not a queue, and slow
+    /// start goes on instead of ending at the initial window.
+    #[test]
+    fn a_path_that_got_slower_is_not_taken_for_a_queue() {
+        let mut cc = CongestionController::new(1200);
+        cc.on_send(1200);
+        cc.on_ack(1200, Duration::from_millis(1));
+        let start = cc.cwnd();
+        for _ in 0..20 {
+            cc.on_send(1200);
+            cc.on_ack(1200, Duration::from_millis(35));
+        }
+        assert_eq!(cc.phase, Phase::SlowStart, "slow start ended on the new path's first ACKs");
+        assert_eq!(cc.cwnd(), start + 20 * 1200);
+        assert_eq!(cc.min_rtt, Duration::from_millis(35));
     }
 
     /// A LAN or same-city path: the ping floor is 1 ms, but data is acked after
