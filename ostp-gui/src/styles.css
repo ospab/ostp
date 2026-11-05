@@ -229,6 +229,20 @@ a { text-decoration: none; }
   overflow-wrap: anywhere;
 }
 
+.reconnect-notice {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 0.78rem;
+  color: var(--c-txt-2);
+  padding: 8px 12px;
+  border-radius: var(--r-sm);
+  border: 1px solid rgba(var(--c-fg-rgb), 0.12);
+  max-width: 340px;
+  line-height: 1.45;
+}
+.reconnect-notice.hidden { display: none; }
+
 /* ── Connection info ─────────────────────────────────────────────────── */
 .connection-info {
   display: flex;

@@ -60,6 +60,12 @@
         <!-- Error banner -->
         <div id="error-banner" class="error-banner hidden" role="alert"></div>
 
+        <!-- The profile changed while connected: it applies on reconnect -->
+        <div id="reconnect-notice" class="reconnect-notice hidden" role="status">
+          <span>The profile changed. The connection still uses the previous one.</span>
+          <button id="btn-reconnect" class="btn secondary compact-btn">Reconnect</button>
+        </div>
+
         <!-- Connection info (visible when connected) -->
         <div id="connection-info" class="connection-info hidden">
           <div class="server-badge">

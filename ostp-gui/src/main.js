@@ -326,6 +326,7 @@ function setState(next) {
     next === 'disconnected' ? 'Connect' : next === 'connecting' ? 'Cancel connecting' : 'Disconnect');
 
   if (next === 'disconnected') {
+    sessionProfile = null;
     statusText.textContent = 'Disconnected';
     uptimeText.textContent  = 'Press the button to connect';
     connInfo.classList.add('hidden');
@@ -373,6 +374,7 @@ function setState(next) {
       uptimeText.textContent = 'Connected for ' + fmtTime(uptimeSecs);
     }, 1000);
   }
+  updateReconnectNotice();
 }
 
 // ── POLLING ───────────────────────────────────────────────────────────
@@ -522,6 +524,32 @@ function buildConfig() {
 // without a sign that it is.
 let toggleBusy = false;
 
+// The profile the running connection was started with, to tell when the
+// selection or the profile itself changed since (it applies on reconnect).
+let sessionProfile = null;
+const profileSignature = id => JSON.stringify(profiles.find(p => p.id === id) || null);
+
+function updateReconnectNotice() {
+  const changed = appState !== 'disconnected' && sessionProfile !== null
+    && sessionProfile !== profileSignature(activeId);
+  $('reconnect-notice').classList.toggle('hidden', !changed);
+}
+
+// Stop and start again with the selected profile. One tunnel cannot hold
+// both servers at once, so apps' connections are reset as with a manual
+// Disconnect and Connect; this only saves the two clicks.
+async function reconnect() {
+  if (toggleBusy || appState === 'disconnected') return;
+  const btn = $('btn-reconnect');
+  btn.disabled = true;
+  try {
+    await handleToggle();
+    if (appState === 'disconnected') await handleToggle();
+  } finally {
+    btn.disabled = false;
+  }
+}
+
 async function handleToggle() {
   if (toggleBusy) return;
   toggleBusy = true;
@@ -554,6 +582,7 @@ async function handleToggle() {
       await invoke('save_config', { jsonContent: JSON.stringify(cfg, null, 2) });
       const ok = await invoke('start_tunnel');
       if (ok) {
+        sessionProfile = profileSignature(activeId);
         startPolling();
       } else {
         setState('disconnected');
@@ -759,6 +788,7 @@ function renderProfiles() {
   profileEmpty.style.display = manual.length || hasSubs ? 'none' : '';
   manual.forEach(p => profileList.appendChild(profileCard(p)));
   renderSubs();
+  updateReconnectNotice();
 }
 
 function profileCard(p) {
@@ -793,7 +823,7 @@ function profileCard(p) {
       saveActiveId(activeId);
       renderProfiles();
       persistConfig();
-      if (appState !== 'disconnected') showToast('The connection keeps using the previous profile until you reconnect');
+      if (appState !== 'disconnected') showToast('The connection keeps using the previous profile. Reconnect on the main screen to switch');
     };
     card.addEventListener('click', e => {
       if (e.target.closest('.profile-action-btn')) return;
@@ -1725,6 +1755,7 @@ window.addEventListener('DOMContentLoaded', async () => {
   // ── Event wiring ──────────────────────────────────────────────────
 
   btnConnect.addEventListener('click', handleToggle);
+  $('btn-reconnect').addEventListener('click', reconnect);
   btnGoSettings.addEventListener('click', () => showScreen('settings'));
   $('btn-go-servers').addEventListener('click', () => showScreen('servers'));
   $('btn-go-more').addEventListener('click', () => showScreen('more'));

@@ -54,6 +54,29 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin, 
   // The profile the running tunnel was started with; the active profile can be
   // changed in Settings meanwhile, which only takes effect on the next connect.
   String? _sessionProfileName;
+  // The whole profile as it was at connect, to notice an edit too, not only another choice.
+  String? _sessionProfileSig;
+  bool _reconnecting = false;
+
+  /// Whether the active profile differs from the one the tunnel runs on.
+  bool get _profileChanged =>
+      _state != ConnectionStateEnum.disconnected &&
+      _sessionProfileSig != null &&
+      _sessionProfileSig != (_activeProfile == null ? null : jsonEncode(_activeProfile!.toJson()));
+
+  /// Stop and start again with the selected profile. One tunnel cannot hold
+  /// two servers at once, so connections are reset as with Disconnect and
+  /// Connect; this only saves the two taps.
+  Future<void> _reconnect() async {
+    if (_reconnecting || _starting || _stopping) return;
+    setState(() => _reconnecting = true);
+    try {
+      await _stopTunnel();
+      if (_state == ConnectionStateEnum.disconnected) await _toggleConnection();
+    } finally {
+      if (mounted) setState(() => _reconnecting = false);
+    }
+  }
 
   static const _callTimeout = Duration(seconds: 5);
   // The system VPN consent dialog waits for the user, so startTunnel gets longer.
@@ -321,6 +344,7 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin, 
       _starting = true;
       _epoch++;
       _sessionProfileName = profile.name;
+      _sessionProfileSig = jsonEncode(profile.toJson());
       _setConnecting();
       widget.prefs.setString('latest_config_json', configStr);
 
@@ -531,6 +555,7 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin, 
       _pingText = '-- ms';
       _pingColor = Colors.white54;
       _sessionProfileName = null;
+      _sessionProfileSig = null;
     });
     _pulseController.stop();
     _pulseController.value = 0.0;
@@ -816,6 +841,27 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin, 
             ],
           ),
         ),
+
+        if (_profileChanged)
+          Padding(
+            padding: const EdgeInsets.only(top: 12),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                const Flexible(
+                  child: Text(
+                    'The profile changed. The VPN still uses the previous one.',
+                    style: TextStyle(fontSize: 13, color: Colors.white60),
+                  ),
+                ),
+                const SizedBox(width: 8),
+                TextButton(
+                  onPressed: _reconnecting ? null : _reconnect,
+                  child: const Text('Reconnect'),
+                ),
+              ],
+            ),
+          ),
 
         if (_showRtt)
         AnimatedOpacity(

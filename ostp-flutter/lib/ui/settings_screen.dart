@@ -49,7 +49,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
       if (running == true && mounted) {
         ScaffoldMessenger.of(context)
           ..hideCurrentSnackBar()
-          ..showSnackBar(const SnackBar(content: Text('The VPN is running. The change applies on the next connect.')));
+          ..showSnackBar(const SnackBar(content: Text('The VPN is running. The change applies after Reconnect on the main screen.')));
       }
     } catch (_) {}
   }
