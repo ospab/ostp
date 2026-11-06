@@ -74,22 +74,9 @@ pub struct TransportConfig {
     /// "udp" or "uot"
     #[serde(default = "default_transport_mode")]
     pub mode: String,
-    /// Split the first UoT/TCP packet (handshake) into tiny TCP segments to
-    /// break DPI that inspects the first packet. UoT/TCP only; ignored for UDP.
-    #[serde(default)]
-    pub tcp_fragmentation: bool,
-    /// TCP chunk size (bytes)
-    #[serde(default = "default_frag_chunk")]
-    pub frag_chunk: usize,
-    /// TCP sleep duration between chunks (ms)
-    #[serde(default = "default_frag_sleep")]
-    pub frag_sleep: u64,
-    /// [min, max] junk packet count
-    #[serde(default = "default_junk_count")]
-    pub junk_pc: [usize; 2],
-    /// [min, max] junk packet size in bytes
-    #[serde(default = "default_junk_size")]
-    pub junk_ps: [usize; 2],
+    // `tcp_fragmentation`, `frag_chunk`, `frag_sleep`, `junk_pc` and `junk_ps`
+    // were removed in 0.4.7; older config files that still have them load fine
+    // (unknown fields are ignored).
     /// TTL-desync (UDP only): before the handshake, send decoy datagrams with a
     /// lowered IP TTL so they reach an on-path DPI box but expire before the server.
     #[serde(default)]
@@ -124,10 +111,6 @@ pub struct TransportConfig {
 fn default_true() -> bool { true }
 
 fn default_transport_mode() -> String { "udp".to_string() }
-fn default_frag_chunk() -> usize { 2 }
-fn default_frag_sleep() -> u64 { 2 }
-fn default_junk_count() -> [usize; 2] { [2, 5] }
-fn default_junk_size() -> [usize; 2] { [100, 1000] }
 fn default_ttl_desync_ttl() -> u8 { 8 }
 fn default_ttl_desync_count() -> u8 { 2 }
 
@@ -135,11 +118,6 @@ impl Default for TransportConfig {
     fn default() -> Self {
         Self {
             mode: default_transport_mode(),
-            tcp_fragmentation: false,
-            frag_chunk: default_frag_chunk(),
-            frag_sleep: default_frag_sleep(),
-            junk_pc: default_junk_count(),
-            junk_ps: default_junk_size(),
             ttl_desync: false,
             ttl_desync_ttl: default_ttl_desync_ttl(),
             ttl_desync_count: default_ttl_desync_count(),
@@ -622,15 +600,6 @@ pub struct ClientFileConfig {
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
 pub struct TransportConfigRaw {
     pub mode: Option<String>,
-    pub tcp_fragmentation: Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub frag_chunk: Option<usize>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub frag_sleep: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub junk_pc: Option<[usize; 2]>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub junk_ps: Option<[usize; 2]>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ttl_desync: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -655,11 +624,6 @@ impl TransportConfigRaw {
         let d = TransportConfig::default();
         TransportConfig {
             mode: self.mode.clone().unwrap_or(d.mode),
-            tcp_fragmentation: self.tcp_fragmentation.unwrap_or(d.tcp_fragmentation),
-            frag_chunk: self.frag_chunk.unwrap_or(d.frag_chunk),
-            frag_sleep: self.frag_sleep.unwrap_or(d.frag_sleep),
-            junk_pc: self.junk_pc.unwrap_or(d.junk_pc),
-            junk_ps: self.junk_ps.unwrap_or(d.junk_ps),
             ttl_desync: self.ttl_desync.unwrap_or(d.ttl_desync),
             ttl_desync_ttl: self.ttl_desync_ttl.unwrap_or(d.ttl_desync_ttl),
             ttl_desync_count: self.ttl_desync_count.unwrap_or(d.ttl_desync_count),

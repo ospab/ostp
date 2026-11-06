@@ -201,7 +201,7 @@ class SubscriptionStore {
   }
 
   /// Replaces the subscription's profiles with the fetched links, keeping the
-  /// active selection and per-profile tweaks (junk, fragmentation, TTL) of
+  /// active selection and per-profile tweaks (TTL desync) of
   /// the profile with the same carrier.
   Future<int> _refreshOne(OstpSubscription sub) async {
     final doc = await _fetch(sub.url);
@@ -250,13 +250,6 @@ class SubscriptionStore {
         accessKey: l.key,
         transportMode: l.transport,
         active: activeCarrier != null ? activeCarrier == c : false,
-        tcpFragmentation: prev?.tcpFragmentation ?? false,
-        fragChunk: prev?.fragChunk ?? 2,
-        fragSleep: prev?.fragSleep ?? 2,
-        junkPcMin: prev?.junkPcMin ?? 2,
-        junkPcMax: prev?.junkPcMax ?? 5,
-        junkPsMin: prev?.junkPsMin ?? 100,
-        junkPsMax: prev?.junkPsMax ?? 1000,
         ttlDesync: prev?.ttlDesync ?? false,
         tls: l.tls,
         tlsSni: l.sni ?? '',

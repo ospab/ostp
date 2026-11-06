@@ -214,7 +214,6 @@ impl Client {
         cfg.ostp.server_addr = server.to_string();
         cfg.ostp.access_key = KEY.to_string();
         cfg.transport.mode = mode.to_string();
-        cfg.transport.junk_pc = [0, 0];
         cfg.multiplex.enabled = false;
         let metrics = Arc::new(BridgeMetrics {
             bytes_sent: AtomicU64::new(0),

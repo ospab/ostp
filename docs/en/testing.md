@@ -42,7 +42,7 @@ Run by CI or by the developer before the manual run.
 | S-01 | Fresh install with `install.sh`, then `ostp setup` in Server mode | the `ostp` service is active, `ostp links` prints working links | P1 |
 | S-02 | `ostp update --branch beta` on a server running the previous version | new version, service restarted, keys and settings kept | P1 |
 | S-03 | `ostp migrate --dry-run` on configs from 0.4.5 and older (modular v0, flat v1) | steps, changes and unknown keys with suggestions are printed; the file is untouched | P1 |
-| S-04 | `ostp migrate` on the same configs | `config_version: 2`, `access_keys` and `api.token` kept, the server starts | P1 |
+| S-04 | `ostp migrate` on the same configs | `config_version: 4`, `access_keys` and `api.token` kept, the server starts | P1 |
 | S-05 | A config newer than supported (`config_version: 99`) | migrate refuses and leaves the file alone | P2 |
 | S-06 | `ostp check` on a valid and a broken config | "Config OK" / a clear error naming the field | P1 |
 | S-07 | Add a key to `config.json` of a running server | within ~5 s the new key connects, no restart | P1 |
@@ -59,7 +59,6 @@ Run by CI or by the developer before the manual run.
 |---|---|---|---|
 | S-10 | Client over a UDP link | connects, traffic flows, RTT shown | P1 |
 | S-11 | Client over UoT (TCP) on 50000 | same | P1 |
-| S-12 | UoT with junk packets and TCP fragmentation | connects | P2 |
 | S-13 | Relay: `ostp init relay`, client goes through the relay | traffic flows, the relay holds no keys | P2 |
 | S-14 | Client with a wrong key | no connection, the server stays up, no key in clear in the log | P1 |
 | S-15 | A TCP/TLS client that goes silent (kill it with the network, not gracefully) | the server closes its connection within 5 minutes; a normal idle client stays connected | P2 |
@@ -146,7 +145,7 @@ Repeat for nginx, apache (Debian and RHEL) and caddy.
 | G-03 | Create, edit and delete a profile by hand | works, the active profile stays consistent | P1 |
 | G-04 | Share a profile | a QR shows (not an empty dialog), a phone scans it, the link copies | P1 |
 | G-05 | Import `https://…/sub/…` | a subscription card (name, usage, "updated just now"); its profiles tagged "sub", the first selected | P1 |
-| G-06 | Change the port or path on the server, press Update in the GUI | the subscription's profiles update, the selected one stays selected (same carrier), fragmentation settings kept | P1 |
+| G-06 | Change the port or path on the server, press Update in the GUI | the subscription's profiles update, the selected one stays selected (same carrier), TTL desync setting kept | P1 |
 | G-07 | Subscription with `update_interval_hours: 1`, restart the GUI an hour later | refreshed on its own | P2 |
 | G-08 | Wrong URL, `http://…`, a removed key | a clear error on the card and in the toast; a URL that never worked is not kept | P1 |
 | G-09 | QR of a subscription card | a phone scans it and imports a subscription | P2 |

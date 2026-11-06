@@ -18,7 +18,7 @@ The client takes your applications' traffic, sends it through an encrypted sessi
 - `uot`: the same datagrams over one TCP connection, each with a 2-byte length prefix. For networks that block or throttle unknown UDP. Nothing is imitated; the stream is length-prefixed opaque data.
 - `uot` with `tls`: UoT inside real TLS to the server's domain, directly on 443 or through nginx/apache/caddy with `ws_path`. The certificate is checked against the Mozilla roots; `tls_insecure` turns that off for testing. See [tls.md](tls.md).
 
-Other options of the `transport` block: `junk_pc` / `junk_ps` (count and size range of random datagrams sent before the handshake), `tcp_fragmentation` / `frag_chunk` / `frag_sleep` (the first TCP segment, which holds the handshake, is split into small pieces with short pauses) and `ttl_desync*` (UDP only, decoy datagrams that expire before the server). Details in [obfuscation.md](obfuscation.md).
+Another option of the `transport` block: `ttl_desync*` (UDP only, decoy datagrams that expire before the server). `junk_pc`, `junk_ps`, `tcp_fragmentation`, `frag_chunk` and `frag_sleep` were removed in 0.4.7 and are ignored; `ostp migrate` deletes them. Details in [obfuscation.md](obfuscation.md).
 
 There is no STUN/TURN client. Strict NATs are handled by roaming on `session_id` (see [server.md](server.md)) and by `uot`.
 

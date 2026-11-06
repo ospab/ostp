@@ -20,13 +20,13 @@ Public by design, and published here on purpose:
 
 - **Algorithms:** Noise `NNpsk0_25519_ChaChaPoly_BLAKE2s`, ChaCha20-Poly1305 (RFC 8439), HKDF-SHA256 (RFC 5869), HMAC-SHA256 (RFC 2104), TLS 1.2/1.3 through rustls.
 - **Constants:** the protocol version, frame layouts, padding ranges, timers. The string `258EAFA5-E914-47DA-95CA-C5AB0DC85B11` in `ostp-core/src/http_upgrade.rs` is the WebSocket GUID from RFC 6455 §1.3. Every browser and web server has it; the WebSocket handshake through nginx, Apache or Caddy does not work without it. It is not a key and hides nothing.
-- **Code paths:** how the server tells OSTP apart from other traffic, how junk packets and fragmentation work, how the prober probes.
+- **Code paths:** how the server tells OSTP apart from other traffic, how TTL-desync decoys work, how the prober probes.
 
 What follows for someone who knows all of the above but not an access key:
 
 - They cannot decrypt traffic, forge packets or complete a handshake. The Noise handshake needs the PSK, and the PSK comes only from the access key.
 - They cannot unmask headers. The header mask is keyed by a value derived from the access key.
-- What they *can* do is statistical: packet sizes, timings, and the fact that there is traffic at all. Padding, junk packets and the TLS carrier make that harder; they do not make it impossible, and this documentation does not claim otherwise.
+- What they *can* do is statistical: packet sizes, timings, and the fact that there is traffic at all. Padding and the TLS carrier make that harder; they do not make it impossible, and this documentation does not claim otherwise.
 
 Obscurity is used only on top of real security, never instead of it: the secret upgrade path and the panel's `webpath` keep scanners away from endpoints that are authenticated anyway.
 
@@ -79,13 +79,12 @@ The `AdaptivePadder` calculates dynamic dummy byte quantities to append to the p
 
 ---
 
-## Junk packets and TCP fragmentation
+## Decoys and the junk marker
 
-OSTP does not try to impersonate a known protocol (TLS, HTTP, or otherwise) — a fingerprint-matching filter can always be updated to catch an impersonation attempt. Instead it follows a **zapret-like** approach: no recognizable header at all, plus active manipulation of packet boundaries, so there is nothing distinctive to fingerprint in the first place.
+OSTP does not try to impersonate a known protocol (TLS, HTTP, or otherwise) — a fingerprint-matching filter can always be updated to catch an impersonation attempt. Instead the handshake and every packet carry no recognizable header at all, so there is nothing distinctive to fingerprint in the first place.
 
 The one opt-in exception is not mimicry either: a server bound to a real domain can carry UoT inside **real TLS** with a real certificate (see [Domains and TLS](tls.md)). That is a genuine HTTPS site, not an imitation of one.
 
-- **Junk packets**: before the handshake, the client sends a configurable number (`junk_pc`) of random-size (`junk_ps`) filler datagrams. Each carries a 4-byte marker **derived from the access key** (the `junk_marker` above) rather than a fixed constant — a fixed marker would itself be a universal signature any observer could filter on across every OSTP deployment. The server derives the same per-key marker while trying candidate keys and drops matching junk silently, before it ever reaches the "unauthorized probe" logging path.
-- **TCP fragmentation** (UoT/TCP transport only): the first packet (the handshake) is split into small chunks (`frag_chunk` bytes) with short delays (`frag_sleep` ms) between writes, so DPI that inspects only the first TCP segment never sees a complete handshake to fingerprint.
+- **TTL desync** (UDP only, off by default): before the handshake the client sends a few decoy datagrams with a lowered IP TTL, so they reach a DPI box on the path but expire before the server. Each starts with the 4-byte `junk_marker` above, **derived from the access key** rather than a fixed constant (a fixed marker would be a signature shared by every OSTP deployment); a decoy that does reach the server is recognised and dropped silently, before the "unauthorized probe" logging path. With `ttl_desync_auto` the client measures the hop distance to the server once and picks the decoy TTL from it.
 
-Both are configurable per-profile; neither is sent over plain UDP transport, where a standalone junk datagram would look exactly like a random one-off probe to the server.
+Junk packets and TCP fragmentation of the handshake (plain UoT/TCP only) were removed in 0.4.7. The handshake already looks like random bytes, so random filler in front of it changes nothing a classifier of fully encrypted traffic looks at, and a plain OSTP stream has no server name for splitting the first segment to hide. The server still drops marked junk from older clients.

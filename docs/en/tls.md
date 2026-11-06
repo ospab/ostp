@@ -144,8 +144,6 @@ The certificate is checked against the bundled Mozilla root store. This works th
 
 SNI and `Host` always use the configured name, not the resolved address, including on the NAT64 fallback.
 
-Inside TLS, junk packets and first-packet fragmentation are skipped (encrypted, they hide nothing).
-
 Share links carry the same options: `ostp://KEY@vpn.example.com:443?type=uot&tls=1&path=%2FXk3p…`. See the Share Links page for every parameter. The Android app and the desktop GUI have the same switches in the profile editor, with "don't verify certificate" marked as insecure.
 
 ## Subscriptions

@@ -229,16 +229,8 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin, 
         "bind_addr": localBind,
         "connect_timeout_ms": 15000,
       },
-      // Junk packets + TCP fragmentation are per-profile settings — same
-      // shape as the desktop GUI's profile object — not global toggles.
       "transport": {
         "mode": p?.transportMode ?? 'udp',
-        "tcp_fragmentation": p?.tcpFragmentation ?? false,
-        // The core reads these as unsigned: a negative or absurd value would fail the whole config.
-        "frag_chunk": (p?.fragChunk ?? 2).clamp(1, 1400),
-        "frag_sleep": (p?.fragSleep ?? 2).clamp(0, 1000),
-        "junk_pc": _range(p?.junkPcMin ?? 2, p?.junkPcMax ?? 5, 30),
-        "junk_ps": _range(p?.junkPsMin ?? 100, p?.junkPsMax ?? 1000, 1400),
         "ttl_desync": p?.ttlDesync ?? false,
         "ttl_desync_auto": true,
         "tls": (p?.transportMode == 'uot') && (p?.tls ?? false),
@@ -277,11 +269,6 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin, 
     if (port == null || port < 1 || port > 65535) return null;
     final host = s.substring(0, c).replaceAll(RegExp(r'^\[|\]$'), '');
     return InternetAddress.tryParse(host) == null ? null : s;
-  }
-
-  static List<int> _range(int a, int b, int max) {
-    final lo = a.clamp(0, max), hi = b.clamp(0, max);
-    return lo <= hi ? [lo, hi] : [hi, lo];
   }
 
   void _updateLatestConfigJson() {

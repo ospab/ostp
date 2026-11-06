@@ -243,22 +243,7 @@ const inShowSpeed   = $('in-show-speed');
 const groupKillSwitch  = $('group-kill-switch');
 const groupMuxSessions = $('group-mux-sessions');
 
-const inJunkEnabled   = $('cs-junk-enabled');
-const btnJunkSettings = $('btn-junk-settings');
-const junkModal       = $('junk-modal');
-const inJunkPcMin     = $('cs-junk-pc-min');
-const inJunkPcMax     = $('cs-junk-pc-max');
-const inJunkPsMin     = $('cs-junk-ps-min');
-const inJunkPsMax     = $('cs-junk-ps-max');
-const btnJunkDone     = $('btn-junk-done');
-
-const inTcpFrag       = $('cs-tcp-frag');
-const btnFragSettings = $('btn-frag-settings');
 const inTtlDesync     = $('cs-ttl-desync');
-const fragModal       = $('frag-modal');
-const inFragChunk     = $('cs-frag-chunk');
-const inFragSleep     = $('cs-frag-sleep');
-const btnFragDone     = $('btn-frag-done');
 
 // ── UTILITIES ─────────────────────────────────────────────────────────
 function fmtTime(s) {
@@ -459,11 +444,6 @@ function clampInt(v, lo, hi, dflt) {
   return Number.isFinite(n) ? Math.min(hi, Math.max(lo, n)) : dflt;
 }
 
-function rangePair(a, b, lo, hi, d) {
-  const x = clampInt(a, lo, hi, d[0]), y = clampInt(b, lo, hi, d[1]);
-  return x <= y ? [x, y] : [y, x];
-}
-
 const MAX_LIST_ITEMS = 500;
 function listOf(text) {
   return String(text || '').split(/[\n,]+/).map(x => x.trim().slice(0, 253)).filter(Boolean).slice(0, MAX_LIST_ITEMS);
@@ -476,18 +456,13 @@ function buildConfig() {
   const s = loadClientSettings();
   const cfg = {
     mode: 'client',
-    config_version: 2,
+    config_version: 4,
     server: active.server,
     access_key: active.key,
     socks5_bind: s.socks || null,
     debug: !!s.debug,
     transport: {
       mode: active.transport || 'udp',
-      tcp_fragmentation: s.tcpFrag || !!active.tcp_fragmentation,
-      frag_chunk: clampInt(s.tcpFrag ? s.fragChunk : active.frag_chunk, 1, 1400, 2),
-      frag_sleep: clampInt(s.tcpFrag ? s.fragSleep : active.frag_sleep, 0, 1000, 2),
-      junk_pc: s.junkEnabled ? rangePair(s.junkPcMin, s.junkPcMax, 0, 100, [2, 5]) : (active.junk_pc || [2, 5]),
-      junk_ps: s.junkEnabled ? rangePair(s.junkPsMin, s.junkPsMax, 1, 1400, [100, 1000]) : (active.junk_ps || [100, 1000]),
       ttl_desync: !!s.ttlDesync,
       ttl_desync_auto: true,
       tls: (active.transport === 'uot') && !!active.tls,
@@ -1297,7 +1272,7 @@ function renderSubs() {
 
 // ── PROBER ────────────────────────────────────────────────────────────
 let lastMatrix = null;
-const CARRIER_NAMES = { udp: 'UDP', uot: 'TCP', uot_frag: 'TCP + frag', uot_tls: 'TLS' };
+const CARRIER_NAMES = { udp: 'UDP', uot: 'TCP', uot_tls: 'TLS' };
 const carrierName = t => CARRIER_NAMES[t] || String(t).toUpperCase();
 
 function proberTls(p) {
@@ -1421,8 +1396,6 @@ async function runDpi() {
       line(r.transparent_proxy_detected, 'A transparent proxy sits on the path', 'No transparent proxy', 'proxy'),
       line(r.connect_hijacked, 'Block pages are injected', 'No injected block pages', 'connect'),
     ].join('');
-    const tip = r.vulnerable_to_fragmentation
-      ? '<p class="field-hint">The filter misses fragmented handshakes: TCP fragmentation (UoT) helps here.</p>' : '';
     // Checks with a verdict and, when the censor answers, its hop.
     const checks = (r.checks || []).map(c => {
       const mark = c.ok === true ? '<span class="pr-ok">✓</span>' : c.ok === false ? '<span class="pr-bad">✕</span>' : '<span class="pr-dim">–</span>';
@@ -1437,7 +1410,7 @@ async function runDpi() {
          ${r.path_summary ? `<p class="field-hint">${escHtml(r.path_summary.charAt(0).toUpperCase() + r.path_summary.slice(1))}.</p>` : ''}
          <table class="pr-table"><tr><th>Hop</th><th>Router</th><th>Network</th></tr>${path}</table>
          <p class="field-hint">A censor that resets or answers is placed by TTL; one that drops silently can only be narrowed to the hops before the destination network.</p>` : '';
-    prCard('Network test', verdict + `<table class="pr-table">${checks}${rows}</table>` + tip + pathBlock);
+    prCard('Network test', verdict + `<table class="pr-table">${checks}${rows}</table>` + pathBlock);
     prStatus('Done.');
   } catch (e) {
     prStatus('Could not run the network test: ' + (e?.message || e), 'is-error');
@@ -1564,14 +1537,6 @@ function loadSettingsIntoForm() {
   inShowRtt.checked     = s.showRtt !== false;
   inShowSpeed.checked   = s.showSpeed !== false;
   $('in-update-check').checked = s.updateCheck !== false;
-  inJunkEnabled.checked = !!s.junkEnabled;
-  inJunkPcMin.value     = s.junkPcMin || 2;
-  inJunkPcMax.value     = s.junkPcMax || 5;
-  inJunkPsMin.value     = s.junkPsMin || 100;
-  inJunkPsMax.value     = s.junkPsMax || 1000;
-  inTcpFrag.checked     = !!s.tcpFrag;
-  inFragChunk.value     = s.fragChunk || 2;
-  inFragSleep.value     = !isNaN(parseInt(s.fragSleep)) ? s.fragSleep : 2;
   if (inTtlDesync) inTtlDesync.checked = !!s.ttlDesync;
   updateClientVisibility();
 }
@@ -1589,9 +1554,6 @@ let autostartChain = Promise.resolve();
 // put in order, so what the form shows is what the core gets.
 const NUMBER_FIELDS = [
   [() => inMuxSessions, 1, 8], [() => inMtu, 576, 1500],
-  [() => inJunkPcMin, 0, 100], [() => inJunkPcMax, 0, 100],
-  [() => inJunkPsMin, 1, 1400], [() => inJunkPsMax, 1, 1400],
-  [() => inFragChunk, 1, 1400], [() => inFragSleep, 0, 1000],
 ];
 
 function normalizeNumberFields() {
@@ -1599,9 +1561,6 @@ function normalizeNumberFields() {
     const el = get();
     if (el.value.trim() === '') continue;
     el.value = String(clampInt(el.value, lo, hi, lo));
-  }
-  for (const [a, b] of [[inJunkPcMin, inJunkPcMax], [inJunkPsMin, inJunkPsMax]]) {
-    if (a.value !== '' && b.value !== '' && +a.value > +b.value) [a.value, b.value] = [b.value, a.value];
   }
 }
 
@@ -1629,14 +1588,6 @@ function collectAndSaveSettings() {
     showRtt:      inShowRtt.checked,
     showSpeed:    inShowSpeed.checked,
     updateCheck:  $('in-update-check').checked,
-    junkEnabled:  inJunkEnabled.checked,
-    junkPcMin:    parseInt(inJunkPcMin.value) || 2,
-    junkPcMax:    parseInt(inJunkPcMax.value) || 5,
-    junkPsMin:    parseInt(inJunkPsMin.value) || 100,
-    junkPsMax:    parseInt(inJunkPsMax.value) || 1000,
-    tcpFrag:      inTcpFrag.checked,
-    fragChunk:    parseInt(inFragChunk.value) || 2,
-    fragSleep:    !isNaN(parseInt(inFragSleep.value)) ? parseInt(inFragSleep.value) : 2,
     ttlDesync:    inTtlDesync ? inTtlDesync.checked : false,
   };
   // Cheap and local: safe to run on every debounced keystroke.
@@ -1667,8 +1618,7 @@ function collectAndSaveSettings() {
   if (appState === 'connected') {
     const tunnelRelevant = JSON.stringify([
       s.tun, s.killSwitch, s.mux, s.muxSessions, s.mtu, s.dns, s.socks,
-      s.exDomains, s.exIps, s.exProcs, s.junkEnabled, s.junkPcMin, s.junkPcMax,
-      s.junkPsMin, s.junkPsMax, s.tcpFrag, s.fragChunk, s.fragSleep, s.ttlDesync,
+      s.exDomains, s.exIps, s.exProcs, s.ttlDesync,
     ]);
     if (tunnelRelevant !== lastAppliedTunnelConfig) {
       clearTimeout(hotReloadTimer);
@@ -1884,10 +1834,10 @@ window.addEventListener('DOMContentLoaded', async () => {
   wintunModal.addEventListener('click', e => { if (e.target === wintunModal) wintunModal.classList.add('hidden'); });
 
   // Client settings — wire all inputs
-  [inTun, inKillSwitch, inMux, inAutoconnect, inLaunchStartup, inDebug, inShowRtt, inShowSpeed, inJunkEnabled, inTcpFrag, inTtlDesync, $('in-update-check')]
+  [inTun, inKillSwitch, inMux, inAutoconnect, inLaunchStartup, inDebug, inShowRtt, inShowSpeed, inTtlDesync, $('in-update-check')]
     .filter(Boolean)
     .forEach(el => el.addEventListener('change', collectAndSaveSettings));
-  [inMuxSessions, inMtu, inDns, inSocks, inExDomains, inExIps, inExProcs, inJunkPcMin, inJunkPcMax, inJunkPsMin, inJunkPsMax, inFragChunk, inFragSleep]
+  [inMuxSessions, inMtu, inDns, inSocks, inExDomains, inExIps, inExProcs]
     .forEach(el => {
       el.addEventListener('input', () => {
         clearTimeout(el._saveTimer);
@@ -1903,23 +1853,6 @@ window.addEventListener('DOMContentLoaded', async () => {
     const problem = socksProblem(inSocks.value.trim());
     if (problem) showToast(problem, 'error');
   });
-
-  // Junk and Frag modals
-  btnJunkSettings.addEventListener('click', () => junkModal.classList.remove('hidden'));
-  btnJunkDone.addEventListener('click', () => {
-    normalizeNumberFields();
-    collectAndSaveSettings();
-    junkModal.classList.add('hidden');
-  });
-  junkModal.addEventListener('click', e => { if (e.target === junkModal) junkModal.classList.add('hidden'); });
-
-  btnFragSettings.addEventListener('click', () => fragModal.classList.remove('hidden'));
-  btnFragDone.addEventListener('click', () => {
-    normalizeNumberFields();
-    collectAndSaveSettings();
-    fragModal.classList.add('hidden');
-  });
-  fragModal.addEventListener('click', e => { if (e.target === fragModal) fragModal.classList.add('hidden'); });
 
   setupInputLimits();
   setupAccessibility();
