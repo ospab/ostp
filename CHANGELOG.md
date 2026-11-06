@@ -8,6 +8,9 @@ Older history is on the [Releases](https://github.com/ospab/ostp/releases) page 
 
 ## [Unreleased]
 
+### Fixed
+- Desktop app: Update now failed with "Command install_update not allowed by ACL": the command was missing from the app's permission list. The installed beta.12 to beta.14 builds cannot update themselves, so the next version has to be installed by hand once; from it on, Update now works.
+
 ## [0.4.7-beta.14] - 2026-11-06
 
 ### Added

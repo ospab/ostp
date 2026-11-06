@@ -23,6 +23,7 @@ allow = [
   "run_dpi_battery",
   "app_build_tag",
   "check_updates",
+  "install_update",
   "servers_list",
   "server_add",
   "server_rename",
