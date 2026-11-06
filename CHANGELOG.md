@@ -8,6 +8,8 @@ Older history is on the [Releases](https://github.com/ospab/ostp/releases) page 
 
 ## [Unreleased]
 
+## [0.4.7-beta.14] - 2026-11-06
+
 ### Added
 - Desktop and Android apps: when the selected profile changes, or the profile in use is edited, while connected, the main screen says that the connection still uses the previous one and shows a Reconnect button. It stops and starts the tunnel with the new profile in one step; open connections are reset, as with Disconnect and Connect. Nothing happens until it is pressed.
 - Per-stream flow control: a large upload to a site that takes it slowly no longer breaks (the server used to reset the connection once 32 MB waited for the site), and a program on the client that reads a download slowly no longer makes the server buffer it. Each stream gets an 8 MiB window in each direction; the receiver grants more as data reaches the site or the program. The client offers it after the handshake and both sides use it only if the server answers, so 0.4.5 servers and clients work as before. Checked: a 100 MB upload to a site taking 1 MB/s arrives whole with the server at 25 MB of memory.
