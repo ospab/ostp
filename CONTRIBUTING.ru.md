@@ -33,6 +33,15 @@
     cargo test --workspace
     ```
 
+4.  **Пакеты выпуска локально** (на Windows, так же, как их собирает CI):
+    ```powershell
+    .\scripts\build.ps1 win,win-gui,linux,linux-gui,apk   # или: all
+    .\scripts\build.ps1 linux --arm64                     # --arm64 или --armv7
+    ```
+    По умолчанию x86_64, для APK arm64-v8a. Linux-таргеты собираются в WSL.
+    Результаты кладутся в `dist/`; для каждого таргета скрипт называет, чего не хватает.
+    Скрипт ничего не коммитит и не ставит тегов: выпуски идут через `scripts/gha.ps1`.
+
 ---
 
 ## Структура проекта

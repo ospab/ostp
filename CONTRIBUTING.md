@@ -33,6 +33,15 @@ To build and test OSTP locally, you will need:
     cargo test --workspace
     ```
 
+4.  **Release packages locally** (Windows host, the same way CI builds them):
+    ```powershell
+    .\scripts\build.ps1 win,win-gui,linux,linux-gui,apk   # or: all
+    .\scripts\build.ps1 linux --arm64                     # --arm64 or --armv7
+    ```
+    x86_64 by default, arm64-v8a for the APK. Linux targets are built in WSL.
+    Results go to `dist/`; the script names what is missing for each target.
+    It never commits or tags: releases go through `scripts/gha.ps1`.
+
 ---
 
 ## Project Structure
