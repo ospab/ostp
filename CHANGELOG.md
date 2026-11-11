@@ -8,6 +8,10 @@ Older history is on the [Releases](https://github.com/ospab/ostp/releases) page 
 
 ## [Unreleased]
 
+### Changed
+- The desktop app's privileged helper `ostp-tun-helper` is now `ostpd` (the crate, the executable and the sidecar), and its Windows scheduled task is "OSTP Daemon". The installer removes the old task and executable. An update of the portable Windows, Linux or macOS build from 0.4.7-beta.15 or older does not copy `ostpd` (that updater only knows the old file name): copy it from the archive by hand, or install the new version over the old one.
+- Desktop app: more room between the Servers button and the exclusions on the More settings screen.
+
 ## [0.4.7-beta.15] - 2026-11-12
 
 ### Changed
