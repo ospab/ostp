@@ -366,10 +366,6 @@ async fn get_config() -> Result<String, String> {
     "processes": []
   },
   
-  "mux": {
-    "enabled": false,
-    "sessions": 1
-  },
   "debug": false
 }"#.into());
     }

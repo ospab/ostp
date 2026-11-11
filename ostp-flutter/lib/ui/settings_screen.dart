@@ -27,9 +27,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
   late TextEditingController _localBindCtrl;
   late TextEditingController _dnsCtrl;
   late TextEditingController _mtuCtrl;
-  late TextEditingController _muxSessionsCtrl;
 
-  bool _muxEnabled = false;
 
   List<OstpProfile> _profiles = [];
   List<OstpSubscription> _subs = [];
@@ -77,8 +75,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
     // Exclusions, app options, logs, server management and updates live on
     // MoreSettingsScreen; this screen only saves what it shows, so it never
     // writes back stale copies of those.
-    _muxEnabled = widget.prefs.getBool('mux_enabled') ?? false;
-    _muxSessionsCtrl = TextEditingController(text: widget.prefs.getString('mux_sessions') ?? '2');
     _profiles = decodeProfiles(widget.prefs.getString('profiles_json'));
     _subs = SubscriptionStore(widget.prefs).load();
   }
@@ -258,7 +254,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
     _localBindCtrl.dispose();
     _dnsCtrl.dispose();
     _mtuCtrl.dispose();
-    _muxSessionsCtrl.dispose();
     super.dispose();
   }
 
@@ -266,8 +261,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
     widget.prefs.setString('local_bind', _localBindCtrl.text.trim());
     widget.prefs.setString('dns_server', _dnsCtrl.text.trim());
     widget.prefs.setString('mtu', _mtuCtrl.text.trim());
-    widget.prefs.setBool('mux_enabled', _muxEnabled);
-    widget.prefs.setString('mux_sessions', _muxSessionsCtrl.text.trim());
     // The profile list is saved by each change to it. Writing it here as well
     // would overwrite a subscription refresh that finished while this screen was open.
   }
@@ -711,35 +704,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
     );
   }
 
-  Widget _buildToggle(String title, String subtitle, bool value, ValueChanged<bool> onChanged) {
-    return Padding(
-      padding: const EdgeInsets.only(bottom: 24),
-      child: Row(
-        mainAxisAlignment: MainAxisAlignment.spaceBetween,
-        children: [
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(title, style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
-                const SizedBox(height: 4),
-                Text(subtitle, style: const TextStyle(fontSize: 13, color: Colors.white54)),
-              ],
-            ),
-          ),
-          Switch(
-            value: value,
-            onChanged: (v) {
-              setState(() => onChanged(v));
-              _saveSettings();
-            },
-            activeColor: Theme.of(context).colorScheme.secondary,
-          )
-        ],
-      ),
-    );
-  }
-
   String? get _activeId {
     for (final x in _profiles) {
       if (x.active) return x.id;
@@ -910,9 +874,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                _buildToggle('MUX (Multiplexing)', 'Multiple sessions over single connection', _muxEnabled, (v) => _muxEnabled = v),
-                if (_muxEnabled)
-                  _buildTextField('MUX Sessions', _muxSessionsCtrl, hint: 'e.g. 2, 4, 8'),
                 _buildTextField('Local Proxy Bind', _localBindCtrl, hint: '127.0.0.1:1088'),
                 _buildTextField('Custom DNS Server', _dnsCtrl, hint: '1.1.1.1 (e.g. 8.8.8.8)'),
                 _buildTextField('MTU (Packet Size)', _mtuCtrl, hint: '1140 (decrease if connection drops)'),

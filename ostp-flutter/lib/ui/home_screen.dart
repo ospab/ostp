@@ -203,8 +203,6 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin, 
     final exIps = widget.prefs.getString('ex_ips') ?? '';
     final debugMode = widget.prefs.getBool('debug_mode') ?? false;
     final mtu = (int.tryParse(widget.prefs.getString('mtu') ?? '') ?? 1140).clamp(576, 1500);
-    final muxEnabled = widget.prefs.getBool('mux_enabled') ?? false;
-    final muxSessions = widget.prefs.getString('mux_sessions') ?? '2';
     final dnsServer = widget.prefs.getString('dns_server');
     // The VPN builder throws on anything but an IP literal, which would fail the start.
     final effectiveDnsServer =
@@ -237,10 +235,6 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin, 
         "tls_sni": (p?.tlsSni ?? '').isEmpty ? null : p!.tlsSni,
         "tls_insecure": p?.tlsInsecure ?? false,
         "ws_path": (p?.wsPath ?? '').isEmpty ? null : p!.wsPath,
-      },
-      "multiplex": {
-        "enabled": muxEnabled,
-        "sessions": (int.tryParse(muxSessions) ?? 2).clamp(1, 16),
       },
       "exclusions": {
         "domains": exDomains.split('\n').map((s) => s.trim()).where((s) => s.isNotEmpty).take(2000).toList(),

@@ -49,7 +49,7 @@ Changes to `config.json` take effect without a reconnect.
 
 Every proxied TCP connection and UDP flow already shares the one encrypted session as `RelayMessage`s (`Connect`, `Data`, `Close`, `UdpAssociate`, `UdpData`), so any number of tabs and downloads fit in it.
 
-The `mux` block is a different, optional thing: several independent sessions to the same server, to spread traffic and loss over separate nonce sequences and congestion controllers.
+The `mux` block is a different, optional thing, available only in the config file: several independent sessions to the same server, each with its own nonce sequence and congestion controller. A stream stays on one session, so a single download gains nothing; in a lab run on a 100 Mbit/s, 80 ms, 0.5% loss path a download took 5.7 Mbit/s without it and 6.9 Mbit/s with 4 sessions, and 40 parallel page objects 4.2 s against 3.3 s. The desktop and Android apps no longer offer it in 0.4.7. Every session also takes a place on the server.
 
 ```json
 "mux": { "enabled": true, "sessions": 5 }

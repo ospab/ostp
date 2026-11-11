@@ -232,8 +232,6 @@ const btnWintunOpen   = $('btn-wintun-open');
 // client settings
 const inTun         = $('in-tun-mode');
 const inKillSwitch  = $('in-kill-switch');
-const inMux         = $('in-mux-mode');
-const inMuxSessions = $('in-mux-sessions');
 const inMtu         = $('in-mtu');
 const inDns         = $('in-dns');
 const inSocks       = $('in-socks');
@@ -246,7 +244,6 @@ const inDebug       = $('in-debug');
 const inShowRtt     = $('in-show-rtt');
 const inShowSpeed   = $('in-show-speed');
 const groupKillSwitch  = $('group-kill-switch');
-const groupMuxSessions = $('group-mux-sessions');
 
 const inTtlDesync     = $('cs-ttl-desync');
 
@@ -488,7 +485,6 @@ function buildConfig() {
       ips: listOf(s.exIps),
       processes: listOf(s.exProcs),
     },
-    mux: s.mux ? { enabled: true, sessions: clampInt(s.muxSessions, 1, 8, 2) } : undefined,
     gui: {
       autoconnect: !!s.autoconnect,
       launch_startup: !!s.launchStartup,
@@ -1533,8 +1529,6 @@ function loadSettingsIntoForm() {
   const s = loadClientSettings();
   inTun.checked         = !!s.tun;
   inKillSwitch.checked  = !!s.killSwitch && KILL_SWITCH_AVAILABLE;
-  inMux.checked         = !!s.mux;
-  inMuxSessions.value   = s.muxSessions || '2';
   inMtu.value           = s.mtu || '';
   inDns.value           = s.dns || '';
   inSocks.value         = s.socks || '';
@@ -1563,7 +1557,7 @@ let autostartChain = Promise.resolve();
 // out of range is replaced by the nearest allowed one and a reversed pair is
 // put in order, so what the form shows is what the core gets.
 const NUMBER_FIELDS = [
-  [() => inMuxSessions, 1, 8], [() => inMtu, 576, 1500],
+  [() => inMtu, 576, 1500],
 ];
 
 function normalizeNumberFields() {
@@ -1584,8 +1578,6 @@ function collectAndSaveSettings() {
   const s = {
     tun:          inTun.checked,
     killSwitch:   inKillSwitch.checked && KILL_SWITCH_AVAILABLE,
-    mux:          inMux.checked,
-    muxSessions:  inMuxSessions.value.trim(),
     mtu:          inMtu.value.trim(),
     dns:          inDns.value.trim(),
     socks:        inSocks.value.trim(),
@@ -1627,7 +1619,7 @@ function collectAndSaveSettings() {
   // once the user has stopped editing rather than between keystrokes.
   if (appState === 'connected') {
     const tunnelRelevant = JSON.stringify([
-      s.tun, s.killSwitch, s.mux, s.muxSessions, s.mtu, s.dns, s.socks,
+      s.tun, s.killSwitch, s.mtu, s.dns, s.socks,
       s.exDomains, s.exIps, s.exProcs, s.ttlDesync,
     ]);
     if (tunnelRelevant !== lastAppliedTunnelConfig) {
@@ -1648,7 +1640,6 @@ function collectAndSaveSettings() {
 
 function updateClientVisibility() {
   groupKillSwitch.style.display  = inTun.checked && KILL_SWITCH_AVAILABLE ? 'flex' : 'none';
-  groupMuxSessions.style.display = inMux.checked  ? 'flex' : 'none';
 
   const showRtt = inShowRtt.checked;
   const showSpeed = inShowSpeed.checked;
@@ -1844,10 +1835,10 @@ window.addEventListener('DOMContentLoaded', async () => {
   wintunModal.addEventListener('click', e => { if (e.target === wintunModal) wintunModal.classList.add('hidden'); });
 
   // Client settings — wire all inputs
-  [inTun, inKillSwitch, inMux, inAutoconnect, inLaunchStartup, inDebug, inShowRtt, inShowSpeed, inTtlDesync, $('in-update-check')]
+  [inTun, inKillSwitch, inAutoconnect, inLaunchStartup, inDebug, inShowRtt, inShowSpeed, inTtlDesync, $('in-update-check')]
     .filter(Boolean)
     .forEach(el => el.addEventListener('change', collectAndSaveSettings));
-  [inMuxSessions, inMtu, inDns, inSocks, inExDomains, inExIps, inExProcs]
+  [inMtu, inDns, inSocks, inExDomains, inExIps, inExProcs]
     .forEach(el => {
       el.addEventListener('input', () => {
         clearTimeout(el._saveTimer);

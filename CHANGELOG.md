@@ -12,6 +12,7 @@ Older history is on the [Releases](https://github.com/ospab/ostp/releases) page 
 - Desktop and Android apps: the Reconnect notice is now a row with a title, the reason and a button that shows "Reconnecting" with a spinner while it works.
 
 ### Removed
+- The multiplexing option (several sessions to the server) from the desktop and Android apps. A lab run on a 100 Mbit/s, 80 ms, 0.5% loss path gave 5.7 Mbit/s without it and 6.9 Mbit/s with 4 sessions for a download, and a stream stays on one session anyway; each session also takes a place on the server. The `mux` block of the config file still works.
 - Junk packets and TCP fragmentation of the handshake (plain TCP only), with their settings in the desktop and Android apps and the `uot_frag` carrier of the network check. The handshake already looks like random bytes, so random filler in front of it changes nothing a classifier of fully encrypted traffic looks at, and a plain OSTP stream has no server name for splitting the first segment to hide; both only made connecting slower. Config files that still have `junk_pc`, `junk_ps`, `tcp_fragmentation`, `frag_chunk` or `frag_sleep` load as before (the fields are ignored), and `ostp migrate` deletes them (client config schema 4). The server still drops marked junk from older clients, and TTL-desync decoys keep their marker, so nothing changes on the wire.
 
 ### Fixed
