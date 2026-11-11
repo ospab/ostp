@@ -8,6 +8,8 @@ Older history is on the [Releases](https://github.com/ospab/ostp/releases) page 
 
 ## [Unreleased]
 
+## [0.4.7-beta.16] - 2026-11-12
+
 ### Fixed
 - Android: "Update now" downloaded the APK and then did nothing, with no installer dialog. The button's own dialog was already closed when the download ended, and the code that starts the installer gave up because that dialog's context was gone. It now uses the screen's context. An app that is already installed has this bug itself: update it by hand once.
 
