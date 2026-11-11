@@ -8,6 +8,8 @@ Older history is on the [Releases](https://github.com/ospab/ostp/releases) page 
 
 ## [Unreleased]
 
+## [0.4.7-beta.15] - 2026-11-12
+
 ### Changed
 - Desktop and Android apps: the Reconnect notice is now a row with a title, the reason and a button that shows "Reconnecting" with a spinner while it works.
 
