@@ -1,4 +1,4 @@
-// ostp-tun-helper/src/main.rs
+// ostpd/src/main.rs
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use anyhow::Result;
@@ -14,7 +14,7 @@ use portable_atomic::Ordering;
 fn log_to_file(msg: &str) {
     let msg = msg.to_string();
     tokio::task::spawn_blocking(move || {
-        // Same shared ostp.log as everything else — not a separate ostp-helper.log.
+        // Same shared ostp.log as everything else — not a separate ostpd.log.
         let path = ostp_client::logging::log_file_path();
         if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
             let _ = writeln!(file, "[{}] {}", chrono::Local::now().format("%Y-%m-%d %H:%M:%S"), msg);
@@ -61,7 +61,7 @@ async fn main() -> Result<()> {
     ostp_client::logging::setup_panic_hook();
     // The helper is a child of the GUI, which already marked the connection in
     // the shared log — pass false so the helper only appends.
-    let _log_guard = ostp_client::logging::init_tracing("info", "ostp-helper", env!("CARGO_PKG_VERSION"), false);
+    let _log_guard = ostp_client::logging::init_tracing("info", "ostpd", env!("CARGO_PKG_VERSION"), false);
 
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {

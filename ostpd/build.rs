@@ -1,4 +1,4 @@
-// build.rs for ostp-tun-helper
+// build.rs for ostpd
 // Embeds a Windows manifest that requests Administrator privileges.
 // This makes Windows show a UAC prompt when the binary is double-clicked
 // or launched via ShellExecuteW("runas").

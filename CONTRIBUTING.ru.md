@@ -57,7 +57,7 @@
 | [`ostp-ssh/`](ostp-ssh) | SSH-клиент, которым приложения ставят и настраивают сервер, и хранилище сохранённых серверов. |
 | [`ostp-dns/`](ostp-dns) | Фильтрующий DNS-резолвер для сервера: списки блокировки, правила, подмены, кэш. |
 | [`ostp-tun/`](ostp-tun) | TUN-устройство и маршруты для каждой платформы (Wintun на Windows). |
-| [`ostp-tun-helper/`](ostp-tun-helper) | Привилегированный помощник, который держит туннель для десктопного GUI на Windows. |
+| [`ostpd/`](ostpd) | Привилегированный помощник, который держит туннель для десктопного GUI на Windows. |
 | [`ostp-jni/`](ostp-jni) | JNI-обвязка для Android-приложения. |
 | [`ostp-gui/`](ostp-gui) | Десктопный клиент (Tauri) для Windows, Linux и macOS; не входит в Cargo-workspace. |
 | [`ostp-flutter/`](ostp-flutter) | Android-клиент (Flutter). |

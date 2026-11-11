@@ -134,7 +134,7 @@ Expand-Archive -Path $zipPath -DestinationPath $extractPath -Force
 $extractedFiles = Get-ChildItem -Path $extractPath -File -Recurse
 if ($extractedFiles.Count -gt 0) {
     Write-Host "Stopping active instances..."
-    Stop-Process -Name "ostp", "ostp-gui", "ostp-tun-helper" -Force -ErrorAction SilentlyContinue
+    Stop-Process -Name "ostp", "ostp-gui", "ostpd" -Force -ErrorAction SilentlyContinue
     Start-Sleep -Seconds 2
 
     foreach ($file in $extractedFiles) {

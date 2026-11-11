@@ -3,7 +3,7 @@ use std::io::Write;
 use std::path::PathBuf;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
-/// The one log file shared by every process (CLI, GUI, TUN helper) and subsystem.
+/// The one log file shared by every process (CLI, GUI, ostpd) and subsystem.
 pub const LOG_FILE_NAME: &str = "ostp.log";
 
 /// Absolute path to the shared log file, next to the running executable.

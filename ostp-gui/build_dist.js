@@ -18,8 +18,8 @@ const filesToCopy = [
     dest: path.join(distDir, 'ostp-gui.exe')
   },
   {
-    src: path.join(workspaceRoot, 'target', 'release', 'ostp-tun-helper.exe'),
-    dest: path.join(distDir, 'ostp-tun-helper.exe')
+    src: path.join(workspaceRoot, 'target', 'release', 'ostpd.exe'),
+    dest: path.join(distDir, 'ostpd.exe')
   },
   {
     src: path.join(workspaceRoot, 'target', 'release', 'wintun.dll'),

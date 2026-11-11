@@ -57,7 +57,7 @@ The repository is a Cargo workspace plus two app projects:
 | [`ostp-ssh/`](ostp-ssh) | SSH client used by the apps to install and manage a server, and the saved-servers store. |
 | [`ostp-dns/`](ostp-dns) | Filtering DNS resolver for the server: block lists, rules, rewrites, cache. |
 | [`ostp-tun/`](ostp-tun) | Platform TUN device and routing (Wintun on Windows). |
-| [`ostp-tun-helper/`](ostp-tun-helper) | Privileged helper that runs the tunnel for the desktop GUI on Windows. |
+| [`ostpd/`](ostpd) | Privileged helper that runs the tunnel for the desktop GUI on Windows. |
 | [`ostp-jni/`](ostp-jni) | JNI bindings used by the Android app. |
 | [`ostp-gui/`](ostp-gui) | Desktop client (Tauri) for Windows, Linux and macOS; not part of the Cargo workspace. |
 | [`ostp-flutter/`](ostp-flutter) | Android client (Flutter). |

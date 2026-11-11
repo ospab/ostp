@@ -1,7 +1,7 @@
-// Stages ostp-tun-helper where Tauri expects a sidecar.
+// Stages ostpd where Tauri expects a sidecar.
 //
-// tauri.installer.conf.json declares `externalBin: ["binaries/ostp-tun-helper"]`,
-// and Tauri resolves that to `binaries/ostp-tun-helper-<target-triple>.exe` at
+// tauri.installer.conf.json declares `externalBin: ["binaries/ostpd"]`,
+// and Tauri resolves that to `binaries/ostpd-<target-triple>.exe` at
 // build time, failing the build outright when the file is absent. Cargo writes
 // the plain name instead, so it has to be copied across first.
 //
@@ -37,22 +37,22 @@ const repoRoot = path.resolve(__dirname, '..');
 // Cargo drops a --target build under target/<triple>/, and a host build
 // straight into target/. CI always passes --target; local builds usually do not.
 const candidates = [
-  path.join(repoRoot, 'target', triple, profile, 'ostp-tun-helper.exe'),
-  path.join(repoRoot, 'target', profile, 'ostp-tun-helper.exe'),
+  path.join(repoRoot, 'target', triple, profile, 'ostpd.exe'),
+  path.join(repoRoot, 'target', profile, 'ostpd.exe'),
 ];
 const src = candidates.find((p) => fs.existsSync(p));
 if (!src) {
   console.error(
-    'stage-sidecar: ostp-tun-helper.exe not found. Looked in:\n  ' +
+    'stage-sidecar: ostpd.exe not found. Looked in:\n  ' +
       candidates.join('\n  ') +
-      `\nBuild it first: cargo build -p ostp-tun-helper${profile === 'release' ? ' --release' : ''}`
+      `\nBuild it first: cargo build -p ostpd${profile === 'release' ? ' --release' : ''}`
   );
   process.exit(1);
 }
 
 const destDir = path.join(__dirname, 'src-tauri', 'binaries');
 fs.mkdirSync(destDir, { recursive: true });
-const dest = path.join(destDir, `ostp-tun-helper-${triple}.exe`);
+const dest = path.join(destDir, `ostpd-${triple}.exe`);
 fs.copyFileSync(src, dest);
 console.log(`stage-sidecar: ${path.relative(repoRoot, src)} -> ${path.relative(repoRoot, dest)}`);
 

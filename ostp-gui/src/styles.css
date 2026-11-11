@@ -873,6 +873,8 @@ textarea.field-input { resize: vertical; min-height: 38px; line-height: 1.4; pad
   font-size: 0.82rem; font-weight: 600; cursor: pointer; transition: background var(--t-fast), border-color var(--t-fast);
 }
 .wide-btn:hover { background: var(--c-card-hover); border-color: rgba(var(--c-fg-rgb),0.16); }
+/* A wide button above a group of settings needs air, or the two read as one block. */
+.wide-btn + .client-settings-card { margin-top: 24px; }
 
 /* Install progress */
 .modal-content.wide { max-width: 440px; }

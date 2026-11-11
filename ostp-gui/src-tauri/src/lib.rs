@@ -529,8 +529,8 @@ async fn reload_tunnel(state: tauri::State<'_, AppState>) -> Result<bool, String
 async fn send_to_helper(tx: &tokio::sync::mpsc::Sender<String>, line: String) -> Result<(), String> {
     match tokio::time::timeout(std::time::Duration::from_secs(3), tx.send(line)).await {
         Ok(Ok(())) => Ok(()),
-        Ok(Err(_)) => Err("The TUN helper is no longer running".into()),
-        Err(_) => Err("The TUN helper did not accept the command".into()),
+        Ok(Err(_)) => Err("The ostpd daemon is no longer running".into()),
+        Err(_) => Err("The ostpd daemon did not accept the command".into()),
     }
 }
 
@@ -1037,7 +1037,7 @@ async fn start_tun_via_helper(
         // the user asked for, nobody is listening to this state).
         let mut s = state_for_task.lock().await;
         if s.connection_state != 0 && s.error_msg.is_none() {
-            s.error_msg = Some("The TUN helper stopped without a message. The file ostp.log next to the app may have details.".into());
+            s.error_msg = Some("The ostpd daemon stopped without a message. The file ostp.log next to the app may have details.".into());
         }
         s.connection_state = 0;
     });
@@ -1054,15 +1054,15 @@ struct HelperPipeState {
     error_msg: Option<String>,
 }
 
-/// Executable name of the TUN helper for the current platform.
+/// Executable name of the ostpd for the current platform.
 ///
 /// The ".exe" suffix was hardcoded, so on Linux every lookup below searched for
 /// a file that cannot exist and the GUI reported the helper as missing on a
 /// platform where it ships without an extension.
 const HELPER_EXE_NAME: &str = if cfg!(windows) {
-    "ostp-tun-helper.exe"
+    "ostpd.exe"
 } else {
-    "ostp-tun-helper"
+    "ostpd"
 };
 
 fn find_helper_exe() -> Option<PathBuf> {
@@ -1105,7 +1105,7 @@ fn find_helper_exe() -> Option<PathBuf> {
 
 /// Name of the Scheduled Task that runs the helper elevated without a prompt.
 #[cfg(target_os = "windows")]
-const HELPER_TASK_NAME: &str = "OSTP TUN Helper";
+const HELPER_TASK_NAME: &str = "OSTP Daemon";
 
 /// Fixed path the GUI writes launch parameters to, and the task's command line
 /// reads them from.
@@ -1317,7 +1317,7 @@ fn launch_as_admin_direct(exe: &std::path::PathBuf, token: &str, port: u16) -> a
     if ret <= 32 {
         let win_err = unsafe { GetLastError() };
         anyhow::bail!(
-            "Failed to request UAC elevation for the TUN helper (ShellExecuteW ret={}, \
+            "Failed to request UAC elevation for the ostpd (ShellExecuteW ret={}, \
              GetLastError={}, path={}). If this keeps happening with no prompt ever appearing, \
              an unsigned binary can be silently blocked by SmartScreen/antivirus during \
              elevation — try running ostp-gui.exe as Administrator manually.",
@@ -1353,7 +1353,7 @@ fn launch_as_admin(exe: &PathBuf, token: &str, port: u16) -> Result<()> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             let _ = std::fs::remove_file(&token_file);
             anyhow::bail!(
-                "pkexec was not found, so the TUN helper cannot be granted the privileges it \
+                "pkexec was not found, so the ostpd cannot be granted the privileges it \
                  needs. Install polkit (package \"policykit-1\" on Debian/Ubuntu, \"polkit\" on \
                  Fedora/Arch), or use proxy mode, which needs no elevation."
             )

@@ -179,7 +179,7 @@ foreach ($t in $targets) {
                 Assert-Msvc
                 & rustup target add $r.Triple | Out-Null
                 # The helper and wintun where stage-sidecar.cjs looks for them.
-                & cargo build -p ostp-tun-helper --release --target $r.Triple; Invoke-Checked 'cargo build ostp-tun-helper'
+                & cargo build -p ostpd --release --target $r.Triple; Invoke-Checked 'cargo build ostpd'
                 Copy-Item (Get-Wintun $r.Wintun) (Join-Path $Root "target\$($r.Triple)\release\wintun.dll") -Force
                 Push-Location (Join-Path $Root 'ostp-gui')
                 try {
@@ -192,7 +192,7 @@ foreach ($t in $targets) {
                 Remove-Item $stage -Recurse -Force -ErrorAction SilentlyContinue
                 New-Item -ItemType Directory -Force -Path $stage | Out-Null
                 Copy-Item (Join-Path $rel 'ostp-gui.exe') $stage
-                Copy-Item (Join-Path $Root "target\$($r.Triple)\release\ostp-tun-helper.exe") $stage
+                Copy-Item (Join-Path $Root "target\$($r.Triple)\release\ostpd.exe") $stage
                 Copy-Item (Get-Wintun $r.Wintun) $stage
                 $zip = Join-Path $Dist "ostp-windows-gui-$($r.Name).zip"
                 Compress-Archive -Path "$stage\*" -DestinationPath $zip -Force
@@ -221,12 +221,12 @@ foreach ($t in $targets) {
                 $distWsl = (& wsl @WslDistroArgs wslpath -u ($Dist -replace '\\', '/')).Trim()
                 # The app is not a workspace member: its own target dir, also inside WSL.
                 Invoke-Wsl ("rustup target add $($r.Triple) >/dev/null; " +
-                    "cargo build -p ostp-tun-helper --release --target $($r.Triple); " +
+                    "cargo build -p ostpd --release --target $($r.Triple); " +
                     "cd ostp-gui; npm install; " +
                     "CARGO_TARGET_DIR=`"`$HOME/.cache/ostp-gui-target`" npx tauri build --no-bundle --target $($r.Triple); " +
                     "stage=`$(mktemp -d)/$name; mkdir -p `"`$stage`"; " +
                     "cp `"`$HOME/.cache/ostp-gui-target/$($r.Triple)/release/ostp-gui`" `"`$stage/`"; " +
-                    "cp `"`$CARGO_TARGET_DIR/$($r.Triple)/release/ostp-tun-helper`" `"`$stage/`"; " +
+                    "cp `"`$CARGO_TARGET_DIR/$($r.Triple)/release/ostpd`" `"`$stage/`"; " +
                     "tar -czf '$distWsl/$name.tar.gz' -C `"`$(dirname `"`$stage`")`" $name")
                 Invoke-Checked 'linux-gui build'
                 $built += Join-Path $Dist "$name.tar.gz"

@@ -181,7 +181,7 @@ pub async fn check() -> Result<UpdateCheck> {
 
 /// Files of the desktop app that an update may replace. Anything else in a
 /// downloaded archive is ignored.
-const APP_FILES: &[&str] = &["ostp-gui", "ostp-gui.exe", "ostp-tun-helper", "ostp-tun-helper.exe", "wintun.dll"];
+const APP_FILES: &[&str] = &["ostp-gui", "ostp-gui.exe", "ostpd", "ostpd.exe", "wintun.dll"];
 /// Larger than any build of the app; a bigger answer is not ours.
 const MAX_DOWNLOAD: u64 = 300 * 1024 * 1024;
 const READ_STALL: std::time::Duration = std::time::Duration::from_secs(30);

@@ -73,7 +73,7 @@ jobs:
           Get-ChildItem "target/wt_tmp" -Filter "wintun.dll" -Recurse | Where-Object { $_.FullName -match 'bin[\\/]${{ matrix.arch }}[\\/]' } | Copy-Item -Destination "target/${{ matrix.target }}/release/wintun.dll" -Force
       - name: Build (as release.yml)
         working-directory: ostp-gui
-        run: npm install && cargo build -p ostp-tun-helper --release --target ${{ matrix.target }} && node stage-sidecar.cjs --release --target ${{ matrix.target }} && npx tauri build --bundles nsis --target ${{ matrix.target }} --config src-tauri/tauri.installer.conf.json
+        run: npm install && cargo build -p ostpd --release --target ${{ matrix.target }} && node stage-sidecar.cjs --release --target ${{ matrix.target }} && npx tauri build --bundles nsis --target ${{ matrix.target }} --config src-tauri/tauri.installer.conf.json
 
   linux-gui:
     name: Warm Linux GUI - ${{ matrix.arch }}
@@ -106,7 +106,7 @@ jobs:
         working-directory: ostp-gui
         run: |
           npm install
-          cargo build -p ostp-tun-helper --release --target ${{ matrix.target }} --manifest-path ../Cargo.toml
+          cargo build -p ostpd --release --target ${{ matrix.target }} --manifest-path ../Cargo.toml
           npx tauri build --no-bundle --target ${{ matrix.target }}
 
   macos-gui:

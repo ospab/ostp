@@ -1,5 +1,5 @@
 [package]
-name = "ostp-tun-helper"
+name = "ostpd"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -7,7 +7,7 @@ description = "Privileged helper that runs the OSTP tunnel in TUN mode for the d
 repository.workspace = true
 
 [[bin]]
-name = "ostp-tun-helper"
+name = "ostpd"
 path = "src/main.rs"
 
 [dependencies]

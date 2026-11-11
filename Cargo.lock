@@ -2365,7 +2365,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "ostp-tun-helper"
+name = "ostpd"
 version = "0.4.7"
 dependencies = [
  "anyhow",

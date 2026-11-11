@@ -1,4 +1,4 @@
-; Registers the Scheduled Task that lets the GUI start the TUN helper elevated
+; Registers the Scheduled Task that lets the GUI start the ostpd daemon elevated
 ; without a consent prompt.
 ;
 ; This belongs in the installer, not in the app. Registering a task that runs
@@ -20,6 +20,12 @@
   ${Else}
     DetailPrint "WARNING: resources\wintun.dll is missing; TUN mode will not start."
   ${EndIf}
+
+  ; Versions before 0.4.7 called the daemon ostp-tun-helper and its task "OSTP TUN Helper".
+  ; Leaving either behind would keep a task that points at a deleted file.
+  nsExec::ExecToLog 'schtasks.exe /Delete /TN "OSTP TUN Helper" /F'
+  Pop $R0
+  Delete "$INSTDIR\ostp-tun-helper.exe"
 
   ; Registered through PowerShell's ScheduledTasks module rather than
   ; `schtasks /XML`. Generating the XML from NSIS wrote a UTF-16 byte-order mark
@@ -44,8 +50,8 @@
   ; only whoever ran the installer. The SID is used because the name is
   ; localized and would not resolve. %LOCALAPPDATA% is likewise left unexpanded
   ; for Task Scheduler to resolve per running user.
-  DetailPrint "Registering the OSTP TUN helper task..."
-  nsExec::ExecToLog `powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "$$act = New-ScheduledTaskAction -Execute '$INSTDIR\ostp-tun-helper.exe' -Argument ('--args-file ' + [char]34 + '%LOCALAPPDATA%\OSTP\helper-args.json' + [char]34); $$prn = New-ScheduledTaskPrincipal -GroupId 'S-1-5-32-545' -RunLevel Highest; $$set = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances Parallel; Register-ScheduledTask -TaskName 'OSTP TUN Helper' -Action $$act -Principal $$prn -Settings $$set -Force | Out-Null"`
+  DetailPrint "Registering the OSTP Daemon task..."
+  nsExec::ExecToLog `powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "$$act = New-ScheduledTaskAction -Execute '$INSTDIR\ostpd.exe' -Argument ('--args-file ' + [char]34 + '%LOCALAPPDATA%\OSTP\helper-args.json' + [char]34); $$prn = New-ScheduledTaskPrincipal -GroupId 'S-1-5-32-545' -RunLevel Highest; $$set = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances Parallel; Register-ScheduledTask -TaskName 'OSTP Daemon' -Action $$act -Principal $$prn -Settings $$set -Force | Out-Null"`
   Pop $R0
 
   ${If} $R0 == 0
@@ -64,7 +70,7 @@
     ; read and execute — for BUILTIN\Users (BU), which is what lets a normal
     ; user start it without being elevated.
     DetailPrint "Granting users permission to start the task..."
-    nsExec::ExecToLog `powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "$$svc = New-Object -ComObject Schedule.Service; $$svc.Connect(); $$t = $$svc.GetFolder('\').GetTask('OSTP TUN Helper'); $$t.SetSecurityDescriptor('D:(A;;GA;;;BA)(A;;GA;;;SY)(A;;GRGX;;;BU)', 0)"`
+    nsExec::ExecToLog `powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "$$svc = New-Object -ComObject Schedule.Service; $$svc.Connect(); $$t = $$svc.GetFolder('\').GetTask('OSTP Daemon'); $$t.SetSecurityDescriptor('D:(A;;GA;;;BA)(A;;GA;;;SY)(A;;GRGX;;;BU)', 0)"`
     Pop $R1
     ${If} $R1 == 0
       DetailPrint "Helper task registered; connecting will not ask for consent."
@@ -84,7 +90,9 @@
   ; Leaving the task behind would point it at a deleted executable, and
   ; `schtasks /Run` reports success for merely accepting such a request — the
   ; app would wait on a helper that never starts.
-  DetailPrint "Removing the OSTP TUN helper task..."
+  DetailPrint "Removing the OSTP Daemon task..."
+  nsExec::ExecToLog 'schtasks.exe /Delete /TN "OSTP Daemon" /F'
+  Pop $R0
   nsExec::ExecToLog 'schtasks.exe /Delete /TN "OSTP TUN Helper" /F'
   Pop $R0
 

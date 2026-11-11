@@ -404,7 +404,7 @@ jobs:
         # Chained, not separate lines: pwsh does not abort a run block when a
         # native command fails, so a failure would otherwise surface far
         # downstream (a missing sidecar) rather than as itself.
-        run: npm install && cargo build -p ostp-tun-helper --release --target ${{ matrix.target }} && node stage-sidecar.cjs --release --target ${{ matrix.target }} && npx tauri build --bundles nsis --target ${{ matrix.target }} --config src-tauri/tauri.installer.conf.json
+        run: npm install && cargo build -p ostpd --release --target ${{ matrix.target }} && node stage-sidecar.cjs --release --target ${{ matrix.target }} && npx tauri build --bundles nsis --target ${{ matrix.target }} --config src-tauri/tauri.installer.conf.json
 
       - name: Package Portable ZIP
         shell: pwsh
@@ -412,7 +412,7 @@ jobs:
           $dir = "ostp-gui-dist"
           New-Item -ItemType Directory -Force -Path $dir
           Copy-Item "ostp-gui/src-tauri/target/${{ matrix.target }}/release/ostp-gui.exe" $dir
-          Copy-Item "target/${{ matrix.target }}/release/ostp-tun-helper.exe" $dir
+          Copy-Item "target/${{ matrix.target }}/release/ostpd.exe" $dir
           Copy-Item "target/${{ matrix.target }}/release/wintun.dll" $dir
 
           Compress-Archive -Path "$dir/*" -DestinationPath "ostp-windows-gui-${{ matrix.arch }}.zip" -Force
@@ -488,7 +488,7 @@ jobs:
           # TUN mode shells out to this helper, elevated via pkexec. Only the
           # Windows job used to build it, so the Linux package shipped without
           # it and TUN could never start.
-          cargo build -p ostp-tun-helper --release --target ${{ matrix.target }} --manifest-path ../Cargo.toml
+          cargo build -p ostpd --release --target ${{ matrix.target }} --manifest-path ../Cargo.toml
           npx tauri build --no-bundle --target ${{ matrix.target }}
 
       - name: Package Portable Tarball
@@ -497,7 +497,7 @@ jobs:
           mkdir ostp-linux-gui-${{ matrix.arch }}
           cp ostp-gui/src-tauri/target/${{ matrix.target }}/release/ostp-gui ostp-linux-gui-${{ matrix.arch }}/
           # The GUI looks for the helper next to its own executable first.
-          cp target/${{ matrix.target }}/release/ostp-tun-helper ostp-linux-gui-${{ matrix.arch }}/
+          cp target/${{ matrix.target }}/release/ostpd ostp-linux-gui-${{ matrix.arch }}/
           tar -czf ostp-linux-gui-${{ matrix.arch }}.tar.gz ostp-linux-gui-${{ matrix.arch }}
 
       - name: Upload to GitHub Release

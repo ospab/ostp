@@ -215,7 +215,7 @@ mod platform {
     }
 
     /// Scans every process's open files for `socket:[inode]`. Reading other
-    /// users' descriptors needs root, which the TUN helper has.
+    /// users' descriptors needs root, which ostpd has.
     fn pid_with_socket(inode: u64) -> Option<u32> {
         let wanted = format!("socket:[{inode}]");
         for entry in std::fs::read_dir("/proc").ok()?.flatten() {
