@@ -8,6 +8,8 @@ Older history is on the [Releases](https://github.com/ospab/ostp/releases) page 
 
 ## [Unreleased]
 
+## [0.4.7] - 2026-11-12
+
 Summary of 0.4.7 (the details are in the beta entries below). Wire-compatible with 0.4.5 and 0.4.6 (protocol version 5).
 
 ### Added
