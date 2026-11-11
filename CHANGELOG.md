@@ -8,6 +8,33 @@ Older history is on the [Releases](https://github.com/ospab/ostp/releases) page 
 
 ## [Unreleased]
 
+Summary of 0.4.7 (the details are in the beta entries below). Wire-compatible with 0.4.5 and 0.4.6 (protocol version 5).
+
+### Added
+- Desktop and Android apps: "Update now" downloads the release for the device, checks it against the SHA-256 GitHub published and starts the installer. A Reconnect button appears when the profile changed while connected.
+- Per-stream flow control: a large upload to a slow site no longer breaks, and a program that reads slowly cannot stall the others.
+- Server: an `overnet` section and `ostp overnet` commands (the `.ov` zone through the server), config schema v4 (`ostp migrate` upgrades older files).
+- `ostp start`, `ostp stop`, `ostp restart` and a richer `ostp status` for the Linux service.
+
+### Changed
+- Reconnects follow one policy instead of five overlapping ones; a silent server is noticed within about 10 seconds, and long outages keep the session and its connections.
+- The congestion controller was reworked: speed on lossy links, on short paths and over TLS and UoT no longer collapses or swings between runs.
+- The desktop app's privileged helper `ostp-tun-helper` is now `ostpd`; its Windows task is "OSTP Daemon".
+
+### Removed
+- Junk packets and TCP fragmentation of the handshake, and the multiplexing option in the apps (the `mux` block of the config file still works).
+- The terminal interface (TUI) of the client.
+- The kill switch on Windows, which never blocked anything; Linux and macOS keep theirs. A firewall-based one is planned for 0.5.0.
+
+### Fixed
+- TUN mode recovers by itself after a network change on Windows and Linux; Android with two SIM cards, other-VPN takeover and the "Connected" state were corrected.
+- Android and desktop "Update now" installs the update (a missing permission and a dismissed dialog's context broke it).
+- Many limits and timeouts so that a hung peer, a huge number or a bad file cannot freeze the client, the server, the panel or the apps.
+
+### Security
+- Clients can no longer reach the server's own services by default; a client cannot take over another user's session; at most 32 sessions per key; panel passwords are salted (PBKDF2); IPv6 no longer bypasses the tunnel in the desktop apps.
+- Installers and `ostp update` check downloads against the SHA-256 GitHub publishes; `/etc/ostp`, `config.json` and `C:\opt\ostp` are no longer readable or writable by every local user.
+
 ## [0.4.7-beta.16] - 2026-11-12
 
 ### Fixed
