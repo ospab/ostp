@@ -232,15 +232,22 @@ a { text-decoration: none; }
 .reconnect-notice {
   display: flex;
   align-items: center;
-  gap: 10px;
-  font-size: 0.78rem;
-  color: var(--c-txt-2);
-  padding: 8px 12px;
-  border-radius: var(--r-sm);
-  border: 1px solid rgba(var(--c-fg-rgb), 0.12);
+  justify-content: space-between;
+  gap: 14px;
+  width: 100%;
   max-width: 340px;
-  line-height: 1.45;
+  padding: 10px 10px 10px 14px;
+  border-radius: var(--r-sm);
+  border: 1px solid var(--c-card-border);
+  background: var(--c-card);
 }
+.reconnect-text { display: flex; flex-direction: column; gap: 2px; min-width: 0; text-align: left; }
+.reconnect-title { font-size: 0.82rem; font-weight: 600; color: var(--c-txt-1); }
+.reconnect-hint { font-size: 0.74rem; line-height: 1.4; color: var(--c-txt-2); }
+.reconnect-btn { height: 32px; padding: 0 14px; display: inline-flex; align-items: center; gap: 8px; }
+.reconnect-spinner { display: none; width: 11px; height: 11px; border-radius: 50%; border: 1.5px solid #000; border-top-color: transparent; animation: spin 0.8s linear infinite; }
+.reconnect-btn.busy .reconnect-spinner { display: inline-block; }
+.reconnect-btn.busy:disabled { opacity: 1; }
 .reconnect-notice.hidden { display: none; }
 
 /* ── Connection info ─────────────────────────────────────────────────── */

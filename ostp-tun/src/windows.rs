@@ -37,7 +37,6 @@ pub(crate) fn refresh_bypass_routes() -> bool {
 }
 
 struct WindowsRouteGuard {
-    kill_switch: bool,
     /// The TUN interface index when IPv6 routes were added through it.
     ipv6_if: Option<u32>,
 }
@@ -52,7 +51,6 @@ impl Drop for WindowsRouteGuard {
         }
         crate::set_physical_if(None, None);
 
-        let is_kill_switch = self.kill_switch;
         let ipv6_if = self.ipv6_if;
         let _ = std::thread::spawn(move || {
             if let Some(idx) = ipv6_if {
@@ -76,12 +74,6 @@ impl Drop for WindowsRouteGuard {
                 .args(["interface", "ipv4", "set", "dnsservers",
                        "name=ostp_tun", "source=dhcp"])
                 .output();
-            if is_kill_switch {
-                let _ = Command::new("route")
-                    .creation_flags(CREATE_NO_WINDOW)
-                    .args(["delete", "0.0.0.0", "mask", "0.0.0.0", "127.0.0.1"])
-                    .output();
-            }
         });
     }
 }
@@ -239,19 +231,15 @@ pub async fn create(opts: OstpTunOptions) -> Result<OstpTunInterface> {
     }
 
     if opts.kill_switch {
-        tracing::info!("kill switch: adding a metric 10 blackhole route");
-        let _ = tokio::task::spawn_blocking(move || {
-            let _ = Command::new("route")
-                .creation_flags(CREATE_NO_WINDOW)
-                .args(["add", "0.0.0.0", "mask", "0.0.0.0", "127.0.0.1", "metric", "10", "if", "1"])
-                .output();
-        });
+        // A blackhole route cannot do this job here: its metric adds to the
+        // loopback interface's 75 and never beats the real default route, so
+        // traffic would still leave outside the tunnel when it drops.
+        tracing::warn!("kill switch is not available on Windows and is ignored");
     }
 
     Ok(OstpTunInterface {
         device: dev,
         guard: Box::new(WindowsRouteGuard {
-            kill_switch: opts.kill_switch,
             ipv6_if,
         }),
     })

@@ -831,22 +831,66 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin, 
 
         if (_profileChanged)
           Padding(
-            padding: const EdgeInsets.only(top: 12),
-            child: Row(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                const Flexible(
-                  child: Text(
-                    'The profile changed. The VPN still uses the previous one.',
-                    style: TextStyle(fontSize: 13, color: Colors.white60),
-                  ),
+            padding: const EdgeInsets.only(top: 14),
+            child: ConstrainedBox(
+              constraints: const BoxConstraints(maxWidth: 360),
+              child: Container(
+                padding: const EdgeInsets.fromLTRB(14, 10, 10, 10),
+                decoration: BoxDecoration(
+                  color: const Color(0x0AFFFFFF),
+                  border: Border.all(color: const Color(0x17FFFFFF)),
+                  borderRadius: BorderRadius.circular(10),
                 ),
-                const SizedBox(width: 8),
-                TextButton(
-                  onPressed: _reconnecting ? null : _reconnect,
-                  child: const Text('Reconnect'),
+                child: Row(
+                  children: [
+                    const Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Text(
+                            'Profile changed',
+                            style: TextStyle(fontSize: 13, fontWeight: FontWeight.w600, color: Colors.white),
+                          ),
+                          SizedBox(height: 2),
+                          Text(
+                            'The VPN still uses the previous one.',
+                            style: TextStyle(fontSize: 12, color: Colors.white54),
+                          ),
+                        ],
+                      ),
+                    ),
+                    const SizedBox(width: 12),
+                    FilledButton(
+                      onPressed: _reconnecting ? null : _reconnect,
+                      style: FilledButton.styleFrom(
+                        backgroundColor: Colors.white,
+                        foregroundColor: Colors.black,
+                        disabledBackgroundColor: Colors.white,
+                        disabledForegroundColor: Colors.black,
+                        minimumSize: const Size(0, 36),
+                        padding: const EdgeInsets.symmetric(horizontal: 14),
+                        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+                        textStyle: const TextStyle(fontSize: 13, fontWeight: FontWeight.w600),
+                      ),
+                      child: _reconnecting
+                          ? const Row(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                SizedBox(
+                                  width: 12,
+                                  height: 12,
+                                  child: CircularProgressIndicator(strokeWidth: 1.5, color: Colors.black),
+                                ),
+                                SizedBox(width: 8),
+                                Text('Reconnecting'),
+                              ],
+                            )
+                          : const Text('Reconnect'),
+                    ),
+                  ],
                 ),
-              ],
+              ),
             ),
           ),
 

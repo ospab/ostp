@@ -62,8 +62,14 @@
 
         <!-- The profile changed while connected: it applies on reconnect -->
         <div id="reconnect-notice" class="reconnect-notice hidden" role="status">
-          <span>The profile changed. The connection still uses the previous one.</span>
-          <button id="btn-reconnect" class="btn secondary compact-btn">Reconnect</button>
+          <div class="reconnect-text">
+            <span class="reconnect-title">Profile changed</span>
+            <span class="reconnect-hint">The connection still uses the previous one.</span>
+          </div>
+          <button id="btn-reconnect" class="btn primary reconnect-btn">
+            <span class="reconnect-spinner" aria-hidden="true"></span>
+            <span id="btn-reconnect-label">Reconnect</span>
+          </button>
         </div>
 
         <!-- Connection info (visible when connected) -->

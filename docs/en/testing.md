@@ -152,7 +152,7 @@ Repeat for nginx, apache (Debian and RHEL) and caddy.
 | G-10 | Remove a subscription | it and its profiles are gone, manual profiles stay | P1 |
 | G-11 | Connect over UDP, UoT, TLS (built-in and through nginx) | connects, traffic flows, speed and RTT shown | P1 |
 | G-12 | TUN mode (with and without wintun.dll) | works with the driver, shows the instructions without it | P1 |
-| G-13 | Kill switch, domain/IP exclusions, MUX, MTU | work; changes while connected apply by hot reload | P2 |
+| G-13 | Domain/IP exclusions, MUX, MTU | work; changes while connected apply by hot reload | P2 |
 | G-13a | Exclude a program (e.g. `chrome`) in proxy mode and in TUN mode | that program's traffic goes direct (its IP on a what-is-my-IP site is the home one), others go through the tunnel; with debug on the log shows `BYPASS (process …)` | P1 |
 | G-13b | Exclude `госуслуги.рф` | the site goes direct in proxy and TUN mode | P2 |
 | G-14 | Network check → Check server on a UDP profile | address × carrier table with RTT, a verdict line | P1 |

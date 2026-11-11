@@ -123,6 +123,11 @@ let pendingLinkExtras = null; // tun/dns/owndns of a link opened in the editor, 
 // ── DOM ───────────────────────────────────────────────────────────────
 const $ = id => document.getElementById(id);
 
+// The kill switch drops the default route, which works on Linux and macOS. On
+// Windows the route it added never won against the real default route, so the
+// option is not offered there (a firewall-based one is planned for 0.5.0).
+const KILL_SWITCH_AVAILABLE = !/Windows/i.test(navigator.userAgent);
+
 const homeScreen     = $('home-screen');
 const settingsScreen = $('settings-screen');
 const brandDot       = $('brand-dot');
@@ -476,7 +481,7 @@ function buildConfig() {
       ipv4_address: '10.1.0.2/24',
       stack: 'ostp',
       dns: s.dns || null,
-      kill_switch: !!s.killSwitch,
+      kill_switch: !!s.killSwitch && KILL_SWITCH_AVAILABLE,
     },
     exclude: {
       domains: listOf(s.exDomains),
@@ -516,12 +521,17 @@ function updateReconnectNotice() {
 async function reconnect() {
   if (toggleBusy || appState === 'disconnected') return;
   const btn = $('btn-reconnect');
+  const label = $('btn-reconnect-label');
   btn.disabled = true;
+  btn.classList.add('busy');
+  label.textContent = 'Reconnecting';
   try {
     await handleToggle();
     if (appState === 'disconnected') await handleToggle();
   } finally {
     btn.disabled = false;
+    btn.classList.remove('busy');
+    label.textContent = 'Reconnect';
   }
 }
 
@@ -1522,7 +1532,7 @@ function onUpdateProgress([done, total]) {
 function loadSettingsIntoForm() {
   const s = loadClientSettings();
   inTun.checked         = !!s.tun;
-  inKillSwitch.checked  = !!s.killSwitch;
+  inKillSwitch.checked  = !!s.killSwitch && KILL_SWITCH_AVAILABLE;
   inMux.checked         = !!s.mux;
   inMuxSessions.value   = s.muxSessions || '2';
   inMtu.value           = s.mtu || '';
@@ -1573,7 +1583,7 @@ function socksProblem(v) {
 function collectAndSaveSettings() {
   const s = {
     tun:          inTun.checked,
-    killSwitch:   inKillSwitch.checked,
+    killSwitch:   inKillSwitch.checked && KILL_SWITCH_AVAILABLE,
     mux:          inMux.checked,
     muxSessions:  inMuxSessions.value.trim(),
     mtu:          inMtu.value.trim(),
@@ -1637,7 +1647,7 @@ function collectAndSaveSettings() {
 }
 
 function updateClientVisibility() {
-  groupKillSwitch.style.display  = inTun.checked  ? 'flex' : 'none';
+  groupKillSwitch.style.display  = inTun.checked && KILL_SWITCH_AVAILABLE ? 'flex' : 'none';
   groupMuxSessions.style.display = inMux.checked  ? 'flex' : 'none';
 
   const showRtt = inShowRtt.checked;

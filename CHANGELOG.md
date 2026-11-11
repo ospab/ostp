@@ -8,10 +8,14 @@ Older history is on the [Releases](https://github.com/ospab/ostp/releases) page 
 
 ## [Unreleased]
 
+### Changed
+- Desktop and Android apps: the Reconnect notice is now a row with a title, the reason and a button that shows "Reconnecting" with a spinner while it works.
+
 ### Removed
 - Junk packets and TCP fragmentation of the handshake (plain TCP only), with their settings in the desktop and Android apps and the `uot_frag` carrier of the network check. The handshake already looks like random bytes, so random filler in front of it changes nothing a classifier of fully encrypted traffic looks at, and a plain OSTP stream has no server name for splitting the first segment to hide; both only made connecting slower. Config files that still have `junk_pc`, `junk_ps`, `tcp_fragmentation`, `frag_chunk` or `frag_sleep` load as before (the fields are ignored), and `ostp migrate` deletes them (client config schema 4). The server still drops marked junk from older clients, and TTL-desync decoys keep their marker, so nothing changes on the wire.
 
 ### Fixed
+- Kill switch on Windows did nothing: its blackhole route got the loopback interface's metric of 75 on top of its own 10, so the real default route (45 on a Wi-Fi adapter) always won and traffic left outside the tunnel when it dropped. The route is gone, the setting is ignored on Windows with a warning in the log, and the desktop app no longer shows it there. Linux and macOS are unchanged (they remove the default route). A firewall-based kill switch is planned for 0.5.0.
 - Desktop app: Update now failed with "Command install_update not allowed by ACL": the command was missing from the app's permission list. The installed beta.12 to beta.14 builds cannot update themselves, so the next version has to be installed by hand once; from it on, Update now works.
 
 ## [0.4.7-beta.14] - 2026-11-06
