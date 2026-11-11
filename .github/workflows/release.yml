@@ -57,7 +57,9 @@ jobs:
   #   - workflow_dispatch                         -> forced by the `channel` input (alpha|beta only)
   resolve-channel:
     name: Resolve release channel
-    runs-on: ubuntu-latest
+    # Pinned: ubuntu-latest moved to 26.04, whose compiler targeted newer CPUs by default, and the
+    # Linux binaries then died with "Illegal instruction" on QEMU virtual CPUs and older servers.
+    runs-on: ubuntu-24.04
     outputs:
       channel: ${{ steps.resolve.outputs.channel }}
       tag_name: ${{ steps.resolve.outputs.tag_name }}
@@ -104,7 +106,7 @@ jobs:
 
   check-and-test:
     name: Check & Test
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -176,44 +178,44 @@ jobs:
             release_name: ostp-darwin-arm64.tar.gz
 
           # -- Linux native --------------------------------------------------
-          - os: ubuntu-latest
+          - os: ubuntu-24.04
             target: x86_64-unknown-linux-musl
             artifact_name: ostp
             release_name: ostp-linux-amd64.tar.gz
 
-          - os: ubuntu-latest
+          - os: ubuntu-24.04
             target: i686-unknown-linux-musl
             artifact_name: ostp
             release_name: ostp-linux-386.tar.gz
             use_cross: true
 
           # -- Linux cross ---------------------------------------------------
-          - os: ubuntu-latest
+          - os: ubuntu-24.04
             target: aarch64-unknown-linux-musl
             artifact_name: ostp
             release_name: ostp-linux-arm64.tar.gz
             use_cross: true
 
-          - os: ubuntu-latest
+          - os: ubuntu-24.04
             target: armv7-unknown-linux-musleabihf
             artifact_name: ostp
             release_name: ostp-linux-armv7.tar.gz
             use_cross: true
 
-          - os: ubuntu-latest
+          - os: ubuntu-24.04
             target: x86_64-unknown-freebsd
             artifact_name: ostp
             release_name: ostp-freebsd-amd64.tar.gz
             use_cross: true
 
-          - os: ubuntu-latest
+          - os: ubuntu-24.04
             target: mipsel-unknown-linux-musl
             artifact_name: ostp
             release_name: ostp-linux-mipsle.tar.gz
             use_cross: true
             toolchain: nightly
 
-          - os: ubuntu-latest
+          - os: ubuntu-24.04
             target: riscv64gc-unknown-linux-gnu
             artifact_name: ostp
             release_name: ostp-linux-riscv64.tar.gz
@@ -264,7 +266,7 @@ jobs:
 
       # -- MUSL tools for native Linux musl builds ----------------------------
       - name: Install musl-tools
-        if: ${{ matrix.os == 'ubuntu-latest' && !matrix.use_cross }}
+        if: ${{ matrix.os == 'ubuntu-24.04' && !matrix.use_cross }}
         run: sudo apt-get update && sudo apt-get install -y musl-tools
 
       # -- Native build -------------------------------------------------------
@@ -447,7 +449,7 @@ jobs:
   build-linux-gui:
     name: Build Linux GUI (Tauri) - ${{ matrix.arch }}
     needs: [check-and-test, resolve-channel]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     strategy:
       matrix:
         include:
@@ -574,7 +576,7 @@ jobs:
   build-android:
     name: Build Android Client (Flutter) - ${{ matrix.arch }}
     needs: [check-and-test, resolve-channel]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     strategy:
       matrix:
         include:

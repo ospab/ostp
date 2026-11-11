@@ -29,6 +29,7 @@ Summary of 0.4.7 (the details are in the beta entries below). Wire-compatible wi
 - The kill switch on Windows, which never blocked anything; Linux and macOS keep theirs. A firewall-based one is planned for 0.5.0.
 
 ### Fixed
+- Linux builds crashed with "Illegal instruction" on CPUs without BMI2 and AVX2 (QEMU virtual CPUs, older servers) in 0.4.7-beta.15 and beta.16: the CI image moved to Ubuntu 26.04, whose compiler targets newer CPUs. The runners are pinned to Ubuntu 24.04 again. Servers on those betas: `ostp update -v 0.4.7-beta.13` or update to 0.4.7.
 - TUN mode recovers by itself after a network change on Windows and Linux; Android with two SIM cards, other-VPN takeover and the "Connected" state were corrected.
 - Android and desktop "Update now" installs the update (a missing permission and a dismissed dialog's context broke it).
 - Many limits and timeouts so that a hung peer, a huge number or a bad file cannot freeze the client, the server, the panel or the apps.
