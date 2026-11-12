@@ -154,6 +154,37 @@ By default client traffic leaves from the server's own address. With the `outbou
 
 ---
 
+## Cloudflare WARP as the exit: `ostp warp`
+
+With WARP the sites a client visits see a Cloudflare address instead of the server's. Cloudflare sees the server's address and where it connects, so this moves trust from the hosting provider to Cloudflare; it does not make anyone anonymous towards Cloudflare. WARP addresses are shared and known, and some sites show captchas or refuse them. WARP is Cloudflare's service under Cloudflare's terms; `--accept-terms` is the operator's acceptance, not ours.
+
+How it works: the `ostp` process runs a WireGuard client in user space (no tun device, no routes, no firewall changes, no root) and a SOCKS5 proxy on `127.0.0.1:40000` (TCP `CONNECT` and UDP `ASSOCIATE`, names and IPv4/IPv6 addresses). The `outbound` section points at that proxy. Names are resolved inside the tunnel, by 1.1.1.1 reached through WARP, never by the server's own resolver. The tunnel's MTU is 1280, the keepalive 25 s, and the handshake is repeated every 5 s while there is none.
+
+```
+sudo ostp warp register --accept-terms   # create the device at Cloudflare; keys go to warp.json
+sudo ostp warp license <key>             # optional: attach a WARP+ key
+sudo ostp warp enable --all              # everything the server opens outwards goes through WARP
+sudo ostp warp enable --rules            # only what the outbound rules send to the proxy
+sudo ostp warp disable                   # off; the previous outbound section comes back
+ostp warp status                         # registration, mode, tunnel, last handshake, address seen outside
+ostp warp test                           # a TCP request and a UDP DNS query through the tunnel; exits non-zero on failure
+sudo ostp warp reset                     # forget the device (asks first; refused while WARP is enabled)
+```
+
+`enable`, `disable` and `license` restart a running service (`--no-restart` to skip), validate the config before writing it and keep the previous one in `config.json.bak`, like the other commands. Nothing registers, enables or restarts by itself.
+
+- **`--all`.** The `outbound` section is written as SOCKS5 to WARP's proxy, no rules, default action `proxy`. Whatever the server opens outwards for clients (TCP, UDP, names), the DNS filter's DoH and list downloads, and plain, DoT and TCP upstream resolvers (carried as DNS over TCP through the proxy) goes through it. There is no direct fallback: with the tunnel down these fail. Connections to the server's own loopback (the panel) stay local, as always.
+- **`--rules`.** Your own `outbound` section is kept as written (rules, default action, `send_from`); only its proxy is replaced by WARP's. It needs at least one rule with action `proxy` (or a default action of `proxy`) and refuses otherwise. What the rules send elsewhere is unchanged.
+- **What `enable` remembers.** The `outbound` section that was there (with its proxy password) is kept in `warp.json` and put back by `disable`; if you edited the section after enabling, `disable` leaves your edit. Switching between `--all` and `--rules` starts from the remembered section, not from the one WARP wrote.
+- **Keys.** The device's private key, access token and WARP+ key live only in `warp.json` next to `config.json` (mode 0600, written atomically). They are never in `config.json`, its backup, the logs or the panel's API. The running server also updates `warp.status.json` there every 5 s (no secrets); `ostp warp status` reads it.
+- **The `warp` section** of `config.json`: `enabled`, `mode` (`all` or `rules`), `listen` (a loopback address only: the proxy has no password), `endpoint` (empty = the registered one, or `host:port` / `ip:port` to replace it). `ostp migrate` (schema 6) writes it into older server configs, off. The server starts the tunnel when `enabled`; if it cannot (not registered, port busy), it logs why, and the connections that the `outbound` section sends to WARP fail: nothing is sent directly instead.
+- **WARP+.** `ostp warp license` sends the key to Cloudflare; if Cloudflare refuses it, nothing is stored and the command prints what the service answered.
+- **Builds.** WARP is not built into the MIPS binary (`ostp warp` says so; the other targets have it).
+
+Things to know before relying on it: the registration interface is the one Cloudflare's own apps use, not a documented one for third parties, and may change, be rate-limited or be refused for server addresses. WARP endpoints (UDP 2408 and others) can be blocked by a hosting provider. Cloudflare has been reported to be moving WARP from WireGuard to MASQUE; this exit only speaks WireGuard. Throughput is bounded by one user-space WireGuard core. A datagram that does not fit the tunnel's MTU (1280) is dropped and counted in `status`.
+
+---
+
 ## overnet: `.ov` for clients and the exit
 
 [overnet](https://github.com/ospab/overnet) is an onion network with its own name zone `.ov`. It runs as a separate process next to the server; the server talks to it only through local SOCKS5 ports. The OSTP protocol is unchanged, so this works with any 0.4.x client.

@@ -1,6 +1,6 @@
 # Cloudflare WARP as the server's exit: design
 
-Status: draft, nothing here is implemented. Decisions of 2026-11-12 are marked; details that depend on Cloudflare's service are marked "verify" and are checked against the live service before any code is written.
+Status: implemented (crate `ostp-warp`, command `ostp warp`, user documentation in [server.md](server.md#cloudflare-warp-as-the-exit-ostp-warp)); the parts that need a real Cloudflare device are not yet tested live, see "How it is checked". Decisions of 2026-11-12 are marked. Where the code differs from the plan it is said under "Differences from the plan".
 
 ## Why
 
@@ -53,7 +53,16 @@ A new crate `ostp-warp`:
 | Stack | `smoltcp` over the tunnel's IP packets, as in the client's TUN mode, giving TCP and UDP sockets. |
 | SOCKS5 | TCP `CONNECT` and UDP `ASSOCIATE`, loopback only. |
 
-It runs as a task of the server process, so there is one service and one `ostp warp` command. A 32-bit MIPS build is left without it if `boringtun` does not build there.
+It runs as a task of the server process, so there is one service and one `ostp warp` command. The MIPS builds are left without it (see "Differences from the plan").
+
+### What the Cloudflare side looks like (as implemented)
+
+Read from the source of other open implementations; nothing here was called live by the implementation (the first live call is the operator's `ostp warp register`).
+
+- Base `https://api.cloudflareclient.com`, version path `v0a5641`, `User-Agent: 1.1.1.1/6.38.9-5641 (Android 16.0.0)`, `CF-Client-Version: a-6.38.9-5641`: `ViRb3/wgcf`, `cloudflare/api.go`.
+- `POST /{v}/reg` with `fcm_token`, `install_id`, `key` (base64 public key), `locale`, `model`, `tos` (timestamp), `serial_number`, `os_version`, `key_type: curve25519`, `tunnel_type: wireguard`: the same file. `GET /{v}/reg/{id}` and `PUT /{v}/reg/{id}/account` (`{"license": ...}`), answers with `id`, `token`, `account.account_type`, `config.client_id`, `config.interface.addresses.v4/v6`, `config.peers[].public_key`, `config.peers[].endpoint.host/v4/v6/ports`: `wgcf`'s `openapi-spec.yml`. The spec lists the endpoint ports `[2408, 500, 1701, 4500]` by default; the host entry is `engage.cloudflareclient.com:2408`.
+- The "reserved" bytes: the first three bytes of the base64-decoded `client_id` go into bytes 1 to 3 of every WireGuard message sent to the peer, after the message (and its MACs) is built; the same bytes are zeroed on what arrives. Sources: Xray-core `proxy/wireguard/bind.go` (set on send, zeroed on receive), the `warp-wireguard-gen` crate (`parse_client_id`) and `xdqi/warp-ebpf`.
+- Not confirmed: the exact format of the `tos` timestamp (the code sends RFC 3339 UTC with milliseconds and `Z`, as `warp-wireguard-gen` does), whether Cloudflare still accepts these client versions, and the URL of the terms (`ostp warp register` prints `https://www.cloudflare.com/application/terms/`, taken from memory).
 
 ## Risks
 
@@ -63,12 +72,28 @@ It runs as a task of the server process, so there is one service and one `ostp w
 
 ## How it is checked
 
-- In wirelab a plain WireGuard peer plays Cloudflare: TCP, UDP (QUIC and DNS) and IPv6 reach a target through it, the target sees the peer's address and not the server's, and with the peer stopped nothing reaches the target.
-- Unit tests only for pure logic (SOCKS5 framing, the reserved bytes, config and rule handling).
-- A real WARP device on a real server for the first live test.
+Done, in `cargo test`:
+
+- `ostp-warp` unit tests: SOCKS5 framing (including domain names and IPv6), the reserved bytes, registration JSON against a fixture in the shape of `wgcf`'s spec, `warp.json` (round trip, atomic replace, mode 0600 on Unix, unknown version refused), the config section and what enabling does to `outbound`, DNS queries inside the tunnel, the trace parser.
+- `ostp-server` (`warp::tests`): the server's own `connect_target` and `connect_udp_target` (the code that serves clients) against the real SOCKS5 proxy and the real tunnel, whose WireGuard peer is a local stand-in for Cloudflare (`ostp_warp::testpeer`: two `boringtun` tunnels over loopback and a `smoltcp` stack that accepts any address). Covered: TCP by name (resolved by the peer's resolver), by IPv4 and by IPv6 address, UDP by address and by name, the reserved bytes on the wire, `rules` mode (a rule-matching connection enters the tunnel, another one leaves directly), a peer that stops (TCP and UDP fail while the target is reachable directly, and it counts zero accepted connections), a tunnel that never came up (every connection is refused).
+- `ostp` (`warp_cmd`): register, license (accepted and refused), reset, enable, disable against a local fake registration service (`ostp_warp::testapi`); nothing registers without `--accept-terms`; keys are not in `config.json`; the previous `outbound` comes back.
+- `ostp-dns`: the proxy client (SOCKS5 names as names, a dead proxy is an error).
+
+Not covered, and why: a real Cloudflare device (the rule was never to call Cloudflare from tests; the first live test is the operator's); throughput (not measured); a UDP datagram larger than the tunnel MTU through a real path; rekeying after 2 minutes of a long session; the DNS filter's DoH through the proxy end to end.
+
+Planned for wirelab (not written): one container as the WARP stand-in running plain WireGuard (`wg-quick`, forwarding and NAT on), one running `ostp` with `warp.enabled`, a registration key pair written to `warp.json` by hand with the stand-in's public key and endpoint, a target container. The checks: TCP, UDP (a QUIC and a DNS exchange) and IPv6 reach the target through the peer, the target sees the peer's address and not the server's, and with the peer stopped nothing reaches the target. A plain `wg-quick` peer ignores the reserved bytes' value only if it is built to; the stand-in needs the three bytes zeroed before it decrypts, as Cloudflare's does.
+
+## Differences from the plan
+
+- The tunnel's TCP/UDP stack is `smoltcp` driven directly (one driver task), not the client's TUN code: that code is tied to a TUN device and the client's flow handling. `netstack-smoltcp` (what the client's TUN mode uses) is used only on the other end, in the test peer.
+- MIPS: the release matrix builds `mipsel`; the new dependencies were not verified for it, and a router is a poor fit, so `ostp-warp` is excluded there with a `cfg` and `ostp warp` says so. The other targets are built with it (see the changelog and the report of the work for what was checked).
+- The DNS filter needed more than the `socks` feature: with a proxy on, its plain UDP, TCP and DoT upstreams also went out directly. They now go through the proxy as DNS over TCP, and a proxy that cannot be used fails queries and list downloads instead of falling back.
+- `ostp warp status` also reads `warp.status.json`, which the running server writes every 5 s, because the tunnel lives in another process; `test` and the "address seen outside" go through the proxy as a client, so they exercise the path the server uses without a second WireGuard session on the same keys.
+- The registration base URL can be replaced with the environment variable `OSTP_WARP_API_BASE`; it exists for tests with a local fake service and is not documented as a setting.
 
 ## Open questions
 
-1. Which ports and addresses to try when `engage.cloudflareclient.com:2408` is blocked.
-2. Whether `--rules` should accept a list of rule names on the command line, or only the rules already in `outbound`.
-3. What `ostp warp status` shows when WARP+ is attached but the license is rejected.
+1. Which ports and addresses to try when `engage.cloudflareclient.com:2408` is blocked. The registration lists the ports 2408, 500, 1701 and 4500; today only the host's port (or `warp.endpoint`) is used, and the operator picks another with `warp.endpoint`. Trying the others automatically is not done.
+2. `--rules` takes only the rules already in `outbound`; a list of rules on the command line is not implemented.
+3. A rejected WARP+ key: `ostp warp license` fails with the service's answer and stores nothing, so `status` never shows a rejected key. How the service behaves when a key later expires is not known.
+4. Whether Cloudflare keeps WireGuard on this registration interface (it has been reported to be moving WARP to MASQUE).

@@ -18,6 +18,10 @@ Older history is on the [Releases](https://github.com/ospab/ostp/releases) page 
 - Desktop and Android apps: a notice on the first connection to a server that filters DNS (links with `owndns=true` or `dnsall=true`). It says that the operator's resolver filters domain names and sees the names looked up, and asks once per profile: the operator's DNS (10.1.0.1), a public DNS, or keep the app's settings. The buttons wait 5 seconds. The choice is kept with the profile and can be changed in the profile editor (*DNS of this server*).
 - Both apps keep and re-export the `dnsall` flag of share and subscription links (Android now also keeps `owndns`).
 - Docs: `carriers-design.md`, a draft study of carrying OSTP inside WebSocket, QUIC/HTTP3, WebRTC, ICMP and HTTPS long-poll: costs, what censors are known to do, and a recommended order (nothing in it is implemented).
+- Server: Cloudflare WARP as the exit, `ostp warp` (`register --accept-terms`, `license`, `enable --all | --rules`, `disable`, `status`, `test`, `reset`). A WireGuard client in the `ostp` process (user space: no tun device, routes or root) with a local SOCKS5 proxy on `127.0.0.1:40000` (TCP and UDP); the `outbound` section is pointed at it. `--all` sends everything the server opens outwards through WARP with no direct fallback, `--rules` only what the outbound rules send to the proxy. Keys are kept only in `warp.json`. New `warp` config section, schema 6 (`ostp migrate` adds it, off). Not built for MIPS. Details: `docs/en/server.md`, `docs/en/warp-design.md`.
+
+### Fixed
+- Server DNS filter: with the outbound proxy on, plain UDP, TCP and DoT upstream resolvers no longer go out directly (they are carried as DNS over TCP through the proxy), DoH through a `socks5h://` proxy works (it failed with "unsupported scheme"), and a proxy that cannot be used fails list downloads and upstream queries instead of silently going direct.
 
 ## [0.4.7] - 2026-11-12
 
