@@ -953,7 +953,8 @@ mod tests {
         let st = dns.stats();
         assert_eq!(st.total, 9);
         assert_eq!(st.cached, 1);
-        assert!(st.blocked >= 5);
+        // The canary is not blocked on this instance (no takeover): four names are.
+        assert!(st.blocked >= 4);
         let log = dns.query_log(3, None);
         assert_eq!(log[0].outcome, Outcome::Cached);
         assert_eq!(dns.query_log(50, Some("tiktok")).len(), 1);
