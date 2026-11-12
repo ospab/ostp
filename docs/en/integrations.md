@@ -23,6 +23,17 @@ The app checks GitHub for a newer stable or beta release when it opens (this can
 
 If the install fails, the dialog shows why and offers the release page instead.
 
+### Servers that filter DNS
+A share link or subscription link carries `owndns=true` when the server runs its own resolver (10.1.0.1), and `dnsall=true` when the operator answers every DNS query whichever resolver it was sent to and refuses encrypted DNS (DoT, DoH). Both apps keep these flags on the profile and write them back when the profile is shared.
+
+On the first connection to such a profile, before the tunnel starts, the app shows a notice that the operator's resolver filters domain names by block lists and sees the names looked up (with `dnsall`, also that a public DNS does not change that on this server). The three buttons stay disabled for 5 seconds, and the notice cannot be closed except by choosing:
+
+- *Use the operator's DNS*: the DNS for this profile is 10.1.0.1.
+- *Use a public DNS*: the app's own DNS setting if it is set, otherwise 1.1.1.1.
+- *Keep my settings*: nothing changes, the app's DNS setting is used.
+
+The choice is stored with the profile (it survives restarts and subscription updates) and is not asked again. It can be changed in the profile editor, *DNS of this server*: *Ask on the next connection*, *Operator's DNS*, *Public DNS*, *My settings*. Profiles without these flags are not affected.
+
 The Android app does the same with its APK: it downloads the build for the phone's architecture, checks the size and the SHA-256, and opens the system installer, which installs it over the current app because both are signed with the same key. If the app may not install apps yet, it opens that setting first.
 
 ## Your own server from the apps

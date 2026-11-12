@@ -14,6 +14,8 @@ Older history is on the [Releases](https://github.com/ospab/ostp/releases) page 
 ### Added
 - Device limit per user for subscriptions: `max_devices` (panel user form, `ostp manage user-limit`), checked by the device ID the app sends when its owner turned that on. A new device over the limit gets HTTP 403 `device_limit`, a request without an ID from a limited user gets 403 `hwid_required`. The record is `devices.json` (0600); the panel lists and removes devices, `ostp manage user-devices` prints them. The apps' part (the toggle and the ID) is not in yet.
 - Docs: `v6-design.md` and `v6-session-design.md`, the draft plans for protocol v6 / 0.5.0, and `warp-design.md`, the draft plan for `ostp warp` (nothing in them is implemented).
+- Desktop and Android apps: a notice on the first connection to a server that filters DNS (links with `owndns=true` or `dnsall=true`). It says that the operator's resolver filters domain names and sees the names looked up, and asks once per profile: the operator's DNS (10.1.0.1), a public DNS, or keep the app's settings. The buttons wait 5 seconds. The choice is kept with the profile and can be changed in the profile editor (*DNS of this server*).
+- Both apps keep and re-export the `dnsall` flag of share and subscription links (Android now also keeps `owndns`).
 
 ## [0.4.7] - 2026-11-12
 

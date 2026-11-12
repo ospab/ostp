@@ -169,6 +169,7 @@ Repeat for nginx, apache (Debian and RHEL) and caddy.
 | G-25 | Turn on the panel from the app, *Open the panel* | the panel opens in the browser through SSH, with no port open on the server; the VPN address is shown | P1 |
 | G-26 | Restart, update or reboot while connected through that server | refused with "Disconnect first"; after disconnecting it works | P2 |
 | G-27 | "Remember" off, restart the app, open the server | the password or key is asked for; with it on it is not; `servers.json` holds no secret in clear | P2 |
+| G-28 | Add a profile from a link with `owndns=true` (and one with `dnsall=true`), press Connect | before the tunnel starts a notice appears; its buttons are disabled for 5 seconds with a countdown, Escape and a click outside do nothing; the `dnsall` text appears only for the second; after a choice the connection starts and the notice does not come back after a restart | P1 |
 
 ## 4. Android
 
@@ -190,6 +191,7 @@ Repeat for nginx, apache (Debian and RHEL) and caddy.
 | M-14 | *Settings → Server Management*: every tab, as G-24 | works on a 360 dp wide screen, nothing cut off | P1 |
 | M-15 | *Open the panel* | opens in an in-app browser tab through SSH; the VPN address opens in Chrome while connected through the server | P1 |
 | M-16 | Close and reopen the app with a remembered server; clear the app's data | no password asked / the servers list is empty and nothing crashes | P2 |
+| M-17 | As G-28: a link with `owndns=true` / `dnsall=true`, then change *DNS of this server* in the profile editor | the notice before connecting (back button does nothing, buttons wait 5 seconds); the chosen DNS is the one the tunnel uses (operator: 10.1.0.1); the editor value is kept | P1 |
 
 ## 5. CLI client
 
