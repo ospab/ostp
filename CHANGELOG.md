@@ -8,6 +8,8 @@ Older history is on the [Releases](https://github.com/ospab/ostp/releases) page 
 
 ## [Unreleased]
 
+## [0.4.8-beta.1] - 2026-11-12
+
 ### Changed
 - Server DNS filter: by default it answers only queries sent to the server's own address (`10.1.0.1`) and no longer takes every client's DNS or refuses encrypted DNS (DoT, DoH) on its own. Taking over all DNS is an explicit option, `ostp dns takeover on` (panel: "Answer every DNS query"), and links and subscriptions then carry `dnsall=true`. `ostp migrate` (schema 5) keeps the takeover on servers whose filter was on, so nothing changes for them until the owner turns it off.
 
