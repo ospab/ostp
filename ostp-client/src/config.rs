@@ -344,6 +344,10 @@ pub struct ServerConfig {
     /// reason as `dns`; the CLI reads it as `ostp_server::OvernetConfig`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub overnet: Option<serde_json::Value>,
+    /// warp: Cloudflare WARP as the server's exit. Untyped like `overnet`; the
+    /// CLI reads it as `ostp_warp::WarpConfig`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warp: Option<serde_json::Value>,
     /// Clients may reach this server's own services (beyond the panel and
     /// DNS) and private networks, e.g. a home LAN behind a router running
     /// OSTP. Off: only the internet. Cloud metadata stays closed either way.

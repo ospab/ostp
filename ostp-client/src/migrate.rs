@@ -22,7 +22,7 @@ use serde_json::{json, Map, Value};
 /// - `1`: flat configs up to 0.4.5, no version stamp; may carry settings of
 ///   features that no longer exist.
 /// - `2`: 0.4.6+, stamped `config_version`.
-pub const CURRENT_VERSION: u32 = 5;
+pub const CURRENT_VERSION: u32 = 6;
 
 /// Which config this file is (mirrors `AppMode`'s `"mode"` tag). Old configs
 /// from before that tag existed are sniffed structurally as a fallback.
@@ -87,6 +87,7 @@ const STEPS: &[Step] = &[
     Step { kind: ConfigKind::Server, from: 2, title: "add the overnet section (off)", run: server_add_overnet },
     Step { kind: ConfigKind::Client, from: 3, title: "remove junk packets and TCP fragmentation", run: client_drop_junk_frag },
     Step { kind: ConfigKind::Server, from: 4, title: "keep taking over all DNS where the filter is on", run: server_keep_dns_takeover },
+    Step { kind: ConfigKind::Server, from: 5, title: "add the warp section (off)", run: server_add_warp },
 ];
 
 fn remove_with_reason(obj: &mut Map<String, Value>, path: &str, key: &str, reason: &str, notes: &mut Vec<String>) {
@@ -239,6 +240,22 @@ fn server_add_overnet(v: &mut Value, notes: &mut Vec<String>) {
         "exit_listen": "127.0.0.1:9151",
     });
     notes.push("added overnet (off): .ov sites for clients with `ostp overnet install` and `ostp overnet enable`".into());
+}
+
+/// The `warp` section (Cloudflare WARP as the server's exit), written out off.
+/// Nothing registers and nothing turns on: `ostp warp register`, then
+/// `ostp warp enable`.
+fn server_add_warp(v: &mut Value, notes: &mut Vec<String>) {
+    if v.get("warp").is_some_and(|o| !o.is_null()) {
+        return;
+    }
+    v["warp"] = json!({
+        "enabled": false,
+        "mode": "rules",
+        "listen": "127.0.0.1:40000",
+        "endpoint": "",
+    });
+    notes.push("added warp (off): Cloudflare WARP as this server's exit with `ostp warp register --accept-terms` and `ostp warp enable --all`".into());
 }
 
 /// Before 0.5.0 a server with `dns.enabled` answered every client's port-53 query
@@ -551,11 +568,14 @@ mod tests {
         assert_eq!(m.output["api"], json!({ "enabled": true, "token": "relay-token" }));
         assert!(m.output.get("outbound").is_none());
         assert_eq!(m.output["tls"], json!({ "enabled": true, "ws_path": "/Xk3pQ9aZr2" }));
-        // The version stamp and, since v3, the overnet section switched off.
-        assert_eq!(m.changes.len(), 2, "{:?}", m.changes);
+        // The version stamp and the sections added switched off: overnet (v3), warp (v6).
+        assert_eq!(m.changes.len(), 3, "{:?}", m.changes);
         assert!(m.changes.contains(&Change::Added { path: "config_version".into(), value: json!(CURRENT_VERSION) }));
-        assert!(matches!(&m.changes[..], [Change::Added { path, .. }, _] | [_, Change::Added { path, .. }] if path == "overnet"));
+        for section in ["overnet", "warp"] {
+            assert!(m.changes.iter().any(|c| matches!(c, Change::Added { path, .. } if path == section)), "{section}: {:?}", m.changes);
+        }
         assert_eq!(m.output["overnet"]["enabled"], false);
+        assert_eq!(m.output["warp"]["enabled"], false);
         assert!(m.unknown_keys.is_empty(), "{:?}", m.unknown_keys);
         assert_idempotent(&m);
     }
@@ -709,5 +729,26 @@ mod tests {
         }))
         .unwrap();
         assert!(m.output.get("dns").is_none());
+    }
+
+    /// The `warp` section appears switched off, in rules mode (which changes
+    /// nothing by itself), and one the owner wrote is left alone. Clients have
+    /// no such section.
+    #[test]
+    fn a_server_gets_a_warp_section_that_is_off() {
+        let m = migrate(json!({
+            "mode": "server", "config_version": 5, "listen": "0.0.0.0:50000", "access_keys": ["k"],
+        }))
+        .unwrap();
+        assert_eq!(m.output["warp"], json!({ "enabled": false, "mode": "rules", "listen": "127.0.0.1:40000", "endpoint": "" }));
+        assert!(m.output.get("outbound").is_none(), "the outbound section is not touched");
+        let m = migrate(json!({
+            "mode": "server", "config_version": 5, "listen": "0.0.0.0:50000", "access_keys": ["k"],
+            "warp": { "enabled": true, "mode": "all" },
+        }))
+        .unwrap();
+        assert_eq!(m.output["warp"], json!({ "enabled": true, "mode": "all" }));
+        let m = migrate(json!({ "mode": "client", "config_version": 5, "server": "h:1", "access_key": "k" })).unwrap();
+        assert!(m.output.get("warp").is_none());
     }
 }
