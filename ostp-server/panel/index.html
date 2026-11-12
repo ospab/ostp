@@ -494,6 +494,9 @@ tr:last-child td { border-bottom: 0; }
     <div class="field" id="mu-key-field"><label class="lbl" for="mu-key" data-t="access_key_opt">Access key (optional)</label>
       <div class="row"><input class="input mono grow" id="mu-key" maxlength="128" spellcheck="false" autocomplete="off" /><button type="button" class="btn" id="mu-gen" data-t="generate">Generate</button></div></div>
     <div class="field"><label class="lbl" for="mu-limit" data-t="limit_gb">Traffic limit, GB (empty = unlimited)</label><input class="input" id="mu-limit" type="number" min="0.01" step="any" /></div>
+    <div class="field"><label class="lbl" for="mu-devices" data-t="devices_limit">Devices (empty = unlimited)</label><input class="input" id="mu-devices" type="number" min="1" max="1000" step="1" inputmode="numeric" />
+      <div class="small muted" data-t="devices_hint">A device is counted when its app fetches the subscription with its device ID turned on.</div></div>
+    <div class="field hidden" id="mu-devices-field"><div class="lbl" data-t="devices_seen">Devices that fetched the subscription</div><div id="mu-devices-list" class="small"></div></div>
     <div class="modal-actions"><button type="button" class="btn" data-close data-t="cancel">Cancel</button><button class="btn primary" data-t="save">Save</button></div>
   </form>
 </div>
@@ -548,6 +551,7 @@ const I18N = {
     config_sub: "The server's config.json. Access keys reload on their own; other changes need a restart.",
     activity_sub: 'Changes made from this panel since the server started.',
     add_user_desc: 'A random access key is generated unless you paste one.', edit_user_desc: 'The access key stays the same.',
+    devices_limit: 'Devices (empty = unlimited)', devices_hint: 'A device is counted when its app fetches the subscription with its device ID turned on.', devices_seen: 'Devices that fetched the subscription', devices_none: 'None yet', device_remove: 'Remove', device_removed: 'Device removed', devices_bad: 'The device limit is a whole number from 1 to 1000',
     name: 'Name', access_key_opt: 'Access key (optional)', generate: 'Generate', limit_gb: 'Traffic limit, GB (empty = unlimited)',
     cancel: 'Cancel', create: 'Create', close: 'Close', copy: 'Copy', copied: 'Copied',
     bulk_desc: 'Creates many unnamed keys at once, e.g. for a batch of devices.', count: 'Count',
@@ -657,6 +661,7 @@ const I18N = {
     config_sub: 'config.json сервера. Ключи доступа подхватываются сами, остальное — после перезапуска.',
     activity_sub: 'Изменения из этой панели с момента запуска сервера.',
     add_user_desc: 'Ключ доступа сгенерируется сам, если не вставить свой.', edit_user_desc: 'Ключ доступа не меняется.',
+    devices_limit: 'Устройства (пусто = без лимита)', devices_hint: 'Устройство считается, когда его приложение запрашивает подписку с включённой передачей ID устройства.', devices_seen: 'Устройства, запросившие подписку', devices_none: 'Пока нет', device_remove: 'Убрать', device_removed: 'Устройство убрано', devices_bad: 'Лимит устройств — целое число от 1 до 1000',
     name: 'Имя', access_key_opt: 'Ключ доступа (необязательно)', generate: 'Сгенерировать', limit_gb: 'Лимит трафика, ГБ (пусто — без лимита)',
     cancel: 'Отмена', create: 'Создать', close: 'Закрыть', copy: 'Копировать', copied: 'Скопировано',
     bulk_desc: 'Создаёт сразу много безымянных ключей, например для партии устройств.', count: 'Количество',
@@ -790,6 +795,13 @@ function readLimit(id) {
   if (raw === '') return null;
   const n = Number(raw);
   return n > 0 && n <= MAX_LIMIT_GB ? Math.round(n * GB) : undefined;
+}
+// Devices limit: '' = none, a whole number 1..1000, anything else is refused.
+function readDevices() {
+  const raw = $('mu-devices').value.trim();
+  if (raw === '') return null;
+  const n = Number(raw);
+  return Number.isInteger(n) && n >= 1 && n <= 1000 ? n : undefined;
 }
 function toast(msg, err = false) {
   const el = document.createElement('div');
@@ -1259,12 +1271,58 @@ function fillUserForm(u) {
   $('mu-name').value = u?.name || '';
   $('mu-limit').value = u?.limit_bytes ? +(u.limit_bytes / GB).toPrecision(4) : '';
 }
+let editingDevices; // the limit as the server has it; undefined while unknown
+async function loadDevices(u) {
+  const field = $('mu-devices-field'), list = $('mu-devices-list');
+  editingDevices = undefined;
+  $('mu-devices').value = '';
+  field.classList.toggle('hidden', !u);
+  list.textContent = '';
+  if (!u) return;
+  try {
+    const d = await api(`users/${encodeURIComponent(u.access_key)}/devices`);
+    if (editing !== u) return; // another user was opened meanwhile
+    editingDevices = d.max_devices || null;
+    $('mu-devices').value = d.max_devices || '';
+    renderDevices(u, d.devices || []);
+  } catch (err) {
+    list.textContent = err.message;
+  }
+}
+function renderDevices(u, devices) {
+  const list = $('mu-devices-list');
+  list.textContent = '';
+  if (!devices.length) { list.textContent = t('devices_none'); return; }
+  for (const d of devices) {
+    const row = document.createElement('div');
+    row.className = 'row';
+    const label = document.createElement('span');
+    label.className = 'grow';
+    const when = new Date(d.last_seen * 1000).toLocaleString();
+    label.textContent = `${[d.os, d.model].filter(Boolean).join(' ') || '?'} · ${d.hwid.slice(0, 8)} · ${when}`;
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'btn';
+    btn.textContent = t('device_remove');
+    btn.addEventListener('click', async () => {
+      // No confirmation: the device is counted again the next time its app fetches the subscription.
+      try {
+        await api(`users/${encodeURIComponent(u.access_key)}/devices/${encodeURIComponent(d.hwid)}`, { method: 'DELETE' });
+        toast(t('device_removed'));
+        loadDevices(u);
+      } catch (err) { toast(err.message, true); }
+    });
+    row.append(label, btn);
+    list.append(row);
+  }
+}
 function openUserModal(u) {
   editing = u || null;
   $('mu-title').textContent = t(u ? 'edit_user' : 'add_user');
   $('mu-desc').textContent = t(u ? 'edit_user_desc' : 'add_user_desc');
   $('mu-key-field').classList.toggle('hidden', !!u);
   fillUserForm(u);
+  loadDevices(u);
   $('mu-key').value = '';
   openModal('m-user');
   setTimeout(() => $('mu-name').focus(), 50);
@@ -1281,6 +1339,8 @@ $('f-user').addEventListener('submit', async e => {
   const name = $('mu-name').value.trim() || null;
   const limit_bytes = readLimit('mu-limit');
   if (limit_bytes === undefined) { toast(t('limit_bad'), true); $('mu-limit').focus(); return; }
+  const max_devices = readDevices();
+  if (max_devices === undefined) { toast(t('devices_bad'), true); $('mu-devices').focus(); return; }
   // The server refuses an existing key too; checking here saves the round trip.
   const key = editing ? null : ($('mu-key').value.trim() || null);
   if (key && !/^[^\p{White_Space}\p{Cc}\/?#%\\]{8,128}$/u.test(key)) { toast(t('key_bad'), true); $('mu-key').focus(); return; }
@@ -1294,11 +1354,14 @@ $('f-user').addEventListener('submit', async e => {
           editing = cur; fillUserForm(cur); toast(t('user_changed'), true); refresh();
           return;
         }
-        await api(`users/${encodeURIComponent(editing.access_key)}`, { method: 'PUT', body: { name, limit_bytes } });
+        // The limit is sent only when it was read from the server: an unknown one stays as it is.
+        const body = { name, limit_bytes };
+        if (editingDevices !== undefined) body.max_devices = max_devices;
+        await api(`users/${encodeURIComponent(editing.access_key)}`, { method: 'PUT', body });
         audit('ev_edit', name || editing.access_key.slice(0, 8)); toast(t('saved'));
         closeModals(); refresh();
       } else {
-        const created = await api('users', { method: 'POST', body: { access_key: key, name, limit_bytes } });
+        const created = await api('users', { method: 'POST', body: { access_key: key, name, limit_bytes, max_devices } });
         audit('ev_add', name || String(created).slice(0, 8)); toast(t('created'));
         closeModals(); await refresh();
         const u = users.find(x => x.access_key === created);

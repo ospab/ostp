@@ -50,6 +50,7 @@ async fn start_server_on(binds: Vec<SocketAddr>) -> SocketAddr {
             ostp_server::api::UserMeta {
                 name: None,
                 limit_bytes: None,
+                max_devices: None,
             },
         )],
         outbound: None,

@@ -82,6 +82,8 @@ pub struct ApiState {
     pub dns_server: std::sync::Arc<crate::dns::DnsServer>,
     pub audit_logs: Arc<RwLock<Vec<AuditLogEntry>>>,
     pub router: std::sync::Arc<crate::router::Router>,
+    /// Devices that fetched a subscription (by HWID), for users with a device limit.
+    pub devices: Arc<crate::devices::DeviceStore>,
 }
 
 /// The TLS endpoint put in subscription links.
@@ -145,6 +147,9 @@ impl Default for ApiConfig {
 pub struct UserMeta {
     pub name: Option<String>,
     pub limit_bytes: Option<u64>,
+    /// Devices (HWIDs) a subscription may serve; `None` = no limit.
+    #[serde(default)]
+    pub max_devices: Option<u32>,
 }
 
 // ── Request/Response types ───────────────────────────────────────────────────
@@ -197,12 +202,25 @@ pub struct CreateUserRequest {
     pub access_key: Option<String>,
     pub name: Option<String>,
     pub limit_bytes: Option<u64>,
+    pub max_devices: Option<u32>,
 }
 
 #[derive(Deserialize)]
 pub struct UpdateUserRequest {
     pub name: Option<String>,
     pub limit_bytes: Option<u64>,
+    /// Absent = unchanged; `null` = no limit; a number = that many devices.
+    #[serde(default, deserialize_with = "present_devices")]
+    pub max_devices: Option<Option<u32>>,
+}
+
+/// Tells a field that is absent from one that is `null`: a request from a panel
+/// or app that predates the field must not clear what it never sent.
+fn present_devices<'de, D>(d: D) -> Result<Option<Option<u32>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<u32>::deserialize(d).map(Some)
 }
 
 #[derive(Deserialize)]
@@ -305,6 +323,8 @@ pub fn create_api_router(state: ApiState) -> Router {
         )
         .route("/users/{key}/limit", put(handle_set_limit))
         .route("/users/{key}/reset", post(handle_reset_stats))
+        .route("/users/{key}/devices", get(handle_list_devices).delete(handle_clear_devices))
+        .route("/users/{key}/devices/{hwid}", axum::routing::delete(handle_remove_device))
         .route("/users/{key}/share", get(handle_user_share))
         .route("/qr", post(handle_qr))
         .route("/subscribe/{key}", get(handle_subscribe))
@@ -392,6 +412,7 @@ pub async fn start_api_server(
         server_port,
         tls_link,
         subscription_prefix,
+        devices: crate::devices::DeviceStore::shared(config_path.as_ref().and_then(|p| p.parent()).map(|d| d.join("devices.json"))),
         config_path,
         dns_server,
         audit_logs: Arc::new(RwLock::new(Vec::new())),
@@ -603,6 +624,15 @@ fn check_name(name: Option<String>) -> Result<Option<String>, &'static str> {
     Ok(Some(name.to_string()).filter(|n| !n.is_empty()))
 }
 
+/// A device limit is a small number; 0 means none and is stored as none.
+fn check_devices(n: Option<u32>) -> Result<Option<u32>, &'static str> {
+    match n {
+        Some(0) | None => Ok(None),
+        Some(n) if n <= 1000 => Ok(Some(n)),
+        Some(_) => Err("device limit is too large (1000 at most)"),
+    }
+}
+
 fn check_limit(limit: Option<u64>) -> Result<(), &'static str> {
     match limit {
         Some(l) if l > MAX_LIMIT_BYTES => Err("traffic limit is too large (1 PiB at most)"),
@@ -642,7 +672,7 @@ fn save_config_keys(state: &ApiState) -> Result<(), String> {
         let keys = state.access_keys.read().unwrap_or_else(|e| e.into_inner());
         let mut access_keys_json = Vec::new();
         for (k, m) in keys.iter() {
-            if m.name.is_none() && m.limit_bytes.is_none() {
+            if m.name.is_none() && m.limit_bytes.is_none() && m.max_devices.is_none() {
                 access_keys_json.push(serde_json::Value::String(k.clone()));
             } else {
                 let mut obj = serde_json::Map::new();
@@ -652,6 +682,9 @@ fn save_config_keys(state: &ApiState) -> Result<(), String> {
                 }
                 if let Some(limit) = m.limit_bytes {
                     obj.insert("limit_bytes".to_string(), serde_json::Value::Number(limit.into()));
+                }
+                if let Some(n) = m.max_devices {
+                    obj.insert("max_devices".to_string(), serde_json::Value::Number(n.into()));
                 }
                 access_keys_json.push(serde_json::Value::Object(obj));
             }
@@ -887,6 +920,10 @@ async fn handle_create_user(
     if let Err(m) = check_limit(body.limit_bytes) {
         return api_error::<String>(m);
     }
+    let max_devices = match check_devices(body.max_devices) {
+        Ok(n) => n,
+        Err(m) => return api_error::<String>(m),
+    };
     let key = match body.access_key.filter(|k| !k.is_empty()) {
         Some(k) => {
             if let Err(m) = check_key(&k) {
@@ -906,7 +943,7 @@ async fn handle_create_user(
         if keys.len() >= MAX_USERS {
             return api_error::<String>("too many users (10000 at most)");
         }
-        keys.insert(key.clone(), UserMeta { name, limit_bytes: body.limit_bytes });
+        keys.insert(key.clone(), UserMeta { name, limit_bytes: body.limit_bytes, max_devices });
     }
 
     let mut stats = state.user_stats.write().unwrap_or_else(|e| e.into_inner());
@@ -945,6 +982,7 @@ async fn delete_user(
         let mut stats = state.user_stats.write().unwrap_or_else(|e| e.into_inner());
         stats.remove(&key);
     }
+    state.devices.clear(&ostp_core::subscription::token_for_key(&key));
 
     if let Err(e) = save_config_keys(&state) {
         tracing::error!("Failed to save config after removing user: {}", e);
@@ -971,12 +1009,22 @@ async fn update_user(
     if let Err(m) = check_limit(body.limit_bytes) {
         return api_error::<String>(m);
     }
+    let max_devices = match body.max_devices {
+        Some(n) => match check_devices(n) {
+            Ok(n) => Some(n),
+            Err(m) => return api_error::<String>(m),
+        },
+        None => None,
+    };
 
     {
         let mut keys = state.access_keys.write().unwrap_or_else(|e| e.into_inner());
         if let Some(meta) = keys.get_mut(&key) {
             meta.name = name;
             meta.limit_bytes = body.limit_bytes;
+            if let Some(n) = max_devices {
+                meta.max_devices = n;
+            }
         } else {
             return api_error::<String>("User not found");
         }
@@ -1064,6 +1112,65 @@ async fn handle_reset_stats(
     } else {
         api_error("user not found")
     }
+}
+
+#[derive(Serialize)]
+struct DevicesView {
+    /// 0 = no limit.
+    max_devices: u32,
+    devices: Vec<crate::devices::Device>,
+}
+
+/// The device limit of a user and the devices that fetched its subscription.
+async fn handle_list_devices(
+    State(state): State<ApiState>,
+    headers: axum::http::HeaderMap,
+    Path(key): Path<String>,
+) -> impl IntoResponse {
+    if !check_token(&state, &headers) {
+        return api_unauthorized::<DevicesView>();
+    }
+    let max = match state.access_keys.read().unwrap_or_else(|e| e.into_inner()).get(&key) {
+        Some(m) => m.max_devices.unwrap_or(0),
+        None => return api_error("user not found"),
+    };
+    let devices = state.devices.list(&ostp_core::subscription::token_for_key(&key));
+    (StatusCode::OK, ApiResponse::success(DevicesView { max_devices: max, devices }))
+}
+
+/// Frees one slot of a user's device limit.
+async fn handle_remove_device(
+    State(state): State<ApiState>,
+    headers: axum::http::HeaderMap,
+    Path((key, hwid)): Path<(String, String)>,
+) -> impl IntoResponse {
+    if !check_token(&state, &headers) {
+        return api_unauthorized::<bool>();
+    }
+    if !state.access_keys.read().unwrap_or_else(|e| e.into_inner()).contains_key(&key) {
+        return api_error("user not found");
+    }
+    if state.devices.remove(&ostp_core::subscription::token_for_key(&key), &hwid) {
+        (StatusCode::OK, ApiResponse::success(true))
+    } else {
+        api_error("device not found")
+    }
+}
+
+/// Forgets every device of a user.
+async fn handle_clear_devices(
+    State(state): State<ApiState>,
+    headers: axum::http::HeaderMap,
+    Path(key): Path<String>,
+) -> impl IntoResponse {
+    if !check_token(&state, &headers) {
+        return api_unauthorized::<usize>();
+    }
+    if !state.access_keys.read().unwrap_or_else(|e| e.into_inner()).contains_key(&key) {
+        return api_error("user not found");
+    }
+    let n = state.devices.clear(&ostp_core::subscription::token_for_key(&key));
+    (StatusCode::OK, ApiResponse::success(n))
 }
 
 /// The links and subscription URL to hand a user, as the panel shows them.
@@ -1269,6 +1376,7 @@ mod tests {
             config_path: None,
             dns_server: crate::dns::DnsServer::new(Default::default(), None),
             audit_logs: Arc::new(RwLock::new(Vec::new())),
+            devices: Arc::new(crate::devices::DeviceStore::in_memory()),
             router: Arc::new(crate::router::Router::new(None, None, crate::dns::DnsServer::new(Default::default(), None), false)),
         }
     }
@@ -1558,6 +1666,7 @@ async fn handle_create_audit(
 pub struct BulkCreateRequest {
     pub count: usize,
     pub limit_bytes: Option<u64>,
+    pub max_devices: Option<u32>,
 }
 
 async fn handle_bulk_create_users(
@@ -1575,6 +1684,10 @@ async fn handle_bulk_create_users(
     if let Err(m) = check_limit(payload.limit_bytes) {
         return api_error(m);
     }
+    let bulk_devices = match check_devices(payload.max_devices) {
+        Ok(n) => n,
+        Err(m) => return api_error(m),
+    };
 
     let mut new_keys = Vec::new();
     let mut keys = match state.access_keys.write() {
@@ -1593,6 +1706,7 @@ async fn handle_bulk_create_users(
         keys.insert(key.clone(), UserMeta {
             name: None,
             limit_bytes: payload.limit_bytes,
+            max_devices: bulk_devices,
         });
         new_keys.push(key);
     }

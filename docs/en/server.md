@@ -81,6 +81,8 @@ Every 30 seconds the server writes per-user traffic to `.ostp_stats.json` next t
 | `ostp manage status` | Version, service state, sessions, users, listen address, TLS domain and certificate, subscriptions, panel, and the system: OS, load, memory, disk |
 | `ostp manage users` | Every user with links, subscription URL and traffic |
 | `ostp manage user-add NAME`, `user-remove WHO`, `user-rename WHO NAME` | WHO is a number (as in `ostp links`), a name or a key. The running server picks up the change from the file; the last user cannot be removed |
+| `ostp manage user-limit WHO --devices N` | Limits the devices that may use the user's subscription (0 removes the limit); see [tls.md](tls.md#device-limit) |
+| `ostp manage user-devices WHO` | Devices that fetched the user's subscription, read from `devices.json` |
 | `ostp manage logs [-n N]` | The service log's last lines |
 | `ostp manage restart` | Restarts the service, reports whether it stayed up |
 

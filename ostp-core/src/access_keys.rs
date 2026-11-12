@@ -1,5 +1,5 @@
 //! `access_keys` entries in a server config come in two forms: a bare key
-//! string, or an object `{ "access_key", "name", "limit_bytes" }`.
+//! string, or an object `{ "access_key", "name", "limit_bytes", "max_devices" }`.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -7,7 +7,14 @@ use serde_json::Value;
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(untagged)]
 pub enum AccessKeyEntry {
-    Detailed { access_key: String, name: Option<String>, limit_bytes: Option<u64> },
+    Detailed {
+        access_key: String,
+        name: Option<String>,
+        limit_bytes: Option<u64>,
+        /// Devices a subscription may serve at once (by HWID); absent = no limit.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max_devices: Option<u32>,
+    },
     KeyOnly(String),
 }
 
@@ -33,10 +40,17 @@ impl AccessKeyEntry {
         }
     }
 
+    pub fn max_devices(&self) -> Option<u32> {
+        match self {
+            AccessKeyEntry::KeyOnly(_) => None,
+            AccessKeyEntry::Detailed { max_devices, .. } => *max_devices,
+        }
+    }
+
     /// `(key, name, limit_bytes)`.
     pub fn into_parts(self) -> (String, Option<String>, Option<u64>) {
         match self {
-            AccessKeyEntry::Detailed { access_key, name, limit_bytes } => (access_key, name, limit_bytes),
+            AccessKeyEntry::Detailed { access_key, name, limit_bytes, .. } => (access_key, name, limit_bytes),
             AccessKeyEntry::KeyOnly(k) => (k, None, None),
         }
     }

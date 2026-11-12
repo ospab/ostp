@@ -70,6 +70,8 @@ pub struct SubscriptionService {
     pub keys: Arc<RwLock<HashMap<String, UserMeta>>>,
     pub stats: Arc<RwLock<HashMap<String, Arc<UserStats>>>>,
     pub lookups: Lookups,
+    /// Devices that fetched a subscription, for users with a device limit.
+    pub devices: Arc<crate::devices::DeviceStore>,
 }
 
 /// What the request asked for.
@@ -81,6 +83,9 @@ struct Request {
     /// Accept-Language prefers Russian.
     ru: bool,
     head_only: bool,
+    /// The device identity from `x-hwid`, `x-device-os` and `x-device-model`;
+    /// absent when the app does not send it (or sends garbage).
+    hwid: Option<crate::devices::Hwid>,
 }
 
 impl SubscriptionService {
@@ -114,11 +119,19 @@ impl SubscriptionService {
                 .unwrap_or("")
                 .to_ascii_lowercase()
         };
+        let raw = |name: &str| {
+            req.headers
+                .iter()
+                .find(|h| h.name.eq_ignore_ascii_case(name))
+                .and_then(|h| std::str::from_utf8(h.value).ok())
+                .unwrap_or("")
+        };
+        let hwid = crate::devices::Hwid::parse(raw("x-hwid"), raw("x-device-os"), raw("x-device-model"));
         let accept = header("accept");
         let json = accept.contains("application/json") || query.split('&').any(|kv| kv == "format=json");
         let html = !json && accept.contains("text/html");
         let ru = prefers_russian(&header("accept-language"));
-        Some(Request { token: token.to_ascii_lowercase(), json, html, ru, head_only })
+        Some(Request { token: token.to_ascii_lowercase(), json, html, ru, head_only, hwid })
     }
 
     /// The access key a token belongs to. Tokens are hashes of the keys, so
@@ -197,6 +210,13 @@ impl SubscriptionService {
             self.lookups.failures.record_failure(client);
             return None;
         };
+        // The device limit is checked after the token is known good, so an unknown
+        // token still gets the decoy and nothing here tells anyone a limit exists.
+        let max_devices = self.keys.read().unwrap_or_else(|e| e.into_inner()).get(&key).and_then(|m| m.max_devices);
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        if let Err(refusal) = self.devices.check(&req.token, max_devices, req.hwid.as_ref(), now) {
+            return Some(self.refuse(&refusal, req.head_only));
+        }
         let doc = self.document(&key).await;
 
         let (content_type, body) = if req.json {
@@ -237,6 +257,37 @@ impl SubscriptionService {
 }
 
 impl SubscriptionService {
+    /// 403 with a JSON body the apps read: `error` is a code, `message` is for a person.
+    fn refuse(&self, refusal: &crate::devices::Refusal, head_only: bool) -> Vec<u8> {
+        use crate::devices::Refusal;
+        let (code, message) = match refusal {
+            Refusal::HwidRequired => (
+                "hwid_required",
+                "This subscription limits the number of devices. Turn on sending the device ID in the app and refresh.".to_string(),
+            ),
+            Refusal::DeviceLimit { max } => (
+                "device_limit",
+                format!("This subscription is limited to {max} device(s) and all of them are in use. Ask the server's operator to remove one."),
+            ),
+        };
+        let body = serde_json::json!({ "error": code, "message": message }).to_string();
+        let mut out = format!(
+            "HTTP/1.1 403 Forbidden
+Content-Type: application/json
+Content-Length: {}
+Cache-Control: no-store
+Connection: close
+
+",
+            body.len()
+        )
+        .into_bytes();
+        if !head_only {
+            out.extend_from_slice(body.as_bytes());
+        }
+        out
+    }
+
     /// The subscription's own address, as a person would paste it.
     fn url(&self, token: &str) -> String {
         match &self.tls {
@@ -366,8 +417,8 @@ mod tests {
 
     fn service() -> SubscriptionService {
         let mut keys = HashMap::new();
-        keys.insert("key-a".to_string(), UserMeta { name: Some("alice".into()), limit_bytes: Some(1000) });
-        keys.insert("key-b".to_string(), UserMeta { name: None, limit_bytes: None });
+        keys.insert("key-a".to_string(), UserMeta { name: Some("alice".into()), limit_bytes: Some(1000), max_devices: None });
+        keys.insert("key-b".to_string(), UserMeta { name: None, limit_bytes: None, max_devices: None });
         let stats = HashMap::from([("key-a".to_string(), Arc::new(UserStats::new(Some(1000))))]);
         stats["key-a"].bytes_up.store(10, std::sync::atomic::Ordering::Relaxed);
         stats["key-a"].bytes_down.store(32, std::sync::atomic::Ordering::Relaxed);
@@ -385,6 +436,7 @@ mod tests {
             keys: Arc::new(RwLock::new(keys)),
             stats: Arc::new(RwLock::new(stats)),
             lookups: Lookups::default(),
+            devices: Arc::new(crate::devices::DeviceStore::in_memory()),
         }
     }
 
@@ -394,6 +446,56 @@ mod tests {
 
     fn get(path: &str, accept: &str) -> Vec<u8> {
         format!("GET {path} HTTP/1.1\r\nHost: vpn.example.com\r\nAccept: {accept}\r\n\r\n").into_bytes()
+    }
+
+    fn get_with_device(path: &str, hwid: Option<&str>) -> Vec<u8> {
+        let mut head = format!("GET {path} HTTP/1.1
+Host: vpn.example.com
+Accept: */*
+");
+        if let Some(h) = hwid {
+            head.push_str(&format!("x-hwid: {h}
+x-device-os: Windows 11
+x-device-model: PC
+"));
+        }
+        head.push_str("
+");
+        head.into_bytes()
+    }
+
+    #[tokio::test]
+    async fn a_device_limit_refuses_a_missing_hwid_and_a_surplus_device_with_codes() {
+        let svc = service();
+        svc.keys.write().unwrap().get_mut("key-a").unwrap().max_devices = Some(1);
+        let path = format!("/sub/{}", token_for_key("key-a"));
+        let text = |r: Vec<u8>| String::from_utf8(r).unwrap();
+
+        let r = text(svc.respond(&get_with_device(&path, None), client()).await.unwrap());
+        assert!(r.starts_with("HTTP/1.1 403"), "{r}");
+        assert!(r.contains("\"error\":\"hwid_required\""), "{r}");
+
+        let one = "0123456789abcdef0123456789abcdef";
+        let two = "fedcba9876543210fedcba9876543210";
+        let r = text(svc.respond(&get_with_device(&path, Some(one)), client()).await.unwrap());
+        assert!(r.starts_with("HTTP/1.1 200"), "{r}");
+        // The same device again is fine; another one is over the limit.
+        let r = text(svc.respond(&get_with_device(&path, Some(one)), client()).await.unwrap());
+        assert!(r.starts_with("HTTP/1.1 200"), "{r}");
+        let r = text(svc.respond(&get_with_device(&path, Some(two)), client()).await.unwrap());
+        assert!(r.starts_with("HTTP/1.1 403") && r.contains("\"error\":\"device_limit\""), "{r}");
+
+        // A user without a limit is not asked for an HWID.
+        let free = format!("/sub/{}", token_for_key("key-b"));
+        let r = text(svc.respond(&get_with_device(&free, None), client()).await.unwrap());
+        assert!(r.starts_with("HTTP/1.1 200"), "{r}");
+    }
+
+    #[tokio::test]
+    async fn an_unknown_token_gets_the_decoy_even_with_an_hwid() {
+        let svc = service();
+        let path = format!("/sub/{}", token_for_key("nope"));
+        assert!(svc.respond(&get_with_device(&path, Some("0123456789abcdef0123456789abcdef")), client()).await.is_none());
     }
 
     #[tokio::test]
@@ -431,7 +533,7 @@ mod tests {
     async fn a_key_added_later_is_found() {
         let svc = service();
         assert!(svc.key_for(&token_for_key("key-a")).is_some());
-        svc.keys.write().unwrap().insert("key-c".into(), UserMeta { name: None, limit_bytes: None });
+        svc.keys.write().unwrap().insert("key-c".into(), UserMeta { name: None, limit_bytes: None, max_devices: None });
         assert_eq!(svc.key_for(&token_for_key("key-c")).as_deref(), Some("key-c"));
         svc.keys.write().unwrap().remove("key-a");
         assert!(svc.key_for(&token_for_key("key-a")).is_none(), "a removed key stops working at once");

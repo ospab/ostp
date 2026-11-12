@@ -1782,6 +1782,7 @@ async fn run_app() -> Result<()> {
                 (uc.key(), ostp_server::api::UserMeta {
                     name: uc.name(),
                     limit_bytes: uc.limit(),
+                    max_devices: uc.max_devices(),
                 })
             }).collect::<Vec<_>>();
             let domain = server_cfg.domain.clone().filter(|d| !d.is_empty());

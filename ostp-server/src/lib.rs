@@ -35,6 +35,7 @@ pub mod target_policy;
 mod admission;
 mod send_gate;
 mod subscription;
+pub mod devices;
 
 pub use subscription::SubscriptionSettings;
 
@@ -230,8 +231,9 @@ pub async fn run_server(params: ServerParams) -> Result<()> {
                                         if cfg.mode == "server" {
                                             let mut new_keys = HashMap::new();
                                             for uc in cfg.access_keys {
+                                                let max_devices = uc.max_devices();
                                                 let (k, name, limit_bytes) = uc.into_parts();
-                                                new_keys.insert(k, crate::api::UserMeta { name, limit_bytes });
+                                                new_keys.insert(k, crate::api::UserMeta { name, limit_bytes, max_devices });
                                             }
                                             
                                             // 1. Update shared_keys
@@ -359,6 +361,7 @@ pub async fn run_server(params: ServerParams) -> Result<()> {
                 keys: shared_keys.clone(),
                 stats: dispatcher.user_stats_ref(),
                 lookups: Default::default(),
+                devices: devices::DeviceStore::shared(config_path.as_ref().and_then(|p| p.parent()).map(|d| d.join("devices.json"))),
             }))
         }
         (Some(_), None) => {
@@ -1182,7 +1185,7 @@ mod traffic_tests {
     use std::sync::atomic::Ordering;
 
     fn meta(limit: Option<u64>) -> api::UserMeta {
-        api::UserMeta { name: None, limit_bytes: limit }
+        api::UserMeta { name: None, limit_bytes: limit, max_devices: None }
     }
 
     #[test]
