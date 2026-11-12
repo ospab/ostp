@@ -533,6 +533,15 @@
             <option value="uot">TCP (UoT)</option>
           </select>
         </div>
+        <div class="field-group" id="pm-dns-group" style="display:none;">
+          <label class="field-label" for="pm-dns-choice">DNS of this server</label>
+          <select id="pm-dns-choice" class="field-input">
+            <option value="">Ask on the next connection</option>
+            <option value="operator">Operator's DNS</option>
+            <option value="public">Public DNS</option>
+            <option value="mine">My settings</option>
+          </select>
+        </div>
         <div id="pm-tls-group" style="display:none;">
           <div class="toggle-row">
             <div class="toggle-text">
@@ -601,6 +610,20 @@
           <button id="btn-update-skip" class="btn secondary">Skip this version</button>
           <button id="btn-update-later" class="btn secondary" data-dismiss>Later</button>
           <button id="btn-update-download" class="btn primary">Update now</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- ── DNS NOTICE MODAL ─────────────────────────────────── -->
+    <div id="dns-notice-modal" class="modal-overlay hidden">
+      <div class="modal-content">
+        <h3 class="modal-title">This server filters DNS</h3>
+        <p class="modal-text">The operator's resolver filters domain names by block lists and sees the names you look up.</p>
+        <p class="modal-text" id="dns-notice-all">This server also answers DNS queries sent to any resolver and blocks encrypted DNS (DoT, DoH). Choosing a public DNS does not change that on this server.</p>
+        <div class="modal-actions">
+          <button type="button" class="btn secondary" data-dns-choice="operator" disabled>Use the operator's DNS</button>
+          <button type="button" class="btn secondary" data-dns-choice="public" disabled>Use a public DNS</button>
+          <button type="button" class="btn secondary" data-dns-choice="mine" disabled>Keep my settings</button>
         </div>
       </div>
     </div>

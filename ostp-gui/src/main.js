@@ -1,3 +1,4 @@
+import { shouldAskDnsNotice, effectiveDns, filtersDns } from './dns_notice.js';
 import { initServers, renderServers, mountSshForm, confirmBox, fmtBytes } from './servers.js';
 
 // ── Tauri invoke shim ─────────────────────────────────────────────────
@@ -37,7 +38,8 @@ function invoke(cmd, args) {
 // Profile shape:
 // { id: string, name: string, server: string, key: string, transport: 'udp'|'uot',
 //   tls?: bool, tls_sni?: string, tls_insecure?: bool, ws_path?: string,
-//   tun?: bool, dns?: string, owndns?: bool,   // carried by share links, kept for export
+//   tun?: bool, dns?: string, owndns?: bool, dnsall?: bool,   // carried by share links, kept for export
+//   dns_choice?: 'operator'|'public'|'mine',   // the user's choice for a server that filters DNS (absent: ask)
 //   sub_id?: string }   // set on profiles owned by a subscription
 
 const PROFILES_KEY  = 'ostp_profiles_v1';
@@ -118,7 +120,7 @@ let activeId  = loadActiveId();
 
 // editor state
 let editingProfileId = null; // null = new profile
-let pendingLinkExtras = null; // tun/dns/owndns of a link opened in the editor, kept until Save
+let pendingLinkExtras = null; // tun/dns/owndns/dnsall of a link opened in the editor, kept until Save
 
 // ── DOM ───────────────────────────────────────────────────────────────
 const $ = id => document.getElementById(id);
@@ -211,6 +213,23 @@ function tlsFieldsFromEditor() {
     ws_path: pmWsPath.value.trim(),
   };
 }
+const pmDnsGroup  = $('pm-dns-group');
+const pmDnsChoice = $('pm-dns-choice');
+
+// "DNS of this server" is offered only for a profile whose link says the
+// server filters DNS; the editor cannot change that, so others do not see it.
+function setDnsChoiceField(p) {
+  pmDnsGroup.style.display = filtersDns(p) ? '' : 'none';
+  pmDnsChoice.value = ['operator', 'public', 'mine'].includes(p.dns_choice) ? p.dns_choice : '';
+}
+
+// Writes the select into the profile: empty means ask on the next connection.
+function applyDnsChoiceField(p) {
+  if (!filtersDns(p)) return;
+  if (pmDnsChoice.value) p.dns_choice = pmDnsChoice.value;
+  else delete p.dns_choice;
+}
+
 const btnProfileCancel = $('btn-profile-cancel');
 const btnProfileSave   = $('btn-profile-save');
 const btnProfileDelete = $('btn-profile-delete');
@@ -477,7 +496,7 @@ function buildConfig() {
       wintun_path: './wintun.dll',
       ipv4_address: '10.1.0.2/24',
       stack: 'ostp',
-      dns: s.dns || null,
+      dns: effectiveDns(active, s.dns),
       kill_switch: !!s.killSwitch && KILL_SWITCH_AVAILABLE,
     },
     exclude: {
@@ -492,6 +511,47 @@ function buildConfig() {
   };
   if (s.mtu) cfg.mtu = clampInt(s.mtu, 576, 1500, 1350);
   return cfg;
+}
+
+// ── DNS NOTICE ────────────────────────────────────────────────────────
+// Resolves to 'operator' | 'public' | 'mine' once the user has chosen. There
+// is no other way out: Escape and a click outside do nothing, and the buttons
+// stay disabled for the first seconds so the text is not skipped by accident.
+const DNS_NOTICE_SECONDS = 5;
+const DNS_NOTICE_BUTTONS = [
+  ['operator', "Use the operator's DNS"],
+  ['public', 'Use a public DNS'],
+  ['mine', 'Keep my settings'],
+];
+
+function askDnsNotice(profile) {
+  return new Promise(resolve => {
+    const modal = $('dns-notice-modal');
+    $('dns-notice-all').style.display = profile.dnsall ? '' : 'none';
+    const buttons = DNS_NOTICE_BUTTONS.map(([value, text]) => {
+      const b = document.querySelector(`#dns-notice-modal [data-dns-choice="${value}"]`);
+      b.onclick = () => finish(value);
+      return [b, text];
+    });
+    let left = DNS_NOTICE_SECONDS;
+    const paint = () => buttons.forEach(([b, text]) => {
+      b.disabled = left > 0;
+      b.textContent = left > 0 ? `${text} (${left})` : text;
+    });
+    const timer = setInterval(() => {
+      left -= 1;
+      paint();
+      if (left <= 0) { clearInterval(timer); buttons[0][0].focus(); }
+    }, 1000);
+    function finish(value) {
+      clearInterval(timer);
+      buttons.forEach(([b]) => { b.onclick = null; });
+      modal.classList.add('hidden');
+      resolve(value);
+    }
+    paint();
+    modal.classList.remove('hidden');
+  });
 }
 
 // ── CONNECT / DISCONNECT ──────────────────────────────────────────────
@@ -552,6 +612,13 @@ async function handleToggle() {
     if (!profiles.some(p => p.id === activeId)) {
       showError('No profile is selected. Open Settings and add or choose one.');
       return;
+    }
+    // A server that filters DNS is explained once, before the tunnel starts.
+    const asked = profiles.find(p => p.id === activeId);
+    if (shouldAskDnsNotice(asked)) {
+      const choice = await askDnsNotice(asked);
+      const cur = profiles.find(p => p.id === asked.id);
+      if (cur) { cur.dns_choice = choice; saveProfiles(profiles); }
     }
     const cfg = buildConfig();
     if (!cfg) { showError('The selected profile is not valid. Open Settings and check it.'); return; }
@@ -846,12 +913,14 @@ function openProfileEditor(id) {
     pmKey.value = p.key || '';
     pmTransport.value = p.transport || 'udp';
     setTlsFields(p);
+    setDnsChoiceField(p);
     btnProfileDelete.style.display = '';
   } else {
     profileModalTitle.textContent = 'New profile';
     pmName.value = pmServer.value = pmKey.value = '';
     pmTransport.value = 'udp';
     setTlsFields({});
+    setDnsChoiceField({});
     btnProfileDelete.style.display = 'none';
   }
   pmKey.type = 'password';
@@ -889,6 +958,7 @@ function saveProfileFromEditor() {
         transport: pmTransport.value,
         ...tlsFieldsFromEditor(),
       };
+      applyDnsChoiceField(profiles[idx]);
     }
   } else {
     const p = {
@@ -901,6 +971,7 @@ function saveProfileFromEditor() {
       ...pendingLinkExtras,
     };
     pendingLinkExtras = null;
+    applyDnsChoiceField(p);
     profiles.push(p);
     if (!activeId) { activeId = p.id; saveActiveId(activeId); }
   }
@@ -995,6 +1066,7 @@ function parseOstpLink(raw) {
     else if (k === 'tun') { if (truthy(v)) out.tun = true; }
     else if (k === 'dns') { if (v.trim()) out.dns = v.trim().slice(0, LIMITS.server); }
     else if (k === 'owndns') { if (truthy(v)) out.owndns = true; }
+    else if (k === 'dnsall') { if (truthy(v)) out.dnsall = true; }
     else if (k === 'name' && cleanName(v)) out.name = cleanName(v);
   }
   out.tls_sni = out.tls_sni.trim().slice(0, LIMITS.sni);
@@ -1013,13 +1085,14 @@ function importFromLink(raw) {
     // Pre-fill editor
     editingProfileId = null;
     pendingLinkExtras = {};
-    for (const k of ['tun', 'dns', 'owndns']) if (parsed[k]) pendingLinkExtras[k] = parsed[k];
+    for (const k of ['tun', 'dns', 'owndns', 'dnsall']) if (parsed[k]) pendingLinkExtras[k] = parsed[k];
     profileModalTitle.textContent = 'New profile';
     pmName.value = parsed.name;
     pmServer.value = parsed.server;
     pmKey.value = parsed.key;
     pmTransport.value = parsed.transport;
     setTlsFields(parsed);
+    setDnsChoiceField(parsed);
     btnProfileDelete.style.display = 'none';
     profileModal.classList.remove('hidden');
     showToast('Check the details, then press Save', 'ok');
@@ -1042,6 +1115,7 @@ function buildShareLink(p) {
   if (p.tun) params.push('tun=true');
   if (p.dns) params.push(`dns=${linkEncode(p.dns)}`);
   if (p.owndns) params.push('owndns=true');
+  if (p.dnsall) params.push('dnsall=true');
   if (p.name) params.push(`name=${linkEncode(p.name)}`);
   return `ostp://${linkEncode(p.key)}@${p.server}?${params.join('&')}`;
 }
@@ -1138,8 +1212,12 @@ function applySubscription(sub, doc) {
   const activeOld = old.find(p => p.id === activeId);
   const fresh = links.map((l, i) => {
     const prev = old.find(p => carrierOf(p) === carrierOf(l));
-    return { ...(prev || {}), ...l, id: prev ? prev.id : genId(), sub_id: sub.id,
+    const merged = { ...(prev || {}), ...l, id: prev ? prev.id : genId(), sub_id: sub.id,
              name: l.name || `${sub.name} · ${carrierOf(l).toUpperCase()}` };
+    // What the server says now wins; the user's dns_choice stays with the profile.
+    if (!l.owndns) delete merged.owndns;
+    if (!l.dnsall) delete merged.dnsall;
+    return merged;
   });
   // Profiles added by hand for the same key and carrier are what this
   // subscription now provides: keep one copy, the subscription's.
