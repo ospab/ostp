@@ -256,6 +256,9 @@ class SubscriptionStore {
         tlsInsecure: l.insecure,
         wsPath: l.path ?? '',
         subId: sub.id,
+        owndns: l.owndns,
+        dnsall: l.dnsall,
+        dnsChoice: prev?.dnsChoice ?? '',
       ));
     }
     // The active carrier vanished from the subscription: fall back to its best link.

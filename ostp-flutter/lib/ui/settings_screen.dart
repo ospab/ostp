@@ -4,6 +4,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'more_settings_screen.dart';
 import 'qr_scanner_screen.dart';
 import 'package:qr_flutter/qr_flutter.dart';
+import '../models/dns_notice.dart';
 import '../models/ostp_profile.dart';
 import '../models/share_link.dart';
 import '../models/subscription.dart';
@@ -308,6 +309,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
           tlsSni: l.sni ?? '',
           tlsInsecure: l.insecure,
           wsPath: l.path ?? '',
+          owndns: l.owndns,
+          dnsall: l.dnsall,
         ));
         _saveProfiles();
       });
@@ -416,6 +419,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
     bool tlsInsecure = profile?.tlsInsecure ?? false;
     final sniCtrl = TextEditingController(text: profile?.tlsSni ?? '');
     final wsPathCtrl = TextEditingController(text: profile?.wsPath ?? '');
+    String dnsChoice = dnsChoices.contains(profile?.dnsChoice) ? profile!.dnsChoice : '';
     bool obscureKey = true;
 
     showDialog(
@@ -513,6 +517,23 @@ class _SettingsScreenState extends State<SettingsScreen> {
                     value: ttlDesync,
                     onChanged: (v) => setDialogState(() => ttlDesync = v),
                   ),
+                  // Offered only for a server whose link says it filters DNS.
+                  if (filtersDns(profile)) ...[
+                    const SizedBox(height: 8),
+                    DropdownButtonFormField<String>(
+                      value: dnsChoice,
+                      decoration: const InputDecoration(labelText: 'DNS of this server'),
+                      items: const [
+                        DropdownMenuItem(value: '', child: Text('Ask on the next connection')),
+                        DropdownMenuItem(value: 'operator', child: Text("Operator's DNS")),
+                        DropdownMenuItem(value: 'public', child: Text('Public DNS')),
+                        DropdownMenuItem(value: 'mine', child: Text('My settings')),
+                      ],
+                      onChanged: (v) {
+                        if (v != null) setDialogState(() => dnsChoice = v);
+                      },
+                    ),
+                  ],
                 ],
               ),
             ),
@@ -584,6 +605,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                       profile.tlsSni = sniCtrl.text.trim();
                       profile.tlsInsecure = tlsInsecure;
                       profile.wsPath = wsPathCtrl.text.trim();
+                      if (filtersDns(profile)) profile.dnsChoice = dnsChoice;
                     }
                     _saveProfiles();
                   });
@@ -616,6 +638,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
       link.insecure = p.tlsInsecure;
     }
     link.path = p.wsPath.isEmpty ? null : p.wsPath;
+    link.owndns = p.owndns;
+    link.dnsall = p.dnsall;
     // Deliberately generic title — not "Share {name}": when a profile has no
     // custom name, `name` falls back to the raw server address, and this
     // dialog is exactly the wrong place to be casually displaying that

@@ -24,6 +24,14 @@ class OstpProfile {
   // are rewritten on every refresh of that subscription.
   String subId;
 
+  // Carried by the share link: the server runs its own resolver (owndns) or
+  // answers every DNS query and refuses DoT/DoH (dnsall). Kept for export and
+  // for the DNS notice. dnsChoice is what the user chose for such a server:
+  // '' (ask on the next connection), 'operator', 'public' or 'mine'.
+  bool owndns;
+  bool dnsall;
+  String dnsChoice;
+
   OstpProfile({
     required this.id,
     required this.name,
@@ -37,6 +45,9 @@ class OstpProfile {
     this.tlsInsecure = false,
     this.wsPath = '',
     this.subId = '',
+    this.owndns = false,
+    this.dnsall = false,
+    this.dnsChoice = '',
   });
 
   Map<String, dynamic> toJson() {
@@ -53,6 +64,9 @@ class OstpProfile {
       'tlsInsecure': tlsInsecure,
       'wsPath': wsPath,
       'subId': subId,
+      'owndns': owndns,
+      'dnsall': dnsall,
+      'dnsChoice': dnsChoice,
     };
   }
 
@@ -70,6 +84,9 @@ class OstpProfile {
       tlsInsecure: json['tlsInsecure'] as bool? ?? false,
       wsPath: json['wsPath'] as String? ?? '',
       subId: json['subId'] as String? ?? '',
+      owndns: json['owndns'] as bool? ?? false,
+      dnsall: json['dnsall'] as bool? ?? false,
+      dnsChoice: json['dnsChoice'] as String? ?? '',
     );
   }
 }

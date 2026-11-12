@@ -7,10 +7,12 @@ import 'package:flutter/services.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:package_info_plus/package_info_plus.dart';
 import '../models/connection_state_enum.dart';
+import '../models/dns_notice.dart';
 import '../models/ostp_profile.dart';
 import '../models/share_link.dart';
 import '../models/subscription.dart';
 import '../services/updates.dart' as updates;
+import 'dns_notice_dialog.dart';
 import 'prober_screen.dart';
 import 'settings_screen.dart';
 
@@ -205,8 +207,8 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin, 
     final mtu = (int.tryParse(widget.prefs.getString('mtu') ?? '') ?? 1140).clamp(576, 1500);
     final dnsServer = widget.prefs.getString('dns_server');
     // The VPN builder throws on anything but an IP literal, which would fail the start.
-    final effectiveDnsServer =
-        (dnsServer != null && InternetAddress.tryParse(dnsServer.trim()) != null) ? dnsServer.trim() : '1.1.1.1';
+    final effectiveDnsServer = effectiveDns(
+        p, (dnsServer != null && InternetAddress.tryParse(dnsServer.trim()) != null) ? dnsServer.trim() : null);
     const tunStack = 'ostp';
     final appRoutingMode = widget.prefs.getString('app_routing_mode') ?? 'bypass';
     final appRoutingPackages = widget.prefs.getStringList('app_routing_packages') ?? [];
@@ -314,6 +316,27 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin, 
           (widget.prefs.getStringList('app_routing_packages') ?? const []).isEmpty) {
         _snack('App routing is set to proxy but no apps are selected. Choose apps or switch the mode.');
         return;
+      }
+
+      // A server that filters DNS is explained once, before the tunnel starts.
+      if (shouldAskDnsNotice(profile)) {
+        _starting = true; // a second tap must not open a second dialog
+        String choice;
+        try {
+          choice = await askDnsNotice(context, dnsAll: profile.dnsall);
+        } finally {
+          _starting = false;
+        }
+        if (!mounted) return;
+        final stored = decodeProfiles(widget.prefs.getString('profiles_json'));
+        final mine = stored.where((p) => p.id == profile.id).firstOrNull;
+        if (mine != null) {
+          mine.dnsChoice = choice;
+          profile.dnsChoice = choice;
+          await widget.prefs.setString('profiles_json', encodeProfiles(stored));
+        }
+        _loadSettings();
+        if (_activeProfile?.id != profile.id) return; // the selection changed meanwhile: the user taps again
       }
 
       final configStr = jsonEncode(_buildConfigMap());

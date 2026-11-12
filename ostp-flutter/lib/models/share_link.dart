@@ -2,7 +2,7 @@
 /// Keep the two (and the desktop GUI's copy) in step: same parameters, same
 /// order, same encoding.
 ///
-/// `ostp://KEY@HOST:PORT?type=uot&tls=1&sni=..&insecure=1&path=%2F..&tun=true&dns=..&owndns=true&name=..`
+/// `ostp://KEY@HOST:PORT?type=uot&tls=1&sni=..&insecure=1&path=%2F..&tun=true&dns=..&owndns=true&dnsall=true&name=..`
 class ShareLink {
   String key;
   String host;
@@ -15,6 +15,7 @@ class ShareLink {
   bool tun;
   String? dns;
   bool owndns;
+  bool dnsall;
   String? name;
 
   ShareLink({
@@ -29,6 +30,7 @@ class ShareLink {
     this.tun = false,
     this.dns,
     this.owndns = false,
+    this.dnsall = false,
     this.name,
   });
 
@@ -112,6 +114,9 @@ class ShareLink {
         case 'owndns':
           link.owndns = _truthy(v);
           break;
+        case 'dnsall':
+          link.dnsall = _truthy(v);
+          break;
         case 'name':
           link.name = _nonEmpty(v);
           break;
@@ -139,6 +144,7 @@ class ShareLink {
     if (tun) q.add('tun=true');
     if (dns != null) q.add('dns=${_encode(dns!)}');
     if (owndns) q.add('owndns=true');
+    if (dnsall) q.add('dnsall=true');
     if (name != null) q.add('name=${_encode(name!)}');
     return 'ostp://${_encode(key)}@$server?${q.join('&')}';
   }

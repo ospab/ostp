@@ -72,6 +72,8 @@ class _WelcomeScreenState extends State<WelcomeScreen> {
           tlsSni: l.sni ?? '',
           tlsInsecure: l.insecure,
           wsPath: l.path ?? '',
+          owndns: l.owndns,
+          dnsall: l.dnsall,
         ));
         await widget.prefs.setString('profiles_json', encodeProfiles(profiles));
       }
