@@ -9,7 +9,7 @@ Older history is on the [Releases](https://github.com/ospab/ostp/releases) page 
 ## [Unreleased]
 
 ### Added
-- Docs: `v6-design.md`, the draft plan for protocol v6 / 0.5.0 (nothing in it is implemented).
+- Docs: `v6-design.md`, the draft plan for protocol v6 / 0.5.0, and `warp-design.md`, the draft plan for `ostp warp` (nothing in them is implemented).
 
 ## [0.4.7] - 2026-11-12
 
