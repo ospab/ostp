@@ -16,6 +16,7 @@ Older history is on the [Releases](https://github.com/ospab/ostp/releases) page 
 - Docs: `v6-design.md` and `v6-session-design.md`, the draft plans for protocol v6 / 0.5.0, and `warp-design.md`, the draft plan for `ostp warp` (nothing in them is implemented).
 - Desktop and Android apps: a notice on the first connection to a server that filters DNS (links with `owndns=true` or `dnsall=true`). It says that the operator's resolver filters domain names and sees the names looked up, and asks once per profile: the operator's DNS (10.1.0.1), a public DNS, or keep the app's settings. The buttons wait 5 seconds. The choice is kept with the profile and can be changed in the profile editor (*DNS of this server*).
 - Both apps keep and re-export the `dnsall` flag of share and subscription links (Android now also keeps `owndns`).
+- Docs: `carriers-design.md`, a draft study of carrying OSTP inside WebSocket, QUIC/HTTP3, WebRTC, ICMP and HTTPS long-poll: costs, what censors are known to do, and a recommended order (nothing in it is implemented).
 
 ## [0.4.7] - 2026-11-12
 
