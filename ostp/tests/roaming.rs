@@ -62,6 +62,7 @@ async fn start_server_on(binds: Vec<SocketAddr>) -> SocketAddr {
         tls: None,
         subscription: None,
         overnet: None,
+        warp: None,
         // The echo target listens on this machine's loopback.
         local_access: true,
     };

@@ -9,6 +9,7 @@ mod sub_cmd;
 mod panel_cmd;
 mod dns_cmd;
 mod overnet_cmd;
+mod warp_cmd;
 mod changelog_cmd;
 mod manage_cmd;
 mod service_cmd;
@@ -114,6 +115,11 @@ enum Commands {
     Overnet {
         #[command(subcommand)]
         action: overnet_cmd::OvernetAction,
+    },
+    /// Cloudflare WARP as this server's exit: register, enable, status, test (server only)
+    Warp {
+        #[command(subcommand)]
+        action: warp_cmd::WarpAction,
     },
     /// Server state and everyday changes as JSON, for the desktop app (server only)
     #[command(hide = true)]
@@ -990,6 +996,7 @@ fn run_setup_wizard(config_path: &std::path::Path) -> Result<Option<PathBuf>> {
                 },
                 "fallback": { "enabled": false, "listen": "0.0.0.0:443", "target": "127.0.0.1:8080" },
                 "overnet": serde_json::to_value(ostp_server::OvernetConfig::default()).unwrap_or_default(),
+                "warp": serde_json::to_value(ostp_server::warp::WarpConfig::default()).unwrap_or_default(),
                 "debug": false
             });
             if let Some(ip) = &bind_ip {
@@ -1084,6 +1091,7 @@ fn run_setup_wizard(config_path: &std::path::Path) -> Result<Option<PathBuf>> {
                 },
                 "fallback": { "enabled": false, "listen": "0.0.0.0:443", "target": "127.0.0.1:8080" },
                 "overnet": serde_json::to_value(ostp_server::OvernetConfig::default()).unwrap_or_default(),
+                "warp": serde_json::to_value(ostp_server::warp::WarpConfig::default()).unwrap_or_default(),
                 "debug": false
             });
             if let Some(ip) = &bind_ip {
@@ -1274,6 +1282,7 @@ async fn run_app() -> Result<()> {
             Commands::Manage { action } => manage_cmd::run(action, &args.config),
             Commands::Dns { action } => return dns_cmd::run(action, &args.config).await,
             Commands::Overnet { action } => return overnet_cmd::run(action, &args.config),
+            Commands::Warp { action } => return warp_cmd::run(action, &args.config).await,
             Commands::Start => return service_cmd::run(service_cmd::Action::Start),
             Commands::Stop => return service_cmd::run(service_cmd::Action::Stop),
             Commands::Restart => return service_cmd::run(service_cmd::Action::Restart),
@@ -1511,6 +1520,7 @@ async fn run_app() -> Result<()> {
                         } else {
                             println!("  overnet: disabled (.ov sites for clients: ostp overnet install, then ostp overnet enable)");
                         }
+                        warp_cmd::print_check_line(s.warp.clone())?;
                     }
                     AppMode::Client(c) => {
                         println!("{} Config OK: client mode", "[ostp]".green().bold());
@@ -1623,6 +1633,16 @@ async fn run_app() -> Result<()> {
     "gateway": "127.0.0.1:9150",
     "exit": false,
     "exit_listen": "127.0.0.1:9151"
+  }},
+
+  // Cloudflare WARP as this server's exit (a WireGuard client inside this
+  // process, reached through a local SOCKS5 proxy). Off until you turn it on:
+  // `ostp warp register --accept-terms`, then `ostp warp enable --all`.
+  "warp": {{
+    "enabled": false,
+    "mode": "rules",
+    "listen": "127.0.0.1:40000",
+    "endpoint": ""
   }},
 
   "debug": false
@@ -1843,6 +1863,11 @@ async fn run_app() -> Result<()> {
                 .map(serde_json::from_value)
                 .transpose()
                 .map_err(|e| anyhow!("Invalid 'overnet' section in server config: {e}"))?;
+            let warp_cfg: Option<ostp_server::warp::WarpConfig> = server_cfg
+                .warp
+                .map(serde_json::from_value)
+                .transpose()
+                .map_err(|e| anyhow!("Invalid 'warp' section in server config: {e}"))?;
             ostp_server::run_server(ostp_server::ServerParams {
                 bind_addrs: listen_addrs,
                 server_public_ip: Some(host),
@@ -1857,6 +1882,7 @@ async fn run_app() -> Result<()> {
                 tls,
                 subscription,
                 overnet: overnet_cfg,
+                warp: warp_cfg,
                 local_access: server_cfg.local_access,
             })
             .await?;
