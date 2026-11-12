@@ -1,6 +1,6 @@
 //! `ostp://` share-link codec, shared by the CLI and the server's subscribe API.
 //!
-//! `ostp://KEY@HOST:PORT?type=uot&tls=1&sni=..&insecure=1&path=%2F..&tun=true&dns=..&owndns=true&name=..`
+//! `ostp://KEY@HOST:PORT?type=uot&tls=1&sni=..&insecure=1&path=%2F..&tun=true&dns=..&owndns=true&dnsall=true&name=..`
 //!
 //! The Dart (Android) and JS (desktop GUI) ports must stay in step with this;
 //! the vectors in the tests below are the shared reference.
@@ -40,6 +40,10 @@ pub struct ShareLink {
     pub tun: bool,
     pub dns: Option<String>,
     pub owndns: bool,
+    /// The server answers every DNS query in the tunnel, whichever resolver it
+    /// was sent to, and refuses encrypted DNS (the operator's choice, declared
+    /// here so apps can say so before the first connection).
+    pub dnsall: bool,
     pub name: Option<String>,
 }
 
@@ -57,6 +61,7 @@ impl ShareLink {
             tun: false,
             dns: None,
             owndns: false,
+            dnsall: false,
             name: None,
         }
     }
@@ -137,6 +142,7 @@ impl ShareLink {
                 "tun" => link.tun = truthy(&v),
                 "dns" => link.dns = non_empty(v),
                 "owndns" => link.owndns = truthy(&v),
+                "dnsall" => link.dnsall = truthy(&v),
                 "name" => link.name = non_empty(v),
                 _ => {}
             }
@@ -170,6 +176,9 @@ impl ShareLink {
         }
         if self.owndns {
             q.push("owndns=true".into());
+        }
+        if self.dnsall {
+            q.push("dnsall=true".into());
         }
         if let Some(name) = &self.name {
             q.push(format!("name={}", encode(name)));
@@ -238,10 +247,10 @@ mod tests {
 
     #[test]
     fn full_tls_link_round_trips() {
-        let uri = "ostp://k1@vpn.example.com:443?type=uot&tls=1&sni=cdn.example.com&insecure=1&path=%2Fs3cr3t&tun=true&dns=1.1.1.1&owndns=true&name=My%20VPN";
+        let uri = "ostp://k1@vpn.example.com:443?type=uot&tls=1&sni=cdn.example.com&insecure=1&path=%2Fs3cr3t&tun=true&dns=1.1.1.1&owndns=true&dnsall=true&name=My%20VPN";
         let l = ShareLink::parse(uri).unwrap();
         assert_eq!(l.transport, LinkTransport::Uot);
-        assert!(l.tls && l.insecure && l.tun && l.owndns);
+        assert!(l.tls && l.insecure && l.tun && l.owndns && l.dnsall);
         assert_eq!(l.sni.as_deref(), Some("cdn.example.com"));
         assert_eq!(l.path.as_deref(), Some("/s3cr3t"));
         assert_eq!(l.dns.as_deref(), Some("1.1.1.1"));

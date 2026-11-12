@@ -458,7 +458,7 @@ function buildConfig() {
   const s = loadClientSettings();
   const cfg = {
     mode: 'client',
-    config_version: 4,
+    config_version: 5,
     server: active.server,
     access_key: active.key,
     socks5_bind: s.socks || null,

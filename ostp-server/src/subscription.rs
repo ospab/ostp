@@ -146,6 +146,7 @@ impl SubscriptionService {
 
     pub async fn document(&self, key: &str) -> SubscriptionDoc {
         let owndns = self.dns.enabled();
+        let dnsall = self.dns.settings().intercept_all_port53;
         let user = self
             .keys
             .read()
@@ -162,11 +163,13 @@ impl SubscriptionService {
         if let (true, Some(t)) = (self.settings.include_tls, &self.tls) {
             let mut l = ShareLink::tls_for(key, &t.host, t.port, t.path.clone(), owndns);
             l.name = Some(title("TLS"));
+            l.dnsall = dnsall;
             links.push(l.to_uri());
         }
         if self.settings.include_udp {
             let mut l = ShareLink::udp_for(key, &self.udp.0, self.udp.1, owndns);
             l.name = Some(title("UDP"));
+            l.dnsall = dnsall;
             links.push(l.to_uri());
         }
 

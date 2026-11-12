@@ -22,7 +22,7 @@ use serde_json::{json, Map, Value};
 /// - `1`: flat configs up to 0.4.5, no version stamp; may carry settings of
 ///   features that no longer exist.
 /// - `2`: 0.4.6+, stamped `config_version`.
-pub const CURRENT_VERSION: u32 = 4;
+pub const CURRENT_VERSION: u32 = 5;
 
 /// Which config this file is (mirrors `AppMode`'s `"mode"` tag). Old configs
 /// from before that tag existed are sniffed structurally as a fallback.
@@ -86,6 +86,7 @@ const STEPS: &[Step] = &[
     Step { kind: ConfigKind::Relay, from: 1, title: "remove relay-side authentication settings", run: relay_drop_auth },
     Step { kind: ConfigKind::Server, from: 2, title: "add the overnet section (off)", run: server_add_overnet },
     Step { kind: ConfigKind::Client, from: 3, title: "remove junk packets and TCP fragmentation", run: client_drop_junk_frag },
+    Step { kind: ConfigKind::Server, from: 4, title: "keep taking over all DNS where the filter is on", run: server_keep_dns_takeover },
 ];
 
 fn remove_with_reason(obj: &mut Map<String, Value>, path: &str, key: &str, reason: &str, notes: &mut Vec<String>) {
@@ -238,6 +239,21 @@ fn server_add_overnet(v: &mut Value, notes: &mut Vec<String>) {
         "exit_listen": "127.0.0.1:9151",
     });
     notes.push("added overnet (off): .ov sites for clients with `ostp overnet install` and `ostp overnet enable`".into());
+}
+
+/// Before 0.5.0 a server with `dns.enabled` answered every client's port-53 query
+/// and refused encrypted DNS. The default is now to answer only queries sent to
+/// the server's own address; an existing server keeps what it did, spelled out.
+fn server_keep_dns_takeover(v: &mut Value, notes: &mut Vec<String>) {
+    let Some(dns) = v.get_mut("dns").and_then(|d| d.as_object_mut()) else { return };
+    if dns.get("enabled").and_then(|e| e.as_bool()) != Some(true) {
+        return;
+    }
+    if dns.get("intercept_all_port53").and_then(|e| e.as_bool()) == Some(true) {
+        return;
+    }
+    dns.insert("intercept_all_port53".into(), json!(true));
+    notes.push("dns.intercept_all_port53 = true: this server keeps answering every client's DNS query and refusing encrypted DNS, as before. New servers answer only queries sent to their own address (10.1.0.1); turn it off with `ostp dns takeover off` to let clients choose their resolver".into());
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -667,5 +683,28 @@ mod tests {
         // Clients have no step for v3; the v4 step finds nothing to remove.
         let m = migrate(json!({ "mode": "client", "config_version": 2, "server": "h:1", "access_key": "k" })).unwrap();
         assert!(m.steps.iter().all(|s| s.notes.is_empty()), "{:?}", m.steps.iter().map(|s| &s.notes).collect::<Vec<_>>());
+    }
+
+    /// A server that filtered DNS before 0.5.0 answered every query; it keeps doing so
+    /// until its owner turns that off, and says so in the file.
+    #[test]
+    fn a_dns_filter_keeps_its_takeover_and_a_plain_server_gets_none() {
+        let m = migrate(json!({
+            "mode": "server", "config_version": 4, "listen": "0.0.0.0:50000", "access_keys": ["k"],
+            "dns": { "enabled": true },
+        }))
+        .unwrap();
+        assert_eq!(m.output["dns"]["intercept_all_port53"], true);
+        let m = migrate(json!({
+            "mode": "server", "config_version": 4, "listen": "0.0.0.0:50000", "access_keys": ["k"],
+            "dns": { "enabled": false },
+        }))
+        .unwrap();
+        assert!(m.output["dns"].get("intercept_all_port53").is_none());
+        let m = migrate(json!({
+            "mode": "server", "config_version": 4, "listen": "0.0.0.0:50000", "access_keys": ["k"],
+        }))
+        .unwrap();
+        assert!(m.output.get("dns").is_none());
     }
 }

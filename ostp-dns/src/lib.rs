@@ -197,6 +197,9 @@ impl Cache {
     }
 }
 
+/// The server as its clients see it inside the tunnel.
+pub const SERVER_TUNNEL_ADDR: &str = "10.1.0.1";
+
 pub struct Dns {
     settings: RwLock<Arc<DnsSettings>>,
     filter: RwLock<Arc<Filter>>,
@@ -395,21 +398,25 @@ impl Dns {
 
     /// Whether a client's connection (TCP or UDP) to `target` is encrypted DNS
     /// that would skip the filter: anything to port 853 (DoT, DoQ), and port
-    /// 443 on a public resolver's address (DoH, DoH over QUIC). Refused while
-    /// filtering is on and `block_doh_bypass` is set; DoH servers reached by
-    /// name are blocked by the resolver itself.
+    /// 443 on a public resolver's address (DoH, DoH over QUIC). Refused only
+    /// while filtering is on and the operator took over all DNS
+    /// (`intercept_all_port53`) with `block_doh_bypass` set; DoH servers
+    /// reached by name are blocked by the resolver itself under the same rule.
     pub fn is_dns_bypass(&self, target: &str) -> bool {
         let s = self.settings();
-        if !s.enabled || !s.block_doh_bypass {
+        if !s.enabled || !s.refuses_encrypted_dns() {
             return false;
         }
         is_encrypted_dns_target(target)
     }
 
-    /// Whether the server should answer its clients' port-53 queries.
-    pub fn intercepts(&self) -> bool {
+    /// Whether the server should answer a client's port-53 query sent to
+    /// `target` ("host:53"): always for the server's own address, for any
+    /// other resolver only when the operator took over all DNS.
+    pub fn answers(&self, target: &str) -> bool {
         let s = self.settings();
-        s.enabled || s.intercept_all_port53
+        let own = target.rsplit_once(':').is_some_and(|(host, _)| host == SERVER_TUNNEL_ADDR);
+        (s.enabled && own) || s.intercept_all_port53
     }
 
     /// DoH and list downloads through the outbound proxy (e.g. socks5h://).
@@ -585,7 +592,7 @@ impl Dns {
                 return ex(Outcome::SafeSearch, format!("safe search: answered with {t}"), None, None);
             }
         }
-        if s.block_doh_bypass && (name == services::DOH_CANARY || services::DOH_HOSTS.contains(&name.as_str())) {
+        if s.refuses_encrypted_dns() && (name == services::DOH_CANARY || services::DOH_HOSTS.contains(&name.as_str())) {
             return ex(Outcome::Blocked, "a browser's own DNS over HTTPS: blocked so queries stay here".into(), None, Some("built-in".into()));
         }
         if let Some(svc) = services::service_of(&name, &s.blocked_services) {
@@ -757,7 +764,7 @@ impl Dns {
                 return self.cname_reply(&q, t).await;
             }
         }
-        if s.block_doh_bypass && (name == services::DOH_CANARY || services::DOH_HOSTS.contains(&name.as_str())) {
+        if s.refuses_encrypted_dns() && (name == services::DOH_CANARY || services::DOH_HOSTS.contains(&name.as_str())) {
             self.record(entry(Outcome::Blocked, Some("browser DNS over HTTPS".into()), Some("built-in".into()), None), None);
             return with_rcode(&q, RCODE::NameError);
         }
@@ -931,7 +938,12 @@ mod tests {
         let a = dns.handle(&query("v16.tiktokcdn.com", TYPE::A), me).await.unwrap();
         assert_eq!(rcode(&a), 3, "blocked service");
         let a = dns.handle(&query(services::DOH_CANARY, TYPE::A), me).await.unwrap();
-        assert_eq!(rcode(&a), 3, "Firefox canary");
+        assert_eq!(rcode(&a), 0, "Firefox canary is left alone while the operator has not taken over all DNS");
+        let mut s = settings(fake_upstream().await);
+        s.intercept_all_port53 = true;
+        let taken = Dns::new(s, None);
+        let a = taken.handle(&query(services::DOH_CANARY, TYPE::A), me).await.unwrap();
+        assert_eq!(rcode(&a), 3, "Firefox canary under a takeover");
 
         let a = dns.handle(&query("cdn.clean.test", TYPE::A), me).await.unwrap();
         assert_eq!(rcode(&a), 3, "CNAME to a blocked name");
@@ -980,11 +992,29 @@ mod tests {
     }
 
     #[test]
+    fn answers_only_its_own_address_unless_the_operator_took_all_dns() {
+        let mut s = DnsSettings::default();
+        let dns = Dns::new(s.clone(), None);
+        assert!(!dns.answers("10.1.0.1:53"), "filter off, nothing taken over");
+        s.enabled = true;
+        let dns = Dns::new(s.clone(), None);
+        assert!(dns.answers("10.1.0.1:53"));
+        assert!(!dns.answers("1.1.1.1:53"), "another resolver is left alone");
+        assert!(!dns.answers("[2606:4700::1111]:53"));
+        s.intercept_all_port53 = true;
+        let dns = Dns::new(s, None);
+        assert!(dns.answers("1.1.1.1:53"), "explicit takeover answers every query");
+    }
+
+    #[test]
     fn encrypted_dns_to_public_resolvers() {
         let mut s = DnsSettings::default();
         let dns = Dns::new(s.clone(), None);
         assert!(!dns.is_dns_bypass("1.1.1.1:853"), "filter off: nothing refused");
         s.enabled = true;
+        let dns = Dns::new(s.clone(), None);
+        assert!(!dns.is_dns_bypass("1.1.1.1:853"), "own-address policy: nothing is refused");
+        s.intercept_all_port53 = true;
         let dns = Dns::new(s.clone(), None);
         assert!(dns.is_dns_bypass("1.1.1.1:853"));
         assert!(dns.is_dns_bypass("8.8.8.8:443"));

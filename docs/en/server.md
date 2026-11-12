@@ -92,15 +92,17 @@ Every 30 seconds the server writes per-user traffic to `.ostp_stats.json` next t
 
 A filtering resolver for clients connected to the server (the `ostp-dns` crate): ad and tracker blocking by lists, your own rules and names, much like AdGuard Home. It is not a DNS tunnel and does not carry OSTP traffic.
 
-**It is not reachable from outside.** There is no separate port: the resolver only answers queries that arrive through the tunnel. With filtering on, everything a client resolves goes through it:
+**It is not reachable from outside.** There is no separate port: the resolver only answers queries that arrive through the tunnel. By default it answers only queries sent to the server's own address, `10.1.0.1`: a client gets the filter by using that address as its DNS server (the apps offer it on the first connection), and every other resolver it asks is left alone. The operator can take over all DNS instead (`ostp dns takeover on`); links and subscriptions then carry `dnsall=true`, so apps say so before the first connection. With takeover on, everything a client resolves goes through the resolver:
 
 | How the client looks a name up | What the server does |
 |---|---|
-| UDP to any address `:53` (TUN mode) | intercepts and answers itself |
-| TCP to any address `:53` | redirects it to the resolver's local DNS-over-TCP |
-| DNS-over-TLS / DNS-over-QUIC (`:853`, TCP and UDP) | the connection is refused and the app falls back to plain DNS (with `doh-bypass on`) |
-| Encrypted DNS to a public resolver's address (1.1.1.1, 8.8.8.8, Quad9, AdGuard, OpenDNS, Yandex… on `:443`, TCP and QUIC) | refused (with `doh-bypass on`). Android ("Private DNS: automatic") and Chrome switch to encrypted DNS by themselves when the system DNS is 1.1.1.1 or 8.8.8.8, and nearly everything would pass the filter |
-| A browser's DoH | the `use-application-dns.net` canary gets NXDOMAIN and known DoH hosts are blocked (with `doh-bypass on`) |
+| UDP to `10.1.0.1:53` | answers itself |
+| UDP to any other address `:53` (TUN mode) | answers itself with takeover on; otherwise passes it through |
+| TCP to `10.1.0.1:53` | redirects it to the resolver's local DNS-over-TCP |
+| TCP to any other address `:53` | the same with takeover on; otherwise passes it through |
+| DNS-over-TLS / DNS-over-QUIC (`:853`, TCP and UDP) | the connection is refused and the app falls back to plain DNS (with takeover and `doh-bypass on`) |
+| Encrypted DNS to a public resolver's address (1.1.1.1, 8.8.8.8, Quad9, AdGuard, OpenDNS, Yandex… on `:443`, TCP and QUIC) | refused (with takeover and `doh-bypass on`). Android ("Private DNS: automatic") and Chrome switch to encrypted DNS by themselves when the system DNS is 1.1.1.1 or 8.8.8.8, and nearly everything would pass the filter |
+| A browser's DoH | the `use-application-dns.net` canary gets NXDOMAIN and known DoH hosts are blocked (with takeover and `doh-bypass on`) |
 | SOCKS/proxy by name (`CONNECT host:port`) | the name is resolved by the same resolver: a blocked name is refused, a rewritten one goes to its address. With the outbound proxy on, the name is passed to it as is, but blocking still applies |
 
 The pipeline for a name: rewrites → other `*.ostp` names get NXDOMAIN → safe search → DoH bypass blocking → blocked services → lists and your rules → cache → upstream → CNAME check (trackers hidden behind a first-party name are caught by the CNAME target).
@@ -121,7 +123,8 @@ ostp dns rule add '||ads.*^$important'   # your own rules, adblock or hosts synt
 ostp dns rewrite add panel.ostp 10.1.0.1 # your own names; *.lan for every subdomain
 ostp dns service block tiktok            # whole services; ostp dns service list shows them
 ostp dns safesearch on                   # Google, YouTube, Bing, DuckDuckGo, Yandex
-ostp dns doh-bypass on|off               # keep browsers from bypassing the filter with their own DoH/DoT
+ostp dns takeover on|off                 # answer every query, not only those sent to 10.1.0.1; clients are told in links
+ostp dns doh-bypass on|off               # keep browsers from bypassing the filter with their own DoH/DoT (only with takeover on)
 ostp dns mode nxdomain|null_ip|refused   # what a blocked name gets
 ostp dns upstream add tls://dns.quad9.net   # https://…/dns-query, tls://, tcp://, udp:// or an IP
 ostp dns upstream mode fallback|parallel

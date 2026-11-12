@@ -42,7 +42,7 @@ Run by CI or by the developer before the manual run.
 | S-01 | Fresh install with `install.sh`, then `ostp setup` in Server mode | the `ostp` service is active, `ostp links` prints working links | P1 |
 | S-02 | `ostp update --branch beta` on a server running the previous version | new version, service restarted, keys and settings kept | P1 |
 | S-03 | `ostp migrate --dry-run` on configs from 0.4.5 and older (modular v0, flat v1) | steps, changes and unknown keys with suggestions are printed; the file is untouched | P1 |
-| S-04 | `ostp migrate` on the same configs | `config_version: 4`, `access_keys` and `api.token` kept, the server starts | P1 |
+| S-04 | `ostp migrate` on the same configs | `config_version: 5`, `access_keys` and `api.token` kept, the server starts | P1 |
 | S-05 | A config newer than supported (`config_version: 99`) | migrate refuses and leaves the file alone | P2 |
 | S-06 | `ostp check` on a valid and a broken config | "Config OK" / a clear error naming the field | P1 |
 | S-07 | Add a key to `config.json` of a running server | within ~5 s the new key connects, no restart | P1 |

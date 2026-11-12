@@ -411,7 +411,9 @@ tr:last-child td { border-bottom: 0; }
         <div class="card">
           <h3 data-t="dns_options">Options</h3>
           <label class="chk"><input type="checkbox" id="dns-safe"> <span data-t="dns_safe">Safe search (Google, YouTube, Bing, DuckDuckGo, Yandex)</span></label>
-          <label class="chk" style="margin-top:8px"><input type="checkbox" id="dns-doh"> <span data-t="dns_doh">Stop browsers' own DNS over HTTPS/TLS</span></label>
+          <label class="chk" style="margin-top:8px"><input type="checkbox" id="dns-takeover"> <span data-t="dns_takeover">Answer every DNS query, not only those sent to this server</span></label>
+          <div class="muted small" data-t="dns_takeover_hint">Off: clients that use this server's address (10.1.0.1) as DNS get filtering, others keep their resolver. On: the choice of resolver is taken from all clients; their apps say so before the first connection.</div>
+          <label class="chk" style="margin-top:8px"><input type="checkbox" id="dns-doh"> <span data-t="dns_doh">Stop browsers' own DNS over HTTPS/TLS (needs the option above)</span></label>
           <div class="row" style="margin-top:10px"><label class="lbl" style="margin:0;min-width:140px" for="dns-blocking" data-t="dns_blocking">Blocked names get</label>
             <select class="input" id="dns-blocking" style="max-width:220px"><option value="nxdomain">NXDOMAIN</option><option value="null_ip">0.0.0.0 / ::</option><option value="refused">REFUSED</option></select></div>
           <div class="row" style="margin-top:8px"><label class="lbl" style="margin:0;min-width:140px" for="dns-interval" data-t="dns_interval">Update lists every, h</label><input class="input" id="dns-interval" type="number" min="1" max="8760" style="max-width:120px"></div>
@@ -620,7 +622,7 @@ const I18N = {
     dns_log: 'Query log', dns_more: 'Show more', dns_filter: 'domain or client', dns_time: 'Time', dns_client: 'Client', dns_domain: 'Domain', dns_result: 'Result',
     dns_upstreams: 'Upstream resolvers', dns_upstreams_help: 'One per line: https://…/dns-query, tls://host, tcp://ip, udp://ip or an IP.',
     dns_mode: 'Mode', dns_fallback: 'In order', dns_parallel: 'Parallel, fastest wins', dns_options: 'Options',
-    dns_safe: 'Safe search (Google, YouTube, Bing, DuckDuckGo, Yandex)', dns_doh: "Stop browsers' own DNS over HTTPS/TLS",
+    dns_safe: 'Safe search (Google, YouTube, Bing, DuckDuckGo, Yandex)', dns_doh: "Stop browsers' own DNS over HTTPS/TLS (needs the option above)", dns_takeover: 'Answer every DNS query, not only those sent to this server', dns_takeover_hint: "Off: clients that use this server's address (10.1.0.1) as DNS get filtering, others keep their resolver. On: the choice of resolver is taken from all clients; their apps say so before the first connection.",
     dns_blocking: 'Blocked names get', dns_interval: 'Update lists every, h', dns_cache: 'Cache entries', dns_lists: 'Block lists',
     dns_add: 'Add', dns_allowlist: 'allow list', dns_rules_own: 'Your rules',
     dns_rules_help: '||domain^ blocks it with subdomains, @@ allows, $important wins over exceptions, * is a wildcard, hosts lines work.',
@@ -729,7 +731,7 @@ const I18N = {
     dns_log: 'Журнал запросов', dns_more: 'Показать ещё', dns_filter: 'домен или клиент', dns_time: 'Время', dns_client: 'Клиент', dns_domain: 'Домен', dns_result: 'Итог',
     dns_upstreams: 'Вышестоящие серверы', dns_upstreams_help: 'По одному в строке: https://…/dns-query, tls://хост, tcp://ip, udp://ip или IP.',
     dns_mode: 'Режим', dns_fallback: 'По очереди', dns_parallel: 'Параллельно, кто быстрее', dns_options: 'Настройки',
-    dns_safe: 'Безопасный поиск (Google, YouTube, Bing, DuckDuckGo, Яндекс)', dns_doh: 'Не давать браузерам свой DNS over HTTPS/TLS',
+    dns_safe: 'Безопасный поиск (Google, YouTube, Bing, DuckDuckGo, Яндекс)', dns_doh: 'Не давать браузерам свой DNS over HTTPS/TLS (нужна опция выше)', dns_takeover: 'Отвечать на любые DNS-запросы, а не только на посланные этому серверу', dns_takeover_hint: 'Выключено: клиенты, у которых DNS — адрес этого сервера (10.1.0.1), получают фильтрацию, остальные сохраняют свой резолвер. Включено: выбор резолвера отбирается у всех клиентов; их приложения говорят об этом перед первым подключением.',
     dns_blocking: 'Ответ на блокировку', dns_interval: 'Обновлять списки, ч', dns_cache: 'Размер кэша', dns_lists: 'Списки блокировки',
     dns_add: 'Добавить', dns_allowlist: 'список разрешений', dns_rules_own: 'Свои правила',
     dns_rules_help: '||домен^ блокирует его с поддоменами, @@ разрешает, $important сильнее исключений, * — шаблон, строки hosts тоже работают.',
@@ -1471,6 +1473,7 @@ function renderDnsSettings() {
   $('dns-upstreams-edit').value = s.upstreams.join('\n');
   $('dns-upstream-mode').value = s.upstream_mode;
   $('dns-safe').checked = s.safe_search;
+  $('dns-takeover').checked = s.intercept_all_port53;
   $('dns-doh').checked = s.block_doh_bypass;
   $('dns-blocking').value = s.blocking_mode;
   $('dns-interval').value = s.update_interval_hours;
@@ -1494,7 +1497,7 @@ function renderDnsSettings() {
 
 // Typing in the settings form marks it as edited, so a reload does not wipe it.
 let dnsEdits = 0; // counts edits, so a save can tell whether the form changed while it was in flight
-const dnsMark = e => { if (e.target.closest('#dns-upstreams-edit, #dns-upstream-mode, #dns-safe, #dns-doh, #dns-blocking, #dns-interval, #dns-cache, #dns-rules-edit, #dns-lists, #dns-services')) { dnsDirty = true; dnsEdits++; } };
+const dnsMark = e => { if (e.target.closest('#dns-upstreams-edit, #dns-upstream-mode, #dns-safe, #dns-takeover, #dns-doh, #dns-blocking, #dns-interval, #dns-cache, #dns-rules-edit, #dns-lists, #dns-services')) { dnsDirty = true; dnsEdits++; } };
 $('page-dns').addEventListener('input', dnsMark);
 $('page-dns').addEventListener('change', dnsMark);
 
@@ -1508,6 +1511,7 @@ function collectDns() {
   s.upstreams = $('dns-upstreams-edit').value.split('\n').map(x => x.trim()).filter(Boolean);
   s.upstream_mode = $('dns-upstream-mode').value;
   s.safe_search = $('dns-safe').checked;
+  s.intercept_all_port53 = $('dns-takeover').checked;
   s.block_doh_bypass = $('dns-doh').checked;
   s.blocking_mode = $('dns-blocking').value;
   s.update_interval_hours = interval;

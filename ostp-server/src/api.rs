@@ -1080,6 +1080,7 @@ async fn handle_user_share(
         None => return api_error("user not found"),
     };
     let owndns = state.dns_server.enabled();
+    let dnsall = state.dns_server.settings().intercept_all_port53;
 
     use ostp_core::share_link::ShareLink;
     let title = |kind: &str| match &name {
@@ -1088,9 +1089,11 @@ async fn handle_user_share(
     };
     let mut udp = ShareLink::udp_for(&key, &state.server_host, state.server_port, owndns);
     udp.name = Some(title("UDP"));
+    udp.dnsall = dnsall;
     let tls = state.tls_link.as_ref().map(|t| {
         let mut l = ShareLink::tls_for(&key, &t.host, t.port, t.path.clone(), owndns);
         l.name = Some(title("TLS"));
+        l.dnsall = dnsall;
         l.to_uri()
     });
     let subscription = match (&state.subscription_prefix, &state.tls_link) {
