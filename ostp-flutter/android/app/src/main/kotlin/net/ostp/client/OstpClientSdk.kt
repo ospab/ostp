@@ -63,10 +63,15 @@ object OstpClientSdk {
     @JvmStatic
     external fun runProberDpiBattery(): String
 
-    /** Subscription document as JSON, or {"error": ...}. Blocking: call off the UI thread. */
+    /**
+     * Subscription document as JSON, or {"error": ...}. Blocking: call off the UI thread.
+     * With [sendHwid] false the other three arguments are ignored and nothing about the
+     * device is sent. With it true the core derives the per-server identifier from
+     * [androidId] (the id itself is never sent) and sends [os] and [model] as text.
+     */
     @Keep
     @JvmStatic
-    external fun fetchSubscription(url: String): String
+    external fun fetchSubscription(url: String, sendHwid: Boolean, androidId: String, os: String, model: String): String
 
     /** Release tag of this build, e.g. "v0.4.6-beta.2". */
     @Keep

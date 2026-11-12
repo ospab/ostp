@@ -19,7 +19,7 @@ Run by CI or by the developer before the manual run.
 | A-02 | `cargo test -p ostp --bin ostp` (nginx/apache/caddy templates, CLI) | green | P1 |
 | A-03 | `cargo test -p ostp-jni` (every Kotlin `external fun` has a JNI export) | green | P1 |
 | A-04 | `flutter analyze lib` | no `error` | P1 |
-| A-05 | `node --check ostp-gui/src/main.js` and `servers.js` | no errors | P1 |
+| A-05 | `node --check ostp-gui/src/main.js`, `servers.js` and `device_limit.js` | no errors | P1 |
 | A-05a | `flutter test test/servers_ui_test.dart` (first-run and server screens on a phone-sized view) | green, no overflow errors | P1 |
 | A-05b | `sudo cargo test -p ostp-ssh --test sshd -- --ignored --test-threads=1` on a throwaway machine with sshd (with `OSTP_BIN=target/debug/ostp` for the manager test) | green: key and password sign-in, sudo, host-key change refused, port forward, `ostp manage` over SSH | P2 |
 | A-06 | `cargo tree -i aws-lc-sys` at the root and in `ostp-gui/src-tauri` | empty | P1 |
@@ -170,6 +170,8 @@ Repeat for nginx, apache (Debian and RHEL) and caddy.
 | G-26 | Restart, update or reboot while connected through that server | refused with "Disconnect first"; after disconnecting it works | P2 |
 | G-27 | "Remember" off, restart the app, open the server | the password or key is asked for; with it on it is not; `servers.json` holds no secret in clear | P2 |
 | G-28 | Add a profile from a link with `owndns=true` (and one with `dnsall=true`), press Connect | before the tunnel starts a notice appears; its buttons are disabled for 5 seconds with a countdown, Escape and a click outside do nothing; the `dnsall` text appears only for the second; after a choice the connection starts and the notice does not come back after a restart | P1 |
+| G-29 | Server user with `max_devices: 1`. Import its `https://…/sub/…` in the GUI with *Send a device ID to subscriptions* off | a dialog "This subscription limits devices"; *Cancel*: the card says `Device ID needed: …`, nothing was sent; *Send and retry*: the switch turns on and the subscription is added; the panel lists one device with the OS (`Windows 11`) and the architecture | P1 |
+| G-29a | The same user from a second computer, then a background refresh with the switch off on a third | the second: the card and the toast show the server's `device_limit` message; the background refresh opens no dialog and writes `Device ID needed: …` on the card | P1 |
 
 ## 4. Android
 
@@ -192,6 +194,7 @@ Repeat for nginx, apache (Debian and RHEL) and caddy.
 | M-15 | *Open the panel* | opens in an in-app browser tab through SSH; the VPN address opens in Chrome while connected through the server | P1 |
 | M-16 | Close and reopen the app with a remembered server; clear the app's data | no password asked / the servers list is empty and nothing crashes | P2 |
 | M-17 | As G-28: a link with `owndns=true` / `dnsall=true`, then change *DNS of this server* in the profile editor | the notice before connecting (back button does nothing, buttons wait 5 seconds); the chosen DNS is the one the tunnel uses (operator: 10.1.0.1); the editor value is kept | P1 |
+| M-18 | As G-29 on a phone: a user with `max_devices: 1`, *Send a device ID to subscriptions* off, add its subscription, then a second phone | the dialog on the first (*Cancel* leaves a card message, *Send and retry* adds it); the panel shows `Android <version>` and the phone's model; the second phone gets the server's `device_limit` message on the card and in the snackbar; a background refresh on launch opens no dialog | P1 |
 
 ## 5. CLI client
 
@@ -200,6 +203,7 @@ Repeat for nginx, apache (Debian and RHEL) and caddy.
 | C-01 | `ostp connect ostp://…` (UDP, UoT, TLS) | connects, SOCKS5 on `127.0.0.1:1088` works | P1 |
 | C-02 | `ostp import ostp://…` | client config written | P1 |
 | C-03 | `ostp import https://…/sub/…` | shows the subscription name, usage, the links and asks which one; the chosen link is written | P1 |
+| C-03a | `ostp import https://…/sub/…` of a user with `max_devices`, with and without `"send_hwid": true` in the config | without: stops with a message that names `send_hwid`; with: imports, and the panel lists the device | P1 |
 | C-04 | `ostp import http://…`, a wrong token | a clear error, config untouched | P1 |
 | C-05 | TUN on Linux, `eval $(ostp proxy-env)` | work | P2 |
 

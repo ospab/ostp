@@ -6,6 +6,7 @@ import 'package:url_launcher/url_launcher.dart';
 import '../models/ostp_profile.dart';
 import '../models/share_link.dart';
 import '../models/subscription.dart';
+import 'device_id_dialog.dart';
 import 'home_screen.dart';
 import 'qr_scanner_screen.dart';
 import 'ssh_setup.dart';
@@ -56,7 +57,7 @@ class _WelcomeScreenState extends State<WelcomeScreen> {
     setState(() => _busy = true);
     try {
       if (isSubscriptionUrl(raw)) {
-        final n = await SubscriptionStore(widget.prefs).add(raw);
+        final n = await SubscriptionStore(widget.prefs).add(raw, askSend: () => askSendDeviceId(context));
         messenger.showSnackBar(SnackBar(content: Text('Subscription added: $n profile(s)')));
       } else {
         final l = ShareLink.parse(raw);

@@ -1,4 +1,5 @@
 import { shouldAskDnsNotice, effectiveDns, filtersDns } from './dns_notice.js';
+import { classifyFetchError, cardMessage, shouldAskToSend, SEND_DIALOG } from './device_limit.js';
 import { initServers, renderServers, mountSshForm, confirmBox, fmtBytes } from './servers.js';
 
 // ── Tauri invoke shim ─────────────────────────────────────────────────
@@ -262,6 +263,7 @@ const inLaunchStartup = $('in-launch-startup');
 const inDebug       = $('in-debug');
 const inShowRtt     = $('in-show-rtt');
 const inShowSpeed   = $('in-show-speed');
+const inSendHwid    = $('in-send-hwid');
 const groupKillSwitch  = $('group-kill-switch');
 
 const inTtlDesync     = $('cs-ttl-desync');
@@ -1240,6 +1242,14 @@ function applySubscription(sub, doc) {
   return fresh.length;
 }
 
+const sendHwidOn = () => !!loadClientSettings().sendHwid;
+
+async function downloadSubscription(url, sendHwid) {
+  const doc = await invoke('fetch_subscription', { url, sendHwid });
+  if (!doc) throw new Error('subscriptions need the desktop app');
+  return doc;
+}
+
 async function refreshSubscription(id, { quiet = false } = {}) {
   const url = loadSubs().find(s => s.id === id)?.url;
   if (!url || refreshing.has(id)) return;
@@ -1247,8 +1257,19 @@ async function refreshSubscription(id, { quiet = false } = {}) {
   renderSubs();
   let outcome = null;
   try {
-    const doc = await invoke('fetch_subscription', { url });
-    if (!doc) throw new Error('subscriptions need the desktop app');
+    let doc;
+    try {
+      doc = await downloadSubscription(url, sendHwidOn());
+    } catch (e) {
+      // A server that limits devices asked for an ID while sending is off. Only a
+      // fetch the person started may ask about it; a background refresh never does.
+      const err = classifyFetchError(e?.message || e);
+      if (!shouldAskToSend({ ...err, manual: !quiet, sendOn: sendHwidOn(), retried: false })) throw e;
+      if (!await confirmBox(SEND_DIALOG.title, SEND_DIALOG.text, SEND_DIALOG.ok, false)) throw e;
+      inSendHwid.checked = true;
+      collectAndSaveSettings();
+      doc = await downloadSubscription(url, true);
+    }
     outcome = { doc };
   } catch (e) {
     outcome = { error: String(e?.message || e) };
@@ -1264,7 +1285,7 @@ async function refreshSubscription(id, { quiet = false } = {}) {
       const n = applySubscription(sub, outcome.doc);
       if (!quiet) showToast(`Subscription updated: ${n} ${n === 1 ? 'profile' : 'profiles'}`, 'ok');
     } catch (e) {
-      sub.lastError = String(e?.message || e).slice(0, 300);
+      sub.lastError = cardMessage(classifyFetchError(e?.message || e)).slice(0, 300);
       if (!quiet) showToast('Could not update the subscription: ' + sub.lastError, 'error');
     }
     saveSubs(subs);
@@ -1619,6 +1640,7 @@ function loadSettingsIntoForm() {
   inShowRtt.checked     = s.showRtt !== false;
   inShowSpeed.checked   = s.showSpeed !== false;
   $('in-update-check').checked = s.updateCheck !== false;
+  inSendHwid.checked    = !!s.sendHwid;
   if (inTtlDesync) inTtlDesync.checked = !!s.ttlDesync;
   updateClientVisibility();
 }
@@ -1668,6 +1690,7 @@ function collectAndSaveSettings() {
     showRtt:      inShowRtt.checked,
     showSpeed:    inShowSpeed.checked,
     updateCheck:  $('in-update-check').checked,
+    sendHwid:     inSendHwid.checked,
     ttlDesync:    inTtlDesync ? inTtlDesync.checked : false,
   };
   // Cheap and local: safe to run on every debounced keystroke.
@@ -1913,7 +1936,7 @@ window.addEventListener('DOMContentLoaded', async () => {
   wintunModal.addEventListener('click', e => { if (e.target === wintunModal) wintunModal.classList.add('hidden'); });
 
   // Client settings — wire all inputs
-  [inTun, inKillSwitch, inAutoconnect, inLaunchStartup, inDebug, inShowRtt, inShowSpeed, inTtlDesync, $('in-update-check')]
+  [inTun, inKillSwitch, inAutoconnect, inLaunchStartup, inDebug, inShowRtt, inShowSpeed, inSendHwid, inTtlDesync, $('in-update-check')]
     .filter(Boolean)
     .forEach(el => el.addEventListener('change', collectAndSaveSettings));
   [inMtu, inDns, inSocks, inExDomains, inExIps, inExProcs]

@@ -193,6 +193,8 @@ A user can have `max_devices` (in `access_keys`, in the panel's user form, or `o
 
 The record is `devices.json` next to the config (mode 0600), keyed by the subscription token, never by the key. The panel lists a user's devices in the user form and removes one to free its slot; `ostp manage user-devices WHO` prints them.
 
+The desktop and Android apps and `ostp import` send the ID only when the owner turned it on (*Send a device ID to subscriptions*, or `send_hwid` in the client config; see [integrations.md](integrations.md)).
+
 The limit applies to fetching the subscription. Someone who copies the key from a link into another app is not stopped by it; a check at the handshake needs a protocol change and is planned for protocol v6.
 
 Clients: in the Android app and the desktop GUI, import also takes an `https://` subscription URL (typed, from the clipboard or by QR). The subscription gets a card with usage and an update button, and its profiles are rewritten on every update. CLI: `ostp import https://…/sub/…`.

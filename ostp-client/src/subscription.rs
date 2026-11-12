@@ -6,6 +6,7 @@ use ostp_core::subscription::SubscriptionDoc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+use crate::hwid::Device;
 use crate::transport::tls::{wrap_tls, TlsClientOptions};
 
 const TIMEOUT: Duration = Duration::from_secs(15);
@@ -55,10 +56,97 @@ pub(crate) fn parse_url(url: &str) -> Result<Url> {
     Ok(Url { host, port, target })
 }
 
-/// Downloads and parses a subscription.
+/// The server refused the subscription because of its device limit (HTTP 403 with a
+/// JSON body). Apps tell the two kinds apart with [`device_error`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeviceError {
+    /// The user has a device limit and the request carried no device ID.
+    HwidRequired(String),
+    /// A new device and no free slot.
+    DeviceLimit(String),
+}
+
+impl DeviceError {
+    /// The server's `error` code: `hwid_required` or `device_limit`.
+    pub fn code(&self) -> &'static str {
+        match self {
+            DeviceError::HwidRequired(_) => "hwid_required",
+            DeviceError::DeviceLimit(_) => "device_limit",
+        }
+    }
+
+    /// The server's own text.
+    pub fn message(&self) -> &str {
+        match self {
+            DeviceError::HwidRequired(m) | DeviceError::DeviceLimit(m) => m,
+        }
+    }
+}
+
+impl std::fmt::Display for DeviceError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.message())
+    }
+}
+
+impl std::error::Error for DeviceError {}
+
+/// The device error inside `e`, if that is what it is.
+pub fn device_error(e: &anyhow::Error) -> Option<&DeviceError> {
+    e.downcast_ref::<DeviceError>()
+}
+
+/// The error as the apps pass it to their UI: `device:<code>:<server message>` for a
+/// device error, the plain text otherwise.
+pub fn error_text(e: &anyhow::Error) -> String {
+    match device_error(e) {
+        Some(d) => format!("device:{}:{}", d.code(), d.message().replace(['\r', '\n'], " ")),
+        None => e.to_string(),
+    }
+}
+
+/// Reads a 403 body: `{"error":"hwid_required"|"device_limit","message":"..."}`.
+/// Any other 403 is not a device error.
+fn parse_device_error(body: &[u8]) -> Option<DeviceError> {
+    let v: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let message = |default: &str| {
+        v.get("message").and_then(|m| m.as_str()).map(str::trim).filter(|m| !m.is_empty()).unwrap_or(default).to_string()
+    };
+    match v.get("error").and_then(|e| e.as_str())? {
+        "hwid_required" => Some(DeviceError::HwidRequired(message("this subscription needs a device ID"))),
+        "device_limit" => Some(DeviceError::DeviceLimit(message("the device limit of this subscription is reached"))),
+        _ => None,
+    }
+}
+
+/// Header values are printable ASCII, at most 64 characters (what the server keeps).
+fn header_value(s: &str) -> String {
+    s.chars().map(|c| if (' '..='~').contains(&c) { c } else { '?' }).take(64).collect::<String>().trim().to_string()
+}
+
+/// The three device headers, each ending in CRLF; empty without a device.
+fn device_headers(device: Option<&Device>) -> String {
+    let Some(d) = device else { return String::new() };
+    let mut out = format!("x-hwid: {}\r\n", header_value(&d.hwid));
+    for (name, value) in [("x-device-os", &d.os), ("x-device-model", &d.model)] {
+        let v = header_value(value);
+        if !v.is_empty() {
+            out.push_str(&format!("{name}: {v}\r\n"));
+        }
+    }
+    out
+}
+
+/// Downloads and parses a subscription, sending no device identity.
 pub async fn fetch(url: &str) -> Result<SubscriptionDoc> {
+    fetch_with_device(url, None).await
+}
+
+/// Like [`fetch`], and sends `x-hwid`, `x-device-os` and `x-device-model` when a
+/// device is given. A server that limits devices answers with a [`DeviceError`].
+pub async fn fetch_with_device(url: &str, device: Option<&Device>) -> Result<SubscriptionDoc> {
     let u = parse_url(url)?;
-    let body = tokio::time::timeout(TIMEOUT, get(&u, "application/json"))
+    let body = tokio::time::timeout(TIMEOUT, get(&u, "application/json", device))
         .await
         .map_err(|_| anyhow!("{} did not answer within {}s", u.host, TIMEOUT.as_secs()))??;
     let text = String::from_utf8(body).map_err(|_| anyhow!("the subscription is not text"))?;
@@ -72,17 +160,29 @@ pub async fn fetch(url: &str) -> Result<SubscriptionDoc> {
 /// GET over verified TLS; returns the status code and the body.
 pub(crate) async fn https_get(url: &str, accept: &str) -> Result<(u16, Vec<u8>)> {
     let u = parse_url(url)?;
-    let raw = tokio::time::timeout(TIMEOUT, get_raw(&u, accept))
+    let raw = tokio::time::timeout(TIMEOUT, get_raw(&u, accept, None))
         .await
         .map_err(|_| anyhow!("{} did not answer within {}s", u.host, TIMEOUT.as_secs()))??;
     split_response(&raw)
 }
 
-async fn get(u: &Url, accept: &str) -> Result<Vec<u8>> {
-    parse_response(&get_raw(u, accept).await?)
+async fn get(u: &Url, accept: &str, device: Option<&Device>) -> Result<Vec<u8>> {
+    parse_response(&get_raw(u, accept, device).await?)
 }
 
-async fn get_raw(u: &Url, accept: &str) -> Result<Vec<u8>> {
+/// The request head as sent.
+fn request_head(u: &Url, accept: &str, device: Option<&Device>) -> String {
+    let host_header = if u.host.contains(':') { format!("[{}]", u.host) } else { u.host.clone() };
+    let host_header = if u.port == 443 { host_header } else { format!("{host_header}:{}", u.port) };
+    format!(
+        "GET {} HTTP/1.1\r\nHost: {host_header}\r\nAccept: {accept}\r\nUser-Agent: ostp/{}\r\n{}Connection: close\r\n\r\n",
+        u.target,
+        env!("CARGO_PKG_VERSION"),
+        device_headers(device)
+    )
+}
+
+async fn get_raw(u: &Url, accept: &str, device: Option<&Device>) -> Result<Vec<u8>> {
     let tcp = tokio::net::TcpStream::connect((u.host.as_str(), u.port))
         .await
         .with_context(|| format!("cannot connect to {}:{}", u.host, u.port))?;
@@ -90,13 +190,7 @@ async fn get_raw(u: &Url, accept: &str) -> Result<Vec<u8>> {
     let opts = TlsClientOptions { sni: u.host.clone(), insecure: false };
     let mut s = wrap_tls(tcp, &opts, TIMEOUT).await?;
 
-    let host_header = if u.host.contains(':') { format!("[{}]", u.host) } else { u.host.clone() };
-    let host_header = if u.port == 443 { host_header } else { format!("{host_header}:{}", u.port) };
-    let req = format!(
-        "GET {} HTTP/1.1\r\nHost: {host_header}\r\nAccept: {accept}\r\nUser-Agent: ostp/{}\r\nConnection: close\r\n\r\n",
-        u.target,
-        env!("CARGO_PKG_VERSION")
-    );
+    let req = request_head(u, accept, device);
     s.write_all(req.as_bytes()).await?;
     s.flush().await?;
 
@@ -159,6 +253,12 @@ fn parse_response(raw: &[u8]) -> Result<Vec<u8>> {
     let code = resp.code.unwrap_or(0);
     match code {
         200 => {}
+        403 => {
+            return Err(match split_response(raw).ok().and_then(|(_, body)| parse_device_error(&body)) {
+                Some(e) => e.into(),
+                None => anyhow!("the server answered HTTP 403"),
+            });
+        }
         404 => bail!("the server does not know this subscription (404): the link is wrong or the key was removed"),
         301 | 302 | 307 | 308 => bail!("the server redirected ({code}); use the final https URL"),
         _ => bail!("the server answered HTTP {code}"),
@@ -232,5 +332,84 @@ mod tests {
         let e = parse_response(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n").unwrap_err();
         assert!(e.to_string().contains("404"));
         assert!(parse_response(b"HTTP/1.1 200 OK\r\nContent-Length: 50\r\n\r\nshort").is_err());
+    }
+
+    fn forbidden(body: &str) -> Vec<u8> {
+        format!("HTTP/1.1 403 Forbidden\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}", body.len()).into_bytes()
+    }
+
+    #[test]
+    fn device_errors_are_told_apart() {
+        let e = parse_response(&forbidden(r#"{"error":"hwid_required","message":"This subscription limits devices."}"#)).unwrap_err();
+        let d = device_error(&e).expect("a typed error");
+        assert_eq!(d, &DeviceError::HwidRequired("This subscription limits devices.".into()));
+        assert_eq!(d.code(), "hwid_required");
+        assert_eq!(e.to_string(), "This subscription limits devices.");
+
+        let e = parse_response(&forbidden(r#"{"error":"device_limit","message":"3 of 3 devices."}"#)).unwrap_err();
+        assert_eq!(device_error(&e), Some(&DeviceError::DeviceLimit("3 of 3 devices.".into())));
+        assert_eq!(device_error(&e).unwrap().code(), "device_limit");
+
+        // A missing message gets a plain default, never an empty error.
+        let e = parse_response(&forbidden(r#"{"error":"device_limit"}"#)).unwrap_err();
+        assert!(!device_error(&e).unwrap().message().is_empty());
+    }
+
+    #[test]
+    fn other_403_answers_are_ordinary_errors() {
+        for body in [r#"{"error":"something_else","message":"x"}"#, "<html>Forbidden</html>", "", r#"{"message":"x"}"#] {
+            let e = parse_response(&forbidden(body)).unwrap_err();
+            assert!(device_error(&e).is_none(), "{body}");
+            assert!(e.to_string().contains("403"), "{e}");
+        }
+        // Other codes keep their old messages.
+        assert!(parse_response(b"HTTP/1.1 500 X\r\nContent-Length: 0\r\n\r\n").unwrap_err().to_string().contains("500"));
+    }
+
+    #[test]
+    fn error_text_for_the_apps() {
+        let e = parse_response(&forbidden(r#"{"error":"device_limit","message":"3 of 3 devices."}"#)).unwrap_err();
+        assert_eq!(error_text(&e), "device:device_limit:3 of 3 devices.");
+        let e = parse_response(&forbidden(r#"{"error":"hwid_required","message":"a\nb"}"#)).unwrap_err();
+        assert_eq!(error_text(&e), "device:hwid_required:a b");
+        let e = parse_response(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n").unwrap_err();
+        assert!(error_text(&e).contains("404") && !error_text(&e).starts_with("device:"));
+    }
+
+    fn url() -> Url {
+        parse_url("https://vpn.example.com/sub/tok").unwrap()
+    }
+
+    #[test]
+    fn no_device_means_no_device_headers() {
+        let head = request_head(&url(), "application/json", None);
+        assert!(head.starts_with("GET /sub/tok HTTP/1.1\r\nHost: vpn.example.com\r\n"), "{head}");
+        let lower = head.to_ascii_lowercase();
+        assert!(!lower.contains("x-hwid") && !lower.contains("x-device"), "{head}");
+        assert!(head.ends_with("Connection: close\r\n\r\n"));
+    }
+
+    #[test]
+    fn a_device_adds_the_three_headers() {
+        let d = Device { hwid: "572c291ff9921f090783fd3d22d69228".into(), os: "Windows 11".into(), model: "x86_64".into() };
+        let head = request_head(&url(), "application/json", Some(&d));
+        assert!(head.contains("\r\nx-hwid: 572c291ff9921f090783fd3d22d69228\r\n"), "{head}");
+        assert!(head.contains("\r\nx-device-os: Windows 11\r\n"), "{head}");
+        assert!(head.contains("\r\nx-device-model: x86_64\r\n"), "{head}");
+        assert!(head.ends_with("Connection: close\r\n\r\n"));
+    }
+
+    #[test]
+    fn header_values_cannot_break_the_request() {
+        let d = Device { hwid: "abc".into(), os: "A\r\nEvil: 1".into(), model: "é".repeat(100) + &"x".repeat(100) };
+        let head = request_head(&url(), "application/json", Some(&d));
+        assert_eq!(head.matches("\r\n\r\n").count(), 1, "{head:?}");
+        assert!(!head.contains("\nEvil"), "{head:?}");
+        let model = head.lines().find(|l| l.starts_with("x-device-model: ")).unwrap();
+        assert!(model.len() <= "x-device-model: ".len() + 64, "{model}");
+        assert!(head.is_ascii());
+        // An empty model is left out instead of sent empty.
+        let d = Device { hwid: "abc".into(), os: "Linux".into(), model: "  ".into() };
+        assert!(!request_head(&url(), "application/json", Some(&d)).contains("x-device-model"));
     }
 }

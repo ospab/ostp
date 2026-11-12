@@ -562,23 +562,39 @@ fn null_jstring(env: &mut JNIEnv) -> jstring {
 /// Downloads a subscription (`https://<domain>/sub/<token>`); returns the
 /// document as JSON (`name`, `update_interval_hours`, `links`, `usage`) or
 /// `{"error": ...}`.
+///
+/// `send_hwid` false: no device information leaves the phone. True: the identifier
+/// sent is a hash of `android_id` made for the URL's host (the id itself is not
+/// sent), with `os` and `model` as plain text. A device-limit refusal comes back as
+/// `{"error": "device:<code>:<message>"}`.
 #[no_mangle]
 pub extern "system" fn Java_net_ostp_client_OstpClientSdk_fetchSubscription(
     mut env: JNIEnv,
     _class: JClass,
     url: JString,
+    send_hwid: jboolean,
+    android_id: JString,
+    os: JString,
+    model: JString,
 ) -> jstring {
-    let url: String = match env.get_string(&url) {
-        Ok(s) => s.into(),
-        Err(_) => return null_jstring(&mut env),
+    let mut text = |s: &JString| -> Option<String> { env.get_string(s).ok().map(String::from) };
+    let (Some(url), Some(android_id), Some(os), Some(model)) = (text(&url), text(&android_id), text(&os), text(&model)) else {
+        return null_jstring(&mut env);
     };
     let result = match Runtime::new() {
-        Ok(rt) => rt.block_on(ostp_client::subscription::fetch(&url)),
+        Ok(rt) => rt.block_on(async {
+            let device = if send_hwid != 0 {
+                Some(ostp_client::hwid::device_for_url(&url, &android_id, &os, &model)?)
+            } else {
+                None
+            };
+            ostp_client::subscription::fetch_with_device(&url, device.as_ref()).await
+        }),
         Err(e) => Err(anyhow::anyhow!("failed to create tokio runtime: {e}")),
     };
     match result {
         Ok(doc) => json_jstring(&mut env, &doc),
-        Err(e) => error_jstring(&mut env, &e.to_string()),
+        Err(e) => error_jstring(&mut env, &ostp_client::subscription::error_text(&e)),
     }
 }
 

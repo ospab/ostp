@@ -36,6 +36,18 @@ The choice is stored with the profile (it survives restarts and subscription upd
 
 The Android app does the same with its APK: it downloads the build for the phone's architecture, checks the size and the SHA-256, and opens the system installer, which installs it over the current app because both are signed with the same key. If the app may not install apps yet, it opens that setting first.
 
+### Subscriptions that limit devices
+A server can give a user `max_devices` (see [tls.md](tls.md), *Device limit*) and count the devices that fetch that user's subscription. For that the app has to send a device ID. Both apps have a switch for it in the settings, *Send a device ID to subscriptions* (Android: *More settings*; desktop: *More settings*, *Application*), and it is **off** by default. Nothing about the device is sent while it is off.
+
+When it is on, a subscription request carries three headers: `x-hwid`, `x-device-os` (such as `Windows 11` or `Android 14`) and `x-device-model` (the CPU architecture on desktop, the phone's model on Android; never the computer's name). The ID is `hex(HMAC-SHA256(key = the system's machine identifier, message = "ostp-hwid:" + the server's host))` cut to 32 characters. It is made per server, so two servers cannot tell that one person is behind both IDs, and the machine identifier itself (`MachineGuid`, `IOPlatformUUID`, `/etc/machine-id`, `ANDROID_ID`) never leaves the device. The ID survives a reinstall of the app, which is what lets the server recognise the device again. It is sent only when a subscription is fetched, never with the tunnel's traffic.
+
+Two answers of the server have their own handling:
+
+- *The subscription needs a device ID* (`hwid_required`): after a fetch you started (adding a subscription, the update button), a dialog asks "This subscription limits devices. The server needs this device's ID to count it. Send it?"; *Send and retry* turns the switch on and tries once more, *Cancel* leaves it off. A background refresh never asks: the subscription card says `Device ID needed: turn on "Send a device ID to subscriptions" in settings`.
+- *The limit is reached* (`device_limit`): the server's own message is shown on the subscription card and in the toast or snackbar. The owner of the server frees a slot by removing a device in the panel.
+
+The CLI sends the ID only with `"send_hwid": true` in the config (see [client.md](client.md)).
+
 ## Your own server from the apps
 
 Both apps can install OSTP on a VPS and manage it afterwards, for people who have bought a server and do not want to learn Linux. The SSH work is done by the `ostp-ssh` crate, shared by the desktop app (Tauri commands in `ostp-gui/src-tauri/src/servers.rs`) and Android (`serversCall` in `ostp-jni`).

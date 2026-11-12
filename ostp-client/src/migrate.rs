@@ -610,12 +610,15 @@ mod tests {
             "server": "h:1", "access_key": "k",
             "tranport": { "mode": "uot" },
             "tun": { "enable": true, "kil_switch": true },
+            "send_hwid": true,
             "my_note": "hello"
         }));
         let find = |p: &str| m.unknown_keys.iter().find(|u| u.path == p).cloned();
         assert_eq!(find("tranport").unwrap().suggestion.as_deref(), Some("transport"));
         assert_eq!(find("tun.kil_switch").unwrap().suggestion.as_deref(), Some("kill_switch"));
         assert_eq!(find("my_note").unwrap().suggestion, None);
+        assert!(find("send_hwid").is_none(), "send_hwid is a known key");
+        assert_eq!(m.output["send_hwid"], json!(true));
         assert_eq!(m.output["tranport"], json!({ "mode": "uot" }), "unknown data is never deleted");
     }
 

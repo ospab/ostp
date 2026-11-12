@@ -21,6 +21,10 @@ pub struct ClientConfig {
     pub tun_stack: String,
     #[serde(default)]
     pub kill_switch: bool,
+    /// Send a device ID (a hash made for the server) when fetching a subscription.
+    /// Off unless the owner turns it on.
+    #[serde(default)]
+    pub send_hwid: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gui: Option<serde_json::Value>,
 }
@@ -166,6 +170,7 @@ impl Default for ClientConfig {
             dns_server: None,
             tun_stack: "system".to_string(),
             kill_switch: false,
+            send_hwid: false,
             gui: None,
         }
     }
@@ -238,6 +243,7 @@ impl ClientFileConfig {
                 .filter(|s| !s.is_empty())
                 .unwrap_or_else(default_tun_stack),
             kill_switch: tun.and_then(|t| t.kill_switch).unwrap_or(false),
+            send_hwid: self.send_hwid.unwrap_or(false),
             gui: self.gui.clone(),
         }
     }
@@ -594,6 +600,9 @@ pub struct ClientFileConfig {
     pub exclude: Option<ExcludeConfig>,
     pub mux: Option<MuxConfig>,
     pub transport: Option<TransportConfigRaw>,
+    /// Send a device ID when fetching a subscription; absent means off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub send_hwid: Option<bool>,
     pub gui: Option<serde_json::Value>,
 }
 
@@ -794,6 +803,7 @@ mod tests {
         assert_eq!(rt.local_proxy.bind_addr, "127.0.0.1:1088");
         assert_eq!(rt.tun_stack, "system");
         assert!(!rt.kill_switch && !rt.multiplex.enabled);
+        assert!(!rt.send_hwid, "the device ID is opt-in");
         assert_eq!(rt.multiplex.sessions, 1);
         assert_eq!(rt.transport.mode, "udp");
     }
@@ -805,6 +815,7 @@ mod tests {
             r#"{"mode":"client","server":"s:1","access_key":"k","mtu":1280,"socks5_bind":"127.0.0.1:9",
                 "tun":{"enable":true,"dns":"1.1.1.1","stack":"gvisor","kill_switch":true},
                 "mux":{"enabled":true,"sessions":3},
+                "send_hwid":true,
                 "exclude":{"domains":["a.b"]},
                 "transport":{"mode":"uot","tls":true,"tls_sni":""}}"#,
         )
@@ -815,6 +826,7 @@ mod tests {
         assert_eq!(rt.tun_stack, "gvisor");
         assert_eq!(rt.dns_server.as_deref(), Some("1.1.1.1"));
         assert!(rt.kill_switch);
+        assert!(rt.send_hwid);
         assert!(rt.multiplex.enabled);
         assert_eq!(rt.multiplex.sessions, 3);
         assert_eq!(rt.exclusions.domains, vec!["a.b".to_string()]);

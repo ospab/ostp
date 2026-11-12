@@ -4,6 +4,7 @@ import 'dart:convert';
 import 'package:flutter/services.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import 'device_limit.dart';
 import 'ostp_profile.dart';
 import 'share_link.dart';
 
@@ -90,6 +91,9 @@ String formatBytes(num n) {
 
 bool isSubscriptionUrl(String s) => s.trim().toLowerCase().startsWith('https://');
 
+/// Asks the person whether to send a device ID; true = send it and retry.
+typedef AskToSend = Future<bool> Function();
+
 class SubscriptionStore {
   static const _channel = MethodChannel('com.ospab.ostp/vpn');
   static const _subsKey = 'subscriptions_json';
@@ -124,43 +128,67 @@ class SubscriptionStore {
 
   Future<void> _save(List<OstpSubscription> subs) => prefs.setString(_subsKey, encodeSubscriptions(subs));
 
-  /// The native core downloads it (verified TLS, same parser as the CLI).
-  static Future<Map<String, dynamic>> _fetch(String url) async {
+  bool get sendHwid => prefs.getBool(sendHwidKey) ?? false;
+
+  /// The native core downloads it (verified TLS, same parser as the CLI). The device
+  /// ID is sent only when "Send a device ID to subscriptions" is on.
+  Future<Map<String, dynamic>> _fetch(String url) async {
     final String? raw;
     try {
-      raw = await _channel.invokeMethod<String>('fetchSubscription', {'url': url.trim()}).timeout(const Duration(seconds: 45));
+      raw = await _channel
+          .invokeMethod<String>('fetchSubscription', {'url': url.trim(), 'sendHwid': sendHwid})
+          .timeout(const Duration(seconds: 45));
     } on TimeoutException {
       throw Exception('the server did not answer in time');
     }
     if (raw == null) throw Exception('no answer from the native core');
     final doc = jsonDecode(raw) as Map<String, dynamic>;
-    if (doc['error'] != null) throw Exception(doc['error']);
+    final err = doc['error'];
+    if (err != null) {
+      final e = classifyFetchError(err.toString());
+      if (e.kind != FetchErrorKind.other) throw DeviceLimitException(e);
+      throw Exception(err);
+    }
     return doc;
+  }
+
+  /// [_fetch], and when the server wants a device ID that is not being sent, a fetch
+  /// the person started ([askSend] given) asks once and retries. Background
+  /// refreshes pass no [askSend]: they never open a dialog.
+  Future<Map<String, dynamic>> _fetchAsking(String url, AskToSend? askSend) async {
+    try {
+      return await _fetch(url);
+    } on DeviceLimitException catch (e) {
+      if (askSend == null || !shouldAskToSend(error: e.error, manual: true, sendOn: sendHwid)) rethrow;
+      if (!await askSend()) rethrow;
+      await prefs.setBool(sendHwidKey, true);
+      return _fetch(url);
+    }
   }
 
   /// Adds a subscription (or refreshes it if the URL is already known).
   /// Returns how many profiles it produced.
-  Future<int> add(String url) => _serialized(() => _add(url));
+  Future<int> add(String url, {AskToSend? askSend}) => _serialized(() => _add(url, askSend));
 
-  Future<int> _add(String url) async {
+  Future<int> _add(String url, AskToSend? askSend) async {
     final subs = load();
     final existing = subs.where((s) => s.url == url.trim()).toList();
     final sub = existing.isNotEmpty
         ? existing.first
         : OstpSubscription(id: 'sub${DateTime.now().millisecondsSinceEpoch}', url: url.trim());
-    final n = await _refreshOne(sub);
+    final n = await _refreshOne(sub, askSend);
     if (existing.isEmpty) subs.add(sub);
     await _save(subs);
     return n;
   }
 
-  Future<int> refresh(String id) => _serialized(() => _refresh(id));
+  Future<int> refresh(String id, {AskToSend? askSend}) => _serialized(() => _refresh(id, askSend));
 
-  Future<int> _refresh(String id) async {
+  Future<int> _refresh(String id, AskToSend? askSend) async {
     final subs = load();
     final sub = subs.firstWhere((s) => s.id == id);
     try {
-      return await _refreshOne(sub);
+      return await _refreshOne(sub, askSend);
     } catch (e) {
       sub.lastError = e.toString().replaceFirst('Exception: ', '');
       rethrow;
@@ -203,8 +231,8 @@ class SubscriptionStore {
   /// Replaces the subscription's profiles with the fetched links, keeping the
   /// active selection and per-profile tweaks (TTL desync) of
   /// the profile with the same carrier.
-  Future<int> _refreshOne(OstpSubscription sub) async {
-    final doc = await _fetch(sub.url);
+  Future<int> _refreshOne(OstpSubscription sub, [AskToSend? askSend]) async {
+    final doc = await _fetchAsking(sub.url, askSend);
     final links = <ShareLink>[];
     for (final l in (doc['links'] as List? ?? const []).take(_maxLinks)) {
       try {

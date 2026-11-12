@@ -8,6 +8,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import '../models/ostp_profile.dart';
 import '../models/share_link.dart';
 import '../models/subscription.dart';
+import '../ui/device_id_dialog.dart';
 
 /// Servers the app installs and manages over SSH. The work is done by the
 /// native core (crate ostp-ssh through ostp-jni's `serversCall`); this is the
@@ -200,7 +201,7 @@ class ServersApi {
       if (picked == null) return null;
       how = picked;
     }
-    if (how == 'subscription') return SubscriptionStore(prefs).add(sub!);
+    if (how == 'subscription') return SubscriptionStore(prefs).add(sub!, askSend: () => askSendDeviceId(context));
     return importUsers(prefs, serverName, [user]);
   }
 

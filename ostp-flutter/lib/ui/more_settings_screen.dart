@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import '../models/device_limit.dart';
 import '../services/updates.dart' as updates;
 import 'app_routing_screen.dart';
 import 'logs_screen.dart';
@@ -25,6 +26,7 @@ class _MoreSettingsScreenState extends State<MoreSettingsScreen> {
   late bool _showSpeed;
   late bool _showRtt;
   late bool _autoUpdateCheck;
+  late bool _sendHwid;
   bool _isCheckingUpdates = false;
 
   @override
@@ -37,6 +39,7 @@ class _MoreSettingsScreenState extends State<MoreSettingsScreen> {
     _showSpeed = p.getBool('show_speed') ?? true;
     _showRtt = p.getBool('show_rtt') ?? true;
     _autoUpdateCheck = p.getBool(updates.autoUpdateCheckKey) ?? true;
+    _sendHwid = p.getBool(sendHwidKey) ?? false;
   }
 
   @override
@@ -55,6 +58,7 @@ class _MoreSettingsScreenState extends State<MoreSettingsScreen> {
     p.setBool('show_speed', _showSpeed);
     p.setBool('show_rtt', _showRtt);
     p.setBool(updates.autoUpdateCheckKey, _autoUpdateCheck);
+    p.setBool(sendHwidKey, _sendHwid);
   }
 
   Future<void> _checkForUpdates() async {
@@ -200,6 +204,12 @@ class _MoreSettingsScreenState extends State<MoreSettingsScreen> {
             decoration: _card,
             child: Column(children: [
               _toggle('Check for updates', 'When the app opens: stable and beta releases', _autoUpdateCheck, (v) => _autoUpdateCheck = v),
+              _toggle(
+                'Send a device ID to subscriptions',
+                'Some servers limit the devices of a subscription. The ID is a hash made for that server; it is sent only when you fetch a subscription.',
+                _sendHwid,
+                (v) => _sendHwid = v,
+              ),
               _toggle('Show Speed', 'Live download/upload speed on the home screen', _showSpeed, (v) => _showSpeed = v),
               _toggle('Show RTT', 'Live server ping on the home screen', _showRtt, (v) => _showRtt = v),
               _toggle('Debug Mode', 'Verbose logging', _debugMode, (v) => _debugMode = v),

@@ -35,6 +35,16 @@ The client does not switch transport or server on its own; that is the user's ch
 
 Ordinary TCP errors (`ConnectionReset`, `BrokenPipe`, `UnexpectedEof`) are not written to the log.
 
+## Device ID for subscriptions
+
+A server can limit the devices of a subscription (see [tls.md](tls.md), *Device limit*). Sending the device's ID is off by default and has to be turned on: the top-level key `send_hwid` of the client config (`false` when absent), or the switch *Send a device ID to subscriptions* in the apps.
+
+```json
+"send_hwid": true
+```
+
+Only `ostp import https://…/sub/…` and the apps' subscription fetch use it, and only at that moment; the tunnel never sends it. What goes out is the headers `x-hwid`, `x-device-os` (for example `Windows 11`, `Linux`, `macOS`, `Android 14`) and `x-device-model` (the CPU architecture on a computer, `Build.MODEL` on Android; never the computer's name). `x-hwid` is `hex(HMAC-SHA256(key = the system's machine identifier, message = "ostp-hwid:" + the server's host))` cut to 32 characters. The machine identifier is `MachineGuid` on Windows, `IOPlatformUUID` on macOS, `/etc/machine-id` on Linux and `ANDROID_ID` on Android; it is the HMAC key and is never sent or logged. With `send_hwid` off, `ostp import` of a subscription that limits devices stops with a message that says how to turn it on.
+
 ## Exclusions
 
 The `exclude` block lists what bypasses the tunnel and goes out directly:

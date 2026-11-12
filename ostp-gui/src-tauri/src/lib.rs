@@ -659,13 +659,25 @@ where
 
 /// Downloads a subscription (`https://<domain>/sub/<token>`) with the same
 /// code as the CLI and Android: verified TLS, JSON or plain link lists.
+///
+/// `send_hwid` is the "Send a device ID to subscriptions" setting. Only when it is
+/// true is a device ID made (a hash for this server's host) and sent. A server's
+/// device-limit refusal comes back as `device:<code>:<message>`.
 #[tauri::command]
-async fn fetch_subscription(url: String) -> Result<serde_json::Value, String> {
+async fn fetch_subscription(url: String, send_hwid: Option<bool>) -> Result<serde_json::Value, String> {
     if url.len() > 2048 || !url.trim().to_ascii_lowercase().starts_with("https://") {
         return Err("a subscription URL must be an https:// address of at most 2048 characters".into());
     }
+    let send_hwid = send_hwid.unwrap_or(false);
     off_thread(std::time::Duration::from_secs(30), move || async move {
-        let doc = ostp_client::subscription::fetch(&url).await.map_err(|e| e.to_string())?;
+        let device = if send_hwid {
+            Some(ostp_client::hwid::local_device(&url).map_err(|e| e.to_string())?)
+        } else {
+            None
+        };
+        let doc = ostp_client::subscription::fetch_with_device(&url, device.as_ref())
+            .await
+            .map_err(|e| ostp_client::subscription::error_text(&e))?;
         serde_json::to_value(doc).map_err(|e| e.to_string())
     })
     .await

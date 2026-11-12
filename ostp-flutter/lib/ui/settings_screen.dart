@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'device_id_dialog.dart';
 import 'more_settings_screen.dart';
 import 'qr_scanner_screen.dart';
 import 'package:qr_flutter/qr_flutter.dart';
@@ -107,7 +108,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
     _importing = true;
     messenger.showSnackBar(const SnackBar(content: Text('Fetching subscription…'), duration: Duration(seconds: 2)));
     try {
-      final n = await SubscriptionStore(widget.prefs).add(url);
+      final n = await SubscriptionStore(widget.prefs).add(url, askSend: () => askSendDeviceId(context));
       _reloadProfilesAndSubs();
       messenger.showSnackBar(SnackBar(content: Text('Subscription added: $n profile(s)')));
     } catch (e) {
@@ -122,7 +123,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
     setState(() => _refreshing.add(s.id));
     final messenger = ScaffoldMessenger.of(context);
     try {
-      final n = await SubscriptionStore(widget.prefs).refresh(s.id);
+      final n = await SubscriptionStore(widget.prefs).refresh(s.id, askSend: () => askSendDeviceId(context));
       messenger.showSnackBar(SnackBar(content: Text('Updated: $n profile(s)')));
     } catch (e) {
       messenger.showSnackBar(SnackBar(content: Text('Could not update the subscription: ${e.toString().replaceFirst('Exception: ', '')}')));

@@ -225,6 +225,17 @@ fn prompt_client_options(client_cfg: &mut ClientConfig) {
     }
 }
 
+/// `send_hwid` of the client config at `path`; false when there is none, it is not
+/// a client config, or it cannot be read.
+fn existing_send_hwid(path: &Path) -> bool {
+    let Ok(raw) = fs::read_to_string(path) else { return false };
+    let mut stripped = json_comments::StripComments::new(raw.as_bytes());
+    match serde_json::from_reader::<_, UnifiedConfig>(&mut stripped) {
+        Ok(UnifiedConfig { mode: AppMode::Client(c), .. }) => c.send_hwid.unwrap_or(false),
+        _ => false,
+    }
+}
+
 fn parse_ostp_link(link: &str) -> Result<ClientConfig> {
     let l = ostp_core::share_link::ShareLink::parse(link)?;
     Ok(ClientConfig {
@@ -245,6 +256,7 @@ fn parse_ostp_link(link: &str) -> Result<ClientConfig> {
         debug: Some(false),
         exclude: None,
         mux: None,
+        send_hwid: None,
         gui: None,
     })
 }
@@ -1376,9 +1388,23 @@ async fn run_app() -> Result<()> {
     if let Some(import_url) = args.import {
         let import_url = if import_url.trim().to_ascii_lowercase().starts_with("https://") {
             println!("{} Fetching subscription", "[ostp]".cyan().bold());
-            let doc = ostp_client::subscription::fetch(&import_url)
+            // The device ID goes out only when the config says `send_hwid: true`.
+            let device = if existing_send_hwid(&args.config) {
+                Some(ostp_client::hwid::local_device(&import_url).map_err(|e| anyhow!("Subscription Error: {e}"))?)
+            } else {
+                None
+            };
+            let doc = ostp_client::subscription::fetch_with_device(&import_url, device.as_ref())
                 .await
-                .map_err(|e| anyhow!("Subscription Error: {e}"))?;
+                .map_err(|e| match ostp_client::subscription::device_error(&e) {
+                    Some(d) if d.code() == "hwid_required" => anyhow!(
+                        "Subscription Error: {d}\n  This subscription limits devices and needs a device ID, but sending it is off. \
+                         To turn it on, set \"send_hwid\": true at the top level of {} and run the import again. \
+                         The ID is a hash made for this server; it is sent only when a subscription is fetched.",
+                        args.config.display()
+                    ),
+                    _ => anyhow!("Subscription Error: {e}"),
+                })?;
             let links = doc.valid_links();
             println!("  {} — {} link(s), refresh every {} h", doc.name.bold(), links.len(), doc.update_interval_hours);
             if let Some(u) = &doc.usage {
@@ -1401,6 +1427,10 @@ async fn run_app() -> Result<()> {
         let mut client_cfg = parse_ostp_link(&import_url)
             .map_err(|e| anyhow!("Share Link Error: {e}"))?;
         prompt_client_options(&mut client_cfg);
+        // Importing writes a fresh config: keep the owner's choice about the device ID.
+        if existing_send_hwid(&args.config) {
+            client_cfg.send_hwid = Some(true);
+        }
         let unified = UnifiedConfig {
             mode: AppMode::Client(client_cfg),
             log_level: Some("info".to_string()),

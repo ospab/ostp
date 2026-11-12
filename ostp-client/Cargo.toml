@@ -36,7 +36,7 @@ tun = { version = "0.8.9", features = ["async"] }
 netstack-smoltcp = "0.2.2"
 futures = "0.3.32"
 libc = "0.2.186"
-winapi = { version = "0.3.9", features = ["iphlpapi", "tcpmib", "udpmib", "winbase", "processthreadsapi", "psapi", "handleapi", "winerror", "minwindef", "winnt", "iptypes", "ws2def"] }
+winapi = { version = "0.3.9", features = ["iphlpapi", "tcpmib", "udpmib", "winbase", "processthreadsapi", "psapi", "handleapi", "winerror", "minwindef", "winnt", "iptypes", "ws2def", "winreg"] }
 
 [dev-dependencies]
 rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "ring"] }
