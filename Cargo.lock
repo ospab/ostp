@@ -2225,6 +2225,7 @@ version = "0.4.7"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
+ "boringtun",
  "bytes",
  "clap",
  "colored",
@@ -2233,6 +2234,7 @@ dependencies = [
  "ostp-core",
  "ostp-dns",
  "ostp-server",
+ "ostp-warp",
  "portable-atomic",
  "qrcode",
  "rand 0.8.5",

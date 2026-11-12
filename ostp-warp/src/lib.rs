@@ -19,6 +19,9 @@ pub mod tunnel;
 #[cfg(any(test, feature = "testing"))]
 pub mod testpeer;
 
+#[cfg(any(test, feature = "testing"))]
+pub mod testapi;
+
 pub use config::{WarpConfig, WarpMode};
 pub use run::{start, Running};
 pub use tunnel::{Tunnel, TunnelConfig, TunnelStatus};

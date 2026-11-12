@@ -47,5 +47,12 @@ hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
 webpki-roots = "1"
 x509-parser = { version = "0.18", default-features = false }
 
+# WARP is not built for MIPS (see src/warp.rs).
+[target.'cfg(not(any(target_arch = "mips", target_arch = "mips64")))'.dependencies]
+ostp-warp = { path = "../ostp-warp" }
+
+[target.'cfg(not(any(target_arch = "mips", target_arch = "mips64")))'.dev-dependencies]
+ostp-warp = { path = "../ostp-warp", features = ["testing"] }
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

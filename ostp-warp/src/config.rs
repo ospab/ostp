@@ -100,13 +100,20 @@ pub fn outbound_points_at(outbound: &Value, listen: std::net::SocketAddr) -> boo
         && outbound.get("port").and_then(Value::as_u64) == Some(u64::from(listen.port()))
 }
 
+/// Whether an action string, read the way the server reads it, means the
+/// proxy: only "direct" and "block" mean something else; an absent or
+/// unknown value is the proxy (see `parse_outbound_action` in `ostp`).
+fn action_is_proxy(a: Option<&str>) -> bool {
+    !matches!(a, Some("direct") | Some("block"))
+}
+
 /// Whether any rule (or the default) sends something to the proxy.
 pub fn outbound_has_proxy_rule(outbound: &Value) -> bool {
-    let default_proxy = outbound.get("default_action").and_then(Value::as_str) == Some("proxy");
+    let default_proxy = action_is_proxy(outbound.get("default_action").and_then(Value::as_str));
     let rule_proxy = outbound
         .get("rules")
         .and_then(Value::as_array)
-        .is_some_and(|r| r.iter().any(|x| x.get("action").and_then(Value::as_str) == Some("proxy")));
+        .is_some_and(|r| r.iter().any(|x| action_is_proxy(x.get("action").and_then(Value::as_str))));
     default_proxy || rule_proxy
 }
 
@@ -221,5 +228,10 @@ mod tests {
         assert!(outbound_for_rules(Some(&none), addr()).is_err());
         let default_proxy = json!({"enabled": true, "rules": [], "default_action": "proxy"});
         assert!(outbound_for_rules(Some(&default_proxy), addr()).is_ok());
+        // The server reads a missing default action as "proxy".
+        let missing = json!({"enabled": true, "rules": []});
+        assert!(outbound_for_rules(Some(&missing), addr()).is_ok());
+        let only_block = json!({"rules": [{"ip_cidr": ["10.0.0.0/8"], "action": "block"}], "default_action": "direct"});
+        assert!(outbound_for_rules(Some(&only_block), addr()).is_err());
     }
 }

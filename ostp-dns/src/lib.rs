@@ -12,6 +12,7 @@ pub mod filter;
 pub mod lists;
 pub mod services;
 pub mod settings;
+pub mod proxy;
 pub mod upstream;
 
 pub use filter::{Match, Verdict};
@@ -423,8 +424,18 @@ impl Dns {
     pub fn set_proxy(&self, proxy: Option<String>) {
         *self.proxy.write().unwrap_or_else(|e| e.into_inner()) = proxy.clone();
         let s = self.settings();
-        if let Ok(u) = Upstreams::new(&s.upstreams, s.upstream_mode, proxy.as_deref()) {
-            *self.upstreams.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(u);
+        match Upstreams::new(&s.upstreams, s.upstream_mode, proxy.as_deref()) {
+            Ok(u) => *self.upstreams.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(u),
+            Err(e) => {
+                // With a proxy asked for and unusable, the old direct upstreams
+                // must not stay: queries fail instead.
+                if proxy.is_some() {
+                    tracing::error!("DNS: the outbound proxy cannot be used for upstream queries ({e:#}); they fail until it is fixed");
+                    if let Ok(empty) = Upstreams::new(&[], s.upstream_mode, None) {
+                        *self.upstreams.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(empty);
+                    }
+                }
+            }
         }
     }
 

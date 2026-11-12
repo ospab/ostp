@@ -189,6 +189,34 @@ impl ApiClient {
     }
 }
 
+/// A fresh WireGuard key pair: (private, public), 32 bytes each.
+pub fn new_keypair() -> ([u8; 32], [u8; 32]) {
+    use boringtun::x25519::{PublicKey, StaticSecret};
+    let private = StaticSecret::random_from_rng(rand::rngs::OsRng);
+    let public = PublicKey::from(&private);
+    (private.to_bytes(), *public.as_bytes())
+}
+
+/// Registers a new device and returns what `warp.json` keeps. This is the one
+/// call that creates something at Cloudflare; callers reach it only through
+/// `ostp warp register --accept-terms`.
+pub async fn register_new(api: &ApiClient) -> Result<crate::store::WarpState> {
+    let (private, public) = new_keypair();
+    let dev = api.register(&crate::store::encode_key(&public)).await?;
+    crate::store::WarpState::from_device(crate::store::encode_key(&private), &dev, rfc3339_now())
+}
+
+/// Attaches a WARP+ key, then reads the device back so that the account type
+/// and config in `st` are what the service now says. The key is kept in `st`
+/// only after the service accepted it.
+pub async fn attach_license(api: &ApiClient, st: &mut crate::store::WarpState, license: &str) -> Result<()> {
+    api.set_license(&st.device_id, &st.access_token, license).await?;
+    st.license = Some(license.to_string());
+    let dev = api.device(&st.device_id, &st.access_token).await?;
+    st.apply_device(&dev)?;
+    Ok(())
+}
+
 async fn read_json(resp: reqwest::Response, what: &str) -> Result<Device> {
     let status = resp.status();
     let text = resp.text().await.context("the answer was cut off")?;

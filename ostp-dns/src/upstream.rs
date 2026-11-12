@@ -66,6 +66,8 @@ pub struct Upstreams {
     list: Vec<Upstream>,
     mode: UpstreamMode,
     http: reqwest::Client,
+    /// Set when the server's outbound proxy is on: nothing here connects directly then.
+    proxy: Option<crate::proxy::Proxy>,
 }
 
 fn tls_config() -> Arc<rustls::ClientConfig> {
@@ -154,10 +156,12 @@ impl Upstreams {
     pub fn new(specs: &[String], mode: UpstreamMode, proxy: Option<&str>) -> Result<Self> {
         let list = specs.iter().map(|s| Upstream::parse(s)).collect::<Result<Vec<_>>>()?;
         let mut builder = reqwest::Client::builder().timeout(TIMEOUT);
+        let mut px = None;
         if let Some(p) = proxy {
             builder = builder.proxy(reqwest::Proxy::all(p)?);
+            px = Some(crate::proxy::Proxy::parse(p)?);
         }
-        Ok(Self { list, mode, http: builder.build()? })
+        Ok(Self { list, mode, http: builder.build()?, proxy: px })
     }
 
     pub fn labels(&self) -> Vec<String> {
@@ -167,6 +171,11 @@ impl Upstreams {
     async fn one(&self, u: &Upstream, q: &[u8]) -> Result<Vec<u8>> {
         let answer = tokio::time::timeout(TIMEOUT, async {
             match u {
+                // Through a proxy a UDP upstream is asked over TCP (see proxy.rs).
+                Upstream::Udp(a) | Upstream::Tcp(a) if self.proxy.is_some() => {
+                    let px = self.proxy.as_ref().expect("checked in the guard");
+                    framed(px.connect(&a.ip().to_string(), a.port()).await?, q).await
+                }
                 Upstream::Udp(a) => {
                     let r = udp(*a, q).await?;
                     // Truncated: ask again over TCP.
@@ -192,7 +201,10 @@ impl Upstreams {
                     Ok(resp.bytes().await?.to_vec())
                 }
                 Upstream::Dot { host, port } => {
-                    let tcp = tokio::net::TcpStream::connect((host.as_str(), *port)).await?;
+                    let tcp = match &self.proxy {
+                        Some(px) => px.connect(host, *port).await?,
+                        None => tokio::net::TcpStream::connect((host.as_str(), *port)).await?,
+                    };
                     let name = rustls::pki_types::ServerName::try_from(host.clone())?;
                     let tls = tokio_rustls::TlsConnector::from(tls_config()).connect(name, tcp).await?;
                     framed(tls, q).await

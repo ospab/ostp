@@ -30,6 +30,7 @@ mod signal;
 pub mod dns;
 pub mod router;
 pub mod overnet;
+pub mod warp;
 pub mod password;
 pub mod target_policy;
 mod admission;
@@ -106,6 +107,8 @@ pub struct ServerParams {
     pub subscription: Option<SubscriptionSettings>,
     /// The `overnet` section: `.ov` for clients and the overnet exit.
     pub overnet: Option<OvernetConfig>,
+    /// The `warp` section: Cloudflare WARP as this server's exit.
+    pub warp: Option<warp::WarpConfig>,
     /// Clients may reach this machine's services and private networks.
     pub local_access: bool,
 }
@@ -125,6 +128,7 @@ pub async fn run_server(params: ServerParams) -> Result<()> {
         tls,
         subscription,
         overnet,
+        warp,
         local_access,
     } = params;
     let mut keys_map = HashMap::new();
@@ -312,6 +316,8 @@ pub async fn run_server(params: ServerParams) -> Result<()> {
             tracing::warn!("local_access: clients may reach this server's own services and private networks");
         }
     }
+    // The WireGuard client and its local SOCKS5 proxy, for as long as the server runs.
+    let _warp = warp::start(warp, config_path.as_deref()).await;
     if let Some(cfg) = overnet.filter(|o| o.enabled) {
         if let Err(e) = overnet::apply(cfg, &router).await {
             tracing::error!("overnet: {e:#}");

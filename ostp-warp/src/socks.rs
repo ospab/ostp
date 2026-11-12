@@ -311,9 +311,11 @@ async fn udp_associate(mut ctl: TcpStream, tunnel: Tunnel, hint: Target, local: 
             let mut buf = vec![0u8; 65_536];
             loop {
                 let (n, src) = relay.recv_from(&mut buf).await?;
-                if !src.ip().is_loopback() {
-                    continue;
-                }
+                // The relay socket is bound to a loopback address, so only
+                // this machine can reach it. The sender may still show one of
+                // the machine's own addresses (a server socket bound to its
+                // public IP sends from that), so the address is not checked;
+                // the first sender is the client, and nobody else is served.
                 {
                     let mut c = client.lock().unwrap_or_else(|e| e.into_inner());
                     match *c {

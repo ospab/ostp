@@ -56,8 +56,10 @@ pub struct UpdateResult {
 pub async fn update_all(settings: &DnsSettings, data_dir: &Path, proxy: Option<&str>) -> Vec<UpdateResult> {
     let mut builder = reqwest::Client::builder().timeout(Duration::from_secs(180)).user_agent(concat!("ostp-dns/", env!("CARGO_PKG_VERSION")));
     if let Some(p) = proxy {
-        if let Ok(px) = reqwest::Proxy::all(p) {
-            builder = builder.proxy(px);
+        // A proxy that cannot be used is a failure, never a direct download.
+        match reqwest::Proxy::all(p) {
+            Ok(px) => builder = builder.proxy(px),
+            Err(e) => return vec![UpdateResult { name: "-".into(), url: "-".into(), ok: false, detail: format!("the outbound proxy cannot be used: {e}") }],
         }
     }
     let client = match builder.build() {
