@@ -8,6 +8,9 @@ Older history is on the [Releases](https://github.com/ospab/ostp/releases) page 
 
 ## [Unreleased]
 
+### Added
+- Docs: `v6-design.md`, the draft plan for protocol v6 / 0.5.0 (nothing in it is implemented).
+
 ## [0.4.7] - 2026-11-12
 
 Summary of 0.4.7 (the details are in the beta entries below). Wire-compatible with 0.4.5 and 0.4.6 (protocol version 5).

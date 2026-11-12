@@ -8,6 +8,7 @@ Each document exists in English (`en/`) and Russian (`ru/`) with the same conten
 | Server | [server.md](en/server.md) | [server.md](ru/server.md) | Dispatcher, attack mitigation, roaming, management API and web panel, `ostp manage`, DNS, fallback listener, outbound proxy, overnet, relay node |
 | Domains and TLS | [tls.md](en/tls.md) | [tls.md](ru/tls.md) | TLS on 443, how the server tells connections apart, `ostp cert`, web servers, renewal, subscriptions |
 | Protocol specification | [specification.md](en/specification.md) | [specification.md](ru/specification.md) | Wire format, header masking, key derivation and handshake, frames, ARQ, congestion control (CUBIC), roaming |
+| Protocol v6 (draft) | [v6-design.md](en/v6-design.md) | [v6-design.md](ru/v6-design.md) | Plan for 0.5.0: server key pinning (NKpsk0), a handshake that looks random, session-layer changes, the transitional mode |
 | Obfuscation | [obfuscation.md](en/obfuscation.md) | [obfuscation.md](ru/obfuscation.md) | Kerckhoffs's principle (what is public, what is secret), secret derivation, masking, padding, TTL-desync decoys |
 | Architecture | [architecture.md](en/architecture.md) | [architecture.md](ru/architecture.md) | How the crates fit together, envelope vs. frame, multiplexing, ARQ, roaming, server subsystems |
 | Integrations | [integrations.md](en/integrations.md) | [integrations.md](ru/integrations.md) | Android app and JNI, desktop GUI, first-run screen, installing and managing your own server over SSH, system interfaces |
