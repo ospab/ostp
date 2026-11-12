@@ -37,7 +37,7 @@ A lost server reply makes the client resend, and the server drops the resend as 
 `PROTOCOL_VERSION` becomes 6 and, as in v5, goes into the IKM, never onto the wire. The transitional server tries v6 first and v5 second on a datagram it cannot place.
 
 ## 2. Session layer
-Each item has a problem in 0.4.x and a direction; the details go to a second page before code.
+Each item has a problem in 0.4.x and a direction; the details are on [v6-session-design.md](v6-session-design.md), which comes before code.
 
 | Problem | Direction |
 |---|---|

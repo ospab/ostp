@@ -12,7 +12,8 @@ Older history is on the [Releases](https://github.com/ospab/ostp/releases) page 
 - Server DNS filter: by default it answers only queries sent to the server's own address (`10.1.0.1`) and no longer takes every client's DNS or refuses encrypted DNS (DoT, DoH) on its own. Taking over all DNS is an explicit option, `ostp dns takeover on` (panel: "Answer every DNS query"), and links and subscriptions then carry `dnsall=true`. `ostp migrate` (schema 5) keeps the takeover on servers whose filter was on, so nothing changes for them until the owner turns it off.
 
 ### Added
-- Docs: `v6-design.md`, the draft plan for protocol v6 / 0.5.0, and `warp-design.md`, the draft plan for `ostp warp` (nothing in them is implemented).
+- Device limit per user for subscriptions: `max_devices` (panel user form, `ostp manage user-limit`), checked by the device ID the app sends when its owner turned that on. A new device over the limit gets HTTP 403 `device_limit`, a request without an ID from a limited user gets 403 `hwid_required`. The record is `devices.json` (0600); the panel lists and removes devices, `ostp manage user-devices` prints them. The apps' part (the toggle and the ID) is not in yet.
+- Docs: `v6-design.md` and `v6-session-design.md`, the draft plans for protocol v6 / 0.5.0, and `warp-design.md`, the draft plan for `ostp warp` (nothing in them is implemented).
 
 ## [0.4.7] - 2026-11-12
 
