@@ -322,7 +322,11 @@ impl Manager {
             "" => "panel".to_string(),
             w => w.to_string(),
         };
-        let local = match self.panels.lock().await.get(id).copied() {
+        // The lock is taken in a statement of its own: held across the `match` it
+        // was still held when the `None` arm locked it again, and the call never
+        // returned (the app's "Open the panel" waited until its time limit).
+        let existing = self.panels.lock().await.get(id).copied();
+        let local = match existing {
             Some(p) => p,
             None => {
                 let s = self.session(id, auth).await?;
