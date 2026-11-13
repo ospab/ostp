@@ -188,6 +188,39 @@ async fn all_mode_sends_tcp_and_udp_through_the_tunnel_and_names_are_resolved_in
     assert!(rig.fake.seen.udp_dsts.lock().unwrap().contains(&"203.0.113.7:5301".parse().unwrap()));
 }
 
+/// `ostp warp test` and `status` use the probe's own SOCKS5 client, not the
+/// server's: it must get through UDP ASSOCIATE too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_probe_gets_udp_through_the_proxy() {
+    let t = targets().await;
+    let rig = rig(&t, "probe", WarpMode::All).await;
+    let r = ostp_warp::probe::dns_via(rig.proxy, "1.1.1.1:53".parse().unwrap(), "echo.test").await;
+    // The stand-in peer echoes datagrams, so the "answer" is the query itself:
+    // what matters is that the exchange completes instead of failing on the proxy.
+    assert!(r.is_ok(), "probe UDP through the proxy failed: {r:?}");
+}
+
+/// An association that has been idle gives its flow in the tunnel back and makes a
+/// new one when the client sends again: the association keeps working, and a
+/// server with thousands of idle ones does not hold a socket in the tunnel for each.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_idle_association_gets_a_new_flow_when_it_wakes_up() {
+    let t = targets().await;
+    let rig = rig(&t, "idle", WarpMode::All).await;
+    let ob = outbound(rig.proxy, vec![], OutboundAction::Proxy);
+    let server_udp = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    let up = connect_udp_target("203.0.113.8:5300", Some(&ob), None, false, server_udp).await.expect("udp associate");
+    let mut buf = [0u8; 2048];
+    up.send_to(b"first", "203.0.113.8:5300").await.unwrap();
+    let (n, _) = tokio::time::timeout(Duration::from_secs(10), up.recv_from(&mut buf)).await.expect("first echo").unwrap();
+    assert_eq!(&buf[..n], b"first");
+    // Longer than the idle time of the test build (0.5 s): the flow is given back.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    up.send_to(b"second", "203.0.113.8:5300").await.unwrap();
+    let (n, _) = tokio::time::timeout(Duration::from_secs(10), up.recv_from(&mut buf)).await.expect("echo after the idle time").unwrap();
+    assert_eq!(&buf[..n], b"second");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn rules_mode_proxies_only_what_the_rules_say() {
     let t = targets().await;

@@ -665,8 +665,11 @@ impl Driver {
             Cmd::Udp { reply } => {
                 let port = self.free_port();
                 let mut s = udp::Socket::new(
-                    udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 64], vec![0u8; 64 * 1024]),
-                    udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 64], vec![0u8; 64 * 1024]),
+                    // Small on purpose: a server carries thousands of flows, most of them a
+                    // DNS lookup or a QUIC handshake, and 16 datagrams of the tunnel's MTU
+                    // are what any of them has in flight.
+                    udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 16], vec![0u8; 24 * 1024]),
+                    udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 16], vec![0u8; 24 * 1024]),
                 );
                 if let Err(e) = s.bind(port) {
                     self.ports.remove(&port);

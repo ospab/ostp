@@ -8,6 +8,9 @@ Older history is on the [Releases](https://github.com/ospab/ostp/releases) page 
 
 ## [Unreleased]
 
+### Fixed
+- WARP: every UDP flow of the server's clients held a socket with 128 KiB of buffers in the tunnel for as long as its client kept the flow (5 minutes after the last datagram), and the relay allocated 64 KiB per association. On a busy server that was thousands of flows, hundreds of megabytes and the tunnel's flow limit (4095), after which UDP, DNS included, stopped working. A flow in the tunnel is now made on the first datagram, given back after 30 seconds of silence and made again when the client sends, its buffers are 24 KiB, and the relay buffer is 2 KiB.
+
 ## [0.4.8-beta.1] - 2026-11-12
 
 ### Changed

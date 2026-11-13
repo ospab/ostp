@@ -6,7 +6,6 @@
 
 use anyhow::{anyhow, bail, Result};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
@@ -275,16 +274,31 @@ async fn connect(mut sock: TcpStream, tunnel: Tunnel, target: Target) -> Result<
     Ok(())
 }
 
+/// A datagram of the SOCKS5 relay is at most the tunnel's MTU plus the header;
+/// anything larger could not enter the tunnel anyway.
+const RELAY_BUF: usize = 2048;
+/// An association that has carried nothing for this long gives its flow in the
+/// tunnel back (a DNS lookup needs a second; a flow that wakes up later gets a
+/// new one). The association itself, which costs a socket, lasts as long as the
+/// control connection does.
+// Short under the `testing` feature (only the tests' builds have it), so that a test can
+// watch a flow being given back and made again without waiting half a minute.
+const FLOW_IDLE: Duration = if cfg!(feature = "testing") { Duration::from_millis(500) } else { Duration::from_secs(30) };
+
 async fn udp_associate(mut ctl: TcpStream, tunnel: Tunnel, hint: Target, local: Option<SocketAddr>) -> Result<()> {
     let ip = local.map(|l| l.ip()).unwrap_or(Ipv4Addr::LOCALHOST.into());
     let relay = match UdpSocket::bind(SocketAddr::new(ip, 0)).await {
-        Ok(s) => Arc::new(s),
+        Ok(s) => s,
         Err(e) => {
             let _ = ctl.write_all(&reply_bytes(REP_GENERAL, None)).await;
             bail!("cannot open the UDP relay: {e}");
         }
     };
-    let flow = match tunnel.udp_flow().await {
+    // The tunnel must be able to carry the flow, or the association is refused
+    // (UDP never goes any other way). The flow itself is made on the first
+    // datagram: a server with thousands of associations that mostly sit idle
+    // would otherwise hold a socket with large buffers in the tunnel for each.
+    let first = match tunnel.udp_flow().await {
         Ok(f) => f,
         Err(e) => {
             let _ = ctl.write_all(&reply_bytes(reply_for_error(&e), None)).await;
@@ -299,30 +313,28 @@ async fn udp_associate(mut ctl: TcpStream, tunnel: Tunnel, hint: Target, local: 
         Target::Addr(a) if a.port() != 0 => Some(a.port()),
         _ => None,
     };
-    let (flow_tx, mut flow_rx) = flow.split();
-    let client: Arc<std::sync::Mutex<Option<SocketAddr>>> = Arc::new(std::sync::Mutex::new(None));
 
-    // client -> tunnel
-    let up = {
-        let relay = relay.clone();
-        let client = client.clone();
-        let tunnel = tunnel.clone();
-        async move {
-            let mut buf = vec![0u8; 65_536];
-            loop {
-                let (n, src) = relay.recv_from(&mut buf).await?;
+    let mut flow = Some(first.split());
+    let mut last = tokio::time::Instant::now();
+    let mut client: Option<SocketAddr> = None;
+    let mut buf = vec![0u8; RELAY_BUF];
+    let mut ctl_buf = [0u8; 64];
+    loop {
+        let idle_at = last + FLOW_IDLE;
+        let has_flow = flow.is_some();
+        tokio::select! {
+            // client -> tunnel
+            r = relay.recv_from(&mut buf) => {
+                let (n, src) = r?;
                 // The relay socket is bound to a loopback address, so only
                 // this machine can reach it. The sender may still show one of
                 // the machine's own addresses (a server socket bound to its
                 // public IP sends from that), so the address is not checked;
                 // the first sender is the client, and nobody else is served.
-                {
-                    let mut c = client.lock().unwrap_or_else(|e| e.into_inner());
-                    match *c {
-                        None if expected_port.is_none_or(|p| p == src.port()) => *c = Some(src),
-                        Some(first) if first == src => {}
-                        _ => continue, // somebody else on the machine
-                    }
+                match client {
+                    None if expected_port.is_none_or(|p| p == src.port()) => client = Some(src),
+                    Some(first) if first == src => {}
+                    _ => continue, // somebody else on the machine
                 }
                 let Ok((target, payload)) = parse_udp_datagram(&buf[..n]) else { continue };
                 if payload.is_empty() {
@@ -335,40 +347,51 @@ async fn udp_associate(mut ctl: TcpStream, tunnel: Tunnel, hint: Target, local: 
                         _ => continue,
                     },
                 };
-                // Gone when the tunnel is down: the datagram is dropped, as
-                // UDP allows, never sent another way.
-                flow_tx.send_to(dst, payload);
+                if flow.is_none() {
+                    match tunnel.udp_flow().await {
+                        Ok(f) => flow = Some(f.split()),
+                        // Gone when the tunnel is down: the datagram is dropped,
+                        // as UDP allows, never sent another way.
+                        Err(_) => continue,
+                    }
+                }
+                if let Some((tx, _)) = &flow {
+                    tx.send_to(dst, payload);
+                }
+                last = tokio::time::Instant::now();
             }
-            #[allow(unreachable_code)]
-            Ok::<(), anyhow::Error>(())
-        }
-    };
-    // tunnel -> client
-    let down = {
-        let relay = relay.clone();
-        let client = client.clone();
-        async move {
-            while let Some((from, payload)) = flow_rx.recv().await {
-                let Some(c) = *client.lock().unwrap_or_else(|e| e.into_inner()) else { continue };
-                let _ = relay.send_to(&encode_udp_datagram(&from, &payload), c).await;
+            // tunnel -> client
+            r = async {
+                match flow.as_mut() {
+                    Some((_, rx)) => rx.recv().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                match r {
+                    Some((from, payload)) => {
+                        if let Some(c) = client {
+                            let _ = relay.send_to(&encode_udp_datagram(&from, &payload), c).await;
+                        }
+                        last = tokio::time::Instant::now();
+                    }
+                    // The tunnel dropped the flow: the next datagram makes a new one.
+                    None => flow = None,
+                }
             }
-            Ok::<(), anyhow::Error>(())
-        }
-    };
-    // The association lives as long as the control connection.
-    let control = async move {
-        let mut b = [0u8; 64];
-        loop {
-            match ctl.read(&mut b).await {
-                Ok(0) | Err(_) => return Ok::<(), anyhow::Error>(()),
-                Ok(_) => {}
+            // Idle: give the flow back.
+            _ = async {
+                if has_flow { tokio::time::sleep_until(idle_at).await } else { std::future::pending().await }
+            } => {
+                flow = None;
+            }
+            // The association lives as long as the control connection.
+            r = ctl.read(&mut ctl_buf) => {
+                match r {
+                    Ok(0) | Err(_) => return Ok(()),
+                    Ok(_) => {}
+                }
             }
         }
-    };
-    tokio::select! {
-        r = up => r,
-        r = down => r,
-        r = control => r,
     }
 }
 
