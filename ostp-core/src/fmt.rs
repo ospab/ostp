@@ -1,5 +1,8 @@
 //! Human-readable sizes.
 
+#[cfg(not(feature = "std"))]
+use alloc::{format, string::String};
+
 /// `1536` -> `1.5 KiB`; binary units, one decimal, plain `N B` below 1 KiB.
 pub fn fmt_bytes(n: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];

@@ -1,4 +1,5 @@
-use rand::Rng;
+#[cfg(not(feature = "std"))]
+use alloc::{vec, vec::Vec};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrafficProfile {
@@ -60,7 +61,7 @@ impl AdaptivePadder {
                 let jitter = if jitter_cap == 0 {
                     0
                 } else {
-                    rand::thread_rng().gen_range(0..=jitter_cap.min(256))
+                    crate::sys::random_range_inclusive(0, jitter_cap.min(256))
                 };
 
                 (base_pad + jitter).min(self.max_pad)
@@ -80,7 +81,7 @@ impl AdaptivePadder {
         let len = self.padding_for_len(payload_len);
         let mut buf = vec![0_u8; len];
         if len > 0 {
-            rand::thread_rng().fill(&mut buf[..]);
+            crate::sys::fill_random(&mut buf);
         }
         buf
     }

@@ -2,6 +2,9 @@
 //! the token that addresses one access key without putting the key itself in
 //! URLs (and so in web-server access logs).
 
+#[cfg(not(feature = "std"))]
+use alloc::{format, string::{String, ToString}, vec::Vec};
+
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 

@@ -1,7 +1,12 @@
+#[cfg(feature = "std")]
 use snow::{Builder, HandshakeState};
+#[cfg(not(feature = "std"))]
+pub use super::noise_lite::NoiseSession;
 
+#[cfg(feature = "std")]
 use crate::protocol::ProtocolError;
 
+#[cfg(feature = "std")]
 const NN_NOISE_PARAMS: &str = "Noise_NNpsk0_25519_ChaChaPoly_BLAKE2s";
 
 #[derive(Clone, Copy, Debug)]
@@ -17,10 +22,12 @@ pub enum NoiseRole {
 /// nonce counter can't express.
 ///
 /// [`raw_split`]: NoiseSession::raw_split
+#[cfg(feature = "std")]
 pub struct NoiseSession {
     handshake: Box<HandshakeState>,
 }
 
+#[cfg(feature = "std")]
 impl NoiseSession {
     pub fn new(
         role: NoiseRole,

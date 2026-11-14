@@ -1,3 +1,6 @@
+#[cfg(not(feature = "std"))]
+use alloc::string::ToString;
+
 use bytes::{BufMut, Bytes, BytesMut};
 
 use crate::protocol::ProtocolError;
@@ -46,7 +49,7 @@ impl FrameHeader {
         out.put_u8(self.kind as u8);
         // Anti-DPI: reserved bytes filled with random data instead of zeros
         // to prevent known-plaintext fingerprinting inside encrypted frames
-        let rnd: u16 = rand::random();
+        let rnd: u16 = crate::sys::random_u16();
         out.put_u16(rnd);
         out.put_u16(self.stream_id);
         out.put_u32(self.payload_len);
