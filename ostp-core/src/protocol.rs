@@ -56,6 +56,26 @@ pub struct ProtocolConfig {
     pub handshake_pad_min: usize,
     pub handshake_pad_max: usize,
     pub mtu: usize,
+    /// `Some`: the handshake is v6 (the server's static key, a masked
+    /// handshake datagram). `None`: v5. The caller derives `psk`,
+    /// `obfuscation_key` and the padding range for the same version.
+    pub v6: Option<V6Handshake>,
+}
+
+/// What a v6 handshake needs besides the PSK.
+#[derive(Clone)]
+pub struct V6Handshake {
+    /// The server's static key: the public half on a client, the private on
+    /// the server.
+    pub server: crate::crypto::ServerStatic,
+    /// The keys of the handshake's outer layer (`crypto::handshake_v6`).
+    pub hs: crate::crypto::HsKeys,
+}
+
+impl std::fmt::Debug for V6Handshake {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "V6Handshake({:?})", self.server)
+    }
 }
 
 impl ProtocolConfig {
@@ -81,8 +101,17 @@ impl ProtocolConfig {
             handshake_pad_min: 32,
             handshake_pad_max: 128,
             mtu,
+            v6: None,
         }
     }
+}
+
+/// The session id a v6 handshake datagram carries, if it has this key's tag.
+/// A server uses it to pick the key (one HMAC per key) before any Noise work.
+pub fn v6_handshake_session_id(keys: &crate::crypto::HsKeys, datagram: &[u8]) -> Option<u32> {
+    let body = crate::crypto::handshake_v6::open(keys, crate::crypto::HsDirection::ClientToServer, datagram)?;
+    let sid = body.get(..4)?;
+    Some(u32::from_be_bytes([sid[0], sid[1], sid[2], sid[3]]))
 }
 
 /// The client's handshake payload: `timestamp(8) | session_id(4) | access_key`,
@@ -201,6 +230,8 @@ pub struct ProtocolMachine {
     handshake_pad_min: usize,
     handshake_pad_max: usize,
     _mtu: usize,
+    /// `Some`: the handshake datagrams are v6 (masked, tagged).
+    v6_hs: Option<crate::crypto::HsKeys>,
 }
 
 // ── Gap recovery (see `ProtocolMachine::recover_stalled_gap`) ────────────────
@@ -241,10 +272,23 @@ struct SentFrame {
 
 impl ProtocolMachine {
     pub fn new(config: ProtocolConfig) -> Result<Self, ProtocolError> {
-        let noise = NoiseSession::new(
-            config.role,
-            &config.psk,
-        )?;
+        let noise = match &config.v6 {
+            Some(v6) => {
+                // The half of the server key must fit the role: a client with a
+                // private key or a server with a public one is a caller's bug.
+                let fits = matches!(
+                    (config.role, &v6.server),
+                    (NoiseRole::Initiator, crate::crypto::ServerStatic::Public(_))
+                        | (NoiseRole::Responder, crate::crypto::ServerStatic::Private(_))
+                );
+                if !fits {
+                    return Err(ProtocolError::State("the server key does not fit the role".to_string()));
+                }
+                NoiseSession::new_v6(&config.psk, &v6.server)?
+            }
+            None => NoiseSession::new(config.role, &config.psk)?,
+        };
+        let v6_hs = config.v6.as_ref().map(|v| v.hs);
         // The MTU comes from user config. Zero divides by zero in the
         // congestion controller and anything under the padder's 64-byte
         // bucket panics in `clamp`, so a nonsense value is raised to the
@@ -298,6 +342,7 @@ impl ProtocolMachine {
             handshake_pad_min: config.handshake_pad_min.max(8),
             handshake_pad_max: config.handshake_pad_max.max(config.handshake_pad_min + 16),
             _mtu: mtu,
+            v6_hs,
         })
     }
 
@@ -468,9 +513,20 @@ impl ProtocolMachine {
     }
 
     fn handle_inbound(&mut self, raw: Bytes) -> Result<ProtocolAction, ProtocolError> {
-        let mut raw_vec = raw.to_vec();
         let is_handshake = self.state == OstpState::Handshaking || self.state == OstpState::Init;
-        crate::crypto::deobfuscate_packet_inplace(&mut raw_vec, &self.obfuscation_key, is_handshake);
+        let raw_vec = match (&self.v6_hs, is_handshake) {
+            (Some(keys), true) => {
+                // The peer's direction: a server reads the client's message
+                // and the other way round.
+                crate::crypto::handshake_v6::open(keys, self.peer_hs_direction(), &raw)
+                    .ok_or_else(|| ProtocolError::Framing("not a handshake for this key".to_string()))?
+            }
+            _ => {
+                let mut v = raw.to_vec();
+                crate::crypto::deobfuscate_packet_inplace(&mut v, &self.obfuscation_key, is_handshake);
+                v
+            }
+        };
 
         if raw_vec.len() < 4 {
             return Err(ProtocolError::Framing("datagram too short".to_string()));
@@ -842,8 +898,26 @@ impl ProtocolMachine {
         out.extend_from_slice(&noise_len.to_be_bytes());
         out.extend_from_slice(noise_payload);
         out.extend_from_slice(&pad);
+        if let Some(keys) = &self.v6_hs {
+            // v6: the same body, masked whole (see `crypto::handshake_v6`).
+            return Ok(Bytes::from(crate::crypto::handshake_v6::seal(keys, self.own_hs_direction(), &out)));
+        }
         crate::crypto::obfuscate_packet_inplace(&mut out, &self.obfuscation_key, true);
         Ok(Bytes::from(out))
+    }
+
+    fn own_hs_direction(&self) -> crate::crypto::HsDirection {
+        match self.role {
+            NoiseRole::Initiator => crate::crypto::HsDirection::ClientToServer,
+            NoiseRole::Responder => crate::crypto::HsDirection::ServerToClient,
+        }
+    }
+
+    fn peer_hs_direction(&self) -> crate::crypto::HsDirection {
+        match self.role {
+            NoiseRole::Initiator => crate::crypto::HsDirection::ServerToClient,
+            NoiseRole::Responder => crate::crypto::HsDirection::ClientToServer,
+        }
     }
 
     fn build_tracked_datagram(&mut self, stream_id: u16, kind: FrameKind, payload: Bytes) -> Result<Bytes, ProtocolError> {
@@ -1351,7 +1425,105 @@ mod tests {
             handshake_pad_min: 8,
             handshake_pad_max: 32,
             mtu: 1400,
+            v6: None,
         }
+    }
+
+    fn v6_keys() -> crate::crypto::HsKeys {
+        crate::crypto::HsKeys { mask_key: [0x11; 32], tag_key: [0x22; 32] }
+    }
+
+    /// A v6 pair of configs: the client holds the public half of `private`.
+    fn v6_configs(private: [u8; 32], client_knows: [u8; 32]) -> (ProtocolConfig, ProtocolConfig) {
+        use crate::crypto::ServerStatic;
+        let mut c = make_config(NoiseRole::Initiator);
+        c.handshake_payload = b"hello".to_vec();
+        c.v6 = Some(V6Handshake { server: ServerStatic::Public(client_knows), hs: v6_keys() });
+        let mut s = make_config(NoiseRole::Responder);
+        s.v6 = Some(V6Handshake { server: ServerStatic::Private(private), hs: v6_keys() });
+        (c, s)
+    }
+
+    fn server_reply(action: ProtocolAction) -> (Bytes, Bytes) {
+        match action {
+            ProtocolAction::HandshakePayload(p, Some(d)) => (p, d),
+            _ => panic!("expected the handshake payload and a reply"),
+        }
+    }
+
+    #[test]
+    fn a_v6_handshake_establishes_and_carries_data() {
+        let (private, public) = crate::crypto::noise::generate_server_key();
+        let (ccfg, scfg) = v6_configs(private, public);
+        let mut client = ProtocolMachine::new(ccfg).unwrap();
+        let mut server = ProtocolMachine::new(scfg).unwrap();
+        let ProtocolAction::SendDatagram(msg1) = client.on_event(OstpEvent::Start).unwrap() else {
+            panic!("expected the handshake datagram")
+        };
+        assert_eq!(v6_handshake_session_id(&v6_keys(), &msg1), Some(1));
+        let (payload, reply) = server_reply(server.on_event(OstpEvent::Inbound(msg1)).unwrap());
+        assert_eq!(&payload[..], b"hello", "the client's payload reaches the server");
+        client.on_event(OstpEvent::Inbound(reply)).unwrap();
+        assert_eq!(client.state(), OstpState::Established);
+        assert_eq!(server.state(), OstpState::Established);
+
+        let ProtocolAction::SendDatagram(data) = client.on_event(OstpEvent::Outbound(7, Bytes::from_static(b"ping"))).unwrap() else {
+            panic!("expected a data datagram")
+        };
+        let delivered = match server.on_event(OstpEvent::Inbound(data)).unwrap() {
+            ProtocolAction::DeliverApp(7, d) => d,
+            ProtocolAction::Multiple(list) => list
+                .into_iter()
+                .find_map(|a| match a {
+                    ProtocolAction::DeliverApp(7, d) => Some(d),
+                    _ => None,
+                })
+                .expect("the data"),
+            _ => panic!("expected the data"),
+        };
+        assert_eq!(&delivered[..], b"ping");
+    }
+
+    /// The point of NK: a server that holds an access key but not the private
+    /// key the client's profile names cannot complete the handshake.
+    #[test]
+    fn a_v6_client_refuses_a_server_with_another_key() {
+        let (_, pinned_public) = crate::crypto::noise::generate_server_key();
+        let (impostor_private, _) = crate::crypto::noise::generate_server_key();
+        let (ccfg, scfg) = v6_configs(impostor_private, pinned_public);
+        let mut client = ProtocolMachine::new(ccfg).unwrap();
+        let mut server = ProtocolMachine::new(scfg).unwrap();
+        let ProtocolAction::SendDatagram(msg1) = client.on_event(OstpEvent::Start).unwrap() else {
+            panic!("expected the handshake datagram")
+        };
+        // The first message is encrypted to the pinned key: the impostor
+        // cannot even read it, so it has nothing to answer with.
+        assert!(server.on_event(OstpEvent::Inbound(msg1)).is_err());
+        assert_ne!(client.state(), OstpState::Established);
+    }
+
+    #[test]
+    fn v5_and_v6_do_not_read_each_other() {
+        let (private, public) = crate::crypto::noise::generate_server_key();
+        let (c6, s6) = v6_configs(private, public);
+        // a v5 client against a v6 server
+        let mut client5 = ProtocolMachine::new(make_config(NoiseRole::Initiator)).unwrap();
+        let mut server6 = ProtocolMachine::new(s6).unwrap();
+        let ProtocolAction::SendDatagram(m) = client5.on_event(OstpEvent::Start).unwrap() else { panic!() };
+        assert!(server6.on_event(OstpEvent::Inbound(m)).is_err());
+        // a v6 client against a v5 server
+        let mut client6 = ProtocolMachine::new(c6).unwrap();
+        let mut server5 = ProtocolMachine::new(make_config(NoiseRole::Responder)).unwrap();
+        let ProtocolAction::SendDatagram(m) = client6.on_event(OstpEvent::Start).unwrap() else { panic!() };
+        assert!(server5.on_event(OstpEvent::Inbound(m)).is_err());
+    }
+
+    #[test]
+    fn the_server_key_must_fit_the_role() {
+        use crate::crypto::ServerStatic;
+        let mut c = make_config(NoiseRole::Initiator);
+        c.v6 = Some(V6Handshake { server: ServerStatic::Private([1; 32]), hs: v6_keys() });
+        assert!(ProtocolMachine::new(c).is_err());
     }
 
     /// Full handshake: Initiator -> Responder -> Initiator -> Established

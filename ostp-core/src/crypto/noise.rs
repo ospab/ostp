@@ -4,10 +4,44 @@ use crate::protocol::ProtocolError;
 
 const NN_NOISE_PARAMS: &str = "Noise_NNpsk0_25519_ChaChaPoly_BLAKE2s";
 
+const NK_NOISE_PARAMS: &str = "Noise_NKpsk0_25519_ChaChaPoly_BLAKE2s";
+/// Bound into the handshake hash: a v6 message cannot be read as anything else.
+const V6_PROLOGUE: &[u8] = b"ostp v6";
+
 #[derive(Clone, Copy, Debug)]
 pub enum NoiseRole {
     Initiator,
     Responder,
+}
+
+/// The server's static X25519 key as one side of a v6 handshake holds it:
+/// the client has the public half (from its profile), the server the private.
+#[derive(Clone)]
+pub enum ServerStatic {
+    Public([u8; 32]),
+    Private([u8; 32]),
+}
+
+impl std::fmt::Debug for ServerStatic {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Never the key itself: this ends up in logs through ProtocolConfig.
+        f.write_str(match self {
+            ServerStatic::Public(_) => "ServerStatic::Public",
+            ServerStatic::Private(_) => "ServerStatic::Private",
+        })
+    }
+}
+
+/// A new server key pair: `(private, public)`.
+pub fn generate_server_key() -> ([u8; 32], [u8; 32]) {
+    let secret = x25519_dalek::StaticSecret::random_from_rng(rand::thread_rng());
+    let public = x25519_dalek::PublicKey::from(&secret);
+    (secret.to_bytes(), public.to_bytes())
+}
+
+/// The public half of a server's private key.
+pub fn server_public_key(private: &[u8; 32]) -> [u8; 32] {
+    x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(*private)).to_bytes()
 }
 
 /// A Noise handshake in progress. OSTP does not use snow's transport mode: once
@@ -42,6 +76,28 @@ impl NoiseSession {
                 .map_err(|_| ProtocolError::Crypto("noise-responder".to_string()))?,
         };
 
+        Ok(Self { handshake: Box::new(handshake) })
+    }
+
+    /// The v6 handshake: `NKpsk0`. The client knows the server's static public
+    /// key in advance and encrypts its first message to it, so only the holder
+    /// of the matching private key can answer. In v5 (`NNpsk0`) anyone with an
+    /// access key could play the server.
+    pub fn new_v6(psk: &[u8; 32], server: &ServerStatic) -> Result<Self, ProtocolError> {
+        let params = NK_NOISE_PARAMS
+            .parse()
+            .map_err(|_| ProtocolError::Crypto("noise-params".to_string()))?;
+        let builder = Builder::new(params).psk(0, psk).prologue(V6_PROLOGUE);
+        let handshake = match server {
+            ServerStatic::Public(public) => builder
+                .remote_public_key(public)
+                .build_initiator()
+                .map_err(|_| ProtocolError::Crypto("noise-init".to_string()))?,
+            ServerStatic::Private(private) => builder
+                .local_private_key(private)
+                .build_responder()
+                .map_err(|_| ProtocolError::Crypto("noise-responder".to_string()))?,
+        };
         Ok(Self { handshake: Box::new(handshake) })
     }
 

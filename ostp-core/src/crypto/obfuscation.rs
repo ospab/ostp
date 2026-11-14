@@ -140,6 +140,43 @@ pub(crate) fn derive_all_secrets_versioned(access_key: &[u8], version: u8) -> De
     }
 }
 
+/// The wire version of 0.5.0. A server in the transitional mode speaks both
+/// this and [`PROTOCOL_VERSION`]; which one a client speaks is part of its
+/// profile (a profile with the server's public key is a v6 profile).
+pub const PROTOCOL_VERSION_V6: u8 = 6;
+
+/// Everything a v6 endpoint derives from an access key: the same secrets as
+/// v5 (under version 6, so none of them equals its v5 value) and the keys of
+/// the handshake's outer layer (see `handshake_v6`).
+#[derive(Clone)]
+pub struct V6Secrets {
+    pub base: DerivedSecrets,
+    pub hs: super::handshake_v6::HsKeys,
+}
+
+pub fn derive_v6_secrets(access_key: &[u8]) -> V6Secrets {
+    let base = derive_all_secrets_versioned(access_key, PROTOCOL_VERSION_V6);
+    let mut mask_key = [0u8; 32];
+    mask_key.copy_from_slice(&derive_labelled(access_key, PROTOCOL_VERSION_V6, 0x05, 32));
+    let mut tag_key = [0u8; 32];
+    tag_key.copy_from_slice(&derive_labelled(access_key, PROTOCOL_VERSION_V6, 0x06, 32));
+    V6Secrets { base, hs: super::handshake_v6::HsKeys { mask_key, tag_key } }
+}
+
+/// One more output of the derivation in `derive_all_secrets_versioned`, under
+/// its own label byte.
+fn derive_labelled(access_key: &[u8], version: u8, label: u8, len: usize) -> Vec<u8> {
+    use sha2::Digest;
+    let key_hash = sha2::Sha256::digest(access_key);
+    let mut ikm = Vec::with_capacity(access_key.len() + 1);
+    ikm.extend_from_slice(access_key);
+    ikm.push(version);
+    let prk = hkdf_extract(&key_hash[..16], &ikm);
+    let mut info = key_hash[16..].to_vec();
+    info.push(label);
+    hkdf_expand(&prk, &info, len)
+}
+
 /// Window length (seconds) for the rotating junk marker. The marker changes
 /// every window, so junk carries no static per-user fingerprint on the wire;
 /// the server checks the current and previous window to absorb clock skew.
