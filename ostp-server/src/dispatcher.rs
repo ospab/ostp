@@ -112,6 +112,19 @@ pub struct Dispatcher {
     stream_limits: HashMap<String, Arc<tokio::sync::Semaphore>>,
     /// Sessions removed by `drop_session` since the last tick.
     dropped: Vec<u32>,
+    /// The server's static private key. `Some`: v6 handshakes are accepted.
+    server_key: Option<[u8; 32]>,
+    /// The transitional mode: v5 handshakes are accepted as well.
+    accept_v5: bool,
+    v6_secrets_cache: HashMap<String, ostp_core::crypto::V6Secrets>,
+    /// The reply to each accepted v6 handshake, by the SHA-256 of the client's
+    /// datagram, with the handshake's timestamp. A client whose reply was lost
+    /// sends the same datagram again; it gets the same reply instead of
+    /// silence (the replay check would drop it). Kept as long as the replay
+    /// cache keeps the handshake. The reply is encrypted to the client's
+    /// ephemeral key, so resending it to someone who replays a captured
+    /// handshake gives them nothing.
+    hs_replies: HashMap<[u8; 32], (u64, Bytes)>,
 }
 
 /// Server-wide key trials per second for sources not seen authenticating.
@@ -164,7 +177,28 @@ impl Dispatcher {
             trials: crate::admission::Admission::new(TRIAL_SOURCE_RATE, TRIAL_SOURCE_BURST, TRIAL_RATE),
             stream_limits: HashMap::new(),
             dropped: Vec::new(),
+            server_key: None,
+            accept_v5: true,
+            v6_secrets_cache: HashMap::new(),
+            hs_replies: HashMap::new(),
         }
+    }
+
+    /// Which wire versions this server speaks. With a server key it accepts
+    /// v6; `accept_v5` keeps v5 clients working next to it (the transitional
+    /// mode). Without a key only v5 can work, whatever `accept_v5` says.
+    pub fn set_wire_versions(&mut self, server_key: Option<[u8; 32]>, accept_v5: bool) {
+        self.accept_v5 = accept_v5 || server_key.is_none();
+        self.server_key = server_key;
+    }
+
+    fn cached_v6_secrets(&mut self, key: &str) -> ostp_core::crypto::V6Secrets {
+        if let Some(s) = self.v6_secrets_cache.get(key) {
+            return s.clone();
+        }
+        let s = ostp_core::crypto::derive_v6_secrets(key.as_bytes());
+        self.v6_secrets_cache.insert(key.to_string(), s.clone());
+        s
     }
 
     /// Fetch this key's derived secrets from cache, computing (and caching) them
@@ -458,27 +492,68 @@ impl Dispatcher {
         // recognised. Computed once per datagram, not per candidate key.
         let junk_window = ostp_core::crypto::current_junk_window();
 
-        for candidate_key in keys_snapshot {
-            let secrets = self.cached_secrets(&candidate_key);
-
-            // Junk frames carry this key's time-rotating marker (no global
-            // constant, no static per-user signature). Drop silently.
-            if packet.len() >= 4 {
-                let (m_now, m_prev) = self.cached_junk_markers(&candidate_key, junk_window);
-                if packet[0..4] == m_now || packet[0..4] == m_prev {
-                    return Ok(DispatchOutcome::Junk);
-                }
+        // A v6 handshake this server already answered, sent again because the
+        // reply was lost: the same reply, no second session.
+        let datagram_hash: Option<[u8; 32]> = self.server_key.map(|_| {
+            use sha2::{Digest, Sha256};
+            Sha256::digest(&packet).into()
+        });
+        if let Some(hash) = &datagram_hash {
+            if let Some((_, reply)) = self.hs_replies.get(hash) {
+                return Ok(DispatchOutcome::Accepted {
+                    responses: vec![reply.clone()],
+                    app_payloads: Vec::new(),
+                    peer_addr: peer,
+                });
             }
+        }
 
-            // Decode the session_id using this key's obfuscation
-            // The handshake mask is derived from the Noise payload at bytes [6..],
-            // so we must deobfuscate the full packet, not just the header.
-            if packet.len() < 7 { continue; }
-            let mut trial = packet.to_vec();
-            ostp_core::crypto::deobfuscate_packet_inplace(&mut trial, &secrets.obfuscation_key, true);
-            let candidate_session_id = u32::from_be_bytes([trial[0], trial[1], trial[2], trial[3]]);
+        // v6 first for every key (a tag check, one HMAC), then v5 for every
+        // key (the transitional mode).
+        let mut attempts: Vec<(String, bool)> = Vec::with_capacity(keys_snapshot.len() * 2);
+        if self.server_key.is_some() {
+            attempts.extend(keys_snapshot.iter().map(|k| (k.clone(), true)));
+        }
+        if self.accept_v5 {
+            attempts.extend(keys_snapshot.into_iter().map(|k| (k, false)));
+        }
+
+        for (candidate_key, is_v6) in attempts {
+            let (secrets, v6_cfg, candidate_session_id) = if is_v6 {
+                let v6 = self.cached_v6_secrets(&candidate_key);
+                let Some(sid) = ostp_core::protocol::v6_handshake_session_id(&v6.hs, &packet) else {
+                    continue;
+                };
+                let Some(private) = self.server_key else { continue };
+                let handshake = ostp_core::protocol::V6Handshake {
+                    server: ostp_core::crypto::ServerStatic::Private(private),
+                    hs: v6.hs,
+                };
+                (v6.base, Some(handshake), sid)
+            } else {
+                let secrets = self.cached_secrets(&candidate_key);
+
+                // Junk frames carry this key's time-rotating marker (no global
+                // constant, no static per-user signature). Drop silently.
+                if packet.len() >= 4 {
+                    let (m_now, m_prev) = self.cached_junk_markers(&candidate_key, junk_window);
+                    if packet[0..4] == m_now || packet[0..4] == m_prev {
+                        return Ok(DispatchOutcome::Junk);
+                    }
+                }
+
+                // Decode the session_id using this key's obfuscation
+                // The handshake mask is derived from the Noise payload at bytes [6..],
+                // so we must deobfuscate the full packet, not just the header.
+                if packet.len() < 7 { continue; }
+                let mut trial = packet.to_vec();
+                ostp_core::crypto::deobfuscate_packet_inplace(&mut trial, &secrets.obfuscation_key, true);
+                let sid = u32::from_be_bytes([trial[0], trial[1], trial[2], trial[3]]);
+                (secrets, None, sid)
+            };
 
             let mut cfg = self.machine_config.clone();
+            cfg.v6 = v6_cfg;
             cfg.session_id = candidate_session_id;
             cfg.psk = secrets.psk;
             cfg.handshake_payload = vec![];
@@ -612,9 +687,20 @@ impl Dispatcher {
                             self.trials.mark_known(peer.ip());
                             self.roaming.mark_known(peer.ip());
 
-                            tracing::info!("New session authenticated: sid={} peer={} (active_sessions={}, replay_cache={})",
-                                candidate_session_id, peer, self.peer_machines.len(), self.replay_cache.len()
+                            tracing::info!("New session authenticated: sid={} peer={} v{} (active_sessions={}, replay_cache={})",
+                                candidate_session_id, peer, if is_v6 { 6 } else { 5 }, self.peer_machines.len(), self.replay_cache.len()
                             );
+
+                            if let (true, Some(hash), Some(reply)) = (is_v6, datagram_hash, response_opt.as_ref()) {
+                                if self.hs_replies.len() >= REPLAY_CACHE_MAX {
+                                    self.hs_replies.retain(|_, (cached_ts, _)| now.abs_diff(*cached_ts) <= 300);
+                                }
+                                // Still full: this reply is not kept, and a lost
+                                // one costs that client a new handshake.
+                                if self.hs_replies.len() < REPLAY_CACHE_MAX {
+                                    self.hs_replies.insert(hash, (ts, reply.clone()));
+                                }
+                            }
 
                             return Ok(DispatchOutcome::Accepted {
                                 responses: response_opt.into_iter().collect(),
@@ -671,6 +757,7 @@ impl Dispatcher {
             .unwrap_or_default()
             .as_secs();
         self.replay_cache.retain(|_, &mut ts| current_sys_time.abs_diff(ts) <= 300);
+        self.hs_replies.retain(|_, (ts, _)| current_sys_time.abs_diff(*ts) <= 300);
 
         // Drop cached secrets/junk-markers for keys that have been deleted, so the
         // caches can't grow without bound as keys churn.
@@ -889,6 +976,132 @@ mod roaming_tests {
 
     fn send(client: &mut ProtocolMachine, data: &'static [u8]) -> Bytes {
         first_datagram(client.on_event(OstpEvent::Outbound(1, Bytes::from_static(data))).unwrap())
+    }
+
+    fn new_dispatcher() -> Dispatcher {
+        let keys = Arc::new(RwLock::new(HashMap::from([(KEY.to_string(), crate::api::UserMeta { name: None, limit_bytes: None, max_devices: None })])));
+        Dispatcher::new(base_config(NoiseRole::Responder), keys)
+    }
+
+    fn handshake_payload() -> Vec<u8> {
+        let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        let mut payload = ts.to_be_bytes().to_vec();
+        payload.extend_from_slice(&SID.to_be_bytes());
+        payload.extend_from_slice(KEY.as_bytes());
+        payload
+    }
+
+    /// A v6 client that knows `server_public`, and its first datagram.
+    fn v6_client(server_public: [u8; 32]) -> (ProtocolMachine, Bytes) {
+        let v6 = ostp_core::crypto::derive_v6_secrets(KEY.as_bytes());
+        let mut cfg = base_config(NoiseRole::Initiator);
+        cfg.session_id = SID;
+        cfg.psk = v6.base.psk;
+        cfg.obfuscation_key = v6.base.obfuscation_key;
+        cfg.handshake_pad_min = v6.base.handshake_pad_min;
+        cfg.handshake_pad_max = v6.base.handshake_pad_max;
+        cfg.handshake_payload = handshake_payload();
+        cfg.v6 = Some(ostp_core::protocol::V6Handshake {
+            server: ostp_core::crypto::ServerStatic::Public(server_public),
+            hs: v6.hs,
+        });
+        let mut client = ProtocolMachine::new(cfg).unwrap();
+        let msg1 = first_datagram(client.on_event(OstpEvent::Start).unwrap());
+        (client, msg1)
+    }
+
+    fn accepted_reply(outcome: DispatchOutcome) -> Option<Bytes> {
+        match outcome {
+            DispatchOutcome::Accepted { mut responses, .. } if !responses.is_empty() => Some(responses.remove(0)),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn a_v6_client_connects_and_its_data_arrives() {
+        let (private, public) = ostp_core::crypto::noise::generate_server_key();
+        let mut dispatcher = new_dispatcher();
+        dispatcher.set_wire_versions(Some(private), true);
+        let (mut client, msg1) = v6_client(public);
+        let home = addr("203.0.113.5:4000");
+        let reply = accepted_reply(dispatcher.on_datagram(home, msg1).unwrap()).expect("the v6 handshake is accepted");
+        client.on_event(OstpEvent::Inbound(reply)).unwrap();
+        assert_eq!(client.state(), OstpState::Established);
+        match dispatcher.on_datagram(home, send(&mut client, b"hello")).unwrap() {
+            DispatchOutcome::Accepted { app_payloads, .. } => {
+                assert_eq!(app_payloads.len(), 1);
+                assert_eq!(&app_payloads[0].2[..], b"hello");
+            }
+            _ => panic!("the data was not accepted"),
+        }
+    }
+
+    /// The transitional mode: the same server serves a 0.4.x client.
+    #[test]
+    fn a_v5_client_connects_only_while_v5_is_accepted() {
+        let (private, _) = ostp_core::crypto::noise::generate_server_key();
+        let v5_msg1 = || {
+            let secrets = ostp_core::crypto::derive_all_secrets(KEY.as_bytes());
+            let mut cfg = base_config(NoiseRole::Initiator);
+            cfg.session_id = SID;
+            cfg.psk = secrets.psk;
+            cfg.obfuscation_key = secrets.obfuscation_key;
+            cfg.handshake_pad_min = secrets.handshake_pad_min;
+            cfg.handshake_pad_max = secrets.handshake_pad_max;
+            cfg.handshake_payload = handshake_payload();
+            let mut client = ProtocolMachine::new(cfg).unwrap();
+            first_datagram(client.on_event(OstpEvent::Start).unwrap())
+        };
+        let home = addr("203.0.113.5:4000");
+
+        let mut both = new_dispatcher();
+        both.set_wire_versions(Some(private), true);
+        assert!(accepted_reply(both.on_datagram(home, v5_msg1()).unwrap()).is_some());
+
+        let mut v6_only = new_dispatcher();
+        v6_only.set_wire_versions(Some(private), false);
+        assert!(matches!(v6_only.on_datagram(home, v5_msg1()).unwrap(), DispatchOutcome::Unauthorized));
+    }
+
+    /// A client that knows another server key gets silence, like any stranger.
+    #[test]
+    fn a_v6_client_with_another_server_key_gets_no_answer() {
+        let (private, _) = ostp_core::crypto::noise::generate_server_key();
+        let (_, other_public) = ostp_core::crypto::noise::generate_server_key();
+        let mut dispatcher = new_dispatcher();
+        dispatcher.set_wire_versions(Some(private), false);
+        let (_, msg1) = v6_client(other_public);
+        assert!(matches!(dispatcher.on_datagram(addr("203.0.113.5:4000"), msg1).unwrap(), DispatchOutcome::Unauthorized));
+        assert_eq!(dispatcher.active_sessions(), 0);
+    }
+
+    /// The reply was lost and the client sends its handshake again: the same
+    /// reply comes back, the session is not created twice, and the reply
+    /// still completes the client's handshake.
+    #[test]
+    fn a_repeated_v6_handshake_gets_the_same_reply() {
+        let (private, public) = ostp_core::crypto::noise::generate_server_key();
+        let mut dispatcher = new_dispatcher();
+        dispatcher.set_wire_versions(Some(private), false);
+        let (mut client, msg1) = v6_client(public);
+        let home = addr("203.0.113.5:4000");
+        let first = accepted_reply(dispatcher.on_datagram(home, msg1.clone()).unwrap()).expect("accepted");
+        let again = accepted_reply(dispatcher.on_datagram(home, msg1.clone()).unwrap()).expect("answered again");
+        assert_eq!(first, again);
+        assert_eq!(dispatcher.active_sessions(), 1);
+        // From another address too (the client's NAT mapping changed): the
+        // answer goes there, the session stays where it was.
+        let elsewhere = addr("198.51.100.9:5000");
+        match dispatcher.on_datagram(elsewhere, msg1).unwrap() {
+            DispatchOutcome::Accepted { responses, peer_addr, .. } => {
+                assert_eq!(responses, vec![first.clone()]);
+                assert_eq!(peer_addr, elsewhere);
+            }
+            _ => panic!("no answer to the repeated handshake"),
+        }
+        assert_eq!(dispatcher.active_sessions(), 1);
+        client.on_event(OstpEvent::Inbound(again)).unwrap();
+        assert_eq!(client.state(), OstpState::Established);
     }
 
     fn reply_addr(outcome: DispatchOutcome) -> SocketAddr {
