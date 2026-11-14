@@ -2396,6 +2396,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "ostp-session"
+version = "0.4.8"
+dependencies = [
+ "ostp-core",
+ "ostp-server",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "ostp-ssh"
 version = "0.4.8"
 dependencies = [

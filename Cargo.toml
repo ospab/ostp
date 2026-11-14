@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "ostp-core",
+    "ostp-session",
     "ostp-client",
     "ostp-server",
     "ostp-jni", "ostp",

@@ -1,0 +1,23 @@
+[package]
+name = "ostp-session"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "OSTP client session without an async runtime: handshake, UDP and UoT carriers, keepalive, relay streams, proxy requests, subscriptions. no_std + alloc without the `std` feature"
+repository.workspace = true
+
+[features]
+# `std` (default): `StdPlatform` over std::net, and ostp-core with its std backends.
+# Without it the crate is `no_std + alloc`; the embedder implements `Platform` and calls
+# `install_core_hooks` once at start-up.
+default = ["std"]
+std = ["ostp-core/std", "serde/std", "serde_json/std"]
+
+[dependencies]
+ostp-core = { path = "../ostp-core", default-features = false }
+serde = { version = "1.0", default-features = false, features = ["derive", "alloc"] }
+serde_json = { version = "1.0", default-features = false, features = ["alloc"] }
+
+[dev-dependencies]
+ostp-server = { path = "../ostp-server" }
+tokio = { workspace = true }
