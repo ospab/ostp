@@ -1518,6 +1518,54 @@ mod tests {
         assert!(server5.on_event(OstpEvent::Inbound(m)).is_err());
     }
 
+    /// A damaged copy of a handshake datagram (any single bit) is refused and
+    /// leaves the machine able to take the clean copy that follows: on both
+    /// sides, for a bit anywhere in the datagram.
+    #[test]
+    fn a_damaged_v6_handshake_copy_does_not_spoil_the_clean_one() {
+        let (private, public) = crate::crypto::noise::generate_server_key();
+        let flip = |d: &Bytes, bit: usize| {
+            let mut v = d.to_vec();
+            v[bit / 8] ^= 1 << (bit % 8);
+            Bytes::from(v)
+        };
+        // Bits in the nonce, the tag, the session id, the length, the Noise
+        // message and the padding (the last byte).
+        let picks = |len: usize| vec![3, 12 * 8 + 1, 16 * 8, 20 * 8 + 3, 30 * 8, 60 * 8 + 5, len * 8 - 1];
+
+        let (ccfg, scfg) = v6_configs(private, public);
+        let mut client = ProtocolMachine::new(ccfg).unwrap();
+        let ProtocolAction::SendDatagram(msg1) = client.on_event(OstpEvent::Start).unwrap() else { panic!() };
+        let mut server = ProtocolMachine::new(scfg).unwrap();
+        for bit in picks(msg1.len()) {
+            let r = server.on_event(OstpEvent::Inbound(flip(&msg1, bit)));
+            // A flipped padding bit changes nothing the server reads.
+            if bit == msg1.len() * 8 - 1 {
+                continue;
+            }
+            assert!(r.is_err(), "bit {bit} of the first message was accepted");
+            assert_ne!(server.state(), OstpState::Established);
+        }
+        // The padding-bit copy may have completed the handshake already; a
+        // fresh server takes the clean one after the damaged ones.
+        let (_, scfg) = v6_configs(private, public);
+        let mut server = ProtocolMachine::new(scfg).unwrap();
+        for bit in [3, 12 * 8 + 1, 16 * 8, 20 * 8 + 3, 30 * 8, 60 * 8 + 5] {
+            assert!(server.on_event(OstpEvent::Inbound(flip(&msg1, bit))).is_err());
+        }
+        let (_, reply) = server_reply(server.on_event(OstpEvent::Inbound(msg1)).unwrap());
+
+        for bit in [3, 12 * 8 + 1, 16 * 8, 20 * 8 + 3, 30 * 8, 60 * 8 + 5] {
+            assert!(client.on_event(OstpEvent::Inbound(flip(&reply, bit))).is_err(), "bit {bit} of the reply was accepted");
+            assert_ne!(client.state(), OstpState::Established);
+        }
+        client.on_event(OstpEvent::Inbound(reply.clone())).unwrap();
+        assert_eq!(client.state(), OstpState::Established);
+        // The reply once more (the server resent it): refused, session intact.
+        assert!(client.on_event(OstpEvent::Inbound(reply)).is_err());
+        assert_eq!(client.state(), OstpState::Established);
+    }
+
     #[test]
     fn the_server_key_must_fit_the_role() {
         use crate::crypto::ServerStatic;
