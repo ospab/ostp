@@ -3,7 +3,7 @@ use std::io::Write;
 use std::path::PathBuf;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
-/// The one log file shared by every process (CLI, GUI, TUN helper) and subsystem.
+/// The one log file shared by every process (CLI, GUI, ostpd) and subsystem.
 pub const LOG_FILE_NAME: &str = "ostp.log";
 
 /// Absolute path to the shared log file, next to the running executable.
@@ -20,7 +20,7 @@ pub fn invocation_is_daemon<I: IntoIterator<Item = String>>(args: I) -> bool {
     const ONE_SHOT: &[&str] = &[
         "gk", "generate-key", "check", "init", "setup", "links", "import",
         "update", "migrate", "proxy-env", "proxy-env-clear", "uninstall",
-        "cert", "sub", "panel", "dns", "overnet", "manage", "changelog", "cl", "hash-password", "hp",
+        "cert", "sub", "panel", "dns", "overnet", "warp", "manage", "changelog", "cl", "hash-password", "hp",
         "start", "stop", "restart", "status", "log",
         "-V", "--version", "-h", "--help", "help",
     ];

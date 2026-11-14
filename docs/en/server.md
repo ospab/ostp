@@ -81,6 +81,8 @@ Every 30 seconds the server writes per-user traffic to `.ostp_stats.json` next t
 | `ostp manage status` | Version, service state, sessions, users, listen address, TLS domain and certificate, subscriptions, panel, and the system: OS, load, memory, disk |
 | `ostp manage users` | Every user with links, subscription URL and traffic |
 | `ostp manage user-add NAME`, `user-remove WHO`, `user-rename WHO NAME` | WHO is a number (as in `ostp links`), a name or a key. The running server picks up the change from the file; the last user cannot be removed |
+| `ostp manage user-limit WHO --devices N` | Limits the devices that may use the user's subscription (0 removes the limit); see [tls.md](tls.md#device-limit) |
+| `ostp manage user-devices WHO` | Devices that fetched the user's subscription, read from `devices.json` |
 | `ostp manage logs [-n N]` | The service log's last lines |
 | `ostp manage restart` | Restarts the service, reports whether it stayed up |
 
@@ -92,15 +94,17 @@ Every 30 seconds the server writes per-user traffic to `.ostp_stats.json` next t
 
 A filtering resolver for clients connected to the server (the `ostp-dns` crate): ad and tracker blocking by lists, your own rules and names, much like AdGuard Home. It is not a DNS tunnel and does not carry OSTP traffic.
 
-**It is not reachable from outside.** There is no separate port: the resolver only answers queries that arrive through the tunnel. With filtering on, everything a client resolves goes through it:
+**It is not reachable from outside.** There is no separate port: the resolver only answers queries that arrive through the tunnel. By default it answers only queries sent to the server's own address, `10.1.0.1`: a client gets the filter by using that address as its DNS server (the apps offer it on the first connection), and every other resolver it asks is left alone. The operator can take over all DNS instead (`ostp dns takeover on`); links and subscriptions then carry `dnsall=true`, so apps say so before the first connection. With takeover on, everything a client resolves goes through the resolver:
 
 | How the client looks a name up | What the server does |
 |---|---|
-| UDP to any address `:53` (TUN mode) | intercepts and answers itself |
-| TCP to any address `:53` | redirects it to the resolver's local DNS-over-TCP |
-| DNS-over-TLS / DNS-over-QUIC (`:853`, TCP and UDP) | the connection is refused and the app falls back to plain DNS (with `doh-bypass on`) |
-| Encrypted DNS to a public resolver's address (1.1.1.1, 8.8.8.8, Quad9, AdGuard, OpenDNS, Yandex… on `:443`, TCP and QUIC) | refused (with `doh-bypass on`). Android ("Private DNS: automatic") and Chrome switch to encrypted DNS by themselves when the system DNS is 1.1.1.1 or 8.8.8.8, and nearly everything would pass the filter |
-| A browser's DoH | the `use-application-dns.net` canary gets NXDOMAIN and known DoH hosts are blocked (with `doh-bypass on`) |
+| UDP to `10.1.0.1:53` | answers itself |
+| UDP to any other address `:53` (TUN mode) | answers itself with takeover on; otherwise passes it through |
+| TCP to `10.1.0.1:53` | redirects it to the resolver's local DNS-over-TCP |
+| TCP to any other address `:53` | the same with takeover on; otherwise passes it through |
+| DNS-over-TLS / DNS-over-QUIC (`:853`, TCP and UDP) | the connection is refused and the app falls back to plain DNS (with takeover and `doh-bypass on`) |
+| Encrypted DNS to a public resolver's address (1.1.1.1, 8.8.8.8, Quad9, AdGuard, OpenDNS, Yandex… on `:443`, TCP and QUIC) | refused (with takeover and `doh-bypass on`). Android ("Private DNS: automatic") and Chrome switch to encrypted DNS by themselves when the system DNS is 1.1.1.1 or 8.8.8.8, and nearly everything would pass the filter |
+| A browser's DoH | the `use-application-dns.net` canary gets NXDOMAIN and known DoH hosts are blocked (with takeover and `doh-bypass on`) |
 | SOCKS/proxy by name (`CONNECT host:port`) | the name is resolved by the same resolver: a blocked name is refused, a rewritten one goes to its address. With the outbound proxy on, the name is passed to it as is, but blocking still applies |
 
 The pipeline for a name: rewrites → other `*.ostp` names get NXDOMAIN → safe search → DoH bypass blocking → blocked services → lists and your rules → cache → upstream → CNAME check (trackers hidden behind a first-party name are caught by the CNAME target).
@@ -121,7 +125,8 @@ ostp dns rule add '||ads.*^$important'   # your own rules, adblock or hosts synt
 ostp dns rewrite add panel.ostp 10.1.0.1 # your own names; *.lan for every subdomain
 ostp dns service block tiktok            # whole services; ostp dns service list shows them
 ostp dns safesearch on                   # Google, YouTube, Bing, DuckDuckGo, Yandex
-ostp dns doh-bypass on|off               # keep browsers from bypassing the filter with their own DoH/DoT
+ostp dns takeover on|off                 # answer every query, not only those sent to 10.1.0.1; clients are told in links
+ostp dns doh-bypass on|off               # keep browsers from bypassing the filter with their own DoH/DoT (only with takeover on)
 ostp dns mode nxdomain|null_ip|refused   # what a blocked name gets
 ostp dns upstream add tls://dns.quad9.net   # https://…/dns-query, tls://, tcp://, udp:// or an IP
 ostp dns upstream mode fallback|parallel
@@ -146,6 +151,37 @@ Every OSTP TCP listener sniffs the first byte of a connection: raw UoT is handle
 ## Outbound proxy
 
 By default client traffic leaves from the server's own address. With the `outbound` section, some or all of it goes through an upstream SOCKS5 proxy. Rules match on `domain_suffix`, `ip_cidr` and `protocol` and choose `proxy`, `direct` or `block` (`default_action` covers the rest), for example `.onion` to a local Tor and everything else direct. A rule can also set `send_from`, a local source address; the server-wide `bind_ip` is the default.
+
+---
+
+## Cloudflare WARP as the exit: `ostp warp`
+
+With WARP the sites a client visits see a Cloudflare address instead of the server's. Cloudflare sees the server's address and where it connects, so this moves trust from the hosting provider to Cloudflare; it does not make anyone anonymous towards Cloudflare. WARP addresses are shared and known, and some sites show captchas or refuse them. WARP is Cloudflare's service under Cloudflare's terms; `--accept-terms` is the operator's acceptance, not ours.
+
+How it works: the `ostp` process runs a WireGuard client in user space (no tun device, no routes, no firewall changes, no root) and a SOCKS5 proxy on `127.0.0.1:40000` (TCP `CONNECT` and UDP `ASSOCIATE`, names and IPv4/IPv6 addresses). The `outbound` section points at that proxy. Names are resolved inside the tunnel, by 1.1.1.1 reached through WARP, never by the server's own resolver. The tunnel's MTU is 1280, the keepalive 25 s, and the handshake is repeated every 5 s while there is none.
+
+```
+sudo ostp warp register --accept-terms   # create the device at Cloudflare; keys go to warp.json
+sudo ostp warp license <key>             # optional: attach a WARP+ key
+sudo ostp warp enable --all              # everything the server opens outwards goes through WARP
+sudo ostp warp enable --rules            # only what the outbound rules send to the proxy
+sudo ostp warp disable                   # off; the previous outbound section comes back
+ostp warp status                         # registration, mode, tunnel, last handshake, address seen outside
+ostp warp test                           # a TCP request and a UDP DNS query through the tunnel; exits non-zero on failure
+sudo ostp warp reset                     # forget the device (asks first; refused while WARP is enabled)
+```
+
+`enable`, `disable` and `license` restart a running service (`--no-restart` to skip), validate the config before writing it and keep the previous one in `config.json.bak`, like the other commands. Nothing registers, enables or restarts by itself.
+
+- **`--all`.** The `outbound` section is written as SOCKS5 to WARP's proxy, no rules, default action `proxy`. Whatever the server opens outwards for clients (TCP, UDP, names), the DNS filter's DoH and list downloads, and plain, DoT and TCP upstream resolvers (carried as DNS over TCP through the proxy) goes through it. There is no direct fallback: with the tunnel down these fail. Connections to the server's own loopback (the panel) stay local, as always.
+- **`--rules`.** Your own `outbound` section is kept as written (rules, default action, `send_from`); only its proxy is replaced by WARP's. It needs at least one rule with action `proxy` (or a default action of `proxy`) and refuses otherwise. What the rules send elsewhere is unchanged.
+- **What `enable` remembers.** The `outbound` section that was there (with its proxy password) is kept in `warp.json` and put back by `disable`; if you edited the section after enabling, `disable` leaves your edit. Switching between `--all` and `--rules` starts from the remembered section, not from the one WARP wrote.
+- **Keys.** The device's private key, access token and WARP+ key live only in `warp.json` next to `config.json` (mode 0600, written atomically). They are never in `config.json`, its backup, the logs or the panel's API. The running server also updates `warp.status.json` there every 5 s (no secrets); `ostp warp status` reads it.
+- **The `warp` section** of `config.json`: `enabled`, `mode` (`all` or `rules`), `listen` (a loopback address only: the proxy has no password), `endpoint` (empty = the registered one, or `host:port` / `ip:port` to replace it). `ostp migrate` (schema 6) writes it into older server configs, off. The server starts the tunnel when `enabled`; if it cannot (not registered, port busy), it logs why, and the connections that the `outbound` section sends to WARP fail: nothing is sent directly instead.
+- **WARP+.** `ostp warp license` sends the key to Cloudflare; if Cloudflare refuses it, nothing is stored and the command prints what the service answered.
+- **Builds.** WARP is not built into the MIPS binary (`ostp warp` says so; the other targets have it).
+
+Things to know before relying on it: the registration interface is the one Cloudflare's own apps use, not a documented one for third parties, and may change, be rate-limited or be refused for server addresses. WARP endpoints (UDP 2408 and others) can be blocked by a hosting provider. Cloudflare has been reported to be moving WARP from WireGuard to MASQUE; this exit only speaks WireGuard. Throughput is bounded by one user-space WireGuard core. A datagram that does not fit the tunnel's MTU (1280) is dropped and counted in `status`.
 
 ---
 

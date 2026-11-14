@@ -76,7 +76,7 @@ Details: [Domains and TLS](docs/en/tls.md), [Server](docs/en/server.md), [Client
 
 - Three transports: UDP, UoT (UDP over TCP) and TLS on 443 with a real certificate, directly or behind a web server.
 - Anything that is not a valid client gets the fallback website or a decoy answer.
-- Local SOCKS5/HTTP proxy (and the Windows system proxy), or a TUN adapter with a kill switch.
+- Local SOCKS5/HTTP proxy (and the Windows system proxy), or a TUN adapter (with a kill switch on Linux and macOS).
 - Domains, IP ranges and, on Windows and Linux, processes can be excluded from the tunnel.
 - When the network changes or a path stalls, the session moves to a new socket without a new handshake.
 - Per-user subscription links, a web panel with a REST API, and a filtering DNS for connected clients.

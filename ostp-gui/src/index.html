@@ -60,6 +60,18 @@
         <!-- Error banner -->
         <div id="error-banner" class="error-banner hidden" role="alert"></div>
 
+        <!-- The profile changed while connected: it applies on reconnect -->
+        <div id="reconnect-notice" class="reconnect-notice hidden" role="status">
+          <div class="reconnect-text">
+            <span class="reconnect-title">Profile changed</span>
+            <span class="reconnect-hint">The connection still uses the previous one.</span>
+          </div>
+          <button id="btn-reconnect" class="btn primary reconnect-btn">
+            <span class="reconnect-spinner" aria-hidden="true"></span>
+            <span id="btn-reconnect-label">Reconnect</span>
+          </button>
+        </div>
+
         <!-- Connection info (visible when connected) -->
         <div id="connection-info" class="connection-info hidden">
           <div class="server-badge">
@@ -187,22 +199,6 @@
             </label>
           </div>
 
-          <div class="toggle-row">
-            <div class="toggle-text">
-              <span class="toggle-name">Multiplexing</span>
-              <span class="toggle-hint">Several streams over one connection</span>
-            </div>
-            <label class="toggle">
-              <input type="checkbox" id="in-mux-mode" />
-              <span class="toggle-track"><span class="toggle-thumb"></span></span>
-            </label>
-          </div>
-
-          <div class="inline-field sub-row" id="group-mux-sessions" style="display:none;">
-            <label class="field-label" for="in-mux-sessions">Sessions</label>
-            <input id="in-mux-sessions" class="field-input compact" type="number" placeholder="2" min="1" max="8" />
-          </div>
-
           <div class="inline-field">
             <label class="field-label" for="in-mtu">MTU</label>
             <input id="in-mtu" class="field-input compact" type="number" placeholder="1350" />
@@ -301,6 +297,17 @@
 
           <div class="toggle-row" style="border-top:none;">
             <div class="toggle-text">
+              <span class="toggle-name">Send a device ID to subscriptions</span>
+              <span class="toggle-hint">Some servers limit the devices of a subscription. The ID is a hash made for that server; it is sent only when you fetch a subscription.</span>
+            </div>
+            <label class="toggle">
+              <input type="checkbox" id="in-send-hwid" />
+              <span class="toggle-track"><span class="toggle-thumb"></span></span>
+            </label>
+          </div>
+
+          <div class="toggle-row" style="border-top:none;">
+            <div class="toggle-text">
               <span class="toggle-name">Debug log</span>
               <span class="toggle-hint">Write detailed output to ostp.log</span>
             </div>
@@ -333,38 +340,6 @@
           </div>
 
           <div class="section-divider-mini"><span>Obfuscation</span></div>
-
-          <div class="toggle-row" style="border-top:none;">
-            <div class="toggle-text">
-              <span class="toggle-name">Junk packets</span>
-              <span class="toggle-hint">Random data before the handshake (TCP only)</span>
-            </div>
-            <div class="toggle-with-gear">
-              <label class="toggle">
-                <input type="checkbox" id="cs-junk-enabled" />
-                <span class="toggle-track"><span class="toggle-thumb"></span></span>
-              </label>
-              <button id="btn-junk-settings" class="gear-btn" title="Junk packet options" aria-label="Junk packet options">
-                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
-              </button>
-            </div>
-          </div>
-
-          <div class="toggle-row" style="border-top:none;">
-            <div class="toggle-text">
-              <span class="toggle-name">TCP fragmentation</span>
-              <span class="toggle-hint">Split the handshake into small segments (TCP only)</span>
-            </div>
-            <div class="toggle-with-gear">
-              <label class="toggle">
-                <input type="checkbox" id="cs-tcp-frag" />
-                <span class="toggle-track"><span class="toggle-thumb"></span></span>
-              </label>
-              <button id="btn-frag-settings" class="gear-btn" title="Fragmentation options" aria-label="Fragmentation options">
-                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
-              </button>
-            </div>
-          </div>
 
           <div class="toggle-row" style="border-top:none;">
             <div class="toggle-text">
@@ -504,6 +479,7 @@
         <button class="tab active" role="tab" aria-selected="true" data-tab="status">Status</button>
         <button class="tab" role="tab" aria-selected="false" data-tab="users">Users</button>
         <button class="tab" role="tab" aria-selected="false" data-tab="connection">Connection</button>
+        <button class="tab" role="tab" aria-selected="false" data-tab="dns">DNS</button>
         <button class="tab" role="tab" aria-selected="false" data-tab="manage">Manage</button>
       </div>
       <div class="settings-body" id="server-body"></div>
@@ -567,6 +543,15 @@
           <select id="pm-transport" class="field-input">
             <option value="udp">UDP (default)</option>
             <option value="uot">TCP (UoT)</option>
+          </select>
+        </div>
+        <div class="field-group" id="pm-dns-group" style="display:none;">
+          <label class="field-label" for="pm-dns-choice">DNS of this server</label>
+          <select id="pm-dns-choice" class="field-input">
+            <option value="">Ask on the next connection</option>
+            <option value="operator">Operator's DNS</option>
+            <option value="public">Public DNS</option>
+            <option value="mine">My settings</option>
           </select>
         </div>
         <div id="pm-tls-group" style="display:none;">
@@ -641,6 +626,20 @@
       </div>
     </div>
 
+    <!-- ── DNS NOTICE MODAL ─────────────────────────────────── -->
+    <div id="dns-notice-modal" class="modal-overlay hidden">
+      <div class="modal-content">
+        <h3 class="modal-title">This server filters DNS</h3>
+        <p class="modal-text">The operator's resolver filters domain names by block lists and sees the names you look up.</p>
+        <p class="modal-text" id="dns-notice-all">This server also answers DNS queries sent to any resolver and blocks encrypted DNS (DoT, DoH). Choosing a public DNS does not change that on this server.</p>
+        <div class="modal-actions">
+          <button type="button" class="btn secondary" data-dns-choice="operator" disabled>Use the operator's DNS</button>
+          <button type="button" class="btn secondary" data-dns-choice="public" disabled>Use a public DNS</button>
+          <button type="button" class="btn secondary" data-dns-choice="mine" disabled>Keep my settings</button>
+        </div>
+      </div>
+    </div>
+
     <!-- ── WINTUN MODAL ─────────────────────────────────────── -->
     <div id="wintun-modal" class="modal-overlay hidden">
       <div class="modal-content">
@@ -655,58 +654,6 @@
         <div class="modal-actions">
           <button id="btn-wintun-cancel" class="btn secondary" data-dismiss>Close</button>
           <a id="btn-wintun-open" href="https://www.wintun.net" target="_blank" rel="noopener" class="btn primary">Open wintun.net</a>
-        </div>
-      </div>
-    </div>
-
-    <!-- ── JUNK PACKETS MODAL ──────────────────────────────────── -->
-    <div id="junk-modal" class="modal-overlay hidden">
-      <div class="modal-content compact">
-        <h3 class="modal-title">Junk packets</h3>
-        <p class="modal-text">Sends random frames before the handshake so that DPI cannot match a fixed pattern. Works on TCP (UoT) only.</p>
-        <div class="modal-row-2">
-          <div class="field-group">
-            <label class="field-label" for="cs-junk-pc-min">Count min</label>
-            <input id="cs-junk-pc-min" class="field-input" type="number" min="0" max="100" placeholder="2" />
-          </div>
-          <div class="field-group">
-            <label class="field-label" for="cs-junk-pc-max">Count max</label>
-            <input id="cs-junk-pc-max" class="field-input" type="number" min="0" max="100" placeholder="5" />
-          </div>
-        </div>
-        <div class="modal-row-2">
-          <div class="field-group">
-            <label class="field-label" for="cs-junk-ps-min">Size min (bytes)</label>
-            <input id="cs-junk-ps-min" class="field-input" type="number" min="1" placeholder="100" />
-          </div>
-          <div class="field-group">
-            <label class="field-label" for="cs-junk-ps-max">Size max (bytes)</label>
-            <input id="cs-junk-ps-max" class="field-input" type="number" min="1" placeholder="1000" />
-          </div>
-        </div>
-        <div class="modal-actions">
-          <button id="btn-junk-done" class="btn primary" data-dismiss>Done</button>
-        </div>
-      </div>
-    </div>
-
-    <!-- ── TCP FRAGMENTATION MODAL ──────────────────────────────── -->
-    <div id="frag-modal" class="modal-overlay hidden">
-      <div class="modal-content compact">
-        <h3 class="modal-title">TCP fragmentation</h3>
-        <p class="modal-text">Splits the first handshake into tiny TCP segments with a pause between them, so DPI does not see the whole signature at once. Works on TCP (UoT) only.</p>
-        <div class="modal-row-2">
-          <div class="field-group">
-            <label class="field-label" for="cs-frag-chunk">Chunk size (bytes)</label>
-            <input id="cs-frag-chunk" class="field-input" type="number" min="1" placeholder="2" />
-          </div>
-          <div class="field-group">
-            <label class="field-label" for="cs-frag-sleep">Delay (ms)</label>
-            <input id="cs-frag-sleep" class="field-input" type="number" min="0" placeholder="2" />
-          </div>
-        </div>
-        <div class="modal-actions">
-          <button id="btn-frag-done" class="btn primary" data-dismiss>Done</button>
         </div>
       </div>
     </div>

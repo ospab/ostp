@@ -226,9 +226,17 @@ class MainActivity : FlutterActivity() {
                 "fetchSubscription" -> {
                     // A network round trip with a TLS handshake: never on the UI thread.
                     val url = call.argument<String>("url") ?: ""
+                    // The device is described only when the person turned "Send a device ID to
+                    // subscriptions" on: otherwise ANDROID_ID is not even read.
+                    val sendHwid = call.argument<Boolean>("sendHwid") ?: false
+                    val androidId = if (sendHwid) {
+                        android.provider.Settings.Secure.getString(contentResolver, android.provider.Settings.Secure.ANDROID_ID) ?: ""
+                    } else ""
+                    val deviceOs = "Android " + android.os.Build.VERSION.RELEASE
+                    val deviceModel = android.os.Build.MODEL ?: ""
                     Thread {
                         try {
-                            val doc = net.ostp.client.OstpClientSdk.fetchSubscription(url)
+                            val doc = net.ostp.client.OstpClientSdk.fetchSubscription(url, sendHwid, androidId, deviceOs, deviceModel)
                             runOnUiThread { result.success(doc) }
                         } catch (e: Throwable) {
                             runOnUiThread { result.error("ERROR", e.message, null) }

@@ -30,11 +30,13 @@ mod signal;
 pub mod dns;
 pub mod router;
 pub mod overnet;
+pub mod warp;
 pub mod password;
 pub mod target_policy;
 mod admission;
 mod send_gate;
 mod subscription;
+pub mod devices;
 
 pub use subscription::SubscriptionSettings;
 
@@ -105,6 +107,8 @@ pub struct ServerParams {
     pub subscription: Option<SubscriptionSettings>,
     /// The `overnet` section: `.ov` for clients and the overnet exit.
     pub overnet: Option<OvernetConfig>,
+    /// The `warp` section: Cloudflare WARP as this server's exit.
+    pub warp: Option<warp::WarpConfig>,
     /// Clients may reach this machine's services and private networks.
     pub local_access: bool,
 }
@@ -124,6 +128,7 @@ pub async fn run_server(params: ServerParams) -> Result<()> {
         tls,
         subscription,
         overnet,
+        warp,
         local_access,
     } = params;
     let mut keys_map = HashMap::new();
@@ -230,8 +235,9 @@ pub async fn run_server(params: ServerParams) -> Result<()> {
                                         if cfg.mode == "server" {
                                             let mut new_keys = HashMap::new();
                                             for uc in cfg.access_keys {
+                                                let max_devices = uc.max_devices();
                                                 let (k, name, limit_bytes) = uc.into_parts();
-                                                new_keys.insert(k, crate::api::UserMeta { name, limit_bytes });
+                                                new_keys.insert(k, crate::api::UserMeta { name, limit_bytes, max_devices });
                                             }
                                             
                                             // 1. Update shared_keys
@@ -310,6 +316,8 @@ pub async fn run_server(params: ServerParams) -> Result<()> {
             tracing::warn!("local_access: clients may reach this server's own services and private networks");
         }
     }
+    // The WireGuard client and its local SOCKS5 proxy, for as long as the server runs.
+    let _warp = warp::start(warp, config_path.as_deref()).await;
     if let Some(cfg) = overnet.filter(|o| o.enabled) {
         if let Err(e) = overnet::apply(cfg, &router).await {
             tracing::error!("overnet: {e:#}");
@@ -359,6 +367,7 @@ pub async fn run_server(params: ServerParams) -> Result<()> {
                 keys: shared_keys.clone(),
                 stats: dispatcher.user_stats_ref(),
                 lookups: Default::default(),
+                devices: devices::DeviceStore::shared(config_path.as_ref().and_then(|p| p.parent()).map(|d| d.join("devices.json"))),
             }))
         }
         (Some(_), None) => {
@@ -1182,7 +1191,7 @@ mod traffic_tests {
     use std::sync::atomic::Ordering;
 
     fn meta(limit: Option<u64>) -> api::UserMeta {
-        api::UserMeta { name: None, limit_bytes: limit }
+        api::UserMeta { name: None, limit_bytes: limit, max_devices: None }
     }
 
     #[test]

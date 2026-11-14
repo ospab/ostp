@@ -229,6 +229,27 @@ a { text-decoration: none; }
   overflow-wrap: anywhere;
 }
 
+.reconnect-notice {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  width: 100%;
+  max-width: 340px;
+  padding: 10px 10px 10px 14px;
+  border-radius: var(--r-sm);
+  border: 1px solid var(--c-card-border);
+  background: var(--c-card);
+}
+.reconnect-text { display: flex; flex-direction: column; gap: 2px; min-width: 0; text-align: left; }
+.reconnect-title { font-size: 0.82rem; font-weight: 600; color: var(--c-txt-1); }
+.reconnect-hint { font-size: 0.74rem; line-height: 1.4; color: var(--c-txt-2); }
+.reconnect-btn { height: 32px; padding: 0 14px; display: inline-flex; align-items: center; gap: 8px; }
+.reconnect-spinner { display: none; width: 11px; height: 11px; border-radius: 50%; border: 1.5px solid #000; border-top-color: transparent; animation: spin 0.8s linear infinite; }
+.reconnect-btn.busy .reconnect-spinner { display: inline-block; }
+.reconnect-btn.busy:disabled { opacity: 1; }
+.reconnect-notice.hidden { display: none; }
+
 /* ── Connection info ─────────────────────────────────────────────────── */
 .connection-info {
   display: flex;
@@ -499,20 +520,6 @@ a { text-decoration: none; }
   transform: translateX(16px);
   background: var(--c-accent);
 }
-
-.toggle-with-gear {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-}
-.gear-btn {
-  width: 26px; height: 26px;
-  display: flex; align-items: center; justify-content: center;
-  border-radius: var(--r-xs);
-  color: var(--c-txt-2);
-  background: transparent;
-}
-.gear-btn:hover { color: var(--c-txt-1); background: rgba(var(--c-fg-rgb),0.07); }
 
 /* ── Inline field (label + input on one line) ────────────────────────── */
 .inline-field {
@@ -866,6 +873,8 @@ textarea.field-input { resize: vertical; min-height: 38px; line-height: 1.4; pad
   font-size: 0.82rem; font-weight: 600; cursor: pointer; transition: background var(--t-fast), border-color var(--t-fast);
 }
 .wide-btn:hover { background: var(--c-card-hover); border-color: rgba(var(--c-fg-rgb),0.16); }
+/* A wide button above a group of settings needs air, or the two read as one block. */
+.wide-btn + .client-settings-card { margin-top: 24px; }
 
 /* Install progress */
 .modal-content.wide { max-width: 440px; }

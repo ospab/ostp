@@ -6,7 +6,7 @@
 //!
 //! Every probe here is a genuine OSTP handshake attempt using the caller's
 //! own `access_key`, reusing the exact wire format the live client uses
-//! (`ostp-core::ProtocolMachine`, `transport::connect_uot`'s junk/fragmentation).
+//! (`ostp-core::ProtocolMachine`, `transport::connect_uot`).
 //! There is no separate prober protocol and no new server-side code: the
 //! existing dispatcher's key-based authentication is what already restricts
 //! this to authorized clients.
@@ -35,7 +35,6 @@ const PROBE_MTU: usize = 1140;
 pub enum TransportKind {
     Udp,
     Uot,
-    UotFrag,
     /// UoT inside TLS (and the upgrade path, when set), as a TLS profile connects.
     UotTls,
 }
@@ -45,7 +44,6 @@ impl TransportKind {
         match self {
             TransportKind::Udp => "udp",
             TransportKind::Uot => "uot",
-            TransportKind::UotFrag => "uot_frag",
             TransportKind::UotTls => "uot_tls",
         }
     }
@@ -54,13 +52,12 @@ impl TransportKind {
         match s {
             "udp" => Some(TransportKind::Udp),
             "uot" => Some(TransportKind::Uot),
-            "uot_frag" => Some(TransportKind::UotFrag),
             "uot_tls" => Some(TransportKind::UotTls),
             _ => None,
         }
     }
 
-    pub const ALL: [TransportKind; 3] = [TransportKind::Udp, TransportKind::Uot, TransportKind::UotFrag];
+    pub const ALL: [TransportKind; 2] = [TransportKind::Udp, TransportKind::Uot];
 }
 
 /// TLS settings of the profile being probed.
@@ -152,7 +149,7 @@ pub async fn attempt_handshake(
             Ok(t) => (t, None),
             Err(e) => return AttemptOutcome { success: false, rtt_ms: None, error: Some(format!("udp connect failed: {e}")), foreign_bytes: None },
         },
-        TransportKind::Uot | TransportKind::UotFrag | TransportKind::UotTls => {
+        TransportKind::Uot | TransportKind::UotTls => {
             let tls = if transport == TransportKind::UotTls {
                 match tls {
                     Some(t) if !t.sni.is_empty() => Some(t),
@@ -162,12 +159,6 @@ pub async fn attempt_handshake(
                 None
             };
             let opts = UotOptions {
-                tcp_fragmentation: transport == TransportKind::UotFrag,
-                frag_chunk: 2,
-                frag_sleep: 2,
-                junk_pc: [2, 5],
-                junk_ps: [100, 1000],
-                access_key: Bytes::copy_from_slice(access_key),
                 ttl,
                 connect_timeout: attempt_timeout,
                 tls: tls.map(|t| crate::transport::TlsClientOptions { sni: t.sni.clone(), insecure: t.insecure }),
@@ -225,8 +216,7 @@ pub struct MatrixEntry {
 /// Resolves `server_addr` and tries a real handshake over every
 /// address × transport combination: each of the resolved IPv4/IPv6
 /// addresses plus a NAT64-synthesized address (for IPv6-only networks, same
-/// synthesis the live client falls back to), each over UDP / UoT / UoT with
-/// TCP fragmentation.
+/// synthesis the live client falls back to), each over UDP and UoT.
 ///
 /// With `tls` set (a TLS profile) the only carrier probed is UoT inside TLS,
 /// on the profile's port: that is how the profile connects, and UDP/raw UoT

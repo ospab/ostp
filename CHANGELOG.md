@@ -12,9 +12,90 @@ Older history is on the [Releases](https://github.com/ospab/ostp/releases) page 
 - `ostp-core` builds as `no_std + alloc` with `--no-default-features` (the default `std` feature keeps the previous behaviour, wire format unchanged), so the protocol can run inside a kernel or firmware. Platform services are injected through `ostp_core::sys::install` (monotonic clock, wall clock, entropy); without `std` the Noise handshake is the in-crate `crypto::noise_lite` (tested against snow in both directions), and `libm` provides the cube root for CUBIC. `ProtocolError` no longer uses `thiserror`.
 
 ### Added
+- `ostp manage dns` shows the DNS filter's settings as JSON, and the SSH manager of the apps can turn the filter, the takeover, the encrypted-DNS block and safe search on or off and update the lists (`dns-*` actions).
+- Desktop and Android apps: a DNS section in server management (a DNS tab). It shows the server's DNS filter and turns the filter, the takeover, the encrypted-DNS block and safe search on or off and updates the lists; every change asks first, because the service restarts and connected clients drop for a few seconds. The resolvers, lists and the counts of rewrites and own rules are shown read-only.
+
+### Fixed
+- Desktop and Android apps: "Open the panel" in server management never finished: the SSH manager held its lock on the table of open panels while it took the same lock again, so the call waited for ever (until the app's time limit). Found by driving the app's own SSH manager against a real server.
+- WARP: every UDP flow of the server's clients held a socket with 128 KiB of buffers in the tunnel for as long as its client kept the flow (5 minutes after the last datagram), and the relay allocated 64 KiB per association. On a busy server that was thousands of flows, hundreds of megabytes and the tunnel's flow limit (4095), after which UDP, DNS included, stopped working. A flow in the tunnel is now made on the first datagram, given back after 30 seconds of silence and made again when the client sends, its buffers are 24 KiB, and the relay buffer is 2 KiB.
+
+## [0.4.8-beta.1] - 2026-11-12
+
+### Changed
+- Server DNS filter: by default it answers only queries sent to the server's own address (`10.1.0.1`) and no longer takes every client's DNS or refuses encrypted DNS (DoT, DoH) on its own. Taking over all DNS is an explicit option, `ostp dns takeover on` (panel: "Answer every DNS query"), and links and subscriptions then carry `dnsall=true`. `ostp migrate` (schema 5) keeps the takeover on servers whose filter was on, so nothing changes for them until the owner turns it off.
+
+### Added
+- Device limit per user for subscriptions: `max_devices` (panel user form, `ostp manage user-limit`), checked by the device ID the app sends when its owner turned that on. A new device over the limit gets HTTP 403 `device_limit`, a request without an ID from a limited user gets 403 `hwid_required`. The record is `devices.json` (0600); the panel lists and removes devices, `ostp manage user-devices` prints them.
+- Desktop and Android apps and the CLI: the device ID for subscriptions that limit devices. The switch *Send a device ID to subscriptions* (CLI: `send_hwid` in the client config) is off by default; when on, a subscription fetch sends a per-server hash of the system's machine identifier plus the OS and the model or CPU architecture, never the identifier itself and never the computer's name. After a fetch you started, a server that needs the ID makes the apps ask "Send and retry"; a background refresh only writes the reason on the subscription card, and a reached limit shows the server's message.
+- Docs: `v6-design.md` and `v6-session-design.md`, the draft plans for protocol v6 / 0.5.0, and `warp-design.md`, the draft plan for `ostp warp` (nothing in them is implemented).
+- Desktop and Android apps: a notice on the first connection to a server that filters DNS (links with `owndns=true` or `dnsall=true`). It says that the operator's resolver filters domain names and sees the names looked up, and asks once per profile: the operator's DNS (10.1.0.1), a public DNS, or keep the app's settings. The buttons wait 5 seconds. The choice is kept with the profile and can be changed in the profile editor (*DNS of this server*).
+- Both apps keep and re-export the `dnsall` flag of share and subscription links (Android now also keeps `owndns`).
+- Docs: `carriers-design.md`, a draft study of carrying OSTP inside WebSocket, QUIC/HTTP3, WebRTC, ICMP and HTTPS long-poll: costs, what censors are known to do, and a recommended order (nothing in it is implemented).
+- Server: Cloudflare WARP as the exit, `ostp warp` (`register --accept-terms`, `license`, `enable --all | --rules`, `disable`, `status`, `test`, `reset`). A WireGuard client in the `ostp` process (user space: no tun device, routes or root) with a local SOCKS5 proxy on `127.0.0.1:40000` (TCP and UDP); the `outbound` section is pointed at it. `--all` sends everything the server opens outwards through WARP with no direct fallback, `--rules` only what the outbound rules send to the proxy. Keys are kept only in `warp.json`. New `warp` config section, schema 6 (`ostp migrate` adds it, off). Not built for MIPS. Details: `docs/en/server.md`, `docs/en/warp-design.md`.
+
+### Fixed
+- Server DNS filter: with the outbound proxy on, plain UDP, TCP and DoT upstream resolvers no longer go out directly (they are carried as DNS over TCP through the proxy), DoH through a `socks5h://` proxy works (it failed with "unsupported scheme"), and a proxy that cannot be used fails list downloads and upstream queries instead of silently going direct.
+
+## [0.4.7] - 2026-11-12
+
+Summary of 0.4.7 (the details are in the beta entries below). Wire-compatible with 0.4.5 and 0.4.6 (protocol version 5).
+
+### Added
+- Desktop and Android apps: "Update now" downloads the release for the device, checks it against the SHA-256 GitHub published and starts the installer. A Reconnect button appears when the profile changed while connected.
+- Per-stream flow control: a large upload to a slow site no longer breaks, and a program that reads slowly cannot stall the others.
+- Server: an `overnet` section and `ostp overnet` commands (the `.ov` zone through the server), config schema v4 (`ostp migrate` upgrades older files).
+- `ostp start`, `ostp stop`, `ostp restart` and a richer `ostp status` for the Linux service.
+
+### Changed
+- Reconnects follow one policy instead of five overlapping ones; a silent server is noticed within about 10 seconds, and long outages keep the session and its connections.
+- The congestion controller was reworked: speed on lossy links, on short paths and over TLS and UoT no longer collapses or swings between runs.
+- The desktop app's privileged helper `ostp-tun-helper` is now `ostpd`; its Windows task is "OSTP Daemon".
+
+### Removed
+- Junk packets and TCP fragmentation of the handshake, and the multiplexing option in the apps (the `mux` block of the config file still works).
+- The terminal interface (TUI) of the client.
+- The kill switch on Windows, which never blocked anything; Linux and macOS keep theirs. A firewall-based one is planned for 0.5.0.
+
+### Fixed
+- Linux builds crashed with "Illegal instruction" on CPUs without BMI2 and AVX2 (QEMU virtual CPUs, older servers) in 0.4.7-beta.15 and beta.16: the CI image moved to Ubuntu 26.04, whose compiler targets newer CPUs. The runners are pinned to Ubuntu 24.04 again. Servers on those betas: `ostp update -v 0.4.7-beta.13` or update to 0.4.7.
+- TUN mode recovers by itself after a network change on Windows and Linux; Android with two SIM cards, other-VPN takeover and the "Connected" state were corrected.
+- Android and desktop "Update now" installs the update (a missing permission and a dismissed dialog's context broke it).
+- Many limits and timeouts so that a hung peer, a huge number or a bad file cannot freeze the client, the server, the panel or the apps.
+
+### Security
+- Clients can no longer reach the server's own services by default; a client cannot take over another user's session; at most 32 sessions per key; panel passwords are salted (PBKDF2); IPv6 no longer bypasses the tunnel in the desktop apps.
+- Installers and `ostp update` check downloads against the SHA-256 GitHub publishes; `/etc/ostp`, `config.json` and `C:\opt\ostp` are no longer readable or writable by every local user.
+
+## [0.4.7-beta.16] - 2026-11-12
+
+### Fixed
+- Android: "Update now" downloaded the APK and then did nothing, with no installer dialog. The button's own dialog was already closed when the download ended, and the code that starts the installer gave up because that dialog's context was gone. It now uses the screen's context. An app that is already installed has this bug itself: update it by hand once.
+
+### Changed
+- The desktop app's privileged helper `ostp-tun-helper` is now `ostpd` (the crate, the executable and the sidecar), and its Windows scheduled task is "OSTP Daemon". The installer removes the old task and executable. An update of the portable Windows, Linux or macOS build from 0.4.7-beta.15 or older does not copy `ostpd` (that updater only knows the old file name): copy it from the archive by hand, or install the new version over the old one.
+- Desktop app: more room between the Servers button and the exclusions on the More settings screen.
+
+## [0.4.7-beta.15] - 2026-11-12
+
+### Changed
+- Desktop and Android apps: the Reconnect notice is now a row with a title, the reason and a button that shows "Reconnecting" with a spinner while it works.
+
+### Removed
+- The multiplexing option (several sessions to the server) from the desktop and Android apps. A lab run on a 100 Mbit/s, 80 ms, 0.5% loss path gave 5.7 Mbit/s without it and 6.9 Mbit/s with 4 sessions for a download, and a stream stays on one session anyway; each session also takes a place on the server. The `mux` block of the config file still works.
+- Junk packets and TCP fragmentation of the handshake (plain TCP only), with their settings in the desktop and Android apps and the `uot_frag` carrier of the network check. The handshake already looks like random bytes, so random filler in front of it changes nothing a classifier of fully encrypted traffic looks at, and a plain OSTP stream has no server name for splitting the first segment to hide; both only made connecting slower. Config files that still have `junk_pc`, `junk_ps`, `tcp_fragmentation`, `frag_chunk` or `frag_sleep` load as before (the fields are ignored), and `ostp migrate` deletes them (client config schema 4). The server still drops marked junk from older clients, and TTL-desync decoys keep their marker, so nothing changes on the wire.
+
+### Fixed
+- Kill switch on Windows did nothing: its blackhole route got the loopback interface's metric of 75 on top of its own 10, so the real default route (45 on a Wi-Fi adapter) always won and traffic left outside the tunnel when it dropped. The route is gone, the setting is ignored on Windows with a warning in the log, and the desktop app no longer shows it there. Linux and macOS are unchanged (they remove the default route). A firewall-based kill switch is planned for 0.5.0.
+- Desktop app: Update now failed with "Command install_update not allowed by ACL": the command was missing from the app's permission list. The installed beta.12 to beta.14 builds cannot update themselves, so the next version has to be installed by hand once; from it on, Update now works.
+
+## [0.4.7-beta.14] - 2026-11-06
+
+### Added
+- Desktop and Android apps: when the selected profile changes, or the profile in use is edited, while connected, the main screen says that the connection still uses the previous one and shows a Reconnect button. It stops and starts the tunnel with the new profile in one step; open connections are reset, as with Disconnect and Connect. Nothing happens until it is pressed.
 - Per-stream flow control: a large upload to a site that takes it slowly no longer breaks (the server used to reset the connection once 32 MB waited for the site), and a program on the client that reads a download slowly no longer makes the server buffer it. Each stream gets an 8 MiB window in each direction; the receiver grants more as data reaches the site or the program. The client offers it after the handshake and both sides use it only if the server answers, so 0.4.5 servers and clients work as before. Checked: a 100 MB upload to a site taking 1 MB/s arrives whole with the server at 25 MB of memory.
 
 ### Fixed
+- TLS and UDP-over-TCP slowed to a quarter of the path when the network got slower after connecting, or behind a deep buffer: the client's own congestion control backed off on the queue that TCP underneath builds anyway, and left TCP with less to send. On these carriers TCP now does the congestion control alone. A path that gets slower while a session sits idle is also no longer taken for a queue (slow start went on from the initial window). Measured on a 35 ms, 300 Mbit/s path with 0.01% loss: TLS 58 to 191 Mbit/s, UDP 119 to 208 Mbit/s.
 - Speed on links with random loss (radio, mobile, a lossy hop) swung between runs, for example 43 to 183 Mbit/s on the same 300 Mbit/s path with 0.01% loss: each loss cut the window to 0.7 as if it were congestion, several times a second. A loss while the round-trip time is at its floor (no queue) now costs a milder cut (0.85); one with a queue built up still costs the full one. The same path now gives a steady ~120 Mbit/s.
 - Server: a client on TCP or TLS that drained its connection slower than the server sent had frames dropped from its queue, and they then waited out the long retransmit timer of a reliable carrier: TLS downloads crawled. The server now reads from sites only as fast as that connection drains.
 - A frame was given up after 10 retransmits, about 30 seconds on a short path, so an outage that the session would otherwise survive lost data. Frames are now given up only after 5 minutes, and a receiver waits as long for a missing one.

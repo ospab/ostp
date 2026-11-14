@@ -8,7 +8,7 @@ The client takes your applications' traffic, sends it through an encrypted sessi
 
 **System proxy (Windows).** In proxy mode the client writes the system proxy settings (WinINet) in the form browsers expect, `http=127.0.0.1:1088;https=127.0.0.1:1088`, and restores the previous values on a normal stop. On Linux with a desktop session it sets the GNOME or KDE proxy; without a desktop `ostp proxy-env` prints the shell exports instead.
 
-**TUN.** On Windows (Wintun), Linux and macOS the client can create a virtual adapter and take all of the machine's IP traffic. A user-space TCP/IP stack (`netstack-smoltcp`) rebuilds TCP and UDP flows from the packets and feeds them into the session as `RelayMessage`s (see [specification.md](specification.md)). The desktop app creates the adapter in the separate `ostp-tun-helper` process, so the app itself does not run elevated (see [integrations.md](integrations.md)). `tun.kill_switch` blocks traffic while the tunnel is down.
+**TUN.** On Windows (Wintun), Linux and macOS the client can create a virtual adapter and take all of the machine's IP traffic. A user-space TCP/IP stack (`netstack-smoltcp`) rebuilds TCP and UDP flows from the packets and feeds them into the session as `RelayMessage`s (see [specification.md](specification.md)). The desktop app creates the adapter in the separate `ostpd` process, so the app itself does not run elevated (see [integrations.md](integrations.md)). `tun.kill_switch` removes the physical default route, so traffic cannot leave outside the tunnel when it drops (Linux and macOS). On Windows it is ignored and the desktop app does not offer it: the blackhole route it used there never took priority over the real default route. A firewall-based kill switch for Windows is planned for 0.5.0.
 
 ## Transports
 
@@ -18,7 +18,7 @@ The client takes your applications' traffic, sends it through an encrypted sessi
 - `uot`: the same datagrams over one TCP connection, each with a 2-byte length prefix. For networks that block or throttle unknown UDP. Nothing is imitated; the stream is length-prefixed opaque data.
 - `uot` with `tls`: UoT inside real TLS to the server's domain, directly on 443 or through nginx/apache/caddy with `ws_path`. The certificate is checked against the Mozilla roots; `tls_insecure` turns that off for testing. See [tls.md](tls.md).
 
-Other options of the `transport` block: `junk_pc` / `junk_ps` (count and size range of random datagrams sent before the handshake), `tcp_fragmentation` / `frag_chunk` / `frag_sleep` (the first TCP segment, which holds the handshake, is split into small pieces with short pauses) and `ttl_desync*` (UDP only, decoy datagrams that expire before the server). Details in [obfuscation.md](obfuscation.md).
+Another option of the `transport` block: `ttl_desync*` (UDP only, decoy datagrams that expire before the server). `junk_pc`, `junk_ps`, `tcp_fragmentation`, `frag_chunk` and `frag_sleep` were removed in 0.4.7 and are ignored; `ostp migrate` deletes them. Details in [obfuscation.md](obfuscation.md).
 
 There is no STUN/TURN client. Strict NATs are handled by roaming on `session_id` (see [server.md](server.md)) and by `uot`.
 
@@ -35,6 +35,16 @@ The client does not switch transport or server on its own; that is the user's ch
 
 Ordinary TCP errors (`ConnectionReset`, `BrokenPipe`, `UnexpectedEof`) are not written to the log.
 
+## Device ID for subscriptions
+
+A server can limit the devices of a subscription (see [tls.md](tls.md), *Device limit*). Sending the device's ID is off by default and has to be turned on: the top-level key `send_hwid` of the client config (`false` when absent), or the switch *Send a device ID to subscriptions* in the apps.
+
+```json
+"send_hwid": true
+```
+
+Only `ostp import https://…/sub/…` and the apps' subscription fetch use it, and only at that moment; the tunnel never sends it. What goes out is the headers `x-hwid`, `x-device-os` (for example `Windows 11`, `Linux`, `macOS`, `Android 14`) and `x-device-model` (the CPU architecture on a computer, `Build.MODEL` on Android; never the computer's name). `x-hwid` is `hex(HMAC-SHA256(key = the system's machine identifier, message = "ostp-hwid:" + the server's host))` cut to 32 characters. The machine identifier is `MachineGuid` on Windows, `IOPlatformUUID` on macOS, `/etc/machine-id` on Linux and `ANDROID_ID` on Android; it is the HMAC key and is never sent or logged. With `send_hwid` off, `ostp import` of a subscription that limits devices stops with a message that says how to turn it on.
+
 ## Exclusions
 
 The `exclude` block lists what bypasses the tunnel and goes out directly:
@@ -49,7 +59,7 @@ Changes to `config.json` take effect without a reconnect.
 
 Every proxied TCP connection and UDP flow already shares the one encrypted session as `RelayMessage`s (`Connect`, `Data`, `Close`, `UdpAssociate`, `UdpData`), so any number of tabs and downloads fit in it.
 
-The `mux` block is a different, optional thing: several independent sessions to the same server, to spread traffic and loss over separate nonce sequences and congestion controllers.
+The `mux` block is a different, optional thing, available only in the config file: several independent sessions to the same server, each with its own nonce sequence and congestion controller. A stream stays on one session, so a single download gains nothing; in a lab run on a 100 Mbit/s, 80 ms, 0.5% loss path a download took 5.7 Mbit/s without it and 6.9 Mbit/s with 4 sessions, and 40 parallel page objects 4.2 s against 3.3 s. The desktop and Android apps no longer offer it in 0.4.7. Every session also takes a place on the server.
 
 ```json
 "mux": { "enabled": true, "sessions": 5 }

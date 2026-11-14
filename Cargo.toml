@@ -4,15 +4,15 @@ members = [
     "ostp-client",
     "ostp-server",
     "ostp-jni", "ostp",
-    "ostp-tun-helper"
-, "ostp-tun", "ostp-dns", "ostp-ssh"]
+    "ostpd"
+, "ostp-tun", "ostp-dns", "ostp-ssh", "ostp-warp"]
 exclude = ["ostp-gui/src-tauri", "ostp-brain", "ostp-prober", "ostp-lab"]
 resolver = "2"
 
 [workspace.package]
 edition = "2021"
 license = "AGPL-3.0"
-version = "0.4.7"
+version = "0.4.8"
 repository = "https://github.com/ospab/ostp"
 homepage = "https://github.com/ospab/ostp"
 

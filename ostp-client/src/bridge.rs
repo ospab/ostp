@@ -34,6 +34,9 @@ const MIGRATION_TIMEOUT_MIN: Duration = Duration::from_secs(4);
 /// Parallel sessions the multiplexer opens at most; the config value is the
 /// user's, and each session is a socket, a task and a handshake in sequence.
 const MAX_MUX_SESSIONS: usize = 32;
+/// Size range of a TTL-desync decoy datagram, in bytes (the first 4 carry the
+/// key's junk marker, so a decoy that does reach the server is dropped there).
+const TTL_DECOY_LEN: (usize, usize) = (100, 1000);
 
 /// Minimum gap between log lines about packets that fail to authenticate.
 const INBOUND_ERROR_LOG_EVERY: Duration = Duration::from_secs(5);
@@ -238,11 +241,6 @@ pub struct Bridge {
     pub mux_sessions: usize,
 
     pub transport_mode: String,
-    pub tcp_fragmentation: bool,
-    pub frag_chunk: usize,
-    pub frag_sleep: u64,
-    pub junk_pc: [usize; 2],
-    pub junk_ps: [usize; 2],
     pub ttl_desync: bool,
     pub ttl_desync_ttl: u8,
     pub ttl_desync_count: u8,
@@ -298,11 +296,6 @@ impl Bridge {
             mux_sessions: config.multiplex.sessions.clamp(1, MAX_MUX_SESSIONS),
 
             transport_mode: config.transport.mode.clone(),
-            tcp_fragmentation: config.transport.tcp_fragmentation,
-            frag_chunk: config.transport.frag_chunk,
-            frag_sleep: config.transport.frag_sleep,
-            junk_pc: config.transport.junk_pc,
-            junk_ps: config.transport.junk_ps,
             ttl_desync: config.transport.ttl_desync,
             ttl_desync_ttl: config.transport.ttl_desync_ttl,
             ttl_desync_count: config.transport.ttl_desync_count,
@@ -1372,12 +1365,9 @@ impl Bridge {
                 );
                 let decoys: Vec<bytes::Bytes> = {
                     let mut rng = rand::thread_rng();
-                    let [min_s, max_s] = self.junk_ps;
-                    let min_s = min_s.max(4);
-                    let max_s = max_s.max(min_s);
                     (0..self.ttl_desync_count)
                         .map(|_| {
-                            let len = rng.gen_range(min_s..=max_s);
+                            let len = rng.gen_range(TTL_DECOY_LEN.0..=TTL_DECOY_LEN.1);
                             let mut b = vec![0u8; len];
                             rng.fill(&mut b[..]);
                             b[..4].copy_from_slice(&marker);
@@ -1615,11 +1605,6 @@ impl Bridge {
         self.mux_enabled = cfg.multiplex.enabled;
         self.mux_sessions = cfg.multiplex.sessions.clamp(1, MAX_MUX_SESSIONS);
         self.transport_mode = cfg.transport.mode.clone();
-        self.tcp_fragmentation = cfg.transport.tcp_fragmentation;
-        self.frag_chunk = cfg.transport.frag_chunk.max(1);
-        self.frag_sleep = cfg.transport.frag_sleep;
-        self.junk_pc = cfg.transport.junk_pc;
-        self.junk_ps = cfg.transport.junk_ps;
         self.ttl_desync = cfg.transport.ttl_desync;
         self.ttl_desync_ttl = cfg.transport.ttl_desync_ttl;
         self.ttl_desync_count = cfg.transport.ttl_desync_count;
@@ -1657,12 +1642,6 @@ impl Bridge {
                 target_ip,
                 port,
                 crate::transport::UotOptions {
-                    tcp_fragmentation: self.tcp_fragmentation,
-                    frag_chunk: self.frag_chunk,
-                    frag_sleep: self.frag_sleep,
-                    junk_pc: self.junk_pc,
-                    junk_ps: self.junk_ps,
-                    access_key: self.access_key.clone(),
                     ttl: None,
                     connect_timeout: UOT_CONNECT_TIMEOUT,
                     // Name, not the resolved IP: the certificate and the web

@@ -9,6 +9,7 @@ mod sub_cmd;
 mod panel_cmd;
 mod dns_cmd;
 mod overnet_cmd;
+mod warp_cmd;
 mod changelog_cmd;
 mod manage_cmd;
 mod service_cmd;
@@ -114,6 +115,11 @@ enum Commands {
     Overnet {
         #[command(subcommand)]
         action: overnet_cmd::OvernetAction,
+    },
+    /// Cloudflare WARP as this server's exit: register, enable, status, test (server only)
+    Warp {
+        #[command(subcommand)]
+        action: warp_cmd::WarpAction,
     },
     /// Server state and everyday changes as JSON, for the desktop app (server only)
     #[command(hide = true)]
@@ -225,6 +231,17 @@ fn prompt_client_options(client_cfg: &mut ClientConfig) {
     }
 }
 
+/// `send_hwid` of the client config at `path`; false when there is none, it is not
+/// a client config, or it cannot be read.
+fn existing_send_hwid(path: &Path) -> bool {
+    let Ok(raw) = fs::read_to_string(path) else { return false };
+    let mut stripped = json_comments::StripComments::new(raw.as_bytes());
+    match serde_json::from_reader::<_, UnifiedConfig>(&mut stripped) {
+        Ok(UnifiedConfig { mode: AppMode::Client(c), .. }) => c.send_hwid.unwrap_or(false),
+        _ => false,
+    }
+}
+
 fn parse_ostp_link(link: &str) -> Result<ClientConfig> {
     let l = ostp_core::share_link::ShareLink::parse(link)?;
     Ok(ClientConfig {
@@ -245,6 +262,7 @@ fn parse_ostp_link(link: &str) -> Result<ClientConfig> {
         debug: Some(false),
         exclude: None,
         mux: None,
+        send_hwid: None,
         gui: None,
     })
 }
@@ -978,6 +996,7 @@ fn run_setup_wizard(config_path: &std::path::Path) -> Result<Option<PathBuf>> {
                 },
                 "fallback": { "enabled": false, "listen": "0.0.0.0:443", "target": "127.0.0.1:8080" },
                 "overnet": serde_json::to_value(ostp_server::OvernetConfig::default()).unwrap_or_default(),
+                "warp": serde_json::to_value(ostp_server::warp::WarpConfig::default()).unwrap_or_default(),
                 "debug": false
             });
             if let Some(ip) = &bind_ip {
@@ -1072,6 +1091,7 @@ fn run_setup_wizard(config_path: &std::path::Path) -> Result<Option<PathBuf>> {
                 },
                 "fallback": { "enabled": false, "listen": "0.0.0.0:443", "target": "127.0.0.1:8080" },
                 "overnet": serde_json::to_value(ostp_server::OvernetConfig::default()).unwrap_or_default(),
+                "warp": serde_json::to_value(ostp_server::warp::WarpConfig::default()).unwrap_or_default(),
                 "debug": false
             });
             if let Some(ip) = &bind_ip {
@@ -1262,6 +1282,7 @@ async fn run_app() -> Result<()> {
             Commands::Manage { action } => manage_cmd::run(action, &args.config),
             Commands::Dns { action } => return dns_cmd::run(action, &args.config).await,
             Commands::Overnet { action } => return overnet_cmd::run(action, &args.config),
+            Commands::Warp { action } => return warp_cmd::run(action, &args.config).await,
             Commands::Start => return service_cmd::run(service_cmd::Action::Start),
             Commands::Stop => return service_cmd::run(service_cmd::Action::Stop),
             Commands::Restart => return service_cmd::run(service_cmd::Action::Restart),
@@ -1376,9 +1397,23 @@ async fn run_app() -> Result<()> {
     if let Some(import_url) = args.import {
         let import_url = if import_url.trim().to_ascii_lowercase().starts_with("https://") {
             println!("{} Fetching subscription", "[ostp]".cyan().bold());
-            let doc = ostp_client::subscription::fetch(&import_url)
+            // The device ID goes out only when the config says `send_hwid: true`.
+            let device = if existing_send_hwid(&args.config) {
+                Some(ostp_client::hwid::local_device(&import_url).map_err(|e| anyhow!("Subscription Error: {e}"))?)
+            } else {
+                None
+            };
+            let doc = ostp_client::subscription::fetch_with_device(&import_url, device.as_ref())
                 .await
-                .map_err(|e| anyhow!("Subscription Error: {e}"))?;
+                .map_err(|e| match ostp_client::subscription::device_error(&e) {
+                    Some(d) if d.code() == "hwid_required" => anyhow!(
+                        "Subscription Error: {d}\n  This subscription limits devices and needs a device ID, but sending it is off. \
+                         To turn it on, set \"send_hwid\": true at the top level of {} and run the import again. \
+                         The ID is a hash made for this server; it is sent only when a subscription is fetched.",
+                        args.config.display()
+                    ),
+                    _ => anyhow!("Subscription Error: {e}"),
+                })?;
             let links = doc.valid_links();
             println!("  {} — {} link(s), refresh every {} h", doc.name.bold(), links.len(), doc.update_interval_hours);
             if let Some(u) = &doc.usage {
@@ -1401,6 +1436,10 @@ async fn run_app() -> Result<()> {
         let mut client_cfg = parse_ostp_link(&import_url)
             .map_err(|e| anyhow!("Share Link Error: {e}"))?;
         prompt_client_options(&mut client_cfg);
+        // Importing writes a fresh config: keep the owner's choice about the device ID.
+        if existing_send_hwid(&args.config) {
+            client_cfg.send_hwid = Some(true);
+        }
         let unified = UnifiedConfig {
             mode: AppMode::Client(client_cfg),
             log_level: Some("info".to_string()),
@@ -1481,6 +1520,7 @@ async fn run_app() -> Result<()> {
                         } else {
                             println!("  overnet: disabled (.ov sites for clients: ostp overnet install, then ostp overnet enable)");
                         }
+                        warp_cmd::print_check_line(s.warp.clone())?;
                     }
                     AppMode::Client(c) => {
                         println!("{} Config OK: client mode", "[ostp]".green().bold());
@@ -1593,6 +1633,16 @@ async fn run_app() -> Result<()> {
     "gateway": "127.0.0.1:9150",
     "exit": false,
     "exit_listen": "127.0.0.1:9151"
+  }},
+
+  // Cloudflare WARP as this server's exit (a WireGuard client inside this
+  // process, reached through a local SOCKS5 proxy). Off until you turn it on:
+  // `ostp warp register --accept-terms`, then `ostp warp enable --all`.
+  "warp": {{
+    "enabled": false,
+    "mode": "rules",
+    "listen": "127.0.0.1:40000",
+    "endpoint": ""
   }},
 
   "debug": false
@@ -1782,6 +1832,7 @@ async fn run_app() -> Result<()> {
                 (uc.key(), ostp_server::api::UserMeta {
                     name: uc.name(),
                     limit_bytes: uc.limit(),
+                    max_devices: uc.max_devices(),
                 })
             }).collect::<Vec<_>>();
             let domain = server_cfg.domain.clone().filter(|d| !d.is_empty());
@@ -1812,6 +1863,11 @@ async fn run_app() -> Result<()> {
                 .map(serde_json::from_value)
                 .transpose()
                 .map_err(|e| anyhow!("Invalid 'overnet' section in server config: {e}"))?;
+            let warp_cfg: Option<ostp_server::warp::WarpConfig> = server_cfg
+                .warp
+                .map(serde_json::from_value)
+                .transpose()
+                .map_err(|e| anyhow!("Invalid 'warp' section in server config: {e}"))?;
             ostp_server::run_server(ostp_server::ServerParams {
                 bind_addrs: listen_addrs,
                 server_public_ip: Some(host),
@@ -1826,6 +1882,7 @@ async fn run_app() -> Result<()> {
                 tls,
                 subscription,
                 overnet: overnet_cfg,
+                warp: warp_cfg,
                 local_access: server_cfg.local_access,
             })
             .await?;

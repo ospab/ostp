@@ -7,10 +7,12 @@ import 'package:flutter/services.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:package_info_plus/package_info_plus.dart';
 import '../models/connection_state_enum.dart';
+import '../models/dns_notice.dart';
 import '../models/ostp_profile.dart';
 import '../models/share_link.dart';
 import '../models/subscription.dart';
 import '../services/updates.dart' as updates;
+import 'dns_notice_dialog.dart';
 import 'prober_screen.dart';
 import 'settings_screen.dart';
 
@@ -54,6 +56,29 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin, 
   // The profile the running tunnel was started with; the active profile can be
   // changed in Settings meanwhile, which only takes effect on the next connect.
   String? _sessionProfileName;
+  // The whole profile as it was at connect, to notice an edit too, not only another choice.
+  String? _sessionProfileSig;
+  bool _reconnecting = false;
+
+  /// Whether the active profile differs from the one the tunnel runs on.
+  bool get _profileChanged =>
+      _state != ConnectionStateEnum.disconnected &&
+      _sessionProfileSig != null &&
+      _sessionProfileSig != (_activeProfile == null ? null : jsonEncode(_activeProfile!.toJson()));
+
+  /// Stop and start again with the selected profile. One tunnel cannot hold
+  /// two servers at once, so connections are reset as with Disconnect and
+  /// Connect; this only saves the two taps.
+  Future<void> _reconnect() async {
+    if (_reconnecting || _starting || _stopping) return;
+    setState(() => _reconnecting = true);
+    try {
+      await _stopTunnel();
+      if (_state == ConnectionStateEnum.disconnected) await _toggleConnection();
+    } finally {
+      if (mounted) setState(() => _reconnecting = false);
+    }
+  }
 
   static const _callTimeout = Duration(seconds: 5);
   // The system VPN consent dialog waits for the user, so startTunnel gets longer.
@@ -180,12 +205,10 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin, 
     final exIps = widget.prefs.getString('ex_ips') ?? '';
     final debugMode = widget.prefs.getBool('debug_mode') ?? false;
     final mtu = (int.tryParse(widget.prefs.getString('mtu') ?? '') ?? 1140).clamp(576, 1500);
-    final muxEnabled = widget.prefs.getBool('mux_enabled') ?? false;
-    final muxSessions = widget.prefs.getString('mux_sessions') ?? '2';
     final dnsServer = widget.prefs.getString('dns_server');
     // The VPN builder throws on anything but an IP literal, which would fail the start.
-    final effectiveDnsServer =
-        (dnsServer != null && InternetAddress.tryParse(dnsServer.trim()) != null) ? dnsServer.trim() : '1.1.1.1';
+    final effectiveDnsServer = effectiveDns(
+        p, (dnsServer != null && InternetAddress.tryParse(dnsServer.trim()) != null) ? dnsServer.trim() : null);
     const tunStack = 'ostp';
     final appRoutingMode = widget.prefs.getString('app_routing_mode') ?? 'bypass';
     final appRoutingPackages = widget.prefs.getStringList('app_routing_packages') ?? [];
@@ -206,26 +229,14 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin, 
         "bind_addr": localBind,
         "connect_timeout_ms": 15000,
       },
-      // Junk packets + TCP fragmentation are per-profile settings — same
-      // shape as the desktop GUI's profile object — not global toggles.
       "transport": {
         "mode": p?.transportMode ?? 'udp',
-        "tcp_fragmentation": p?.tcpFragmentation ?? false,
-        // The core reads these as unsigned: a negative or absurd value would fail the whole config.
-        "frag_chunk": (p?.fragChunk ?? 2).clamp(1, 1400),
-        "frag_sleep": (p?.fragSleep ?? 2).clamp(0, 1000),
-        "junk_pc": _range(p?.junkPcMin ?? 2, p?.junkPcMax ?? 5, 30),
-        "junk_ps": _range(p?.junkPsMin ?? 100, p?.junkPsMax ?? 1000, 1400),
         "ttl_desync": p?.ttlDesync ?? false,
         "ttl_desync_auto": true,
         "tls": (p?.transportMode == 'uot') && (p?.tls ?? false),
         "tls_sni": (p?.tlsSni ?? '').isEmpty ? null : p!.tlsSni,
         "tls_insecure": p?.tlsInsecure ?? false,
         "ws_path": (p?.wsPath ?? '').isEmpty ? null : p!.wsPath,
-      },
-      "multiplex": {
-        "enabled": muxEnabled,
-        "sessions": (int.tryParse(muxSessions) ?? 2).clamp(1, 16),
       },
       "exclusions": {
         "domains": exDomains.split('\n').map((s) => s.trim()).where((s) => s.isNotEmpty).take(2000).toList(),
@@ -254,11 +265,6 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin, 
     if (port == null || port < 1 || port > 65535) return null;
     final host = s.substring(0, c).replaceAll(RegExp(r'^\[|\]$'), '');
     return InternetAddress.tryParse(host) == null ? null : s;
-  }
-
-  static List<int> _range(int a, int b, int max) {
-    final lo = a.clamp(0, max), hi = b.clamp(0, max);
-    return lo <= hi ? [lo, hi] : [hi, lo];
   }
 
   void _updateLatestConfigJson() {
@@ -312,6 +318,27 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin, 
         return;
       }
 
+      // A server that filters DNS is explained once, before the tunnel starts.
+      if (shouldAskDnsNotice(profile)) {
+        _starting = true; // a second tap must not open a second dialog
+        String choice;
+        try {
+          choice = await askDnsNotice(context, dnsAll: profile.dnsall);
+        } finally {
+          _starting = false;
+        }
+        if (!mounted) return;
+        final stored = decodeProfiles(widget.prefs.getString('profiles_json'));
+        final mine = stored.where((p) => p.id == profile.id).firstOrNull;
+        if (mine != null) {
+          mine.dnsChoice = choice;
+          profile.dnsChoice = choice;
+          await widget.prefs.setString('profiles_json', encodeProfiles(stored));
+        }
+        _loadSettings();
+        if (_activeProfile?.id != profile.id) return; // the selection changed meanwhile: the user taps again
+      }
+
       final configStr = jsonEncode(_buildConfigMap());
       if (configStr.length > _maxConfigChars) {
         _snack('The settings are too large to start. Shorten the exclusion lists.');
@@ -321,6 +348,7 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin, 
       _starting = true;
       _epoch++;
       _sessionProfileName = profile.name;
+      _sessionProfileSig = jsonEncode(profile.toJson());
       _setConnecting();
       widget.prefs.setString('latest_config_json', configStr);
 
@@ -531,6 +559,7 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin, 
       _pingText = '-- ms';
       _pingColor = Colors.white54;
       _sessionProfileName = null;
+      _sessionProfileSig = null;
     });
     _pulseController.stop();
     _pulseController.value = 0.0;
@@ -816,6 +845,71 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin, 
             ],
           ),
         ),
+
+        if (_profileChanged)
+          Padding(
+            padding: const EdgeInsets.only(top: 14),
+            child: ConstrainedBox(
+              constraints: const BoxConstraints(maxWidth: 360),
+              child: Container(
+                padding: const EdgeInsets.fromLTRB(14, 10, 10, 10),
+                decoration: BoxDecoration(
+                  color: const Color(0x0AFFFFFF),
+                  border: Border.all(color: const Color(0x17FFFFFF)),
+                  borderRadius: BorderRadius.circular(10),
+                ),
+                child: Row(
+                  children: [
+                    const Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Text(
+                            'Profile changed',
+                            style: TextStyle(fontSize: 13, fontWeight: FontWeight.w600, color: Colors.white),
+                          ),
+                          SizedBox(height: 2),
+                          Text(
+                            'The VPN still uses the previous one.',
+                            style: TextStyle(fontSize: 12, color: Colors.white54),
+                          ),
+                        ],
+                      ),
+                    ),
+                    const SizedBox(width: 12),
+                    FilledButton(
+                      onPressed: _reconnecting ? null : _reconnect,
+                      style: FilledButton.styleFrom(
+                        backgroundColor: Colors.white,
+                        foregroundColor: Colors.black,
+                        disabledBackgroundColor: Colors.white,
+                        disabledForegroundColor: Colors.black,
+                        minimumSize: const Size(0, 36),
+                        padding: const EdgeInsets.symmetric(horizontal: 14),
+                        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+                        textStyle: const TextStyle(fontSize: 13, fontWeight: FontWeight.w600),
+                      ),
+                      child: _reconnecting
+                          ? const Row(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                SizedBox(
+                                  width: 12,
+                                  height: 12,
+                                  child: CircularProgressIndicator(strokeWidth: 1.5, color: Colors.black),
+                                ),
+                                SizedBox(width: 8),
+                                Text('Reconnecting'),
+                              ],
+                            )
+                          : const Text('Reconnect'),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
 
         if (_showRtt)
         AnimatedOpacity(

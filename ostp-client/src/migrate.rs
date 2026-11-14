@@ -22,7 +22,7 @@ use serde_json::{json, Map, Value};
 /// - `1`: flat configs up to 0.4.5, no version stamp; may carry settings of
 ///   features that no longer exist.
 /// - `2`: 0.4.6+, stamped `config_version`.
-pub const CURRENT_VERSION: u32 = 3;
+pub const CURRENT_VERSION: u32 = 6;
 
 /// Which config this file is (mirrors `AppMode`'s `"mode"` tag). Old configs
 /// from before that tag existed are sniffed structurally as a fallback.
@@ -85,6 +85,9 @@ const STEPS: &[Step] = &[
     Step { kind: ConfigKind::Client, from: 1, title: "remove settings of removed features", run: client_drop_removed },
     Step { kind: ConfigKind::Relay, from: 1, title: "remove relay-side authentication settings", run: relay_drop_auth },
     Step { kind: ConfigKind::Server, from: 2, title: "add the overnet section (off)", run: server_add_overnet },
+    Step { kind: ConfigKind::Client, from: 3, title: "remove junk packets and TCP fragmentation", run: client_drop_junk_frag },
+    Step { kind: ConfigKind::Server, from: 4, title: "keep taking over all DNS where the filter is on", run: server_keep_dns_takeover },
+    Step { kind: ConfigKind::Server, from: 5, title: "add the warp section (off)", run: server_add_warp },
 ];
 
 fn remove_with_reason(obj: &mut Map<String, Value>, path: &str, key: &str, reason: &str, notes: &mut Vec<String>) {
@@ -102,6 +105,17 @@ fn client_drop_removed(v: &mut Value, notes: &mut Vec<String>) {
     if let Some(t) = v.get_mut("transport").and_then(|t| t.as_object_mut()) {
         remove_with_reason(t, "transport.", "wss", "WSS framing was removed in 0.4.0; the TLS carrier is `transport.tls`", notes);
         remove_with_reason(t, "transport.", "stealth_sni", "never reached the wire; the real TLS server name is `transport.tls_sni`", notes);
+    }
+}
+
+/// Junk packets and handshake fragmentation (plain-TCP UoT only) were removed in 0.4.7:
+/// random bytes in front of a random-looking handshake change nothing a classifier
+/// looks at, and there is no server name in a plain OSTP stream for splitting to hide.
+fn client_drop_junk_frag(v: &mut Value, notes: &mut Vec<String>) {
+    if let Some(t) = v.get_mut("transport").and_then(|t| t.as_object_mut()) {
+        for key in ["junk_pc", "junk_ps", "tcp_fragmentation", "frag_chunk", "frag_sleep"] {
+            remove_with_reason(t, "transport.", key, "junk packets and TCP fragmentation were removed in 0.4.7", notes);
+        }
     }
 }
 
@@ -200,7 +214,6 @@ fn client_modular_to_flat(v: &mut Value, notes: &mut Vec<String>) {
         },
         "transport": {
             "mode": mode,
-            "tcp_fragmentation": t.and_then(|t| t.get("tcp_fragmentation")).and_then(|x| x.as_bool()).unwrap_or(false),
         },
     });
     if let Some(mtu) = tun.and_then(|t| t.get("mtu")).and_then(|m| m.as_u64()) {
@@ -227,6 +240,37 @@ fn server_add_overnet(v: &mut Value, notes: &mut Vec<String>) {
         "exit_listen": "127.0.0.1:9151",
     });
     notes.push("added overnet (off): .ov sites for clients with `ostp overnet install` and `ostp overnet enable`".into());
+}
+
+/// The `warp` section (Cloudflare WARP as the server's exit), written out off.
+/// Nothing registers and nothing turns on: `ostp warp register`, then
+/// `ostp warp enable`.
+fn server_add_warp(v: &mut Value, notes: &mut Vec<String>) {
+    if v.get("warp").is_some_and(|o| !o.is_null()) {
+        return;
+    }
+    v["warp"] = json!({
+        "enabled": false,
+        "mode": "rules",
+        "listen": "127.0.0.1:40000",
+        "endpoint": "",
+    });
+    notes.push("added warp (off): Cloudflare WARP as this server's exit with `ostp warp register --accept-terms` and `ostp warp enable --all`".into());
+}
+
+/// Before 0.5.0 a server with `dns.enabled` answered every client's port-53 query
+/// and refused encrypted DNS. The default is now to answer only queries sent to
+/// the server's own address; an existing server keeps what it did, spelled out.
+fn server_keep_dns_takeover(v: &mut Value, notes: &mut Vec<String>) {
+    let Some(dns) = v.get_mut("dns").and_then(|d| d.as_object_mut()) else { return };
+    if dns.get("enabled").and_then(|e| e.as_bool()) != Some(true) {
+        return;
+    }
+    if dns.get("intercept_all_port53").and_then(|e| e.as_bool()) == Some(true) {
+        return;
+    }
+    dns.insert("intercept_all_port53".into(), json!(true));
+    notes.push("dns.intercept_all_port53 = true: this server keeps answering every client's DNS query and refusing encrypted DNS, as before. New servers answer only queries sent to their own address (10.1.0.1); turn it off with `ostp dns takeover off` to let clients choose their resolver".into());
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -524,11 +568,14 @@ mod tests {
         assert_eq!(m.output["api"], json!({ "enabled": true, "token": "relay-token" }));
         assert!(m.output.get("outbound").is_none());
         assert_eq!(m.output["tls"], json!({ "enabled": true, "ws_path": "/Xk3pQ9aZr2" }));
-        // The version stamp and, since v3, the overnet section switched off.
-        assert_eq!(m.changes.len(), 2, "{:?}", m.changes);
+        // The version stamp and the sections added switched off: overnet (v3), warp (v6).
+        assert_eq!(m.changes.len(), 3, "{:?}", m.changes);
         assert!(m.changes.contains(&Change::Added { path: "config_version".into(), value: json!(CURRENT_VERSION) }));
-        assert!(matches!(&m.changes[..], [Change::Added { path, .. }, _] | [_, Change::Added { path, .. }] if path == "overnet"));
+        for section in ["overnet", "warp"] {
+            assert!(m.changes.iter().any(|c| matches!(c, Change::Added { path, .. } if path == section)), "{section}: {:?}", m.changes);
+        }
         assert_eq!(m.output["overnet"]["enabled"], false);
+        assert_eq!(m.output["warp"]["enabled"], false);
         assert!(m.unknown_keys.is_empty(), "{:?}", m.unknown_keys);
         assert_idempotent(&m);
     }
@@ -553,11 +600,23 @@ mod tests {
     }
 
     #[test]
+    fn junk_and_fragmentation_settings_are_removed() {
+        let m = run(json!({
+            "mode": "client", "config_version": 3, "server": "198.51.100.9:50000", "access_key": "k",
+            "transport": { "mode": "uot", "tcp_fragmentation": true, "frag_chunk": 2, "frag_sleep": 2,
+                           "junk_pc": [2, 5], "junk_ps": [100, 1000], "ttl_desync": true }
+        }));
+        assert_eq!(m.output["transport"], json!({ "mode": "uot", "ttl_desync": true }));
+        assert!(m.unknown_keys.is_empty(), "{:?}", m.unknown_keys);
+        assert_idempotent(&m);
+    }
+
+    #[test]
     fn current_config_is_a_true_no_op() {
         let current = json!({
             "mode": "client", "config_version": CURRENT_VERSION,
             "server": "vpn.example.com:443", "access_key": "k",
-            "transport": { "mode": "uot", "tcp_fragmentation": false, "tls": true, "ws_path": "/Xk3pQ9aZr2" }
+            "transport": { "mode": "uot", "tls": true, "ws_path": "/Xk3pQ9aZr2" }
         });
         let m = run(current.clone());
         assert!(m.is_up_to_date(), "{:?}", m.changes);
@@ -571,12 +630,15 @@ mod tests {
             "server": "h:1", "access_key": "k",
             "tranport": { "mode": "uot" },
             "tun": { "enable": true, "kil_switch": true },
+            "send_hwid": true,
             "my_note": "hello"
         }));
         let find = |p: &str| m.unknown_keys.iter().find(|u| u.path == p).cloned();
         assert_eq!(find("tranport").unwrap().suggestion.as_deref(), Some("transport"));
         assert_eq!(find("tun.kil_switch").unwrap().suggestion.as_deref(), Some("kill_switch"));
         assert_eq!(find("my_note").unwrap().suggestion, None);
+        assert!(find("send_hwid").is_none(), "send_hwid is a known key");
+        assert_eq!(m.output["send_hwid"], json!(true));
         assert_eq!(m.output["tranport"], json!({ "mode": "uot" }), "unknown data is never deleted");
     }
 
@@ -603,7 +665,7 @@ mod tests {
         let client = json!({
             "mode": "client", "config_version": CURRENT_VERSION, "server": "127.0.0.1:50000", "access_key": "k",
             "socks5_bind": "127.0.0.1:1088",
-            "transport": { "mode": "udp", "tcp_fragmentation": false },
+            "transport": { "mode": "udp" },
             "debug": false,
         });
         let server = json!({
@@ -641,8 +703,52 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(m.output["overnet"], json!({ "enabled": true, "gateway": "127.0.0.1:9999" }));
-        // Clients have no step for v3: only the version number moves.
+        // Clients have no step for v3; the v4 step finds nothing to remove.
         let m = migrate(json!({ "mode": "client", "config_version": 2, "server": "h:1", "access_key": "k" })).unwrap();
-        assert!(m.steps.is_empty());
+        assert!(m.steps.iter().all(|s| s.notes.is_empty()), "{:?}", m.steps.iter().map(|s| &s.notes).collect::<Vec<_>>());
+    }
+
+    /// A server that filtered DNS before 0.5.0 answered every query; it keeps doing so
+    /// until its owner turns that off, and says so in the file.
+    #[test]
+    fn a_dns_filter_keeps_its_takeover_and_a_plain_server_gets_none() {
+        let m = migrate(json!({
+            "mode": "server", "config_version": 4, "listen": "0.0.0.0:50000", "access_keys": ["k"],
+            "dns": { "enabled": true },
+        }))
+        .unwrap();
+        assert_eq!(m.output["dns"]["intercept_all_port53"], true);
+        let m = migrate(json!({
+            "mode": "server", "config_version": 4, "listen": "0.0.0.0:50000", "access_keys": ["k"],
+            "dns": { "enabled": false },
+        }))
+        .unwrap();
+        assert!(m.output["dns"].get("intercept_all_port53").is_none());
+        let m = migrate(json!({
+            "mode": "server", "config_version": 4, "listen": "0.0.0.0:50000", "access_keys": ["k"],
+        }))
+        .unwrap();
+        assert!(m.output.get("dns").is_none());
+    }
+
+    /// The `warp` section appears switched off, in rules mode (which changes
+    /// nothing by itself), and one the owner wrote is left alone. Clients have
+    /// no such section.
+    #[test]
+    fn a_server_gets_a_warp_section_that_is_off() {
+        let m = migrate(json!({
+            "mode": "server", "config_version": 5, "listen": "0.0.0.0:50000", "access_keys": ["k"],
+        }))
+        .unwrap();
+        assert_eq!(m.output["warp"], json!({ "enabled": false, "mode": "rules", "listen": "127.0.0.1:40000", "endpoint": "" }));
+        assert!(m.output.get("outbound").is_none(), "the outbound section is not touched");
+        let m = migrate(json!({
+            "mode": "server", "config_version": 5, "listen": "0.0.0.0:50000", "access_keys": ["k"],
+            "warp": { "enabled": true, "mode": "all" },
+        }))
+        .unwrap();
+        assert_eq!(m.output["warp"], json!({ "enabled": true, "mode": "all" }));
+        let m = migrate(json!({ "mode": "client", "config_version": 5, "server": "h:1", "access_key": "k" })).unwrap();
+        assert!(m.output.get("warp").is_none());
     }
 }

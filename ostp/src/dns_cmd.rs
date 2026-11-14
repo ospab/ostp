@@ -74,7 +74,16 @@ pub enum DnsAction {
         #[arg(long)]
         no_restart: bool,
     },
-    /// Stop browsers from using their own DNS over HTTPS/TLS: on or off
+    /// Answer every client's DNS query, not only those sent to this server (10.1.0.1):
+    /// on or off. On also lets `doh-bypass` refuse encrypted DNS; clients are told in
+    /// their links and subscriptions
+    Takeover {
+        #[arg(value_parser = ["on", "off"])]
+        state: String,
+        #[arg(long)]
+        no_restart: bool,
+    },
+    /// Stop browsers from using their own DNS over HTTPS/TLS: on or off (only while `takeover` is on)
     DohBypass {
         #[arg(value_parser = ["on", "off"])]
         state: String,
@@ -445,6 +454,11 @@ pub async fn run(action: DnsAction, config_path: &Path) -> Result<()> {
             s.safe_search = state == "on";
             save(config_path, v, &s, no_restart)
         }
+        DnsAction::Takeover { state, no_restart } => {
+            let (v, mut s) = load(config_path)?;
+            s.intercept_all_port53 = state == "on";
+            save(config_path, v, &s, no_restart)
+        }
         DnsAction::DohBypass { state, no_restart } => {
             let (v, mut s) = load(config_path)?;
             s.block_doh_bypass = state == "on";
@@ -539,7 +553,8 @@ fn status(config_path: &Path, data_dir: &Path) -> Result<()> {
     println!("    Rewrites:      {}", if s.rewrites.is_empty() { "none".into() } else { s.rewrites.iter().map(|r| format!("{} → {}", r.domain, r.answer)).collect::<Vec<_>>().join(", ") });
     println!("    Services:      {}", if s.blocked_services.is_empty() { "none blocked".into() } else { s.blocked_services.join(", ") });
     println!("    Safe search:   {}", if s.safe_search { "on" } else { "off" });
-    println!("    DoH/DoT bypass blocked: {}", if s.block_doh_bypass { "yes" } else { "no" });
+    println!("    Answers:       {}", if s.intercept_all_port53 { "every client's DNS query (takeover on)" } else { "queries sent to this server (10.1.0.1) only" });
+    println!("    DoH/DoT bypass blocked: {}", if s.refuses_encrypted_dns() { "yes" } else if s.block_doh_bypass { "set, but takeover is off" } else { "no" });
     if s.enabled && ostp_dns::lists::update_due(&s, data_dir) {
         println!("\n  {} Some lists are missing or out of date: ostp dns update", "!".yellow());
     }

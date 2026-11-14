@@ -1,9 +1,11 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'device_id_dialog.dart';
 import 'more_settings_screen.dart';
 import 'qr_scanner_screen.dart';
 import 'package:qr_flutter/qr_flutter.dart';
+import '../models/dns_notice.dart';
 import '../models/ostp_profile.dart';
 import '../models/share_link.dart';
 import '../models/subscription.dart';
@@ -27,9 +29,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
   late TextEditingController _localBindCtrl;
   late TextEditingController _dnsCtrl;
   late TextEditingController _mtuCtrl;
-  late TextEditingController _muxSessionsCtrl;
 
-  bool _muxEnabled = false;
 
   List<OstpProfile> _profiles = [];
   List<OstpSubscription> _subs = [];
@@ -40,7 +40,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
   static const _maxSubscriptions = 20;
   static const _vpn = MethodChannel('com.ospab.ostp/vpn');
   // Digits only, five at most: ports, sizes, delays.
-  static final List<TextInputFormatter> _digits = [FilteringTextInputFormatter.digitsOnly, LengthLimitingTextInputFormatter(5)];
 
   /// Profile changes do not touch a running tunnel; say so instead of letting the user wonder.
   Future<void> _noteIfRunning() async {
@@ -49,7 +48,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
       if (running == true && mounted) {
         ScaffoldMessenger.of(context)
           ..hideCurrentSnackBar()
-          ..showSnackBar(const SnackBar(content: Text('The VPN is running. The change applies on the next connect.')));
+          ..showSnackBar(const SnackBar(content: Text('The VPN is running. The change applies after Reconnect on the main screen.')));
       }
     } catch (_) {}
   }
@@ -78,8 +77,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
     // Exclusions, app options, logs, server management and updates live on
     // MoreSettingsScreen; this screen only saves what it shows, so it never
     // writes back stale copies of those.
-    _muxEnabled = widget.prefs.getBool('mux_enabled') ?? false;
-    _muxSessionsCtrl = TextEditingController(text: widget.prefs.getString('mux_sessions') ?? '2');
     _profiles = decodeProfiles(widget.prefs.getString('profiles_json'));
     _subs = SubscriptionStore(widget.prefs).load();
   }
@@ -111,7 +108,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
     _importing = true;
     messenger.showSnackBar(const SnackBar(content: Text('Fetching subscription…'), duration: Duration(seconds: 2)));
     try {
-      final n = await SubscriptionStore(widget.prefs).add(url);
+      final n = await SubscriptionStore(widget.prefs).add(url, askSend: () => askSendDeviceId(context));
       _reloadProfilesAndSubs();
       messenger.showSnackBar(SnackBar(content: Text('Subscription added: $n profile(s)')));
     } catch (e) {
@@ -126,7 +123,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
     setState(() => _refreshing.add(s.id));
     final messenger = ScaffoldMessenger.of(context);
     try {
-      final n = await SubscriptionStore(widget.prefs).refresh(s.id);
+      final n = await SubscriptionStore(widget.prefs).refresh(s.id, askSend: () => askSendDeviceId(context));
       messenger.showSnackBar(SnackBar(content: Text('Updated: $n profile(s)')));
     } catch (e) {
       messenger.showSnackBar(SnackBar(content: Text('Could not update the subscription: ${e.toString().replaceFirst('Exception: ', '')}')));
@@ -259,7 +256,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
     _localBindCtrl.dispose();
     _dnsCtrl.dispose();
     _mtuCtrl.dispose();
-    _muxSessionsCtrl.dispose();
     super.dispose();
   }
 
@@ -267,8 +263,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
     widget.prefs.setString('local_bind', _localBindCtrl.text.trim());
     widget.prefs.setString('dns_server', _dnsCtrl.text.trim());
     widget.prefs.setString('mtu', _mtuCtrl.text.trim());
-    widget.prefs.setBool('mux_enabled', _muxEnabled);
-    widget.prefs.setString('mux_sessions', _muxSessionsCtrl.text.trim());
     // The profile list is saved by each change to it. Writing it here as well
     // would overwrite a subscription refresh that finished while this screen was open.
   }
@@ -316,6 +310,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
           tlsSni: l.sni ?? '',
           tlsInsecure: l.insecure,
           wsPath: l.path ?? '',
+          owndns: l.owndns,
+          dnsall: l.dnsall,
         ));
         _saveProfiles();
       });
@@ -418,19 +414,13 @@ class _SettingsScreenState extends State<SettingsScreen> {
     final nameCtrl = TextEditingController(text: profile?.name ?? '');
     final serverCtrl = TextEditingController(text: profile?.serverAddr ?? '');
     final keyCtrl = TextEditingController(text: profile?.accessKey ?? '');
-    final fragChunkCtrl = TextEditingController(text: (profile?.fragChunk ?? 2).toString());
-    final fragSleepCtrl = TextEditingController(text: (profile?.fragSleep ?? 2).toString());
-    final junkPcMinCtrl = TextEditingController(text: (profile?.junkPcMin ?? 2).toString());
-    final junkPcMaxCtrl = TextEditingController(text: (profile?.junkPcMax ?? 5).toString());
-    final junkPsMinCtrl = TextEditingController(text: (profile?.junkPsMin ?? 100).toString());
-    final junkPsMaxCtrl = TextEditingController(text: (profile?.junkPsMax ?? 1000).toString());
     String transportMode = profile?.transportMode ?? 'udp';
-    bool tcpFragmentation = profile?.tcpFragmentation ?? false;
     bool ttlDesync = profile?.ttlDesync ?? false;
     bool tls = profile?.tls ?? false;
     bool tlsInsecure = profile?.tlsInsecure ?? false;
     final sniCtrl = TextEditingController(text: profile?.tlsSni ?? '');
     final wsPathCtrl = TextEditingController(text: profile?.wsPath ?? '');
+    String dnsChoice = dnsChoices.contains(profile?.dnsChoice) ? profile!.dnsChoice : '';
     bool obscureKey = true;
 
     showDialog(
@@ -481,11 +471,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
                       if (v != null) setDialogState(() => transportMode = v);
                     },
                   ),
-                  // Junk packets and TCP fragmentation only take effect on the
-                  // UoT (TCP) transport — the UDP path applies neither — so the
-                  // whole section is hidden under UDP instead of shown with a
-                  // "UoT only" caveat. Reactive: switching Transport above calls
-                  // setDialogState, which rebuilds this and shows/hides it.
+                  // TLS only applies to the UoT (TCP) transport, so the section
+                  // is hidden under UDP. Reactive: switching Transport above
+                  // calls setDialogState, which rebuilds this.
                   if (transportMode == 'uot') ...[
                     const Divider(height: 32),
                     const Text('TLS', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 13, color: Colors.white54, letterSpacing: 1.0)),
@@ -523,39 +511,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
                       ),
                     ],
                   ],
-                  // Inside TLS junk and fragmentation are encrypted and hide
-                  // nothing, so the engine skips them; hide their controls too.
-                  if (transportMode == 'uot' && !tls) ...[
-                    const Divider(height: 32),
-                    const Text('DPI OBFUSCATION', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 13, color: Colors.white54, letterSpacing: 1.0)),
-                    const SizedBox(height: 12),
-                    Row(
-                      children: [
-                        Expanded(
-                          child: OutlinedButton.icon(
-                            icon: const Icon(Icons.shuffle_rounded, size: 18),
-                            label: const Text('Junk Packets'),
-                            onPressed: () => _showJunkPacketsModal(
-                              context, junkPcMinCtrl, junkPcMaxCtrl, junkPsMinCtrl, junkPsMaxCtrl,
-                            ),
-                          ),
-                        ),
-                        const SizedBox(width: 12),
-                        Expanded(
-                          child: OutlinedButton.icon(
-                            icon: Icon(tcpFragmentation ? Icons.call_split_rounded : Icons.horizontal_rule_rounded, size: 18),
-                            label: Text(tcpFragmentation ? 'TCP Frag: On' : 'TCP Frag: Off'),
-                            onPressed: () => _showTcpFragModal(
-                              context,
-                              tcpFragmentation,
-                              (v) => setDialogState(() => tcpFragmentation = v),
-                              fragChunkCtrl, fragSleepCtrl,
-                            ),
-                          ),
-                        ),
-                      ],
-                    ),
-                  ],
                   SwitchListTile(
                     contentPadding: EdgeInsets.zero,
                     title: const Text('TTL Desync', style: TextStyle(fontSize: 14)),
@@ -563,6 +518,23 @@ class _SettingsScreenState extends State<SettingsScreen> {
                     value: ttlDesync,
                     onChanged: (v) => setDialogState(() => ttlDesync = v),
                   ),
+                  // Offered only for a server whose link says it filters DNS.
+                  if (filtersDns(profile)) ...[
+                    const SizedBox(height: 8),
+                    DropdownButtonFormField<String>(
+                      value: dnsChoice,
+                      decoration: const InputDecoration(labelText: 'DNS of this server'),
+                      items: const [
+                        DropdownMenuItem(value: '', child: Text('Ask on the next connection')),
+                        DropdownMenuItem(value: 'operator', child: Text("Operator's DNS")),
+                        DropdownMenuItem(value: 'public', child: Text('Public DNS')),
+                        DropdownMenuItem(value: 'mine', child: Text('My settings')),
+                      ],
+                      onChanged: (v) {
+                        if (v != null) setDialogState(() => dnsChoice = v);
+                      },
+                    ),
+                  ],
                 ],
               ),
             ),
@@ -618,13 +590,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
                         accessKey: key,
                         transportMode: transportMode,
                         active: wasEmpty,
-                        tcpFragmentation: tcpFragmentation,
-                        fragChunk: int.tryParse(fragChunkCtrl.text) ?? 2,
-                        fragSleep: int.tryParse(fragSleepCtrl.text) ?? 2,
-                        junkPcMin: int.tryParse(junkPcMinCtrl.text) ?? 2,
-                        junkPcMax: int.tryParse(junkPcMaxCtrl.text) ?? 5,
-                        junkPsMin: int.tryParse(junkPsMinCtrl.text) ?? 100,
-                        junkPsMax: int.tryParse(junkPsMaxCtrl.text) ?? 1000,
                         ttlDesync: ttlDesync,
                         tls: transportMode == 'uot' && tls,
                         tlsSni: sniCtrl.text.trim(),
@@ -636,18 +601,12 @@ class _SettingsScreenState extends State<SettingsScreen> {
                       profile.serverAddr = server;
                       profile.accessKey = key;
                       profile.transportMode = transportMode;
-                      profile.tcpFragmentation = tcpFragmentation;
-                      profile.fragChunk = int.tryParse(fragChunkCtrl.text) ?? 2;
-                      profile.fragSleep = int.tryParse(fragSleepCtrl.text) ?? 2;
-                      profile.junkPcMin = int.tryParse(junkPcMinCtrl.text) ?? 2;
-                      profile.junkPcMax = int.tryParse(junkPcMaxCtrl.text) ?? 5;
-                      profile.junkPsMin = int.tryParse(junkPsMinCtrl.text) ?? 100;
-                      profile.junkPsMax = int.tryParse(junkPsMaxCtrl.text) ?? 1000;
                       profile.ttlDesync = ttlDesync;
                       profile.tls = transportMode == 'uot' && tls;
                       profile.tlsSni = sniCtrl.text.trim();
                       profile.tlsInsecure = tlsInsecure;
                       profile.wsPath = wsPathCtrl.text.trim();
+                      if (filtersDns(profile)) profile.dnsChoice = dnsChoice;
                     }
                     _saveProfiles();
                   });
@@ -660,110 +619,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
           ),
         );
       },
-    );
-  }
-
-  // The numeric fields below all edit the SAME TextEditingControllers that
-  // the outer profile-edit dialog already holds — no extra propagation is
-  // needed for them, closing this modal just leaves the shared controllers
-  // updated. Only the `tcpFragmentation` bool (not a controller) needs an
-  // explicit callback to reach back into the outer dialog's state.
-
-  void _showJunkPacketsModal(
-    BuildContext context,
-    TextEditingController pcMin,
-    TextEditingController pcMax,
-    TextEditingController psMin,
-    TextEditingController psMax,
-  ) {
-    showDialog(
-      context: context,
-      builder: (context) => AlertDialog(
-        backgroundColor: Theme.of(context).colorScheme.surface,
-        title: const Text('Junk Packets'),
-        content: SingleChildScrollView(
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              const Text(
-                'Sends random-size filler packets before the handshake so DPI can\'t fingerprint its size or timing.',
-                style: TextStyle(fontSize: 12, color: Colors.white54),
-              ),
-              const SizedBox(height: 16),
-              Row(
-                children: [
-                  Expanded(child: TextField(controller: pcMin, keyboardType: TextInputType.number, inputFormatters: _digits, decoration: const InputDecoration(labelText: 'Count (min)'))),
-                  const SizedBox(width: 12),
-                  Expanded(child: TextField(controller: pcMax, keyboardType: TextInputType.number, inputFormatters: _digits, decoration: const InputDecoration(labelText: 'Count (max)'))),
-                ],
-              ),
-              const SizedBox(height: 12),
-              Row(
-                children: [
-                  Expanded(child: TextField(controller: psMin, keyboardType: TextInputType.number, inputFormatters: _digits, decoration: const InputDecoration(labelText: 'Size min (bytes)'))),
-                  const SizedBox(width: 12),
-                  Expanded(child: TextField(controller: psMax, keyboardType: TextInputType.number, inputFormatters: _digits, decoration: const InputDecoration(labelText: 'Size max (bytes)'))),
-                ],
-              ),
-            ],
-          ),
-        ),
-        actions: [TextButton(onPressed: () => Navigator.pop(context), child: const Text('Done'))],
-      ),
-    );
-  }
-
-  void _showTcpFragModal(
-    BuildContext context,
-    bool initialEnabled,
-    ValueChanged<bool> onChanged,
-    TextEditingController chunkCtrl,
-    TextEditingController sleepCtrl,
-  ) {
-    bool enabled = initialEnabled;
-    showDialog(
-      context: context,
-      builder: (context) => StatefulBuilder(
-        builder: (context, setModalState) => AlertDialog(
-          backgroundColor: Theme.of(context).colorScheme.surface,
-          title: const Text('TCP Fragmentation'),
-          content: SingleChildScrollView(
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                SwitchListTile(
-                  contentPadding: EdgeInsets.zero,
-                  title: const Text('Enabled', style: TextStyle(fontSize: 14)),
-                  subtitle: const Text('Split the handshake into small chunks', style: TextStyle(fontSize: 12, color: Colors.white54)),
-                  value: enabled,
-                  onChanged: (v) => setModalState(() => enabled = v),
-                ),
-                if (enabled) ...[
-                  const SizedBox(height: 8),
-                  Row(
-                    children: [
-                      Expanded(child: TextField(controller: chunkCtrl, keyboardType: TextInputType.number, inputFormatters: _digits, decoration: const InputDecoration(labelText: 'Chunk size (bytes)'))),
-                      const SizedBox(width: 12),
-                      Expanded(child: TextField(controller: sleepCtrl, keyboardType: TextInputType.number, inputFormatters: _digits, decoration: const InputDecoration(labelText: 'Delay (ms)'))),
-                    ],
-                  ),
-                ],
-              ],
-            ),
-          ),
-          actions: [
-            TextButton(
-              onPressed: () {
-                onChanged(enabled);
-                Navigator.pop(context);
-              },
-              child: const Text('Done'),
-            ),
-          ],
-        ),
-      ),
     );
   }
 
@@ -784,6 +639,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
       link.insecure = p.tlsInsecure;
     }
     link.path = p.wsPath.isEmpty ? null : p.wsPath;
+    link.owndns = p.owndns;
+    link.dnsall = p.dnsall;
     // Deliberately generic title — not "Share {name}": when a profile has no
     // custom name, `name` falls back to the raw server address, and this
     // dialog is exactly the wrong place to be casually displaying that
@@ -867,35 +724,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
               contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 16),
             ),
           ),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildToggle(String title, String subtitle, bool value, ValueChanged<bool> onChanged) {
-    return Padding(
-      padding: const EdgeInsets.only(bottom: 24),
-      child: Row(
-        mainAxisAlignment: MainAxisAlignment.spaceBetween,
-        children: [
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(title, style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
-                const SizedBox(height: 4),
-                Text(subtitle, style: const TextStyle(fontSize: 13, color: Colors.white54)),
-              ],
-            ),
-          ),
-          Switch(
-            value: value,
-            onChanged: (v) {
-              setState(() => onChanged(v));
-              _saveSettings();
-            },
-            activeColor: Theme.of(context).colorScheme.secondary,
-          )
         ],
       ),
     );
@@ -1071,9 +899,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                _buildToggle('MUX (Multiplexing)', 'Multiple sessions over single connection', _muxEnabled, (v) => _muxEnabled = v),
-                if (_muxEnabled)
-                  _buildTextField('MUX Sessions', _muxSessionsCtrl, hint: 'e.g. 2, 4, 8'),
                 _buildTextField('Local Proxy Bind', _localBindCtrl, hint: '127.0.0.1:1088'),
                 _buildTextField('Custom DNS Server', _dnsCtrl, hint: '1.1.1.1 (e.g. 8.8.8.8)'),
                 _buildTextField('MTU (Packet Size)', _mtuCtrl, hint: '1140 (decrease if connection drops)'),

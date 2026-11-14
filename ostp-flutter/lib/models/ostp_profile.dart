@@ -1,9 +1,8 @@
 import 'dart:convert';
 
 /// A saved server profile. Field shape mirrors the desktop GUI's profile
-/// object (ostp-gui/src/main.js) 1:1 — server/key/transport/tcp_fragmentation/
-/// frag_chunk/frag_sleep/junk_pc/junk_ps — so behavior matches across
-/// platforms. UoT can optionally run inside real TLS to the server's own
+/// object (ostp-gui/src/main.js) — server/key/transport/TLS — so behavior
+/// matches across platforms. UoT can optionally run inside real TLS to the server's own
 /// domain (`tls`), optionally through a web server on 443 (`wsPath`).
 class OstpProfile {
   String id;
@@ -13,16 +12,6 @@ class OstpProfile {
   String transportMode; // 'udp' | 'uot'
   bool active;
 
-  // Junk packets + TCP fragmentation — per-profile, exactly like ostp-gui's
-  // profile editor. Defaults match ostp_client::config::TransportConfig's
-  // own defaults (frag_chunk=2, frag_sleep=2, junk_pc=[2,5], junk_ps=[100,1000]).
-  bool tcpFragmentation;
-  int fragChunk;
-  int fragSleep;
-  int junkPcMin;
-  int junkPcMax;
-  int junkPsMin;
-  int junkPsMax;
   bool ttlDesync; // TTL-desync decoys (UDP), auto-calibrated in the engine
 
   // TLS carrier (UoT only).
@@ -35,6 +24,14 @@ class OstpProfile {
   // are rewritten on every refresh of that subscription.
   String subId;
 
+  // Carried by the share link: the server runs its own resolver (owndns) or
+  // answers every DNS query and refuses DoT/DoH (dnsall). Kept for export and
+  // for the DNS notice. dnsChoice is what the user chose for such a server:
+  // '' (ask on the next connection), 'operator', 'public' or 'mine'.
+  bool owndns;
+  bool dnsall;
+  String dnsChoice;
+
   OstpProfile({
     required this.id,
     required this.name,
@@ -42,19 +39,15 @@ class OstpProfile {
     required this.accessKey,
     this.transportMode = 'udp',
     this.active = false,
-    this.tcpFragmentation = false,
-    this.fragChunk = 2,
-    this.fragSleep = 2,
-    this.junkPcMin = 2,
-    this.junkPcMax = 5,
-    this.junkPsMin = 100,
-    this.junkPsMax = 1000,
     this.ttlDesync = false,
     this.tls = false,
     this.tlsSni = '',
     this.tlsInsecure = false,
     this.wsPath = '',
     this.subId = '',
+    this.owndns = false,
+    this.dnsall = false,
+    this.dnsChoice = '',
   });
 
   Map<String, dynamic> toJson() {
@@ -65,19 +58,15 @@ class OstpProfile {
       'accessKey': accessKey,
       'transportMode': transportMode,
       'active': active,
-      'tcpFragmentation': tcpFragmentation,
-      'fragChunk': fragChunk,
-      'fragSleep': fragSleep,
-      'junkPcMin': junkPcMin,
-      'junkPcMax': junkPcMax,
-      'junkPsMin': junkPsMin,
-      'junkPsMax': junkPsMax,
       'ttlDesync': ttlDesync,
       'tls': tls,
       'tlsSni': tlsSni,
       'tlsInsecure': tlsInsecure,
       'wsPath': wsPath,
       'subId': subId,
+      'owndns': owndns,
+      'dnsall': dnsall,
+      'dnsChoice': dnsChoice,
     };
   }
 
@@ -89,19 +78,15 @@ class OstpProfile {
       accessKey: json['accessKey'] as String? ?? '',
       transportMode: json['transportMode'] as String? ?? 'udp',
       active: json['active'] as bool? ?? false,
-      tcpFragmentation: json['tcpFragmentation'] as bool? ?? false,
-      fragChunk: json['fragChunk'] as int? ?? 2,
-      fragSleep: json['fragSleep'] as int? ?? 2,
-      junkPcMin: json['junkPcMin'] as int? ?? 2,
-      junkPcMax: json['junkPcMax'] as int? ?? 5,
-      junkPsMin: json['junkPsMin'] as int? ?? 100,
-      junkPsMax: json['junkPsMax'] as int? ?? 1000,
       ttlDesync: json['ttlDesync'] as bool? ?? false,
       tls: json['tls'] as bool? ?? false,
       tlsSni: json['tlsSni'] as String? ?? '',
       tlsInsecure: json['tlsInsecure'] as bool? ?? false,
       wsPath: json['wsPath'] as String? ?? '',
       subId: json['subId'] as String? ?? '',
+      owndns: json['owndns'] as bool? ?? false,
+      dnsall: json['dnsall'] as bool? ?? false,
+      dnsChoice: json['dnsChoice'] as String? ?? '',
     );
   }
 }

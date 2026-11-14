@@ -63,7 +63,8 @@ pub mod sys {
                             continue;
                         }
                     }
-                    // and the kill switch's blackhole through 127.0.0.1.
+                    // and a blackhole through 127.0.0.1 that older versions
+                    // added for the kill switch and may have left in this boot.
                     if dword_to_ipv4(row.dwForwardNextHop).is_loopback() {
                         continue;
                     }

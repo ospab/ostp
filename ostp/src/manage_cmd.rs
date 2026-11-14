@@ -41,11 +41,21 @@ pub enum ManageAction {
     UserRemove { user: String },
     /// Rename a user: number, name or access key, then the new name
     UserRename { user: String, name: String },
+    /// Limit how many devices may use a user's subscription (0 removes the limit)
+    UserLimit {
+        user: String,
+        #[arg(long)]
+        devices: u32,
+    },
+    /// Devices that fetched a user's subscription (read from devices.json)
+    UserDevices { user: String },
     /// Last lines of the service log
     Logs {
         #[arg(short = 'n', long, default_value_t = 200)]
         lines: usize,
     },
+    /// The DNS filter's settings (from the config)
+    Dns,
     /// Restart the service
     Restart,
 }
@@ -58,6 +68,9 @@ pub fn run(action: ManageAction, config_path: &Path) -> ! {
         ManageAction::UserAdd { name } => user_add(config_path, &name),
         ManageAction::UserRemove { user } => user_remove(config_path, &user),
         ManageAction::UserRename { user, name } => user_rename(config_path, &user, &name),
+        ManageAction::UserLimit { user, devices } => user_limit(config_path, &user, devices),
+        ManageAction::UserDevices { user } => user_devices(config_path, &user),
+        ManageAction::Dns => dns_info(config_path),
         ManageAction::Logs { lines } => logs(lines),
         ManageAction::Restart => restart().map(|active| json!({ "active": active })),
     };
@@ -304,6 +317,7 @@ fn users(config_path: &Path) -> Result<Value> {
                 "online": s.map(|s| s.online),
                 "last_seen": s.and_then(|s| s.last_seen),
                 "limit_bytes": u.limit(),
+                "max_devices": u.max_devices(),
             })
         })
         .collect();
@@ -360,6 +374,64 @@ fn user_rename(config_path: &Path, who: &str, name: &str) -> Result<Value> {
     *entry = renamed;
     save(config_path, &v)?;
     Ok(json!({ "renamed": { "key": key, "name": name } }))
+}
+
+fn user_limit(config_path: &Path, who: &str, devices: u32) -> Result<Value> {
+    if devices > 1000 {
+        bail!("a device limit is 1000 at most (0 removes it)");
+    }
+    let (mut v, _) = load(config_path)?;
+    let i = find_user(&v, who)?;
+    let entry = &mut v["access_keys"][i];
+    let (key, name) = key_and_name(entry);
+    let mut updated = if entry.is_object() { entry.clone() } else { json!({ "access_key": key }) };
+    if devices == 0 {
+        updated.as_object_mut().map(|o| o.remove("max_devices"));
+    } else {
+        updated["max_devices"] = devices.into();
+    }
+    *entry = updated;
+    save(config_path, &v)?;
+    Ok(json!({ "limit": { "key": key, "name": name, "max_devices": if devices == 0 { Value::Null } else { devices.into() } } }))
+}
+
+fn user_devices(config_path: &Path, who: &str) -> Result<Value> {
+    let (v, _) = load(config_path)?;
+    let i = find_user(&v, who)?;
+    let entry = &v["access_keys"][i];
+    let (key, name) = key_and_name(entry);
+    let max = entry.get("max_devices").and_then(Value::as_u64);
+    let path = config_path.parent().unwrap_or_else(|| Path::new(".")).join("devices.json");
+    let devices = ostp_server::devices::DeviceStore::read_list(&path, &ostp_core::subscription::token_for_key(&key));
+    Ok(json!({ "user": { "key": key, "name": name }, "max_devices": max, "devices": devices }))
+}
+
+/// The DNS filter as the apps show it: what is on, what it answers, where it asks
+/// and which lists it uses. Read from the config; changes go through `ostp dns`.
+fn dns_info(config_path: &Path) -> Result<Value> {
+    let v = crate::cert_cmd::read_json(config_path)?;
+    let s: ostp_dns::DnsSettings = match v.get("dns") {
+        Some(d) if !d.is_null() => serde_json::from_value(d.clone()).context("the dns section does not parse")?,
+        _ => ostp_dns::DnsSettings::default(),
+    };
+    let s = s.normalized();
+    let all = serde_json::to_value(&s)?;
+    Ok(json!({
+        "dns": {
+            "enabled": s.enabled,
+            "takeover": s.intercept_all_port53,
+            "block_doh_bypass": s.block_doh_bypass,
+            "refuses_encrypted_dns": s.refuses_encrypted_dns(),
+            "safe_search": s.safe_search,
+            "blocking_mode": all["blocking_mode"],
+            "upstream_mode": all["upstream_mode"],
+            "upstreams": s.upstreams,
+            "lists": s.lists.iter().map(|l| json!({ "name": l.name, "url": l.url, "enabled": l.enabled })).collect::<Vec<_>>(),
+            "blocked_services": s.blocked_services,
+            "rewrites": s.rewrites.len(),
+            "user_rules": s.user_rules.len(),
+        }
+    }))
 }
 
 fn logs(lines: usize) -> Result<Value> {
@@ -513,5 +585,25 @@ mod tests {
         assert!(s["arch"].is_string());
         #[cfg(target_os = "linux")]
         assert!(s["mem_total"].as_u64().unwrap_or(0) > 0);
+    }
+
+    /// A server that never configured DNS shows the defaults; one with the filter on
+    /// and a takeover shows what the apps need to say about it.
+    #[test]
+    fn dns_info_shows_the_defaults_and_the_takeover() {
+        let plain = temp_config(&json!({ "mode": "server", "listen": ["0.0.0.0:50000"], "access_keys": ["k"] }));
+        let d = dns_info(&plain.path().join("config.json")).unwrap();
+        assert_eq!(d["dns"]["enabled"], false);
+        assert_eq!(d["dns"]["takeover"], false);
+        assert_eq!(d["dns"]["refuses_encrypted_dns"], false);
+        let on = temp_config(&json!({
+            "mode": "server", "listen": ["0.0.0.0:50000"], "access_keys": ["k"],
+            "dns": { "enabled": true, "intercept_all_port53": true },
+        }));
+        let d = dns_info(&on.path().join("config.json")).unwrap();
+        assert_eq!(d["dns"]["enabled"], true);
+        assert_eq!(d["dns"]["takeover"], true);
+        assert_eq!(d["dns"]["refuses_encrypted_dns"], true, "takeover with the default doh-bypass refuses encrypted DNS");
+        assert!(d["dns"]["upstreams"].as_array().is_some_and(|u| !u.is_empty()));
     }
 }

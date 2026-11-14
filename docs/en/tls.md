@@ -144,8 +144,6 @@ The certificate is checked against the bundled Mozilla root store. This works th
 
 SNI and `Host` always use the configured name, not the resolved address, including on the NAT64 fallback.
 
-Inside TLS, junk packets and first-packet fragmentation are skipped (encrypted, they hide nothing).
-
 Share links carry the same options: `ostp://KEY@vpn.example.com:443?type=uot&tls=1&path=%2FXk3p…`. See the Share Links page for every parameter. The Android app and the desktop GUI have the same switches in the profile editor, with "don't verify certificate" marked as insecure.
 
 ## Subscriptions
@@ -182,5 +180,21 @@ Opened in a browser, the subscription URL shows a page for a person instead of r
 - Subscriptions are served only inside TLS, or to a local web server (nginx, apache, caddy) that terminated TLS itself. They are never answered in plain HTTP on the OSTP port.
 - An unknown token gets the same decoy as any other path.
 - By default the answer is one link per line. With `Accept: application/json` or `?format=json` it is JSON with the name, update interval, links and traffic usage. The `Profile-Update-Interval`, `Profile-Title` and `Subscription-Userinfo` headers are understood by third-party subscription managers too.
+
+### Device limit
+
+A user can have `max_devices` (in `access_keys`, in the panel's user form, or `ostp manage user-limit WHO --devices N`; 0 removes it). The limit is checked when a subscription is fetched. The app sends a device ID in the headers `x-hwid`, `x-device-os` and `x-device-model` when its owner turned that on; the ID is a hash of the platform's identifier made for this server, so it survives a reinstall, and two servers cannot match it to one person.
+
+- A device the server has seen before always passes; a new one takes a free slot.
+- With no free slot the answer is HTTP 403 with JSON `{"error": "device_limit", "message": ...}`.
+- A user with a limit whose app sends no ID gets 403 `{"error": "hwid_required", ...}`.
+- A user without a limit is not asked for an ID, and a device that sends one is only recorded.
+- An unknown token still gets the decoy; the limit is never mentioned to someone without a valid token.
+
+The record is `devices.json` next to the config (mode 0600), keyed by the subscription token, never by the key. The panel lists a user's devices in the user form and removes one to free its slot; `ostp manage user-devices WHO` prints them.
+
+The desktop and Android apps and `ostp import` send the ID only when the owner turned it on (*Send a device ID to subscriptions*, or `send_hwid` in the client config; see [integrations.md](integrations.md)).
+
+The limit applies to fetching the subscription. Someone who copies the key from a link into another app is not stopped by it; a check at the handshake needs a protocol change and is planned for protocol v6.
 
 Clients: in the Android app and the desktop GUI, import also takes an `https://` subscription URL (typed, from the clipboard or by QR). The subscription gets a card with usage and an update button, and its profiles are rewritten on every update. CLI: `ostp import https://…/sub/…`.

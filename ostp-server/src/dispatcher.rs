@@ -861,7 +861,7 @@ mod roaming_tests {
 
     /// A dispatcher and a client with an established session on `home`.
     fn established(home: SocketAddr) -> (Dispatcher, ProtocolMachine) {
-        let keys = Arc::new(RwLock::new(HashMap::from([(KEY.to_string(), crate::api::UserMeta { name: None, limit_bytes: None })])));
+        let keys = Arc::new(RwLock::new(HashMap::from([(KEY.to_string(), crate::api::UserMeta { name: None, limit_bytes: None, max_devices: None })])));
         let mut dispatcher = Dispatcher::new(base_config(NoiseRole::Responder), keys);
 
         let secrets = ostp_core::crypto::derive_all_secrets(KEY.as_bytes());

@@ -33,6 +33,15 @@ To build and test OSTP locally, you will need:
     cargo test --workspace
     ```
 
+4.  **Release packages locally** (Windows host, the same way CI builds them):
+    ```powershell
+    .\scripts\build.ps1 win,win-gui,linux,linux-gui,apk   # or: all
+    .\scripts\build.ps1 linux --arm64                     # --arm64 or --armv7
+    ```
+    x86_64 by default, arm64-v8a for the APK. Linux targets are built in WSL.
+    Results go to `dist/`; the script names what is missing for each target.
+    It never commits or tags: releases go through `scripts/gha.ps1`.
+
 ---
 
 ## Project Structure
@@ -48,7 +57,7 @@ The repository is a Cargo workspace plus two app projects:
 | [`ostp-ssh/`](ostp-ssh) | SSH client used by the apps to install and manage a server, and the saved-servers store. |
 | [`ostp-dns/`](ostp-dns) | Filtering DNS resolver for the server: block lists, rules, rewrites, cache. |
 | [`ostp-tun/`](ostp-tun) | Platform TUN device and routing (Wintun on Windows). |
-| [`ostp-tun-helper/`](ostp-tun-helper) | Privileged helper that runs the tunnel for the desktop GUI on Windows. |
+| [`ostpd/`](ostpd) | Privileged helper that runs the tunnel for the desktop GUI on Windows. |
 | [`ostp-jni/`](ostp-jni) | JNI bindings used by the Android app. |
 | [`ostp-gui/`](ostp-gui) | Desktop client (Tauri) for Windows, Linux and macOS; not part of the Cargo workspace. |
 | [`ostp-flutter/`](ostp-flutter) | Android client (Flutter). |

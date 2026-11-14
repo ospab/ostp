@@ -30,6 +30,14 @@ sha2.workspace = true
 # GetUserDefaultUILanguage, for the language of `ostp changelog`.
 winapi = { version = "0.3.9", features = ["winnls"] }
 
+# WARP is not built for MIPS (see ostp-server/src/warp.rs).
+[target.'cfg(not(any(target_arch = "mips", target_arch = "mips64")))'.dependencies]
+ostp-warp = { path = "../ostp-warp" }
+
+[target.'cfg(not(any(target_arch = "mips", target_arch = "mips64")))'.dev-dependencies]
+boringtun = { version = "0.7", default-features = false }
+ostp-warp = { path = "../ostp-warp", features = ["testing"] }
+
 [dev-dependencies]
 bytes.workspace = true
 portable-atomic.workspace = true

@@ -64,7 +64,7 @@ pub async fn handle_relay_message(
             // over TLS is refused while it would skip the filtering (Android's
             // "Private DNS: automatic" then falls back to port 53).
             let port = connect_target.rsplit(':').next().unwrap_or("");
-            if port == "53" && router.dns_server.intercepts() {
+            if port == "53" && router.dns_server.answers(&target) {
                 if let Some(addr) = router.dns_tcp.get() {
                     connect_target = addr.to_string();
                 }
@@ -312,7 +312,7 @@ pub async fn handle_relay_message(
                         let _ = udp_reply_tx.try_send((session_id, stream_id, target, response));
                         return Ok(());
                     }
-                    let should_intercept = router.dns_server.intercepts();
+                    let should_intercept = router.dns_server.answers(&target);
 
                     if should_intercept {
                         // Resolved in its own task: this runs on the server's

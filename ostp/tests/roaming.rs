@@ -50,6 +50,7 @@ async fn start_server_on(binds: Vec<SocketAddr>) -> SocketAddr {
             ostp_server::api::UserMeta {
                 name: None,
                 limit_bytes: None,
+                max_devices: None,
             },
         )],
         outbound: None,
@@ -61,6 +62,7 @@ async fn start_server_on(binds: Vec<SocketAddr>) -> SocketAddr {
         tls: None,
         subscription: None,
         overnet: None,
+        warp: None,
         // The echo target listens on this machine's loopback.
         local_access: true,
     };
@@ -214,7 +216,6 @@ impl Client {
         cfg.ostp.server_addr = server.to_string();
         cfg.ostp.access_key = KEY.to_string();
         cfg.transport.mode = mode.to_string();
-        cfg.transport.junk_pc = [0, 0];
         cfg.multiplex.enabled = false;
         let metrics = Arc::new(BridgeMetrics {
             bytes_sent: AtomicU64::new(0),

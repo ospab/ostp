@@ -59,8 +59,13 @@ pub const PRESET_LISTS: &[(&str, &str, &str)] = &[
 pub struct DnsSettings {
     /// Filtering resolver for everything clients resolve through the tunnel.
     pub enabled: bool,
-    /// While `enabled` is off, still answer clients' port-53 queries
-    /// (forwarded, unfiltered) so they never leave from the server's address.
+    /// Answer every client's port-53 query, whichever resolver it was sent
+    /// to, and refuse encrypted DNS (see `block_doh_bypass`). Off by default:
+    /// the server then answers only queries sent to its own address (10.1.0.1),
+    /// which clients choose by using that address as their DNS server. With
+    /// `enabled` off it still forwards the queries, unfiltered, so they never
+    /// leave from the server's address. Must be declared in links and
+    /// subscriptions (`dnsall`): it takes the choice of resolver from users.
     pub intercept_all_port53: bool,
     /// "https://host/dns-query" (DoH), "tls://host" (DoT), "tcp://ip:53",
     /// "udp://ip:53" or a bare IP.
@@ -85,7 +90,8 @@ pub struct DnsSettings {
     /// Forces safe search on Google, YouTube, Bing, DuckDuckGo and Yandex.
     pub safe_search: bool,
     /// Stops browsers from skipping this resolver with their own DNS over
-    /// HTTPS (Firefox canary domain, well-known DoH hostnames).
+    /// HTTPS (Firefox canary domain, well-known DoH hostnames). Applies only
+    /// together with `intercept_all_port53`: nothing is refused silently.
     pub block_doh_bypass: bool,
     /// Ids from `services::SERVICES`.
     pub blocked_services: Vec<String>,
@@ -101,6 +107,14 @@ pub struct DnsSettings {
     pub custom_domains: Option<HashMap<String, String>>,
     #[serde(skip_serializing)]
     pub local_port: Option<u16>,
+}
+
+impl DnsSettings {
+    /// Encrypted DNS and the names of DoH providers are refused only when the
+    /// operator took over all DNS.
+    pub fn refuses_encrypted_dns(&self) -> bool {
+        self.intercept_all_port53 && self.block_doh_bypass
+    }
 }
 
 impl Default for DnsSettings {

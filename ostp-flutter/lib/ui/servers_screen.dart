@@ -6,6 +6,7 @@ import 'package:qr_flutter/qr_flutter.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:url_launcher/url_launcher.dart';
 
+import '../models/server_dns.dart';
 import '../services/servers.dart';
 import 'ssh_setup.dart';
 
@@ -211,29 +212,31 @@ class _ServerScreenState extends State<ServerScreen> {
     return r;
   }
 
-  static const _titles = {
+  static final _titles = {
     'update': 'Updating OSTP', 'restart': 'Restarting OSTP', 'reboot': 'Rebooting', 'uninstall': 'Removing OSTP',
     'panel-enable': 'Turning on the panel', 'panel-disable': 'Turning off the panel', 'cert-issue': 'Getting a certificate',
     'sub-enable': 'Turning on subscriptions', 'sub-disable': 'Turning off subscriptions',
     'overnet-install': 'Installing the overnet gateway', 'overnet-enable': 'Turning .ov on', 'overnet-disable': 'Turning .ov off',
     'overnet-exit-on': 'Opening the overnet exit', 'overnet-exit-off': 'Closing the overnet exit',
+    for (final e in dnsActions.entries) e.key: e.value.busy,
   };
 
   /// Runs a change on the server with its output shown live. Changes that
   /// restart the service are refused while the VPN goes through this server.
-  Future<void> _action(String action, {String? confirmTitle, String? confirmText, Map<String, dynamic>? params}) async {
+  Future<void> _action(String action,
+      {String? confirmTitle, String? confirmText, String? okLabel, Map<String, dynamic>? params}) async {
     const disruptive = {
       'restart', 'update', 'reboot', 'uninstall', 'panel-enable', 'panel-disable', 'cert-issue',
       'overnet-enable', 'overnet-disable', 'overnet-exit-on', 'overnet-exit-off',
     };
-    if (disruptive.contains(action) && await ServersApi.connectedThrough(widget.prefs, _server['host'] as String)) {
+    if ((disruptive.contains(action) || dnsActions.containsKey(action)) && await ServersApi.connectedThrough(widget.prefs, _server['host'] as String)) {
       if (!mounted) return;
       await _confirm('Disconnect first',
           'The VPN goes through this server, and this change interrupts it. Disconnect, then try again.',
           ok: 'OK', danger: false);
       return;
     }
-    if (confirmTitle != null && !await _confirm(confirmTitle, confirmText ?? '')) return;
+    if (confirmTitle != null && !await _confirm(confirmTitle, confirmText ?? '', ok: okLabel ?? 'Continue')) return;
     if (!mounted) return;
     await showDialog(
       context: context,
@@ -254,7 +257,7 @@ class _ServerScreenState extends State<ServerScreen> {
   @override
   Widget build(BuildContext context) {
     return DefaultTabController(
-      length: 4,
+      length: 5,
       child: Scaffold(
         appBar: AppBar(
           title: Text(_server['name'] as String),
@@ -263,6 +266,7 @@ class _ServerScreenState extends State<ServerScreen> {
             Tab(text: 'Status'),
             Tab(text: 'Users'),
             Tab(text: 'Connection'),
+            Tab(text: 'DNS'),
             Tab(text: 'Management'),
           ]),
         ),
@@ -270,6 +274,7 @@ class _ServerScreenState extends State<ServerScreen> {
           _Loader(key: ValueKey('s$_generation'), load: () => _manage(['status']), build: _status),
           _Loader(key: ValueKey('u$_generation'), load: () => _manage(['users']), build: _users),
           _Loader(key: ValueKey('c$_generation'), load: () => _manage(['status']), build: _connection),
+          _Loader(key: ValueKey('d$_generation'), load: _loadDns, build: _dns),
           _Loader(key: ValueKey('m$_generation'), load: () => _manage(['status']), build: _management),
         ]),
       ),
@@ -552,6 +557,73 @@ class _ServerScreenState extends State<ServerScreen> {
       const _Note('With .ov on, devices connected through this server open .ov sites (try http://search.ov/) in any browser. '
           "The gateway is overnet's own program; nothing is installed until you press the button."),
     ];
+  }
+
+  // ── DNS ───────────────────────────────────────────────────────────────
+  // The DNS filter on the server. Every change restarts the service, so each
+  // one asks first.
+  Future<Map<String, dynamic>> _loadDns() async {
+    try {
+      return await _manage(['dns']);
+    } catch (e) {
+      if (isOldServerError(e.toString())) return {'old': true};
+      rethrow;
+    }
+  }
+
+  static const _dnsRows = {
+    'filter': 'DNS filter',
+    'takeover': 'Takeover of all DNS queries',
+    'doh': 'Block encrypted DNS',
+    'safesearch': 'Safe search',
+  };
+
+  Widget _dns(Map<String, dynamic> r) {
+    if (r['old'] == true) {
+      return const _Message('The OSTP on this server is too old to manage DNS from the app. Update it on the Status tab.');
+    }
+    final dns = (r['dns'] as Map?)?.cast<String, dynamic>();
+    if (dns == null) return const _Message('The server did not report its DNS settings');
+    final toggles = [for (final k in dnsKinds) dnsToggle(dns, k)];
+    final lists = (dns['lists'] as List? ?? const []).cast<Map<String, dynamic>>();
+    final upstreams = (dns['upstreams'] as List? ?? const []).join(', ');
+    Widget button(DnsToggle t) => t.on
+        ? OutlinedButton(
+            onPressed: t.disabled ? null : () => _action(t.action, confirmTitle: t.title, confirmText: t.text, okLabel: t.button),
+            child: Text(t.button))
+        : FilledButton(
+            onPressed: t.disabled ? null : () => _action(t.action, confirmTitle: t.title, confirmText: t.text, okLabel: t.button),
+            child: Text(t.button));
+    return ListView(padding: const EdgeInsets.all(16), children: [
+      _Card([
+        for (final k in dnsKinds)
+          _Row(_dnsRows[k]!, pill: dnsStateLabel(dns, k) == 'on' ? ('on', _green) : (dnsStateLabel(dns, k), _amber)),
+      ]),
+      for (final t in toggles) ...[
+        button(t),
+        const SizedBox(height: 8),
+      ],
+      OutlinedButton(
+        onPressed: () => _action('dns-update',
+            confirmTitle: 'Update the block lists?',
+            confirmText: 'The server downloads the lists now. $dnsRestart',
+            okLabel: dnsActions['dns-update']!.button),
+        child: Text(dnsActions['dns-update']!.button),
+      ),
+      _Note(dnsExplain['filter']!),
+      _Note(dnsExplain['takeover']!),
+      _Note('${dnsExplain['doh']!}${toggles[2].disabled ? ' Turn the takeover on first.' : ''}'),
+      _Note('${dnsExplain['safesearch']!} ${dnsExplain['update']!}'),
+      const _Section('Set on the server'),
+      _Card([
+        _Row('Upstream resolvers', value: upstreams.isEmpty ? '—' : upstreams, mono: true),
+        for (final l in lists) _Row(l['name']?.toString() ?? '', pill: l['enabled'] == true ? ('on', _green) : ('off', _amber)),
+        if (lists.isEmpty) const _Row('Block lists', value: 'none'),
+        _Row('Rewrites', value: '${dns['rewrites'] ?? 0}'),
+        _Row('Own rules', value: '${dns['user_rules'] ?? 0}'),
+      ]),
+      const _Note('Lists, rewrites and own rules are changed in the web panel.'),
+    ]);
   }
 
   // ── Management ────────────────────────────────────────────────────────

@@ -3,6 +3,7 @@ pub mod bridge;
 pub mod config;
 pub mod debug_preview;
 pub mod dpi_probes;
+pub mod hwid;
 pub mod migrate;
 pub mod path_probe;
 pub mod prober;

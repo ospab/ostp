@@ -61,3 +61,6 @@ ostp-web/
 
 # Tauri sidecar staging area (copied from target/ at build time)
 ostp-gui/src-tauri/binaries/
+
+# Local notes for Claude Code sessions
+.claude/

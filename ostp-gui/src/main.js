@@ -1,3 +1,5 @@
+import { shouldAskDnsNotice, effectiveDns, filtersDns } from './dns_notice.js';
+import { classifyFetchError, cardMessage, shouldAskToSend, SEND_DIALOG } from './device_limit.js';
 import { initServers, renderServers, mountSshForm, confirmBox, fmtBytes } from './servers.js';
 
 // ── Tauri invoke shim ─────────────────────────────────────────────────
@@ -37,7 +39,8 @@ function invoke(cmd, args) {
 // Profile shape:
 // { id: string, name: string, server: string, key: string, transport: 'udp'|'uot',
 //   tls?: bool, tls_sni?: string, tls_insecure?: bool, ws_path?: string,
-//   tun?: bool, dns?: string, owndns?: bool,   // carried by share links, kept for export
+//   tun?: bool, dns?: string, owndns?: bool, dnsall?: bool,   // carried by share links, kept for export
+//   dns_choice?: 'operator'|'public'|'mine',   // the user's choice for a server that filters DNS (absent: ask)
 //   sub_id?: string }   // set on profiles owned by a subscription
 
 const PROFILES_KEY  = 'ostp_profiles_v1';
@@ -118,10 +121,15 @@ let activeId  = loadActiveId();
 
 // editor state
 let editingProfileId = null; // null = new profile
-let pendingLinkExtras = null; // tun/dns/owndns of a link opened in the editor, kept until Save
+let pendingLinkExtras = null; // tun/dns/owndns/dnsall of a link opened in the editor, kept until Save
 
 // ── DOM ───────────────────────────────────────────────────────────────
 const $ = id => document.getElementById(id);
+
+// The kill switch drops the default route, which works on Linux and macOS. On
+// Windows the route it added never won against the real default route, so the
+// option is not offered there (a firewall-based one is planned for 0.5.0).
+const KILL_SWITCH_AVAILABLE = !/Windows/i.test(navigator.userAgent);
 
 const homeScreen     = $('home-screen');
 const settingsScreen = $('settings-screen');
@@ -206,6 +214,23 @@ function tlsFieldsFromEditor() {
     ws_path: pmWsPath.value.trim(),
   };
 }
+const pmDnsGroup  = $('pm-dns-group');
+const pmDnsChoice = $('pm-dns-choice');
+
+// "DNS of this server" is offered only for a profile whose link says the
+// server filters DNS; the editor cannot change that, so others do not see it.
+function setDnsChoiceField(p) {
+  pmDnsGroup.style.display = filtersDns(p) ? '' : 'none';
+  pmDnsChoice.value = ['operator', 'public', 'mine'].includes(p.dns_choice) ? p.dns_choice : '';
+}
+
+// Writes the select into the profile: empty means ask on the next connection.
+function applyDnsChoiceField(p) {
+  if (!filtersDns(p)) return;
+  if (pmDnsChoice.value) p.dns_choice = pmDnsChoice.value;
+  else delete p.dns_choice;
+}
+
 const btnProfileCancel = $('btn-profile-cancel');
 const btnProfileSave   = $('btn-profile-save');
 const btnProfileDelete = $('btn-profile-delete');
@@ -227,8 +252,6 @@ const btnWintunOpen   = $('btn-wintun-open');
 // client settings
 const inTun         = $('in-tun-mode');
 const inKillSwitch  = $('in-kill-switch');
-const inMux         = $('in-mux-mode');
-const inMuxSessions = $('in-mux-sessions');
 const inMtu         = $('in-mtu');
 const inDns         = $('in-dns');
 const inSocks       = $('in-socks');
@@ -240,25 +263,10 @@ const inLaunchStartup = $('in-launch-startup');
 const inDebug       = $('in-debug');
 const inShowRtt     = $('in-show-rtt');
 const inShowSpeed   = $('in-show-speed');
+const inSendHwid    = $('in-send-hwid');
 const groupKillSwitch  = $('group-kill-switch');
-const groupMuxSessions = $('group-mux-sessions');
 
-const inJunkEnabled   = $('cs-junk-enabled');
-const btnJunkSettings = $('btn-junk-settings');
-const junkModal       = $('junk-modal');
-const inJunkPcMin     = $('cs-junk-pc-min');
-const inJunkPcMax     = $('cs-junk-pc-max');
-const inJunkPsMin     = $('cs-junk-ps-min');
-const inJunkPsMax     = $('cs-junk-ps-max');
-const btnJunkDone     = $('btn-junk-done');
-
-const inTcpFrag       = $('cs-tcp-frag');
-const btnFragSettings = $('btn-frag-settings');
 const inTtlDesync     = $('cs-ttl-desync');
-const fragModal       = $('frag-modal');
-const inFragChunk     = $('cs-frag-chunk');
-const inFragSleep     = $('cs-frag-sleep');
-const btnFragDone     = $('btn-frag-done');
 
 // ── UTILITIES ─────────────────────────────────────────────────────────
 function fmtTime(s) {
@@ -326,6 +334,7 @@ function setState(next) {
     next === 'disconnected' ? 'Connect' : next === 'connecting' ? 'Cancel connecting' : 'Disconnect');
 
   if (next === 'disconnected') {
+    sessionProfile = null;
     statusText.textContent = 'Disconnected';
     uptimeText.textContent  = 'Press the button to connect';
     connInfo.classList.add('hidden');
@@ -373,6 +382,7 @@ function setState(next) {
       uptimeText.textContent = 'Connected for ' + fmtTime(uptimeSecs);
     }, 1000);
   }
+  updateReconnectNotice();
 }
 
 // ── POLLING ───────────────────────────────────────────────────────────
@@ -457,11 +467,6 @@ function clampInt(v, lo, hi, dflt) {
   return Number.isFinite(n) ? Math.min(hi, Math.max(lo, n)) : dflt;
 }
 
-function rangePair(a, b, lo, hi, d) {
-  const x = clampInt(a, lo, hi, d[0]), y = clampInt(b, lo, hi, d[1]);
-  return x <= y ? [x, y] : [y, x];
-}
-
 const MAX_LIST_ITEMS = 500;
 function listOf(text) {
   return String(text || '').split(/[\n,]+/).map(x => x.trim().slice(0, 253)).filter(Boolean).slice(0, MAX_LIST_ITEMS);
@@ -474,18 +479,13 @@ function buildConfig() {
   const s = loadClientSettings();
   const cfg = {
     mode: 'client',
-    config_version: 2,
+    config_version: 5,
     server: active.server,
     access_key: active.key,
     socks5_bind: s.socks || null,
     debug: !!s.debug,
     transport: {
       mode: active.transport || 'udp',
-      tcp_fragmentation: s.tcpFrag || !!active.tcp_fragmentation,
-      frag_chunk: clampInt(s.tcpFrag ? s.fragChunk : active.frag_chunk, 1, 1400, 2),
-      frag_sleep: clampInt(s.tcpFrag ? s.fragSleep : active.frag_sleep, 0, 1000, 2),
-      junk_pc: s.junkEnabled ? rangePair(s.junkPcMin, s.junkPcMax, 0, 100, [2, 5]) : (active.junk_pc || [2, 5]),
-      junk_ps: s.junkEnabled ? rangePair(s.junkPsMin, s.junkPsMax, 1, 1400, [100, 1000]) : (active.junk_ps || [100, 1000]),
       ttl_desync: !!s.ttlDesync,
       ttl_desync_auto: true,
       tls: (active.transport === 'uot') && !!active.tls,
@@ -498,15 +498,14 @@ function buildConfig() {
       wintun_path: './wintun.dll',
       ipv4_address: '10.1.0.2/24',
       stack: 'ostp',
-      dns: s.dns || null,
-      kill_switch: !!s.killSwitch,
+      dns: effectiveDns(active, s.dns),
+      kill_switch: !!s.killSwitch && KILL_SWITCH_AVAILABLE,
     },
     exclude: {
       domains: listOf(s.exDomains),
       ips: listOf(s.exIps),
       processes: listOf(s.exProcs),
     },
-    mux: s.mux ? { enabled: true, sessions: clampInt(s.muxSessions, 1, 8, 2) } : undefined,
     gui: {
       autoconnect: !!s.autoconnect,
       launch_startup: !!s.launchStartup,
@@ -516,11 +515,83 @@ function buildConfig() {
   return cfg;
 }
 
+// ── DNS NOTICE ────────────────────────────────────────────────────────
+// Resolves to 'operator' | 'public' | 'mine' once the user has chosen. There
+// is no other way out: Escape and a click outside do nothing, and the buttons
+// stay disabled for the first seconds so the text is not skipped by accident.
+const DNS_NOTICE_SECONDS = 5;
+const DNS_NOTICE_BUTTONS = [
+  ['operator', "Use the operator's DNS"],
+  ['public', 'Use a public DNS'],
+  ['mine', 'Keep my settings'],
+];
+
+function askDnsNotice(profile) {
+  return new Promise(resolve => {
+    const modal = $('dns-notice-modal');
+    $('dns-notice-all').style.display = profile.dnsall ? '' : 'none';
+    const buttons = DNS_NOTICE_BUTTONS.map(([value, text]) => {
+      const b = document.querySelector(`#dns-notice-modal [data-dns-choice="${value}"]`);
+      b.onclick = () => finish(value);
+      return [b, text];
+    });
+    let left = DNS_NOTICE_SECONDS;
+    const paint = () => buttons.forEach(([b, text]) => {
+      b.disabled = left > 0;
+      b.textContent = left > 0 ? `${text} (${left})` : text;
+    });
+    const timer = setInterval(() => {
+      left -= 1;
+      paint();
+      if (left <= 0) { clearInterval(timer); buttons[0][0].focus(); }
+    }, 1000);
+    function finish(value) {
+      clearInterval(timer);
+      buttons.forEach(([b]) => { b.onclick = null; });
+      modal.classList.add('hidden');
+      resolve(value);
+    }
+    paint();
+    modal.classList.remove('hidden');
+  });
+}
+
 // ── CONNECT / DISCONNECT ──────────────────────────────────────────────
 // The button is disabled while start_tunnel / stop_tunnel are running (a TUN
 // start can wait for the administrator prompt), so a click is never ignored
 // without a sign that it is.
 let toggleBusy = false;
+
+// The profile the running connection was started with, to tell when the
+// selection or the profile itself changed since (it applies on reconnect).
+let sessionProfile = null;
+const profileSignature = id => JSON.stringify(profiles.find(p => p.id === id) || null);
+
+function updateReconnectNotice() {
+  const changed = appState !== 'disconnected' && sessionProfile !== null
+    && sessionProfile !== profileSignature(activeId);
+  $('reconnect-notice').classList.toggle('hidden', !changed);
+}
+
+// Stop and start again with the selected profile. One tunnel cannot hold
+// both servers at once, so apps' connections are reset as with a manual
+// Disconnect and Connect; this only saves the two clicks.
+async function reconnect() {
+  if (toggleBusy || appState === 'disconnected') return;
+  const btn = $('btn-reconnect');
+  const label = $('btn-reconnect-label');
+  btn.disabled = true;
+  btn.classList.add('busy');
+  label.textContent = 'Reconnecting';
+  try {
+    await handleToggle();
+    if (appState === 'disconnected') await handleToggle();
+  } finally {
+    btn.disabled = false;
+    btn.classList.remove('busy');
+    label.textContent = 'Reconnect';
+  }
+}
 
 async function handleToggle() {
   if (toggleBusy) return;
@@ -544,6 +615,13 @@ async function handleToggle() {
       showError('No profile is selected. Open Settings and add or choose one.');
       return;
     }
+    // A server that filters DNS is explained once, before the tunnel starts.
+    const asked = profiles.find(p => p.id === activeId);
+    if (shouldAskDnsNotice(asked)) {
+      const choice = await askDnsNotice(asked);
+      const cur = profiles.find(p => p.id === asked.id);
+      if (cur) { cur.dns_choice = choice; saveProfiles(profiles); }
+    }
     const cfg = buildConfig();
     if (!cfg) { showError('The selected profile is not valid. Open Settings and check it.'); return; }
     const socksBad = socksProblem(cfg.socks5_bind || '');
@@ -554,6 +632,7 @@ async function handleToggle() {
       await invoke('save_config', { jsonContent: JSON.stringify(cfg, null, 2) });
       const ok = await invoke('start_tunnel');
       if (ok) {
+        sessionProfile = profileSignature(activeId);
         startPolling();
       } else {
         setState('disconnected');
@@ -759,6 +838,7 @@ function renderProfiles() {
   profileEmpty.style.display = manual.length || hasSubs ? 'none' : '';
   manual.forEach(p => profileList.appendChild(profileCard(p)));
   renderSubs();
+  updateReconnectNotice();
 }
 
 function profileCard(p) {
@@ -793,7 +873,7 @@ function profileCard(p) {
       saveActiveId(activeId);
       renderProfiles();
       persistConfig();
-      if (appState !== 'disconnected') showToast('The connection keeps using the previous profile until you reconnect');
+      if (appState !== 'disconnected') showToast('The connection keeps using the previous profile. Reconnect on the main screen to switch');
     };
     card.addEventListener('click', e => {
       if (e.target.closest('.profile-action-btn')) return;
@@ -835,12 +915,14 @@ function openProfileEditor(id) {
     pmKey.value = p.key || '';
     pmTransport.value = p.transport || 'udp';
     setTlsFields(p);
+    setDnsChoiceField(p);
     btnProfileDelete.style.display = '';
   } else {
     profileModalTitle.textContent = 'New profile';
     pmName.value = pmServer.value = pmKey.value = '';
     pmTransport.value = 'udp';
     setTlsFields({});
+    setDnsChoiceField({});
     btnProfileDelete.style.display = 'none';
   }
   pmKey.type = 'password';
@@ -878,6 +960,7 @@ function saveProfileFromEditor() {
         transport: pmTransport.value,
         ...tlsFieldsFromEditor(),
       };
+      applyDnsChoiceField(profiles[idx]);
     }
   } else {
     const p = {
@@ -890,6 +973,7 @@ function saveProfileFromEditor() {
       ...pendingLinkExtras,
     };
     pendingLinkExtras = null;
+    applyDnsChoiceField(p);
     profiles.push(p);
     if (!activeId) { activeId = p.id; saveActiveId(activeId); }
   }
@@ -984,6 +1068,7 @@ function parseOstpLink(raw) {
     else if (k === 'tun') { if (truthy(v)) out.tun = true; }
     else if (k === 'dns') { if (v.trim()) out.dns = v.trim().slice(0, LIMITS.server); }
     else if (k === 'owndns') { if (truthy(v)) out.owndns = true; }
+    else if (k === 'dnsall') { if (truthy(v)) out.dnsall = true; }
     else if (k === 'name' && cleanName(v)) out.name = cleanName(v);
   }
   out.tls_sni = out.tls_sni.trim().slice(0, LIMITS.sni);
@@ -1002,13 +1087,14 @@ function importFromLink(raw) {
     // Pre-fill editor
     editingProfileId = null;
     pendingLinkExtras = {};
-    for (const k of ['tun', 'dns', 'owndns']) if (parsed[k]) pendingLinkExtras[k] = parsed[k];
+    for (const k of ['tun', 'dns', 'owndns', 'dnsall']) if (parsed[k]) pendingLinkExtras[k] = parsed[k];
     profileModalTitle.textContent = 'New profile';
     pmName.value = parsed.name;
     pmServer.value = parsed.server;
     pmKey.value = parsed.key;
     pmTransport.value = parsed.transport;
     setTlsFields(parsed);
+    setDnsChoiceField(parsed);
     btnProfileDelete.style.display = 'none';
     profileModal.classList.remove('hidden');
     showToast('Check the details, then press Save', 'ok');
@@ -1031,6 +1117,7 @@ function buildShareLink(p) {
   if (p.tun) params.push('tun=true');
   if (p.dns) params.push(`dns=${linkEncode(p.dns)}`);
   if (p.owndns) params.push('owndns=true');
+  if (p.dnsall) params.push('dnsall=true');
   if (p.name) params.push(`name=${linkEncode(p.name)}`);
   return `ostp://${linkEncode(p.key)}@${p.server}?${params.join('&')}`;
 }
@@ -1127,8 +1214,12 @@ function applySubscription(sub, doc) {
   const activeOld = old.find(p => p.id === activeId);
   const fresh = links.map((l, i) => {
     const prev = old.find(p => carrierOf(p) === carrierOf(l));
-    return { ...(prev || {}), ...l, id: prev ? prev.id : genId(), sub_id: sub.id,
+    const merged = { ...(prev || {}), ...l, id: prev ? prev.id : genId(), sub_id: sub.id,
              name: l.name || `${sub.name} · ${carrierOf(l).toUpperCase()}` };
+    // What the server says now wins; the user's dns_choice stays with the profile.
+    if (!l.owndns) delete merged.owndns;
+    if (!l.dnsall) delete merged.dnsall;
+    return merged;
   });
   // Profiles added by hand for the same key and carrier are what this
   // subscription now provides: keep one copy, the subscription's.
@@ -1151,6 +1242,14 @@ function applySubscription(sub, doc) {
   return fresh.length;
 }
 
+const sendHwidOn = () => !!loadClientSettings().sendHwid;
+
+async function downloadSubscription(url, sendHwid) {
+  const doc = await invoke('fetch_subscription', { url, sendHwid });
+  if (!doc) throw new Error('subscriptions need the desktop app');
+  return doc;
+}
+
 async function refreshSubscription(id, { quiet = false } = {}) {
   const url = loadSubs().find(s => s.id === id)?.url;
   if (!url || refreshing.has(id)) return;
@@ -1158,8 +1257,19 @@ async function refreshSubscription(id, { quiet = false } = {}) {
   renderSubs();
   let outcome = null;
   try {
-    const doc = await invoke('fetch_subscription', { url });
-    if (!doc) throw new Error('subscriptions need the desktop app');
+    let doc;
+    try {
+      doc = await downloadSubscription(url, sendHwidOn());
+    } catch (e) {
+      // A server that limits devices asked for an ID while sending is off. Only a
+      // fetch the person started may ask about it; a background refresh never does.
+      const err = classifyFetchError(e?.message || e);
+      if (!shouldAskToSend({ ...err, manual: !quiet, sendOn: sendHwidOn(), retried: false })) throw e;
+      if (!await confirmBox(SEND_DIALOG.title, SEND_DIALOG.text, SEND_DIALOG.ok, false)) throw e;
+      inSendHwid.checked = true;
+      collectAndSaveSettings();
+      doc = await downloadSubscription(url, true);
+    }
     outcome = { doc };
   } catch (e) {
     outcome = { error: String(e?.message || e) };
@@ -1175,7 +1285,7 @@ async function refreshSubscription(id, { quiet = false } = {}) {
       const n = applySubscription(sub, outcome.doc);
       if (!quiet) showToast(`Subscription updated: ${n} ${n === 1 ? 'profile' : 'profiles'}`, 'ok');
     } catch (e) {
-      sub.lastError = String(e?.message || e).slice(0, 300);
+      sub.lastError = cardMessage(classifyFetchError(e?.message || e)).slice(0, 300);
       if (!quiet) showToast('Could not update the subscription: ' + sub.lastError, 'error');
     }
     saveSubs(subs);
@@ -1267,7 +1377,7 @@ function renderSubs() {
 
 // ── PROBER ────────────────────────────────────────────────────────────
 let lastMatrix = null;
-const CARRIER_NAMES = { udp: 'UDP', uot: 'TCP', uot_frag: 'TCP + frag', uot_tls: 'TLS' };
+const CARRIER_NAMES = { udp: 'UDP', uot: 'TCP', uot_tls: 'TLS' };
 const carrierName = t => CARRIER_NAMES[t] || String(t).toUpperCase();
 
 function proberTls(p) {
@@ -1391,8 +1501,6 @@ async function runDpi() {
       line(r.transparent_proxy_detected, 'A transparent proxy sits on the path', 'No transparent proxy', 'proxy'),
       line(r.connect_hijacked, 'Block pages are injected', 'No injected block pages', 'connect'),
     ].join('');
-    const tip = r.vulnerable_to_fragmentation
-      ? '<p class="field-hint">The filter misses fragmented handshakes: TCP fragmentation (UoT) helps here.</p>' : '';
     // Checks with a verdict and, when the censor answers, its hop.
     const checks = (r.checks || []).map(c => {
       const mark = c.ok === true ? '<span class="pr-ok">✓</span>' : c.ok === false ? '<span class="pr-bad">✕</span>' : '<span class="pr-dim">–</span>';
@@ -1407,7 +1515,7 @@ async function runDpi() {
          ${r.path_summary ? `<p class="field-hint">${escHtml(r.path_summary.charAt(0).toUpperCase() + r.path_summary.slice(1))}.</p>` : ''}
          <table class="pr-table"><tr><th>Hop</th><th>Router</th><th>Network</th></tr>${path}</table>
          <p class="field-hint">A censor that resets or answers is placed by TTL; one that drops silently can only be narrowed to the hops before the destination network.</p>` : '';
-    prCard('Network test', verdict + `<table class="pr-table">${checks}${rows}</table>` + tip + pathBlock);
+    prCard('Network test', verdict + `<table class="pr-table">${checks}${rows}</table>` + pathBlock);
     prStatus('Done.');
   } catch (e) {
     prStatus('Could not run the network test: ' + (e?.message || e), 'is-error');
@@ -1519,9 +1627,7 @@ function onUpdateProgress([done, total]) {
 function loadSettingsIntoForm() {
   const s = loadClientSettings();
   inTun.checked         = !!s.tun;
-  inKillSwitch.checked  = !!s.killSwitch;
-  inMux.checked         = !!s.mux;
-  inMuxSessions.value   = s.muxSessions || '2';
+  inKillSwitch.checked  = !!s.killSwitch && KILL_SWITCH_AVAILABLE;
   inMtu.value           = s.mtu || '';
   inDns.value           = s.dns || '';
   inSocks.value         = s.socks || '';
@@ -1534,14 +1640,7 @@ function loadSettingsIntoForm() {
   inShowRtt.checked     = s.showRtt !== false;
   inShowSpeed.checked   = s.showSpeed !== false;
   $('in-update-check').checked = s.updateCheck !== false;
-  inJunkEnabled.checked = !!s.junkEnabled;
-  inJunkPcMin.value     = s.junkPcMin || 2;
-  inJunkPcMax.value     = s.junkPcMax || 5;
-  inJunkPsMin.value     = s.junkPsMin || 100;
-  inJunkPsMax.value     = s.junkPsMax || 1000;
-  inTcpFrag.checked     = !!s.tcpFrag;
-  inFragChunk.value     = s.fragChunk || 2;
-  inFragSleep.value     = !isNaN(parseInt(s.fragSleep)) ? s.fragSleep : 2;
+  inSendHwid.checked    = !!s.sendHwid;
   if (inTtlDesync) inTtlDesync.checked = !!s.ttlDesync;
   updateClientVisibility();
 }
@@ -1558,10 +1657,7 @@ let autostartChain = Promise.resolve();
 // out of range is replaced by the nearest allowed one and a reversed pair is
 // put in order, so what the form shows is what the core gets.
 const NUMBER_FIELDS = [
-  [() => inMuxSessions, 1, 8], [() => inMtu, 576, 1500],
-  [() => inJunkPcMin, 0, 100], [() => inJunkPcMax, 0, 100],
-  [() => inJunkPsMin, 1, 1400], [() => inJunkPsMax, 1, 1400],
-  [() => inFragChunk, 1, 1400], [() => inFragSleep, 0, 1000],
+  [() => inMtu, 576, 1500],
 ];
 
 function normalizeNumberFields() {
@@ -1569,9 +1665,6 @@ function normalizeNumberFields() {
     const el = get();
     if (el.value.trim() === '') continue;
     el.value = String(clampInt(el.value, lo, hi, lo));
-  }
-  for (const [a, b] of [[inJunkPcMin, inJunkPcMax], [inJunkPsMin, inJunkPsMax]]) {
-    if (a.value !== '' && b.value !== '' && +a.value > +b.value) [a.value, b.value] = [b.value, a.value];
   }
 }
 
@@ -1584,9 +1677,7 @@ function socksProblem(v) {
 function collectAndSaveSettings() {
   const s = {
     tun:          inTun.checked,
-    killSwitch:   inKillSwitch.checked,
-    mux:          inMux.checked,
-    muxSessions:  inMuxSessions.value.trim(),
+    killSwitch:   inKillSwitch.checked && KILL_SWITCH_AVAILABLE,
     mtu:          inMtu.value.trim(),
     dns:          inDns.value.trim(),
     socks:        inSocks.value.trim(),
@@ -1599,14 +1690,7 @@ function collectAndSaveSettings() {
     showRtt:      inShowRtt.checked,
     showSpeed:    inShowSpeed.checked,
     updateCheck:  $('in-update-check').checked,
-    junkEnabled:  inJunkEnabled.checked,
-    junkPcMin:    parseInt(inJunkPcMin.value) || 2,
-    junkPcMax:    parseInt(inJunkPcMax.value) || 5,
-    junkPsMin:    parseInt(inJunkPsMin.value) || 100,
-    junkPsMax:    parseInt(inJunkPsMax.value) || 1000,
-    tcpFrag:      inTcpFrag.checked,
-    fragChunk:    parseInt(inFragChunk.value) || 2,
-    fragSleep:    !isNaN(parseInt(inFragSleep.value)) ? parseInt(inFragSleep.value) : 2,
+    sendHwid:     inSendHwid.checked,
     ttlDesync:    inTtlDesync ? inTtlDesync.checked : false,
   };
   // Cheap and local: safe to run on every debounced keystroke.
@@ -1636,9 +1720,8 @@ function collectAndSaveSettings() {
   // once the user has stopped editing rather than between keystrokes.
   if (appState === 'connected') {
     const tunnelRelevant = JSON.stringify([
-      s.tun, s.killSwitch, s.mux, s.muxSessions, s.mtu, s.dns, s.socks,
-      s.exDomains, s.exIps, s.exProcs, s.junkEnabled, s.junkPcMin, s.junkPcMax,
-      s.junkPsMin, s.junkPsMax, s.tcpFrag, s.fragChunk, s.fragSleep, s.ttlDesync,
+      s.tun, s.killSwitch, s.mtu, s.dns, s.socks,
+      s.exDomains, s.exIps, s.exProcs, s.ttlDesync,
     ]);
     if (tunnelRelevant !== lastAppliedTunnelConfig) {
       clearTimeout(hotReloadTimer);
@@ -1657,8 +1740,7 @@ function collectAndSaveSettings() {
 }
 
 function updateClientVisibility() {
-  groupKillSwitch.style.display  = inTun.checked  ? 'flex' : 'none';
-  groupMuxSessions.style.display = inMux.checked  ? 'flex' : 'none';
+  groupKillSwitch.style.display  = inTun.checked && KILL_SWITCH_AVAILABLE ? 'flex' : 'none';
 
   const showRtt = inShowRtt.checked;
   const showSpeed = inShowSpeed.checked;
@@ -1725,6 +1807,7 @@ window.addEventListener('DOMContentLoaded', async () => {
   // ── Event wiring ──────────────────────────────────────────────────
 
   btnConnect.addEventListener('click', handleToggle);
+  $('btn-reconnect').addEventListener('click', reconnect);
   btnGoSettings.addEventListener('click', () => showScreen('settings'));
   $('btn-go-servers').addEventListener('click', () => showScreen('servers'));
   $('btn-go-more').addEventListener('click', () => showScreen('more'));
@@ -1853,10 +1936,10 @@ window.addEventListener('DOMContentLoaded', async () => {
   wintunModal.addEventListener('click', e => { if (e.target === wintunModal) wintunModal.classList.add('hidden'); });
 
   // Client settings — wire all inputs
-  [inTun, inKillSwitch, inMux, inAutoconnect, inLaunchStartup, inDebug, inShowRtt, inShowSpeed, inJunkEnabled, inTcpFrag, inTtlDesync, $('in-update-check')]
+  [inTun, inKillSwitch, inAutoconnect, inLaunchStartup, inDebug, inShowRtt, inShowSpeed, inSendHwid, inTtlDesync, $('in-update-check')]
     .filter(Boolean)
     .forEach(el => el.addEventListener('change', collectAndSaveSettings));
-  [inMuxSessions, inMtu, inDns, inSocks, inExDomains, inExIps, inExProcs, inJunkPcMin, inJunkPcMax, inJunkPsMin, inJunkPsMax, inFragChunk, inFragSleep]
+  [inMtu, inDns, inSocks, inExDomains, inExIps, inExProcs]
     .forEach(el => {
       el.addEventListener('input', () => {
         clearTimeout(el._saveTimer);
@@ -1872,23 +1955,6 @@ window.addEventListener('DOMContentLoaded', async () => {
     const problem = socksProblem(inSocks.value.trim());
     if (problem) showToast(problem, 'error');
   });
-
-  // Junk and Frag modals
-  btnJunkSettings.addEventListener('click', () => junkModal.classList.remove('hidden'));
-  btnJunkDone.addEventListener('click', () => {
-    normalizeNumberFields();
-    collectAndSaveSettings();
-    junkModal.classList.add('hidden');
-  });
-  junkModal.addEventListener('click', e => { if (e.target === junkModal) junkModal.classList.add('hidden'); });
-
-  btnFragSettings.addEventListener('click', () => fragModal.classList.remove('hidden'));
-  btnFragDone.addEventListener('click', () => {
-    normalizeNumberFields();
-    collectAndSaveSettings();
-    fragModal.classList.add('hidden');
-  });
-  fragModal.addEventListener('click', e => { if (e.target === fragModal) fragModal.classList.add('hidden'); });
 
   setupInputLimits();
   setupAccessibility();

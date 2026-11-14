@@ -61,8 +61,8 @@ Future<void> checkForUpdates(BuildContext context, SharedPreferences prefs, {req
   final stable = r['stable'] as Map<String, dynamic>?;
   await showDialog(
     context: context,
-    builder: (context) => AlertDialog(
-      backgroundColor: Theme.of(context).colorScheme.surface,
+    builder: (dialogContext) => AlertDialog(
+      backgroundColor: Theme.of(dialogContext).colorScheme.surface,
       title: Text(isBeta ? 'Beta version available' : 'Update available'),
       content: Column(
         mainAxisSize: MainAxisSize.min,
@@ -84,21 +84,22 @@ Future<void> checkForUpdates(BuildContext context, SharedPreferences prefs, {req
         TextButton(
           onPressed: () {
             prefs.setString(_skipKey, offer['tag'] as String);
-            Navigator.pop(context);
+            Navigator.pop(dialogContext);
           },
           child: const Text('Skip this version'),
         ),
-        TextButton(onPressed: () => Navigator.pop(context), child: const Text('Later')),
+        TextButton(onPressed: () => Navigator.pop(dialogContext), child: const Text('Later')),
         TextButton(
           onPressed: () {
-            Navigator.pop(context);
+            Navigator.pop(dialogContext);
             _openReleasePage(offer['url'] as String);
           },
           child: const Text('Release page'),
         ),
         TextButton(
           onPressed: () {
-            Navigator.pop(context);
+            Navigator.pop(dialogContext);
+            // The screen's context, not the dialog's: the dialog is gone by the time the download ends.
             _updateNow(context, offer['tag'] as String, offer['url'] as String);
           },
           child: const Text('Update now'),

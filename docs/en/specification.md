@@ -215,9 +215,9 @@ OSTP provides reliability over an inherently unreliable datagram substrate using
 * **In-flight accounting:** only retransmittable `Data` frames count toward backpressure; control frames (`Ack`/`Nack`) are excluded so acknowledgment traffic can never itself throttle the session.
 * **Graceful close:** the `Closing` state keeps processing inbound frames (including trailing ACKs and retransmits) instead of tearing down on the first post-`Close` packet, so in-flight data isn't lost during teardown.
 
-### 9.2 Junk Packets and TCP Fragmentation
+### 9.2 Marked Junk
 
-Before the handshake, a client may send a configurable number of random-size filler datagrams, each stamped with the time-windowed `junk_marker` from §6.1 rather than a fixed constant. The server derives the same per-key marker while trying candidate keys and silently drops matching junk before it ever reaches "unauthorized probe" logging. Over the UoT transport only, the first TCP segment (the handshake) can additionally be split into small chunks with short inter-write delays, so DPI that inspects only the first TCP segment never observes a complete handshake. See [`obfuscation.md`](obfuscation.md) for full detail; neither mechanism applies to plain UDP transport.
+Any datagram (UDP) or UoT frame that starts with the time-windowed `junk_marker` of §6.1 for one of the server's keys, in the current or the previous window, is junk: the server drops it silently while trying candidate keys, before "unauthorized probe" logging. Clients send it as TTL-desync decoys over UDP (see [`obfuscation.md`](obfuscation.md)); clients before 0.4.7 could also send it as filler frames ahead of a UoT handshake, which current clients no longer do. A server keeps dropping it for as long as it accepts PROTOCOL_VERSION 5.
 
 ### 9.3 Transport Modes and Session Multiplexing
 
