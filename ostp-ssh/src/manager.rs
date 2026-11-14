@@ -71,6 +71,16 @@ pub enum Action {
     OvernetDisable,
     /// The overnet exit on or off
     OvernetExit(bool),
+    /// The DNS filter on or off
+    DnsEnable,
+    DnsDisable,
+    /// Answer every client's DNS query, not only those sent to the server
+    DnsTakeover(bool),
+    /// Refuse encrypted DNS (only has an effect with the takeover on)
+    DnsDohBypass(bool),
+    DnsSafesearch(bool),
+    /// Download the block lists now
+    DnsUpdate,
 }
 
 impl Action {
@@ -105,6 +115,15 @@ impl Action {
             "overnet-disable" => Action::OvernetDisable,
             "overnet-exit-on" => Action::OvernetExit(true),
             "overnet-exit-off" => Action::OvernetExit(false),
+            "dns-enable" => Action::DnsEnable,
+            "dns-disable" => Action::DnsDisable,
+            "dns-takeover-on" => Action::DnsTakeover(true),
+            "dns-takeover-off" => Action::DnsTakeover(false),
+            "dns-doh-on" => Action::DnsDohBypass(true),
+            "dns-doh-off" => Action::DnsDohBypass(false),
+            "dns-safesearch-on" => Action::DnsSafesearch(true),
+            "dns-safesearch-off" => Action::DnsSafesearch(false),
+            "dns-update" => Action::DnsUpdate,
             other => bail!("unknown action {other}"),
         })
     }
@@ -135,12 +154,18 @@ impl Action {
             Action::OvernetEnable => (format!("{OSTP} overnet enable"), None),
             Action::OvernetDisable => (format!("{OSTP} overnet disable"), None),
             Action::OvernetExit(on) => (format!("{OSTP} overnet exit {}", if *on { "on" } else { "off" }), None),
+            Action::DnsEnable => (format!("{OSTP} dns enable"), None),
+            Action::DnsDisable => (format!("{OSTP} dns disable"), None),
+            Action::DnsTakeover(on) => (format!("{OSTP} dns takeover {}", if *on { "on" } else { "off" }), None),
+            Action::DnsDohBypass(on) => (format!("{OSTP} dns doh-bypass {}", if *on { "on" } else { "off" }), None),
+            Action::DnsSafesearch(on) => (format!("{OSTP} dns safesearch {}", if *on { "on" } else { "off" }), None),
+            Action::DnsUpdate => (format!("{OSTP} dns update"), None),
         }
     }
 }
 
 /// `ostp manage` subcommands the apps may run.
-pub const MANAGE_COMMANDS: &[&str] = &["status", "users", "user-add", "user-remove", "user-rename", "logs", "restart"];
+pub const MANAGE_COMMANDS: &[&str] = &["status", "users", "user-add", "user-remove", "user-rename", "user-limit", "user-devices", "dns", "logs", "restart"];
 
 /// A password or key typed in the app, as JSON:
 /// `{"kind": "password"|"key", "secret": "...", "passphrase": "..."}`.
@@ -442,6 +467,19 @@ mod tests {
         let key = auth_from_json(&serde_json::json!({ "kind": "key", "secret": "k", "passphrase": "" })).unwrap().unwrap();
         assert!(matches!(key, Auth::Key { passphrase: None, .. }));
         assert!(auth_from_json(&serde_json::json!({ "kind": "password", "secret": "" })).is_err());
+    }
+
+    #[test]
+    fn dns_actions_run_the_dns_commands() {
+        let run = |name: &str| Action::parse(name, &Value::Null, Channel::Stable).unwrap().command().0;
+        assert_eq!(run("dns-enable"), "/usr/local/bin/ostp dns enable");
+        assert_eq!(run("dns-disable"), "/usr/local/bin/ostp dns disable");
+        assert_eq!(run("dns-takeover-on"), "/usr/local/bin/ostp dns takeover on");
+        assert_eq!(run("dns-takeover-off"), "/usr/local/bin/ostp dns takeover off");
+        assert_eq!(run("dns-doh-on"), "/usr/local/bin/ostp dns doh-bypass on");
+        assert_eq!(run("dns-safesearch-off"), "/usr/local/bin/ostp dns safesearch off");
+        assert_eq!(run("dns-update"), "/usr/local/bin/ostp dns update");
+        assert!(Action::parse("dns-takeover", &Value::Null, Channel::Stable).is_err(), "no half-names");
     }
 
     #[tokio::test]
