@@ -441,6 +441,10 @@ async fn run_client_once(
     // Wait for either external shutdown OR any task to fail
     let mut outcome: std::result::Result<(), anyhow::Error> = Ok(());
     let mut first_connect_failed = false;
+    // A JoinHandle that has produced its result must not be awaited again (tokio
+    // panics with "JoinHandle polled after completion"), so the branch that took
+    // a task's result marks it done and the cleanup below skips it.
+    let (mut bridge_done, mut proxy_done, mut wintun_done) = (false, false, false);
     tokio::select! {
         _ = shutdown_rx_ext.changed() => {
             let _ = cmd_tx.send(BridgeCommand::Shutdown).await;
@@ -456,26 +460,35 @@ async fn run_client_once(
             });
         }
         res = &mut bridge_task => {
+            bridge_done = true;
             let _ = shutdown_tx.send(true);
             outcome = res.map_err(|e| anyhow::anyhow!("Bridge task panicked: {}", e)).and_then(|r| r);
         }
         res = &mut proxy_task => {
+            proxy_done = true;
             let _ = shutdown_tx.send(true);
             outcome = res.map_err(|e| anyhow::anyhow!("Proxy task panicked: {}", e)).and_then(|r| r);
         }
         res = async {
             if let Some(t) = wintun_task.as_mut() { t.await } else { std::future::pending().await }
         } => {
+            wintun_done = true;
             let _ = shutdown_tx.send(true);
             outcome = res.map_err(|e| anyhow::anyhow!("TUN task panicked: {}", e)).and_then(|r| r);
         }
     }
 
     // Final cleanup: wait for tasks to finish
-    let _ = bridge_task.await;
-    let _ = proxy_task.await;
+    if !bridge_done {
+        let _ = bridge_task.await;
+    }
+    if !proxy_done {
+        let _ = proxy_task.await;
+    }
     if let Some(task) = wintun_task {
-        let _ = task.await;
+        if !wintun_done {
+            let _ = task.await;
+        }
     }
 
     match outcome {
