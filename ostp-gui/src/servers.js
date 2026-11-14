@@ -3,6 +3,8 @@
 // work; this file is the first-run screen's "I have a server", the list of
 // servers and each server's page.
 
+import { DNS_ACTIONS, DNS_EXPLAIN, DNS_KINDS, dnsToggle, dnsUpdate, dnsStateLabel, isOldServerError } from './server_dns.js';
+
 let app = null; // helpers handed over by main.js (initServers)
 const $ = id => document.getElementById(id);
 
@@ -481,6 +483,7 @@ async function renderTab() {
     if (currentTab === 'status') await renderStatus(body, id, seq);
     else if (currentTab === 'users') await renderUsers(body, id, seq);
     else if (currentTab === 'connection') await renderConnection(body, id, seq);
+    else if (currentTab === 'dns') await renderDns(body, id, seq);
     else await renderManage(body, id, seq);
   } catch (e) {
     if (stale(id, seq)) return;
@@ -641,6 +644,61 @@ async function renderConnection(body, id, seq) {
     s.subscription ? 'Turn subscriptions off?' : null, s.subscription ? 'Subscription links stop updating in the apps.' : null);
 }
 
+// The DNS filter on the server: what is on, and the switches. Every change
+// restarts the service, so each one asks first.
+const DNS_ROWS = { filter: 'DNS filter', takeover: 'Takeover of all DNS queries', doh: 'Block encrypted DNS', safesearch: 'Safe search' };
+
+async function renderDns(body, id, seq) {
+  let dns;
+  try {
+    dns = (await call('server_manage', { id, args: ['dns'] })).dns;
+  } catch (e) {
+    if (!isOldServerError(e?.message || e)) throw e;
+    if (stale(id, seq)) return;
+    body.innerHTML = '<div class="empty-note">The OSTP on this server is too old to manage DNS from the app. Update it on the Status tab.</div>';
+    return;
+  }
+  if (stale(id, seq)) return;
+  if (!dns) throw new Error('The server did not report its DNS settings');
+  const pillFor = (kind) => {
+    const label = dnsStateLabel(dns, kind);
+    return `<span class="pill ${label === 'on' ? 'ok' : 'warn'}">${label}</span>`;
+  };
+  const toggles = DNS_KINDS.map(k => dnsToggle(dns, k));
+  const lists = dns.lists || [];
+  const upstreams = dns.upstreams || [];
+  body.innerHTML = `
+    <div class="kv-card">
+      ${DNS_KINDS.map(k => kv(DNS_ROWS[k], pillFor(k))).join('')}
+    </div>
+    <div class="btn-row">
+      ${toggles.slice(0, 2).map(t => `<button class="btn ${t.on ? 'secondary' : 'primary'}" data-dns="${t.kind}">${esc(t.button)}</button>`).join('')}
+    </div>
+    <div class="btn-row">
+      ${toggles.slice(2).map(t => `<button class="btn secondary" data-dns="${t.kind}" ${t.disabled ? `disabled title="${esc(t.reason)}"` : ''}>${esc(t.button)}</button>`).join('')}
+      <button class="btn secondary" id="btn-dns-update">${esc(DNS_ACTIONS['dns-update'].button)}</button>
+    </div>
+    <p class="card-note">${esc(DNS_EXPLAIN.filter)}</p>
+    <p class="card-note">${esc(DNS_EXPLAIN.takeover)}</p>
+    <p class="card-note">${esc(DNS_EXPLAIN.doh)}${toggles[2].disabled ? ' Turn the takeover on first.' : ''}</p>
+    <p class="card-note">${esc(DNS_EXPLAIN.safesearch)} ${esc(DNS_EXPLAIN.update)}</p>
+
+    <div class="section-divider"><span>Set on the server</span></div>
+    <div class="kv-card">
+      ${kv('Upstream resolvers', esc(upstreams.join(', ') || '—'), 'mono')}
+      ${lists.map(l => kv(l.name, `<span class="pill ${l.enabled ? 'ok' : 'warn'}">${l.enabled ? 'on' : 'off'}</span>`)).join('') || kv('Block lists', 'none')}
+      ${kv('Rewrites', String(dns.rewrites ?? 0))}
+      ${kv('Own rules', String(dns.user_rules ?? 0))}
+    </div>
+    <p class="card-note">Lists, rewrites and own rules are changed in the web panel.</p>`;
+  body.querySelectorAll('[data-dns]').forEach(btn => {
+    const t = toggles.find(x => x.kind === btn.dataset.dns);
+    btn.onclick = () => runAction(id, t.action, t.title, t.text);
+  });
+  const up = dnsUpdate();
+  $('btn-dns-update').onclick = () => runAction(id, up.action, up.title, up.text);
+}
+
 // overnet (github.com/ospab/overnet): .ov sites for this server's clients
 // through the overnet gateway on the server. Off until the owner turns it on.
 function overnetSection(ov) {
@@ -789,13 +847,14 @@ const CONFIRM_LABEL = {
   'panel-disable': 'Turn off the panel', 'sub-disable': 'Turn subscriptions off',
   'overnet-install': 'Install gateway', 'overnet-enable': 'Turn .ov on', 'overnet-disable': 'Turn .ov off',
   'overnet-exit-on': 'Open the exit', 'overnet-exit-off': 'Close the exit',
+  ...Object.fromEntries(Object.entries(DNS_ACTIONS).map(([a, v]) => [a, v.button])),
 };
 
 async function runAction(id, action, confirmTitle, confirmText, params = null) {
   if (changing) { app.showToast('Another change is still running on a server. Wait for it to finish.', 'error'); return; }
   const server = serversCache.find(s => s.id === id);
   const disruptive = ['restart', 'update', 'reboot', 'uninstall', 'panel-enable', 'panel-disable', 'cert-issue',
-    'overnet-enable', 'overnet-disable', 'overnet-exit-on', 'overnet-exit-off'].includes(action);
+    'overnet-enable', 'overnet-disable', 'overnet-exit-on', 'overnet-exit-off'].includes(action) || action in DNS_ACTIONS;
   if (disruptive && server && app.connectedThrough(server.host)) {
     await confirmBox('Disconnect first', 'This app is connected through this server, and this change would cut that connection. Disconnect, then try again.', 'OK', false);
     return;
@@ -807,6 +866,7 @@ async function runAction(id, action, confirmTitle, confirmText, params = null) {
     'sub-enable': 'Turning on subscriptions', 'sub-disable': 'Turning off subscriptions',
     'overnet-install': 'Installing the overnet gateway', 'overnet-enable': 'Turning .ov on', 'overnet-disable': 'Turning .ov off',
     'overnet-exit-on': 'Opening the overnet exit', 'overnet-exit-off': 'Closing the overnet exit',
+    ...Object.fromEntries(Object.entries(DNS_ACTIONS).map(([a, v]) => [a, v.busy])),
   }[action] || action);
   const st = steps(['Running on the server']);
   st.run(0);

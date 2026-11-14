@@ -10,6 +10,7 @@ Older history is on the [Releases](https://github.com/ospab/ostp/releases) page 
 
 ### Added
 - `ostp manage dns` shows the DNS filter's settings as JSON, and the SSH manager of the apps can turn the filter, the takeover, the encrypted-DNS block and safe search on or off and update the lists (`dns-*` actions).
+- Desktop and Android apps: a DNS section in server management (a DNS tab). It shows the server's DNS filter and turns the filter, the takeover, the encrypted-DNS block and safe search on or off and updates the lists; every change asks first, because the service restarts and connected clients drop for a few seconds. The resolvers, lists and the counts of rewrites and own rules are shown read-only.
 
 ### Fixed
 - Desktop and Android apps: "Open the panel" in server management never finished: the SSH manager held its lock on the table of open panels while it took the same lock again, so the call waited for ever (until the app's time limit). Found by driving the app's own SSH manager against a real server.

@@ -172,6 +172,7 @@ Repeat for nginx, apache (Debian and RHEL) and caddy.
 | G-28 | Add a profile from a link with `owndns=true` (and one with `dnsall=true`), press Connect | before the tunnel starts a notice appears; its buttons are disabled for 5 seconds with a countdown, Escape and a click outside do nothing; the `dnsall` text appears only for the second; after a choice the connection starts and the notice does not come back after a restart | P1 |
 | G-29 | Server user with `max_devices: 1`. Import its `https://…/sub/…` in the GUI with *Send a device ID to subscriptions* off | a dialog "This subscription limits devices"; *Cancel*: the card says `Device ID needed: …`, nothing was sent; *Send and retry*: the switch turns on and the subscription is added; the panel lists one device with the OS (`Windows 11`) and the architecture | P1 |
 | G-29a | The same user from a second computer, then a background refresh with the switch off on a third | the second: the card and the toast show the server's `device_limit` message; the background refresh opens no dialog and writes `Device ID needed: …` on the card | P1 |
+| G-30 | *Server management → DNS* on a server with `ostp manage dns`: turn the filter, the takeover, encrypted-DNS block and safe search on and off, *Update lists* | each press asks first with `The service restarts and connected clients drop for a few seconds.` and a button that names the action; the result is shown like other actions and the tab reloads with the new state; the encrypted-DNS button is disabled with a reason while the takeover is off; lists, resolvers, rewrite and rule counts match `ostp manage dns`; against a server without `manage dns` the tab only says it is too old | P1 |
 
 ## 4. Android
 
@@ -195,6 +196,7 @@ Repeat for nginx, apache (Debian and RHEL) and caddy.
 | M-16 | Close and reopen the app with a remembered server; clear the app's data | no password asked / the servers list is empty and nothing crashes | P2 |
 | M-17 | As G-28: a link with `owndns=true` / `dnsall=true`, then change *DNS of this server* in the profile editor | the notice before connecting (back button does nothing, buttons wait 5 seconds); the chosen DNS is the one the tunnel uses (operator: 10.1.0.1); the editor value is kept | P1 |
 | M-18 | As G-29 on a phone: a user with `max_devices: 1`, *Send a device ID to subscriptions* off, add its subscription, then a second phone | the dialog on the first (*Cancel* leaves a card message, *Send and retry* adds it); the panel shows `Android <version>` and the phone's model; the second phone gets the server's `device_limit` message on the card and in the snackbar; a background refresh on launch opens no dialog | P1 |
+| M-19 | As G-30 on a phone: *Settings → Server Management → DNS* | the same texts, confirmations and states as the desktop; the five tabs fit a 360 dp wide screen | P1 |
 
 ## 5. CLI client
 

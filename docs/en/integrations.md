@@ -60,6 +60,7 @@ Both apps can install OSTP on a VPS and manage it afterwards, for people who hav
 - *Status*: service state, version, running time, connected sessions, users, OS, load, memory, disk; restart and update OSTP.
 - *Users*: add, rename, revoke; traffic (kept across restarts and updates) and who is online; add a user's links to this app; share as a QR code.
 - *Connection*: UDP/TCP port, TLS on 443 with the domain and certificate expiry, getting a certificate (`ostp cert issue`), subscriptions on or off.
+- *DNS*: the server's DNS filter (block lists, safe search), shown from `ostp manage dns`. Switches for the filter, the takeover (the server answers every DNS query of its clients, whichever resolver they ask; by default it answers only queries sent to its own address, 10.1.0.1), blocking encrypted DNS (DoT/DoH, which has an effect only while the takeover is on) and safe search, and *Update lists*. The upstream resolvers, the lists with their state and the counts of rewrites and own rules are read-only here (change them in the web panel). Each change asks first, because the service restarts and connected clients drop for a few seconds. A server whose OSTP is too old for `manage dns` is told so, and nothing else is offered.
 - *Management*: the web panel (turn on with a sign-in, open, turn off), the server log, the SSH host key, rename, reboot, uninstall OSTP, forget the server.
 
 Changes that restart the service are refused while this device's VPN goes through the same server, since the answer would never arrive.
