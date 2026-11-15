@@ -212,14 +212,15 @@ pub async fn run_client_core(
         if *shutdown_rx_ext.borrow() {
             // Shutdown was requested during (or right after) this attempt — honor it, don't retry.
             return match result {
-                Err(RunError::Startup(e) | RunError::Crashed(e)) => Err(e),
+                Err(RunError::Startup(e) | RunError::Crashed(e) | RunError::Closed(e)) => Err(e),
                 Ok(()) => Ok(()),
             };
         }
         match result {
             Ok(()) => {}
             // Never retry a start that failed: the user fixes the cause and starts again.
-            Err(RunError::Startup(e)) => return Err(e),
+            // Nor a session the server closed: the user chooses.
+            Err(RunError::Startup(e) | RunError::Closed(e)) => return Err(e),
             Err(RunError::Crashed(e)) => {
                 tracing::warn!("client run ended unexpectedly, will auto-reconnect: {e}");
             }
@@ -251,6 +252,9 @@ enum RunError {
     Startup(anyhow::Error),
     /// A task died after the link had been up: worth a restart.
     Crashed(anyhow::Error),
+    /// The server ended the session on purpose and said why. The user decides
+    /// what to do next: never restarted by itself.
+    Closed(anyhow::Error),
 }
 
 async fn run_client_once(
@@ -330,12 +334,16 @@ async fn run_client_once(
     let was_up = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let was_up_logger = was_up.clone();
     let (first_fail_tx, mut first_fail_rx) = tokio::sync::oneshot::channel::<String>();
+    // The server closed the session on purpose (v6): the run ends with the
+    // reason and is never restarted by itself.
+    let (server_closed_tx, mut server_closed_rx) = tokio::sync::oneshot::channel::<String>();
 
     // Headless event logger
     tokio::spawn(async move {
         let mut last_status = None;
         let mut last_failure = String::new();
         let mut first_fail_tx = Some(first_fail_tx);
+        let mut server_closed_tx = Some(server_closed_tx);
         while let Some(msg) = ui_rx.recv().await {
             match msg {
                 crate::app::UiEvent::Log(text) => {
@@ -361,6 +369,13 @@ async fn run_client_once(
                 crate::app::UiEvent::ProfileChanged(profile) => {
                     if debug_enabled {
                         println!("[ostp] Obfuscation profile: {profile:?}");
+                    }
+                }
+                crate::app::UiEvent::ServerClosed(message) => {
+                    println!("[ostp] {message}");
+                    log_to_core_file(&format!("[ostp] {message}"));
+                    if let Some(tx) = server_closed_tx.take() {
+                        let _ = tx.send(message);
                     }
                 }
                 crate::app::UiEvent::TunnelStopped => {
@@ -441,6 +456,7 @@ async fn run_client_once(
     // Wait for either external shutdown OR any task to fail
     let mut outcome: std::result::Result<(), anyhow::Error> = Ok(());
     let mut first_connect_failed = false;
+    let mut server_closed = false;
     // A JoinHandle that has produced its result must not be awaited again (tokio
     // panics with "JoinHandle polled after completion"), so the branch that took
     // a task's result marks it done and the cleanup below skips it.
@@ -458,6 +474,11 @@ async fn run_client_once(
             } else {
                 anyhow::anyhow!("the first connection to {} failed: {}", server_name, reason)
             });
+        }
+        Ok(message) = &mut server_closed_rx => {
+            let _ = shutdown_tx.send(true);
+            server_closed = true;
+            outcome = Err(anyhow::anyhow!(message));
         }
         res = &mut bridge_task => {
             bridge_done = true;
@@ -493,6 +514,7 @@ async fn run_client_once(
 
     match outcome {
         Ok(()) => Ok(()),
+        Err(e) if server_closed => Err(RunError::Closed(e)),
         Err(e) if first_connect_failed || !was_up.load(std::sync::atomic::Ordering::Relaxed) => Err(RunError::Startup(e)),
         Err(e) => Err(RunError::Crashed(e)),
     }

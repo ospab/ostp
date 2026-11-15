@@ -52,6 +52,20 @@ async fn start_server(protocol: Option<serde_json::Value>) -> SocketAddr {
 /// tests need `127.0.0.1`: without it the association's socket is `[::]`,
 /// which on Windows is IPv6-only and cannot send to an IPv4 target.
 async fn start_server_bound(protocol: Option<serde_json::Value>, bind_ip: Option<&str>) -> SocketAddr {
+    start_server_full(protocol, bind_ip, None, None).await
+}
+
+const API_TOKEN: &str = "v6-wire-e2e-token";
+
+/// `config_path`: the file the server watches for access-key changes (hot
+/// reload, polled every 5 s). `api`: where the management API listens (token
+/// `API_TOKEN`), to read the server's own count of live sessions.
+async fn start_server_full(
+    protocol: Option<serde_json::Value>,
+    bind_ip: Option<&str>,
+    config_path: Option<std::path::PathBuf>,
+    api: Option<SocketAddr>,
+) -> SocketAddr {
     let addr: SocketAddr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
     let mut cfg = serde_json::json!({
         "listen": addr.to_string(),
@@ -71,11 +85,18 @@ async fn start_server_bound(protocol: Option<serde_json::Value>, bind_ip: Option
         bind_ip: bind_ip.map(str::to_string),
         access_keys: vec![(KEY.to_string(), ostp_server::api::UserMeta { name: None, limit_bytes: None, max_devices: None })],
         outbound: None,
-        api_config: None,
+        api_config: api.map(|a| ostp_server::api::ApiConfig {
+            enabled: true,
+            bind: a.to_string(),
+            token: Some(API_TOKEN.to_string()),
+            webpath: String::new(),
+            username: String::new(),
+            password_hash: String::new(),
+        }),
         fallback_config: None,
         privacy: ostp_core::logpriv::Privacy::Normal,
         dns_config: None,
-        config_path: None,
+        config_path,
         tls: None,
         subscription: None,
         overnet: None,
@@ -117,11 +138,17 @@ async fn start_echo() -> SocketAddr {
 }
 
 struct Client {
-    _cmd: mpsc::Sender<BridgeCommand>,
+    cmd: mpsc::Sender<BridgeCommand>,
     proxy_ev: mpsc::Sender<ProxyEvent>,
     to_app: mpsc::UnboundedReceiver<(u32, ProxyToClientMsg)>,
     logs: Arc<Mutex<Vec<String>>>,
     _shutdown: watch::Sender<bool>,
+    metrics: Arc<BridgeMetrics>,
+    /// When the bridge reported that the server closed the session, and what
+    /// it told the user.
+    closed: Arc<Mutex<Option<(std::time::Instant, String)>>>,
+    /// `TunnelStopped` was reported.
+    stopped: Arc<AtomicBool>,
 }
 
 impl Client {
@@ -139,7 +166,7 @@ impl Client {
             connection_state: AtomicU8::new(0),
             rtt_ms: AtomicU32::new(0),
         });
-        let bridge = Bridge::new(&cfg, metrics).unwrap();
+        let bridge = Bridge::new(&cfg, metrics.clone()).unwrap();
         let (ui_tx, mut ui_rx) = mpsc::channel(4096);
         let (cmd_tx, cmd_rx) = mpsc::channel(16);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -147,18 +174,23 @@ impl Client {
         let (to_app_tx, to_app_rx) = mpsc::unbounded_channel();
         tokio::spawn(bridge.run(ui_tx, cmd_rx, shutdown_rx, proxy_ev_rx, to_app_tx));
         let logs = Arc::new(Mutex::new(Vec::new()));
+        let closed = Arc::new(Mutex::new(None));
+        let stopped = Arc::new(AtomicBool::new(false));
         {
-            let logs = logs.clone();
+            let (logs, closed, stopped) = (logs.clone(), closed.clone(), stopped.clone());
             tokio::spawn(async move {
                 while let Some(ev) = ui_rx.recv().await {
-                    if let UiEvent::Log(line) = ev {
-                        logs.lock().unwrap().push(line);
+                    match ev {
+                        UiEvent::Log(line) => logs.lock().unwrap().push(line),
+                        UiEvent::ServerClosed(message) => *closed.lock().unwrap() = Some((std::time::Instant::now(), message)),
+                        UiEvent::TunnelStopped => stopped.store(true, Ordering::Relaxed),
+                        _ => {}
                     }
                 }
             });
         }
         cmd_tx.send(BridgeCommand::ToggleTunnel).await.unwrap();
-        Client { _cmd: cmd_tx, proxy_ev: proxy_ev_tx, to_app: to_app_rx, logs, _shutdown: shutdown_tx }
+        Client { cmd: cmd_tx, proxy_ev: proxy_ev_tx, to_app: to_app_rx, logs, _shutdown: shutdown_tx, metrics, closed, stopped }
     }
 
     async fn wait_log(&self, needle: &str, within: Duration) -> bool {
@@ -748,6 +780,113 @@ async fn a_udp_flow_works_and_a_datagram_lost_on_the_path_is_not_resent() {
     // The flow goes on.
     flow.send(udp_target, b"after").await;
     assert_eq!(flow.recv(Duration::from_secs(5)).await.as_deref(), Some(&b"after"[..]));
+}
+
+// ── The session Close (stage 3) ──────────────────────────────────────────────
+
+/// The server's own count of live sessions, from its management API.
+async fn live_sessions(api: SocketAddr) -> Option<u64> {
+    let mut s = TcpStream::connect(api).await.ok()?;
+    let req = format!(
+        "GET /panel/api/server/status HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer {API_TOKEN}\r\nConnection: close\r\n\r\n"
+    );
+    s.write_all(req.as_bytes()).await.ok()?;
+    let mut raw = Vec::new();
+    timeout(Duration::from_secs(2), s.read_to_end(&mut raw)).await.ok()?.ok()?;
+    let text = String::from_utf8_lossy(&raw);
+    let body = &text[text.find('{')?..=text.rfind('}')?];
+    let v: serde_json::Value = serde_json::from_str(body).ok()?;
+    v["data"]["connections"].as_u64()
+}
+
+async fn wait_live_sessions(api: SocketAddr, want: u64, within: Duration) -> Option<std::time::Instant> {
+    let deadline = tokio::time::Instant::now() + within;
+    while tokio::time::Instant::now() < deadline {
+        if live_sessions(api).await == Some(want) {
+            return Some(std::time::Instant::now());
+        }
+        tokio::time::sleep(Duration::from_millis(30)).await;
+    }
+    None
+}
+
+fn config_with_keys(keys: &[&str]) -> String {
+    serde_json::json!({ "mode": "server", "access_keys": keys }).to_string()
+}
+
+/// The server drops the key (hot reload of its config): the v6 client is told
+/// at once, stops within a second of that, says why, and does not reconnect.
+#[tokio::test(flavor = "multi_thread")]
+async fn removing_the_key_closes_the_session_with_a_reason_and_the_client_stops_without_reconnecting() {
+    let dir = std::env::temp_dir().join(format!("ostp-v6-close-{}", free_port()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let config = dir.join("config.json");
+    std::fs::write(&config, config_with_keys(&[KEY])).unwrap();
+    let api: SocketAddr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
+    let (protocol, public) = section(false);
+    let server = start_server_full(Some(protocol), None, Some(config.clone()), Some(api)).await;
+    let echo = start_echo().await;
+    let mut client = Client::from_link(&link_to(server, Some(public)), "udp").await;
+    assert!(client.wait_log("Connection established", Duration::from_secs(10)).await, "log:\n{}", client.log_text());
+    client.echo_through(echo, b"before the key is removed").await;
+    assert!(wait_live_sessions(api, 1, Duration::from_secs(5)).await.is_some(), "the server counts the session");
+
+    // The key goes. The server notices within its 5 s poll; what is measured is
+    // what happens after it drops the session.
+    std::fs::write(&config, config_with_keys(&[])).unwrap();
+    let dropped_at = wait_live_sessions(api, 0, Duration::from_secs(20))
+        .await
+        .unwrap_or_else(|| panic!("the server did not drop the session; log:\n{}", client.log_text()));
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while client.closed.lock().unwrap().is_none() && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let (closed_at, message) = client
+        .closed
+        .lock()
+        .unwrap()
+        .clone()
+        .unwrap_or_else(|| panic!("the client was not told; log:\n{}", client.log_text()));
+    assert!(
+        closed_at.saturating_duration_since(dropped_at) < Duration::from_secs(1),
+        "the client stopped {:?} after the server dropped the session (silence detection would take 10 s)",
+        closed_at.saturating_duration_since(dropped_at)
+    );
+    assert!(message.starts_with("The server closed the connection: your key was revoked"), "{message}");
+    assert!(message.contains("Ask the server owner"), "{message}");
+    assert!(client.stopped.load(Ordering::Relaxed), "the tunnel is reported stopped");
+    assert_eq!(client.metrics.connection_state.load(Ordering::Relaxed), 0, "and the state is `stopped`");
+
+    // No reconnect by itself, and not through the failure path.
+    tokio::time::sleep(Duration::from_secs(6)).await;
+    let log = client.log_text();
+    assert_eq!(log.matches("Connection established").count(), 1, "no second connection:\n{log}");
+    assert!(!log.to_lowercase().contains("reconnect"), "{log}");
+    assert!(!log.contains("No answer from the server"), "{log}");
+    assert!(!log.contains("control stream was lost"), "{log}");
+    assert_eq!(client.metrics.connection_state.load(Ordering::Relaxed), 0);
+    assert_eq!(live_sessions(api).await, Some(0));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The client stops on purpose: the server frees the session at once, not
+/// after its ten minutes of idle time.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_client_that_stops_frees_its_session_on_the_server_at_once() {
+    let api: SocketAddr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
+    let (protocol, public) = section(false);
+    let server = start_server_full(Some(protocol), None, None, Some(api)).await;
+    let echo = start_echo().await;
+    let mut client = Client::from_link(&link_to(server, Some(public)), "udp").await;
+    assert!(client.wait_log("Connection established", Duration::from_secs(10)).await, "log:\n{}", client.log_text());
+    client.echo_through(echo, b"hello").await;
+    assert!(wait_live_sessions(api, 1, Duration::from_secs(5)).await.is_some(), "the server counts the session");
+
+    let stop = std::time::Instant::now();
+    client.cmd.send(BridgeCommand::ToggleTunnel).await.unwrap();
+    let freed = wait_live_sessions(api, 0, Duration::from_secs(3)).await.expect("the session is not freed");
+    assert!(freed.duration_since(stop) < Duration::from_secs(1), "freed after {:?}", freed.duration_since(stop));
 }
 
 /// A 0.4.x profile against the transitional server: the old behaviour, through

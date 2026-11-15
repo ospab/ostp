@@ -167,6 +167,8 @@ struct Collected {
     datagrams: Vec<(u32, Bytes)>,
     /// Streams reset by the peer or given up on by us (v6).
     resets: Vec<u32>,
+    /// The server ended the session on purpose (v6 `Close` with a reason).
+    closed: Option<(ostp_core::CloseReason, String)>,
 }
 
 impl Collected {
@@ -182,6 +184,7 @@ impl Collected {
             ProtocolAction::DeliverApp(stream, payload) => self.streams.push((stream, payload)),
             ProtocolAction::DeliverDatagram(stream, payload) => self.datagrams.push((stream, payload)),
             ProtocolAction::StreamReset(stream, _reason) => self.resets.push(stream),
+            ProtocolAction::PeerClosed(reason, text) => self.closed = Some((reason, text)),
             ProtocolAction::Multiple(list) => {
                 for item in list {
                     self.add(item);
@@ -602,7 +605,7 @@ impl Bridge {
             session.last_recv = Instant::now();
         }
 
-        let Collected { frames, streams, datagrams, resets } = Collected::from(initial_action);
+        let Collected { frames, streams, datagrams, resets, closed } = Collected::from(initial_action);
         for frame in frames {
             let _ = send_datagram(&session.socket, &frame, false).await;
             self.metrics.bytes_sent.fetch_add(frame.len() as u64, Ordering::Relaxed);
@@ -623,7 +626,40 @@ impl Bridge {
         }
         for wire_stream_id in resets {
             self.on_stream_reset(session_index, wire_stream_id, tx, proxy_tx).await;
+            // A reset of stream 0 starts a reconnect and drops the sessions.
+            if self.sessions.get(session_index).is_none() {
+                return;
+            }
         }
+        if let Some((reason, text)) = closed {
+            self.on_server_close(reason, &text, tx, proxy_tx).await;
+        }
+    }
+
+    /// The server ended the session on purpose and said why (v6 `Close`). Not
+    /// a failure of the path or of the protocol, so nothing is recovered or
+    /// reconnected: the tunnel stops, the reason goes to the user, and the user
+    /// decides what to do (the client never reconnects on its own after this).
+    /// The acknowledgement of the `Close` was sent with this batch of frames.
+    async fn on_server_close(
+        &mut self,
+        reason: ostp_core::CloseReason,
+        text: &str,
+        tx: &mpsc::Sender<UiEvent>,
+        proxy_tx: &mpsc::UnboundedSender<(u32, ProxyToClientMsg)>,
+    ) {
+        let message = crate::app::server_close_message(reason, text);
+        let _ = tx
+            .send(UiEvent::Log(format!("Session closed by the server (reason {}). {message}", reason.to_wire())))
+            .await;
+        // Before the state turns to "stopped": an app that polls it finds the reason.
+        crate::app::set_stop_notice(Some(message.clone()));
+        // Any other session of a multiplexed tunnel is told we are leaving; the
+        // one that was closed is already done and sends nothing.
+        self.close_sessions().await;
+        self.reset_proxy_streams(tx, proxy_tx, "closed by the server");
+        let _ = tx.send(UiEvent::ServerClosed(message)).await;
+        let _ = tx.send(UiEvent::TunnelStopped).await;
     }
 
     /// A message the server sent on a stream (or, for stream 0, on the
@@ -822,6 +858,7 @@ impl Bridge {
                     let stop_msg = if self.mode == "tun" { "TUN tunnel stopped" } else { "Bridge stopped" };
                     tx.send(UiEvent::Log(stop_msg.to_string())).await.ok();
                 } else {
+                    crate::app::set_stop_notice(None);
                     tx.send(UiEvent::Log("Connecting to remote server...".to_string())).await.ok();
                     tx.send(UiEvent::Metrics { status: ConnectionStatus::Handshaking, rtt_ms: 0.0, throughput_bps: 0 }).await.ok();
                     self.metrics.connection_state.store(1, Ordering::Relaxed);
