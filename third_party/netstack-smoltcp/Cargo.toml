@@ -1,0 +1,42 @@
+[package]
+name = "netstack-smoltcp"
+version = "0.2.4"
+edition = "2021"
+authors = ["cavivie <cavivie@gmail.com>"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/cavivie/netstack-smoltcp"
+homepage = "https://github.com/cavivie/netstack-smoltcp"
+documentation = "https://docs.rs/netstack-smoltcp"
+keywords = ["netstack", "smoltcp", "network", "ip", "tun"]
+categories = ["network-programming"]
+description = """
+A netstack for the special purpose of turning packets from/to a TUN interface
+into TCP streams and UDP packets. It uses smoltcp-rs as the backend netstack.
+OSTP copy: adds TcpStream::abort (a TCP RST instead of a FIN).
+"""
+rust-version = "1.75.0"
+publish = false
+
+[dependencies]
+tracing = { version = "0.1", default-features = false, features = ["std"] }
+tokio = { version = "1", features = ["sync", "time", "rt", "macros"] }
+tokio-util = "0.7.10"
+etherparse = "0.16"
+futures = "0.3"
+rand = "0.8"
+spin = "0.9"
+smoltcp = { version = "0.12", default-features = false, features = [
+    "std",
+    "log",
+    "medium-ip",
+    "proto-ipv4",
+    "proto-ipv6",
+    "socket-icmp",
+    "socket-udp",
+    "socket-tcp",
+] }
+
+# The upstream examples and their dev-dependencies (tun2, tun-rs, structopt,
+# socket2, tracing-subscriber) are not part of this copy.
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "macros", "rt-multi-thread", "io-util", "time"] }

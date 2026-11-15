@@ -56,6 +56,8 @@ ostp-control/
 
 .agents/
 netstack-smoltcp/
+# ...except the patched copy the build depends on (third_party/netstack-smoltcp/README.md)
+!third_party/netstack-smoltcp/
 dnstt/
 ostp-web/
 

@@ -5,7 +5,7 @@ members = [
     "ostp-server",
     "ostp-jni", "ostp",
     "ostpd"
-, "ostp-tun", "ostp-dns", "ostp-ssh", "ostp-warp"]
+, "ostp-tun", "ostp-dns", "ostp-ssh", "ostp-warp", "third_party/netstack-smoltcp"]
 exclude = ["ostp-gui/src-tauri", "ostp-brain", "ostp-prober", "ostp-lab"]
 resolver = "2"
 
@@ -28,3 +28,8 @@ tracing = "0.1"
 sha2 = "0.10"
 hmac = "0.12"
 portable-atomic = "1.10"
+
+# netstack-smoltcp 0.2.4 with TcpStream::abort (a TCP RST); see third_party/netstack-smoltcp/README.md.
+# ostp-gui/src-tauri is a separate workspace and carries the same patch.
+[patch.crates-io]
+netstack-smoltcp = { path = "third_party/netstack-smoltcp" }
