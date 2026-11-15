@@ -143,7 +143,14 @@ async fn start_relay(upstream: SocketAddr) -> Relay {
             let flows: UdpFlows = Default::default();
             let mut buf = vec![0u8; 65535];
             loop {
-                let (n, client) = front.recv_from(&mut buf).await.unwrap();
+                // On Windows a datagram sent earlier to a closed port makes the
+                // next recv_from fail with WSAECONNRESET (10054); the socket is
+                // fine, so the relay keeps going instead of dying with the test.
+                let (n, client) = match front.recv_from(&mut buf).await {
+                    Ok(r) => r,
+                    Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => continue,
+                    Err(e) => panic!("relay recv: {e}"),
+                };
                 if blackhole.load(std::sync::atomic::Ordering::Relaxed) {
                     continue;
                 }
