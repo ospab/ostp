@@ -3376,7 +3376,7 @@ dependencies = [
 
 [[package]]
 name = "ostp-client"
-version = "0.4.8"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -3411,14 +3411,16 @@ dependencies = [
 
 [[package]]
 name = "ostp-core"
-version = "0.4.8"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
  "bytes",
+ "chacha20 0.9.1",
  "chacha20poly1305",
  "hkdf 0.12.4",
  "hmac 0.12.1",
+ "idna",
  "percent-encoding",
  "rand 0.8.6",
  "serde",
@@ -3433,7 +3435,7 @@ dependencies = [
 
 [[package]]
 name = "ostp-gui"
-version = "0.4.8"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -3458,7 +3460,7 @@ dependencies = [
 
 [[package]]
 name = "ostp-ssh"
-version = "0.4.8"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -3473,10 +3475,11 @@ dependencies = [
 
 [[package]]
 name = "ostp-tun"
-version = "0.4.8"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "libc",
+ "ostp-core",
  "tokio",
  "tracing",
  "tun",

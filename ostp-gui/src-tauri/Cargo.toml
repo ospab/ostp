@@ -1,6 +1,6 @@
 [package]
 name = "ostp-gui"
-version = "0.4.8"
+version = "0.5.0"
 description = "OSTP desktop GUI"
 authors = ["ospab"]
 edition = "2021"
