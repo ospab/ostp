@@ -78,6 +78,41 @@ impl Drop for WindowsRouteGuard {
     }
 }
 
+/// The smallest MTU IPv6 allows (RFC 8200 §5); Windows refuses a lower one.
+const IPV6_MIN_MTU: u16 = 1280;
+
+/// The MTUs to give the adapter: IPv4 takes the configured one, IPv6 the same
+/// but never under its minimum. TCP through the tunnel ends at the local
+/// stack, which announces its own MSS, so an IPv6 MTU above the configured one
+/// only matters for large IPv6 UDP datagrams.
+fn tun_mtus(mtu: u16) -> (u16, u16) {
+    (mtu, mtu.max(IPV6_MIN_MTU))
+}
+
+/// Sets the adapter's MTU per address family (`store=active`: it goes with the
+/// adapter). A failure is logged and the tunnel still starts.
+async fn set_tun_mtu(idx: u32, mtu: u16) {
+    const CREATE_NO_WINDOW: u32 = 0x08000000;
+    let (v4, v6) = tun_mtus(mtu);
+    let results = tokio::task::spawn_blocking(move || {
+        let run = |family: &str, value: u16| {
+            Command::new("netsh")
+                .creation_flags(CREATE_NO_WINDOW)
+                .args(["interface", family, "set", "subinterface", &idx.to_string(), &format!("mtu={value}"), "store=active"])
+                .output()
+                .is_ok_and(|o| o.status.success())
+        };
+        (run("ipv4", v4), run("ipv6", v6))
+    })
+    .await
+    .unwrap_or((false, false));
+    match results {
+        (true, true) => tracing::info!("TUN MTU set: IPv4 {v4}, IPv6 {v6} (if_index={idx})."),
+        (true, false) => tracing::warn!("TUN MTU set for IPv4 ({v4}); IPv6 refused {v6} (IPv6 may be off on this machine)."),
+        (false, _) => tracing::error!("Could not set the TUN MTU to {v4} (if_index={idx}); large packets may be dropped."),
+    }
+}
+
 pub async fn create(opts: OstpTunOptions) -> Result<OstpTunInterface> {
     const CREATE_NO_WINDOW: u32 = 0x08000000;
 
@@ -107,11 +142,13 @@ pub async fn create(opts: OstpTunOptions) -> Result<OstpTunInterface> {
         .address((10, 1, 0, 2))
         .netmask((255, 255, 255, 0))
         .destination((10, 1, 0, 1))
-        .mtu(opts.mtu)
         .up();
+    // No `.mtu()` here: the tun crate sets it for IPv4 and IPv6 alike, and IPv6
+    // refuses anything under 1280 with os error 87 (ERROR_INVALID_PARAMETER),
+    // so with the default MTU of 1140 the adapter could never be set up. The
+    // MTU is set per family below, once the interface index is known.
 
-    // Setting the address right after the adapter is created can fail with os error 87
-    // until the interface is registered in the IP stack; a retry reuses the adapter.
+    // A retry reuses the adapter left by the previous attempt.
     let dev = {
         let mut attempt = 0;
         loop {
@@ -156,6 +193,10 @@ pub async fn create(opts: OstpTunOptions) -> Result<OstpTunInterface> {
             idx
         }
     };
+
+    if let Some(idx) = tun_index {
+        set_tun_mtu(idx, opts.mtu).await;
+    }
 
     if let Some(idx) = tun_index {
         match windows_route::sys::add_ipv4_route(
@@ -243,4 +284,18 @@ pub async fn create(opts: OstpTunOptions) -> Result<OstpTunInterface> {
             ipv6_if,
         }),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The default MTU (1140) is below IPv6's minimum: IPv4 keeps it, IPv6
+    /// gets 1280. Asking Windows for 1140 on IPv6 failed with os error 87.
+    #[test]
+    fn ipv6_never_gets_an_mtu_under_its_minimum() {
+        assert_eq!(tun_mtus(1140), (1140, 1280));
+        assert_eq!(tun_mtus(1280), (1280, 1280));
+        assert_eq!(tun_mtus(1400), (1400, 1400));
+    }
 }
