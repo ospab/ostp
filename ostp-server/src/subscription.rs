@@ -66,6 +66,8 @@ pub struct SubscriptionService {
     pub tls: Option<TlsLink>,
     /// Host and port of the plain UDP link.
     pub udp: (String, u16),
+    /// The server's static public key (protocol v6); goes into every link as `pk`.
+    pub server_pk: Option<[u8; 32]>,
     pub dns: Arc<crate::dns::DnsServer>,
     pub keys: Arc<RwLock<HashMap<String, UserMeta>>>,
     pub stats: Arc<RwLock<HashMap<String, Arc<UserStats>>>>,
@@ -174,13 +176,13 @@ impl SubscriptionService {
 
         let mut links = Vec::new();
         if let (true, Some(t)) = (self.settings.include_tls, &self.tls) {
-            let mut l = ShareLink::tls_for(key, &t.host, t.port, t.path.clone(), owndns);
+            let mut l = ShareLink::tls_for(key, &t.host, t.port, t.path.clone(), owndns).with_pk(self.server_pk);
             l.name = Some(title("TLS"));
             l.dnsall = dnsall;
             links.push(l.to_uri());
         }
         if self.settings.include_udp {
-            let mut l = ShareLink::udp_for(key, &self.udp.0, self.udp.1, owndns);
+            let mut l = ShareLink::udp_for(key, &self.udp.0, self.udp.1, owndns).with_pk(self.server_pk);
             l.name = Some(title("UDP"));
             l.dnsall = dnsall;
             links.push(l.to_uri());
@@ -432,6 +434,7 @@ mod tests {
             },
             tls: Some(TlsLink { host: "vpn.example.com".into(), port: 443, path: Some("/s3cr3tpath".into()) }),
             udp: ("vpn.example.com".into(), 50000),
+            server_pk: None,
             dns: crate::dns::DnsServer::new(Default::default(), None),
             keys: Arc::new(RwLock::new(keys)),
             stats: Arc::new(RwLock::new(stats)),
@@ -514,6 +517,20 @@ x-device-model: PC
         assert_eq!(links[0].key, "key-a");
         assert!(links[0].name.as_deref().unwrap().contains("alice"));
         assert!(!links[1].tls && links[1].port == 50000);
+    }
+
+    #[tokio::test]
+    async fn links_carry_the_server_key_only_when_the_server_has_one() {
+        let mut svc = service();
+        let none = svc.document("key-a").await;
+        assert!(none.valid_links().iter().all(|l| l.pk.is_none()), "no key: v5 profiles");
+        assert!(none.links.iter().all(|l| !l.contains("pk=")));
+        let (_, public) = ostp_core::crypto::noise::generate_server_key();
+        svc.server_pk = Some(public);
+        let doc = svc.document("key-a").await;
+        let links = doc.valid_links();
+        assert_eq!(links.len(), 2);
+        assert!(links.iter().all(|l| l.pk == Some(public)), "TLS and UDP links are both v6 profiles");
     }
 
     #[tokio::test]

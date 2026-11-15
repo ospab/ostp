@@ -111,6 +111,19 @@ pub struct ServerParams {
     pub warp: Option<warp::WarpConfig>,
     /// Clients may reach this machine's services and private networks.
     pub local_access: bool,
+    /// The `protocol` section: the server's static X25519 private key
+    /// (protocol v6) and whether v5 clients are still accepted. Read at
+    /// start; a change takes a restart (the hot reload covers access keys only).
+    pub wire: WireSettings,
+}
+
+/// Which wire versions the server speaks.
+#[derive(Debug, Clone, Default)]
+pub struct WireSettings {
+    /// The private half of the server key. `None`: v5 only, as before 0.5.0.
+    pub server_key: Option<[u8; 32]>,
+    /// Keep accepting v5 clients next to v6. Ignored without a key.
+    pub accept_v5: bool,
 }
 
 pub async fn run_server(params: ServerParams) -> Result<()> {
@@ -130,6 +143,7 @@ pub async fn run_server(params: ServerParams) -> Result<()> {
         overnet,
         warp,
         local_access,
+        wire,
     } = params;
     let mut keys_map = HashMap::new();
     for (key, meta) in access_keys {
@@ -165,7 +179,15 @@ pub async fn run_server(params: ServerParams) -> Result<()> {
         ..ProtocolConfig::with_defaults(NoiseRole::Responder, 1350)
     };
 
-    let dispatcher = Dispatcher::new(protocol_config, shared_keys.clone());
+    let mut dispatcher = Dispatcher::new(protocol_config, shared_keys.clone());
+    dispatcher.set_wire_versions(wire.server_key, wire.accept_v5);
+    // Only the public half is ever used outside the dispatcher (links, logs).
+    let server_pk = wire.server_key.as_ref().map(ostp_core::crypto::noise::server_public_key);
+    match (&server_pk, wire.accept_v5) {
+        (Some(_), true) => tracing::info!("Wire: protocol v6 with a server key; v5 clients are still accepted (transitional mode)"),
+        (Some(_), false) => tracing::info!("Wire: protocol v6 only; v5 clients are refused"),
+        (None, _) => tracing::info!("Wire: protocol v5 only (no server key in the config; `ostp v6 key new` creates one)"),
+    }
 
     // Traffic per user carries over restarts and updates: without this every
     // restart zeroed the counters, and with them the traffic limits.
@@ -363,6 +385,7 @@ pub async fn run_server(params: ServerParams) -> Result<()> {
                 settings,
                 tls: tls_link.clone(),
                 udp: (server_host.clone(), server_port),
+                server_pk,
                 dns: dns_server.clone(),
                 keys: shared_keys.clone(),
                 stats: dispatcher.user_stats_ref(),
@@ -389,7 +412,7 @@ pub async fn run_server(params: ServerParams) -> Result<()> {
             let tls_link = tls_link.clone();
             let sub_prefix = subscription.as_ref().map(|s| s.settings.prefix.clone());
             tokio::spawn(async move {
-                api::start_api_server(api_cfg, api_keys, api_stats, server_host, server_port, tls_link, sub_prefix, config_path_api, dns_server_api, router_api).await;
+                api::start_api_server(api_cfg, api_keys, api_stats, server_host, server_port, server_pk, tls_link, sub_prefix, config_path_api, dns_server_api, router_api).await;
             });
         }
     }

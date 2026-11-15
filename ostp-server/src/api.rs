@@ -74,6 +74,8 @@ pub struct ApiState {
     /// Server address for subscription links (e.g. "example.com")
     pub server_host: String,
     pub server_port: u16,
+    /// The server's static public key (protocol v6); goes into every link as `pk`.
+    pub server_pk: Option<[u8; 32]>,
     /// Where clients reach the server over TLS, when that is set up.
     pub tls_link: Option<TlsLink>,
     /// Subscription URL prefix (e.g. "/sub") when subscriptions are served.
@@ -381,6 +383,7 @@ pub async fn start_api_server(
     user_stats: Arc<RwLock<HashMap<String, Arc<UserStats>>>>,
     server_host: String,
     server_port: u16,
+    server_pk: Option<[u8; 32]>,
     tls_link: Option<TlsLink>,
     subscription_prefix: Option<String>,
     config_path: Option<std::path::PathBuf>,
@@ -410,6 +413,7 @@ pub async fn start_api_server(
         password_hash: config.password_hash.clone(),
         server_host,
         server_port,
+        server_pk,
         tls_link,
         subscription_prefix,
         devices: crate::devices::DeviceStore::shared(config_path.as_ref().and_then(|p| p.parent()).map(|d| d.join("devices.json"))),
@@ -1194,11 +1198,11 @@ async fn handle_user_share(
         Some(n) => format!("{n} · {kind}"),
         None => format!("{} · {kind}", state.server_host),
     };
-    let mut udp = ShareLink::udp_for(&key, &state.server_host, state.server_port, owndns);
+    let mut udp = ShareLink::udp_for(&key, &state.server_host, state.server_port, owndns).with_pk(state.server_pk);
     udp.name = Some(title("UDP"));
     udp.dnsall = dnsall;
     let tls = state.tls_link.as_ref().map(|t| {
-        let mut l = ShareLink::tls_for(&key, &t.host, t.port, t.path.clone(), owndns);
+        let mut l = ShareLink::tls_for(&key, &t.host, t.port, t.path.clone(), owndns).with_pk(state.server_pk);
         l.name = Some(title("TLS"));
         l.dnsall = dnsall;
         l.to_uri()
@@ -1295,8 +1299,8 @@ async fn handle_subscribe(
 
     use ostp_core::share_link::ShareLink;
     let dns_enabled = state.dns_server.enabled();
-    let udp = ShareLink::udp_for(&key, &state.server_host, state.server_port, dns_enabled);
-    let tls = state.tls_link.as_ref().map(|t| ShareLink::tls_for(&key, &t.host, t.port, t.path.clone(), dns_enabled));
+    let udp = ShareLink::udp_for(&key, &state.server_host, state.server_port, dns_enabled).with_pk(state.server_pk);
+    let tls = state.tls_link.as_ref().map(|t| ShareLink::tls_for(&key, &t.host, t.port, t.path.clone(), dns_enabled).with_pk(state.server_pk));
     let chosen = match (query.transport.as_deref(), &tls) {
         (Some("udp"), _) | (_, None) => udp.clone(),
         (_, Some(t)) => t.clone(),
@@ -1371,6 +1375,7 @@ mod tests {
             password_hash: "hash".to_string(),
             server_host: "127.0.0.1".to_string(),
             server_port: 50000,
+            server_pk: None,
             tls_link: None,
             subscription_prefix: None,
             config_path: None,
@@ -1608,6 +1613,7 @@ mod tests {
                 state.user_stats,
                 String::new(),
                 0,
+                None,
                 None,
                 None,
                 None,

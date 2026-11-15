@@ -8,6 +8,7 @@ pub mod keys;
 pub mod net;
 pub mod protocol;
 pub mod relay;
+pub mod server_key;
 pub mod share_link;
 pub mod subscription;
 

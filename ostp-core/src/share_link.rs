@@ -1,6 +1,8 @@
 //! `ostp://` share-link codec, shared by the CLI and the server's subscribe API.
 //!
-//! `ostp://KEY@HOST:PORT?type=uot&tls=1&sni=..&insecure=1&path=%2F..&tun=true&dns=..&owndns=true&dnsall=true&name=..`
+//! `ostp://KEY@HOST:PORT?type=uot&tls=1&sni=..&insecure=1&path=%2F..&tun=true&dns=..&owndns=true&dnsall=true&name=..&pk=..`
+//!
+//! `pk` is the server's public key (protocol v6, base64url); a link without it is a v5 profile.
 //!
 //! The Dart (Android) and JS (desktop GUI) ports must stay in step with this;
 //! the vectors in the tests below are the shared reference.
@@ -45,6 +47,10 @@ pub struct ShareLink {
     /// here so apps can say so before the first connection).
     pub dnsall: bool,
     pub name: Option<String>,
+    /// The server's static public key (`pk=`, base64url, 32 bytes). With it
+    /// the link is a protocol v6 profile and the client checks the server;
+    /// without it, a v5 profile.
+    pub pk: Option<[u8; 32]>,
 }
 
 impl ShareLink {
@@ -63,7 +69,14 @@ impl ShareLink {
             owndns: false,
             dnsall: false,
             name: None,
+            pk: None,
         }
+    }
+
+    /// The same link as a v6 profile for the server with this public key.
+    pub fn with_pk(mut self, pk: Option<[u8; 32]>) -> Self {
+        self.pk = pk;
+        self
     }
 
     /// Plain UDP link; `owndns` when the server runs its own resolver.
@@ -144,6 +157,9 @@ impl ShareLink {
                 "owndns" => link.owndns = truthy(&v),
                 "dnsall" => link.dnsall = truthy(&v),
                 "name" => link.name = non_empty(v),
+                // A damaged key is an error: quietly dropping it would turn a
+                // v6 profile into a v5 one.
+                "pk" => link.pk = Some(crate::server_key::decode_key(&v).map_err(|e| anyhow!("link has an invalid pk: {e}"))?),
                 _ => {}
             }
         }
@@ -182,6 +198,9 @@ impl ShareLink {
         }
         if let Some(name) = &self.name {
             q.push(format!("name={}", encode(name)));
+        }
+        if let Some(pk) = &self.pk {
+            q.push(format!("pk={}", crate::server_key::encode_key(pk)));
         }
         format!("ostp://{}@{}?{}", encode(&self.key), self.server(), q.join("&"))
     }
@@ -256,6 +275,36 @@ mod tests {
         assert_eq!(l.dns.as_deref(), Some("1.1.1.1"));
         assert_eq!(l.name.as_deref(), Some("My VPN"));
         assert_eq!(l.to_uri(), uri);
+    }
+
+    #[test]
+    fn a_link_with_pk_is_a_v6_profile_and_round_trips() {
+        let pk = [0xabu8; 32];
+        let text = crate::server_key::encode_key(&pk);
+        let uri = format!("ostp://k1@vpn.example.com:443?type=uot&tls=1&path=%2Fx&name=A&pk={text}");
+        let l = ShareLink::parse(&uri).unwrap();
+        assert_eq!(l.pk, Some(pk));
+        assert_eq!(l.to_uri(), uri);
+        // Without pk it is a v5 profile and the output has no pk.
+        let v5 = ShareLink::parse("ostp://k1@h:1?type=udp").unwrap();
+        assert_eq!(v5.pk, None);
+        assert!(!v5.to_uri().contains("pk="));
+        assert_eq!(ShareLink::new("k", "h", 1).with_pk(Some(pk)).to_uri(), format!("ostp://k@h:1?type=udp&pk={text}"));
+    }
+
+    #[test]
+    fn a_malformed_pk_is_an_error_not_a_v5_profile() {
+        let good = crate::server_key::encode_key(&[1u8; 32]);
+        for bad in [
+            good[..42].to_string(),
+            format!("{good}A"),
+            format!("{}!", &good[..42]),
+            "%%%".to_string(),
+            String::new(),
+        ] {
+            let uri = format!("ostp://k@h:1?pk={bad}");
+            assert!(ShareLink::parse(&uri).is_err(), "pk={bad:?} should be refused");
+        }
     }
 
     #[test]
