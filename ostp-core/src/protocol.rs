@@ -197,6 +197,8 @@ pub struct ProtocolMachine {
     /// A NACK went out for the current gap. The tick sends one for a gap no
     /// new frame has prompted a NACK for, never a stream of them.
     gap_nacked: bool,
+    /// NACKs sent for the current gap; spaces out the tick's repeats.
+    gap_nack_count: u32,
     /// The nonce the last NACK asked for. If that frame then arrives twice,
     /// the original was only late: the NACK was spurious.
     nacked_nonce: Option<u64>,
@@ -272,6 +274,8 @@ const REORDER_WINDOW_MAX: Duration = Duration::from_millis(100);
 /// 7.5 ms. Spurious NACKs widen it from there.
 const REORDER_MULT_MAX: u32 = 16;
 const REORDER_MULT_DECAY: Duration = Duration::from_secs(10);
+/// The longest pause between the tick's repeated NACKs for one gap.
+const RENACK_MAX: Duration = Duration::from_secs(2);
 /// The fastest an ACK or NACK goes out in answer to a frame that is not
 /// delivered (a duplicate, or one beyond the reorder window).
 const ANSWER_MIN_INTERVAL: Duration = Duration::from_millis(10);
@@ -344,6 +348,7 @@ impl ProtocolMachine {
             last_nack_sent: now.checked_sub(Duration::from_secs(1)).unwrap_or(now),
             gap_since: None,
             gap_nacked: false,
+            gap_nack_count: 0,
             nacked_nonce: None,
             reorder_mult: 1,
             reorder_mult_at: Instant::now(),
@@ -1043,6 +1048,24 @@ impl ProtocolMachine {
     fn gap_moved(&mut self) {
         self.gap_since = (!self.reorder_buffer.is_empty()).then(Instant::now);
         self.gap_nacked = false;
+        self.gap_nack_count = 0;
+    }
+
+    /// A gap that was NACKed and is still open, with no frame arriving to
+    /// prompt another NACK: the NACK, or the frame sent for it, was lost.
+    /// The tick asks again, with a growing pause (RTO x2, x4, ... up to
+    /// RENACK_MAX), until the gap closes or `recover_stalled_gap` skips it.
+    ///
+    /// This is not only for lost data: a hole can be a control frame (an ACK
+    /// or NACK holds a nonce too) that no retransmit timer ever resends, and
+    /// the SACK of what lies behind it lets the sender forget everything, so
+    /// a lost NACK left both ends silent for good.
+    fn renack_due(&self) -> bool {
+        let wait = self
+            .base_rto()
+            .saturating_mul(1u32 << self.gap_nack_count.clamp(1, 6))
+            .min(RENACK_MAX);
+        self.gap_nacked && self.gap_since.is_some() && self.last_nack_sent.elapsed() >= wait
     }
 
     /// A NACK for the frame at `expected_recv_nonce`, once the gap is older
@@ -1060,6 +1083,7 @@ impl ProtocolMachine {
         }
         self.last_nack_sent = Instant::now();
         self.gap_nacked = true;
+        self.gap_nack_count = self.gap_nack_count.saturating_add(1);
         self.nacked_nonce = Some(self.expected_recv_nonce);
         let nack_payload = self.expected_recv_nonce.to_be_bytes();
         self.build_control_datagram(0, FrameKind::Nack, Bytes::copy_from_slice(&nack_payload)).ok()
@@ -1076,7 +1100,7 @@ impl ProtocolMachine {
         // ── A gap older than the reorder window, nothing new since ────
         // Inbound frames NACK a gap once it is old enough; when none arrive
         // after that point (the tail of a burst) the tick has to.
-        if !self.gap_nacked {
+        if !self.gap_nacked || self.renack_due() {
             if let Some(nack_frame) = self.nack_if_due() {
                 actions.push(ProtocolAction::SendDatagram(nack_frame));
             }
@@ -2235,7 +2259,7 @@ mod tests {
     }
 
     /// A gap older than the reorder window with nothing arriving after it
-    /// (the tail of a burst) is NACKed by the tick, once.
+    /// (the tail of a burst) is NACKed by the tick.
     #[test]
     fn the_tick_nacks_an_old_gap_once() {
         let (mut client, mut server) = do_handshake();
@@ -2254,12 +2278,76 @@ mod tests {
         assert!(resent, "the old gap was not NACKed");
         assert!(server.cc.cwnd() < before, "a real loss shrinks the window");
 
-        client.last_nack_sent = Instant::now() - Duration::from_secs(1);
+        // Straight after, the tick does not NACK again (it repeats a NACK only
+        // after a growing pause: see a_lost_nack_for_a_lost_control_frame_is_asked_again).
         let mut again = false;
         for d in datagrams(client.on_event(OstpEvent::Tick).unwrap()) {
             again |= datagrams(server.on_event(OstpEvent::Inbound(d)).unwrap()).contains(&frames[0]);
         }
-        assert!(!again, "the tick NACKs one gap once; retransmission timers do the rest");
+        assert!(!again, "the tick does not NACK one gap in a stream");
+    }
+
+    /// The stall seen with loss in both directions. A lost ACK (a control
+    /// frame: it holds a nonce but no retransmit timer ever resends it) leaves
+    /// a hole the receiver can only fill by NACKing. The receiver also SACKs
+    /// the data behind the hole, so the sender drops it and has nothing in
+    /// flight. If then the NACK, or the frame sent for it, is lost, both ends
+    /// are silent for good: the tick used to NACK a gap once.
+    #[test]
+    fn a_lost_nack_for_a_lost_control_frame_is_asked_again() {
+        let (mut client, mut server) = do_handshake();
+
+        // The client sends something; the server's ACK for it (nonce 0 of the
+        // server's sequence, a control frame) is lost.
+        let hello = datagrams(client.on_event(OstpEvent::Outbound(1, Bytes::from_static(b"hi"))).unwrap()).remove(0);
+        server.last_ack_sent = Instant::now() - Duration::from_secs(1);
+        let lost_ack = datagrams(server.on_event(OstpEvent::Inbound(hello)).unwrap());
+        assert_eq!(lost_ack.len(), 1, "the server ACKs the client's frame");
+
+        // The server then sends three data frames; they arrive and wait
+        // behind the hole.
+        let frames: Vec<Bytes> = (0..3u8)
+            .map(|i| datagrams(server.on_event(OstpEvent::Outbound(1, Bytes::from(vec![i; 100]))).unwrap()).remove(0))
+            .collect();
+        let mut to_server = Vec::new();
+        for f in &frames {
+            client.last_ack_sent = Instant::now() - Duration::from_secs(1);
+            let out = client.on_event(OstpEvent::Inbound(f.clone())).unwrap();
+            assert!(delivered_payloads(&out).is_empty(), "held back behind the missing frame");
+            to_server.extend(datagrams(out));
+        }
+        // The client's SACK reaches the server, which now has nothing in flight.
+        for d in to_server {
+            let _ = server.on_event(OstpEvent::Inbound(d)).unwrap();
+        }
+        assert_eq!(server.in_flight_count(), 0, "everything behind the hole was acknowledged");
+
+        // The gap is old enough: the tick NACKs it, and that NACK is lost.
+        client.gap_since = Some(Instant::now() - REORDER_WINDOW_MAX);
+        client.last_nack_sent = Instant::now() - Duration::from_secs(1);
+        let first = datagrams(client.on_event(OstpEvent::Tick).unwrap());
+        assert!(!first.is_empty(), "the tick NACKs the old gap");
+        assert!(client.gap_nacked);
+
+        // A retry is not a stream: right after, the tick stays quiet.
+        let quiet = datagrams(client.on_event(OstpEvent::Tick).unwrap());
+        assert!(quiet.is_empty(), "no NACK again straight away");
+
+        // Nothing at all happens on the server side either.
+        assert!(datagrams(server.on_event(OstpEvent::Tick).unwrap()).is_empty());
+
+        // Later the tick asks again; this one arrives, the server resends the
+        // control frame, and the client delivers everything behind it.
+        client.last_nack_sent = Instant::now() - Duration::from_secs(10);
+        let second = datagrams(client.on_event(OstpEvent::Tick).unwrap());
+        assert!(!second.is_empty(), "the tick asks for the missing frame again");
+        let mut delivered = 0;
+        for nack in second {
+            for resent in datagrams(server.on_event(OstpEvent::Inbound(nack)).unwrap()) {
+                delivered += delivered_payloads(&client.on_event(OstpEvent::Inbound(resent)).unwrap()).len();
+            }
+        }
+        assert_eq!(delivered, 3, "the three held frames are delivered once the hole is filled");
     }
 
     /// Once our Close is acknowledged the session is Closed, even if the peer
