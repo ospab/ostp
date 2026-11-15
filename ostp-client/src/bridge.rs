@@ -542,7 +542,12 @@ impl Bridge {
                         actions_queue.push_back(a);
                     }
                 }
-                ProtocolAction::DeliverApp(stream_id, dec_payload) => {
+                ProtocolAction::DeliverApp(wire_stream_id, dec_payload) => {
+                    // Callers still use 16-bit stream ids until the v6 id
+                    // rules are wired in (stage 2).
+                    let Ok(stream_id) = u16::try_from(wire_stream_id) else {
+                        continue;
+                    };
                     match RelayMessage::decode(&dec_payload) {
                         Ok(relay_msg) => {
                             match relay_msg {
@@ -1183,7 +1188,7 @@ impl Bridge {
         };
         for relay_msg in messages {
             let out_payload = Bytes::from(relay_msg.encode());
-            match session.machine.on_event(OstpEvent::Outbound(stream_id, out_payload)) {
+            match session.machine.on_event(OstpEvent::Outbound(u32::from(stream_id), out_payload)) {
                 Ok(ProtocolAction::SendDatagram(frame)) => {
                     if send_datagram(&session.socket, &frame, self.transport_mode == "udp" ).await.is_ok() {
                         self.metrics.bytes_sent.fetch_add(frame.len() as u64, Ordering::Relaxed);

@@ -33,6 +33,9 @@ pub struct AdaptivePadder {
     pub mtu_hint: usize,
     pub max_pad: usize,
     pub strategy: PaddingStrategy,
+    /// Bytes a datagram adds around the payload and padding (the v5 value
+    /// unless `with_overhead` says otherwise).
+    pub overhead: usize,
 }
 
 impl AdaptivePadder {
@@ -41,7 +44,14 @@ impl AdaptivePadder {
             mtu_hint,
             max_pad,
             strategy,
+            overhead: super::DATAGRAM_OVERHEAD,
         }
+    }
+
+    /// For a session whose frame header is not the v5 one.
+    pub fn with_overhead(mut self, overhead: usize) -> Self {
+        self.overhead = overhead;
+        self
     }
 
     pub fn padding_for_len(&self, payload_len: usize) -> usize {
@@ -72,7 +82,7 @@ impl AdaptivePadder {
         };
 
         // Strict clamp to ensure total packet size (including overhead) never exceeds mtu_hint
-        let max_allowed = self.mtu_hint.saturating_sub(payload_len).saturating_sub(super::DATAGRAM_OVERHEAD);
+        let max_allowed = self.mtu_hint.saturating_sub(payload_len).saturating_sub(self.overhead);
         raw_pad.min(max_allowed)
     }
 

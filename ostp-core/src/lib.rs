@@ -11,6 +11,7 @@ pub mod protocol;
 pub mod relay;
 pub mod server_key;
 pub mod share_link;
+pub mod streams;
 pub mod subscription;
 
 pub use crypto::NoiseRole;
