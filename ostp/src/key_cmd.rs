@@ -17,7 +17,7 @@ use crate::service_cmd::restart_service;
 
 #[derive(clap::Subcommand, Debug)]
 pub enum KeyAction {
-    /// Print new access keys; on a server config they are also added to access_keys
+    /// Print new access keys and change nothing; with --add they also go into access_keys of the server config
     Gen {
         /// Format of the keys
         #[arg(long, default_value = "hex", value_parser = ["hex", "base64"])]
@@ -26,6 +26,9 @@ pub enum KeyAction {
         // No short `-c`: the global `--config` already owns it and clap panics on a duplicate.
         #[arg(short = 'n', long, default_value_t = 1)]
         count: usize,
+        /// Also add the keys to access_keys of the server config (a backup is kept in config.json.bak)
+        #[arg(long)]
+        add: bool,
     },
     /// The server's key: print the public key alone, or make a new one
     Server {
@@ -111,53 +114,53 @@ fn status_lines(p: &ProtocolCfg, access_keys: usize) -> Result<Vec<String>> {
     Ok(lines)
 }
 
-/// Adds keys to `access_keys` of a server config. Returns whether the config
-/// was changed; a missing, unreadable or non-server config is left alone, as
-/// `ostp gk` always did.
-fn add_to_config(config_path: &Path, new_keys: Vec<String>) -> bool {
-    if !config_path.exists() {
-        return false;
-    }
-    let Ok(content) = std::fs::read_to_string(config_path) else { return false };
-    let mut stripped = json_comments::StripComments::new(content.as_bytes());
-    let mut content_str = String::new();
-    use std::io::Read;
-    if stripped.read_to_string(&mut content_str).is_err() {
-        return false;
-    }
-    let Ok(mut json_val) = serde_json::from_str::<serde_json::Value>(&content_str) else { return false };
-    if json_val.get("mode").and_then(|m| m.as_str()) != Some("server") {
-        return false;
-    }
-    let Some(access_keys) = json_val.get_mut("access_keys").and_then(|a| a.as_array_mut()) else { return false };
-    for key in new_keys {
-        access_keys.push(serde_json::Value::String(key));
-    }
-    let Ok(new_content) = serde_json::to_string_pretty(&json_val) else { return false };
-    ostp_server::config_io::save_config(config_path, &new_content, false).is_ok()
+/// Appends keys to `access_keys` of a server config value.
+fn append_keys(v: &mut serde_json::Value, new_keys: &[String]) -> Result<()> {
+    let list = v
+        .as_object_mut()
+        .context("the config is not a JSON object")?
+        .entry("access_keys")
+        .or_insert_with(|| serde_json::Value::Array(Vec::new()));
+    let list = list.as_array_mut().context("access_keys in the config is not a list")?;
+    list.extend(new_keys.iter().cloned().map(serde_json::Value::String));
+    Ok(())
 }
 
-/// `ostp key gen` (and the hidden `ostp gk`, `ostp generate-key`).
-pub fn gen(config_path: &Path, format: &str, count: usize) -> Result<()> {
-    let mut new_keys = Vec::new();
-    for _ in 0..count {
-        let key = match format.to_lowercase().as_str() {
+fn make_keys(format: &str, count: usize) -> Vec<String> {
+    (0..count)
+        .map(|_| match format.to_lowercase().as_str() {
             "base64" => ostp_core::keys::access_key_base64(),
             _ => ostp_core::keys::access_key_hex(),
-        };
-        println!("{}", key);
-        new_keys.push(key);
+        })
+        .collect()
+}
+
+/// `ostp key gen` (and the hidden `ostp gk`, `ostp generate-key`): prints new
+/// keys and changes nothing. With `add` they are also appended to
+/// `access_keys` of the server config (previous file kept as `config.json.bak`).
+/// The running server reads access keys again within seconds, so no restart.
+pub fn gen(config_path: &Path, format: &str, count: usize, add: bool) -> Result<()> {
+    // Read the config before anything is printed, so a missing or non-server
+    // config fails with no keys shown that were never stored.
+    let mut config = if add { Some(read_json(config_path)?) } else { None };
+    let new_keys = make_keys(format, count);
+    if let Some(v) = config.as_mut() {
+        append_keys(v, &new_keys)?;
+        save_json(config_path, v)?;
     }
-    // On a server config the new keys are appended to access_keys.
-    if add_to_config(config_path, new_keys) {
-        println!("[ostp] Added to access_keys in {:?}", config_path);
+    for key in &new_keys {
+        println!("{key}");
+    }
+    if add {
+        println!("  {} Added to access_keys in {} (previous: config.json.bak)", "✓".green(), config_path.display());
+        println!("  A running server picks the keys up by itself within a few seconds (hot reload of access keys); no restart needed.");
     }
     Ok(())
 }
 
 pub fn run(action: Option<KeyAction>, config_path: &Path) -> Result<()> {
     let action = match action {
-        Some(KeyAction::Gen { format, count }) => return gen(config_path, &format, count),
+        Some(KeyAction::Gen { format, count, add }) => return gen(config_path, &format, count, add),
         Some(a) => a,
         None => {
             let (v, p) = load(config_path)?;
@@ -271,21 +274,56 @@ mod tests {
         path
     }
 
-    /// `gen` keeps what `gk` did: a server config gets the keys in access_keys,
-    /// any other config is left untouched.
+    fn keys_of(path: &Path) -> serde_json::Value {
+        let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        v["access_keys"].clone()
+    }
+
+    /// Without `--add`, `gen` changes nothing: not the file, not even a backup.
     #[test]
-    fn new_keys_are_added_to_a_server_config_only() {
-        let server = temp_config("server", r#"{"mode":"server","access_keys":["old"]}"#);
-        assert!(add_to_config(&server, vec!["new1".into(), "new2".into()]));
-        let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&server).unwrap()).unwrap();
-        assert_eq!(v["access_keys"], serde_json::json!(["old", "new1", "new2"]));
-
-        let client = temp_config("client", r#"{"mode":"client"}"#);
-        assert!(!add_to_config(&client, vec!["x".into()]));
-        assert_eq!(std::fs::read_to_string(&client).unwrap(), r#"{"mode":"client"}"#);
-
-        assert!(!add_to_config(&std::env::temp_dir().join("ostp-key-cmd-missing.json"), vec!["x".into()]));
+    fn gen_without_add_leaves_the_config_alone() {
+        let body = r#"{"mode":"server","access_keys":["old"]}"#;
+        let server = temp_config("noadd", body);
+        gen(&server, "hex", 2, false).unwrap();
+        assert_eq!(std::fs::read_to_string(&server).unwrap(), body);
+        assert!(!server.with_extension("json.bak").exists());
+        // A missing config is no problem when nothing is to be stored.
+        gen(&std::env::temp_dir().join("ostp-key-cmd-missing.json"), "base64", 1, false).unwrap();
         let _ = std::fs::remove_file(server);
+    }
+
+    /// With `--add` the keys are appended to access_keys and the previous file is kept.
+    #[test]
+    fn gen_with_add_appends_and_keeps_a_backup() {
+        let body = r#"{"mode":"server","access_keys":["old"]}"#;
+        let server = temp_config("add", body);
+        gen(&server, "hex", 2, true).unwrap();
+        let keys = keys_of(&server);
+        let list = keys.as_array().unwrap();
+        assert_eq!(list.len(), 3);
+        assert_eq!(list[0], "old");
+        assert!(list[1..].iter().all(|k| k.as_str().is_some_and(|s| s.len() == 32 && s.chars().all(|c| c.is_ascii_hexdigit()))), "{keys}");
+        assert_eq!(std::fs::read_to_string(server.with_extension("json.bak")).unwrap(), body);
+        let _ = std::fs::remove_file(server.with_extension("json.bak"));
+        let _ = std::fs::remove_file(server);
+    }
+
+    /// `--add` on a client config or a missing file is an error and writes nothing.
+    #[test]
+    fn gen_with_add_refuses_a_config_that_is_not_a_server_one() {
+        let client = temp_config("client", r#"{"mode":"client"}"#);
+        assert!(gen(&client, "hex", 1, true).is_err());
+        assert_eq!(std::fs::read_to_string(&client).unwrap(), r#"{"mode":"client"}"#);
+        assert!(gen(&std::env::temp_dir().join("ostp-key-cmd-missing.json"), "hex", 1, true).is_err());
         let _ = std::fs::remove_file(client);
+    }
+
+    #[test]
+    fn append_keys_creates_a_missing_list_and_refuses_a_wrong_one() {
+        let mut v = serde_json::json!({"mode":"server"});
+        append_keys(&mut v, &["a".to_string()]).unwrap();
+        assert_eq!(v["access_keys"], serde_json::json!(["a"]));
+        let mut bad = serde_json::json!({"mode":"server","access_keys":"x"});
+        assert!(append_keys(&mut bad, &["a".to_string()]).is_err());
     }
 }

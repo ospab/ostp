@@ -57,6 +57,9 @@ enum Commands {
         // No short `-c`: the global `--config` already owns it and clap panics on a duplicate.
         #[arg(short = 'n', long, default_value_t = 1)]
         count: usize,
+        /// Also add the keys to access_keys of the server config (before 0.5.0 `gk` did this by itself)
+        #[arg(long)]
+        add: bool,
     },
     /// Output ready-to-use client sharing links (ostp://...) from the server configuration.
     /// `ostp links qr` shows a QR code per client, one client at a time.
@@ -1284,7 +1287,7 @@ async fn run_app() -> Result<()> {
                 println!();
                 return Ok(());
             }
-            Commands::GenerateKey { format, count } => return key_cmd::gen(&args.config, &format, count),
+            Commands::GenerateKey { format, count, add } => return key_cmd::gen(&args.config, &format, count, add),
             Commands::Links { view: Some(_), all } => return cmd_links_qr(&args.config, all),
             Commands::Links { view: None, .. } => { args.links = true; }
             Commands::Check => { args.check = true; }

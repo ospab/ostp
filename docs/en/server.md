@@ -96,7 +96,7 @@ Nothing here happens by itself; a change restarts the running service (`--no-res
 
 ```
 ostp key                              # status: the server's public key, legacy clients, number of access keys
-ostp key gen [-n N] [--format hex|base64]   # print new access keys (on a server config they are added to access_keys)
+ostp key gen [-n N] [--format hex|base64] [--add]   # print new access keys; --add also puts them into access_keys
 ostp key server                       # the public key alone, for scripts
 ostp key server new [--yes]           # create the server key, or replace it
 ostp key legacy on|off                # accept clients older than 0.5.0 next to current ones
@@ -105,7 +105,8 @@ ostp key legacy on|off                # accept clients older than 0.5.0 next to 
 - The server has one static key. Its public half is the `pk` of every `ostp://` link and subscription; the private half (`protocol.server_key` in the config) is never printed. A client whose profile has `pk` checks the server against it; a profile without `pk` is a legacy profile.
 - A new install creates the key. An existing server has none until `ostp key server new`. Replacing a key needs `--yes`, because every link and subscription made with the old key stops working and has to be reissued.
 - `ostp key legacy off` refuses clients older than 0.5.0 and links without `pk` (the transitional mode ends); it is refused while the server has no key. The config field is `protocol.accept_v5`, `true` by default.
-- `ostp gk` and `ostp generate-key` still work as hidden aliases of `ostp key gen`.
+- `ostp key gen` only prints the keys and changes nothing. `--add` appends them to `access_keys` of the server config (the previous file is kept as `config.json.bak`); a running server reads access keys again within a few seconds (hot reload), so no restart is needed. `--add` on a config that is not a server one is an error.
+- `ostp gk` and `ostp generate-key` still work as hidden aliases of `ostp key gen`. Note: before 0.5.0 `ostp gk` added the keys to the server config by itself; now it does so only with `--add`.
 
 ---
 
