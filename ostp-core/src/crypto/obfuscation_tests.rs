@@ -2,6 +2,42 @@
 mod tests {
     use crate::crypto::obfuscation::*;
 
+    fn hex(b: &[u8]) -> String {
+        b.iter().map(|x| format!("{x:02x}")).collect()
+    }
+
+    /// Pinned outputs, computed once (the v6 ones also with an independent
+    /// HMAC-SHA256 implementation following RFC 5869): any later change to the
+    /// v6 derivation (labels, salt, mapping) or to the v5 one fails here.
+    #[test]
+    fn pinned_derivation_vectors() {
+        let v6 = derive_v6_secrets(b"vector-access-key");
+        assert_eq!(hex(&v6.base.psk), "2bbaa86df1586fe9c2e8983155b3251658b6a37db100bedc8146d0f751f3f24f");
+        assert_eq!(hex(&v6.base.obfuscation_key), "b80214735fc1db79");
+        assert_eq!((v6.base.handshake_pad_min, v6.base.handshake_pad_max), (52, 196));
+        assert_eq!(hex(&v6.hs.mask_key), "4b4550422255b216b10220a2dc43d0eb623e855f0c98951179bbad6fff20f8bb");
+        assert_eq!(hex(&v6.hs.tag_key), "53dfe3259031de1f59ffa6e5c847c0d50991387c96eeef7447a642c6c1fc7c84");
+
+        // v5 is byte for byte what 0.4.x derives.
+        let v5 = derive_all_secrets(b"vector-access-key");
+        assert_eq!(hex(&v5.psk), "0afade0ce1664b6636c52d21d8fb953710102a1bf96d7b2c9e70711326e96e41");
+        assert_eq!(hex(&v5.obfuscation_key), "75ef112307182bf4");
+        assert_eq!((v5.handshake_pad_min, v5.handshake_pad_max), (76, 182));
+    }
+
+    #[test]
+    fn v6_secrets_are_distinct_from_each_other_and_from_v5() {
+        let v6 = derive_v6_secrets(b"another-key");
+        let v5 = derive_all_secrets(b"another-key");
+        assert_ne!(v6.base.psk, v5.psk);
+        assert_ne!(v6.base.obfuscation_key, v5.obfuscation_key);
+        let outputs = [v6.base.psk, v6.hs.mask_key, v6.hs.tag_key];
+        assert!(outputs[0] != outputs[1] && outputs[1] != outputs[2] && outputs[0] != outputs[2]);
+        assert_ne!(derive_v6_secrets(b"key a").hs.tag_key, derive_v6_secrets(b"key b").hs.tag_key);
+        assert!((16..=79).contains(&v6.base.handshake_pad_min));
+        assert!((v6.base.handshake_pad_min + 48..=v6.base.handshake_pad_min + 175).contains(&v6.base.handshake_pad_max));
+    }
+
     /// Verifies that derive_all_secrets is deterministic — same input always
     /// produces the same output.
     #[test]
