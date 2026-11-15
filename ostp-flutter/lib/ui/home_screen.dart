@@ -11,6 +11,7 @@ import '../models/dns_notice.dart';
 import '../models/log_privacy.dart';
 import '../models/ostp_profile.dart';
 import '../models/share_link.dart';
+import '../models/stop_reason.dart';
 import '../models/subscription.dart';
 import '../services/updates.dart' as updates;
 import 'dns_notice_dialog.dart';
@@ -293,11 +294,11 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin, 
     super.dispose();
   }
 
-  void _snack(String text) {
+  void _snack(String text, {Duration duration = const Duration(seconds: 4)}) {
     if (!mounted) return;
     ScaffoldMessenger.of(context)
       ..hideCurrentSnackBar()
-      ..showSnackBar(SnackBar(content: Text(text)));
+      ..showSnackBar(SnackBar(content: Text(text), duration: duration));
   }
 
   Future<void> _toggleConnection() async {
@@ -497,6 +498,8 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin, 
       // 0 = not connected, 1 = handshake or reconnect in progress, 2 = connected.
       final connState = (parsed['connection_state'] as num?)?.toInt() ?? 0;
       final rttMs = (parsed['rtt_ms'] as num?)?.toInt() ?? 0;
+      // Set when the server closed the session on purpose; empty otherwise.
+      final stopReason = parsed['stop_reason'];
 
       if (connState != 0) _coreActive = true;
 
@@ -513,7 +516,7 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin, 
           _stopping = false;
         }
         _setDisconnected();
-        _snack('Could not connect to the server. See Logs for the reason.');
+        _snack(stoppedMessage(stopReason), duration: stoppedMessageDuration(stopReason));
         return;
       }
 

@@ -249,6 +249,7 @@ pub extern "system" fn Java_net_ostp_client_OstpClientSdk_nativeStartClient(
                 UiEvent::Log(text) => add_log(text),
                 UiEvent::ProfileChanged(p) => add_log(format!("Profile changed: {p:?}")),
                 UiEvent::TunnelStopped => add_log("Tunnel stopped".to_string()),
+                UiEvent::ServerClosed(message) => add_log(message),
                 _ => {}
             }
         }
@@ -359,9 +360,12 @@ pub extern "system" fn Java_net_ostp_client_OstpClientSdk_nativeGetMetrics(
         let recv = m.bytes_recv.load(Ordering::Relaxed);
         let conn_state = m.connection_state.load(Ordering::Relaxed);
         let rtt = m.rtt_ms.load(Ordering::Relaxed);
+        // Why the tunnel stopped by itself (the server closed the session):
+        // set before `connection_state` turns to 0. Empty otherwise.
+        let stop_reason = serde_json::Value::String(ostp_client::app::stop_notice().unwrap_or_default());
         let json = format!(
-            r#"{{"bytes_sent": {}, "bytes_recv": {}, "connection_state": {}, "rtt_ms": {}}}"#,
-            sent, recv, conn_state, rtt
+            r#"{{"bytes_sent": {}, "bytes_recv": {}, "connection_state": {}, "rtt_ms": {}, "stop_reason": {}}}"#,
+            sent, recv, conn_state, rtt, stop_reason
         );
         match env.new_string(json.replace('\0', "")) {
             Ok(s) => s.into_raw(),

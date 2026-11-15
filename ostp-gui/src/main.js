@@ -334,7 +334,9 @@ function persistConfig() {
 // The tunnel stopped on its own: say so, with the reason.
 function onTunnelError(msg) {
   setState('disconnected');
-  showError('The connection stopped: ' + msg);
+  // The server closed the session on purpose: its message is already a full
+  // sentence with what to do about it, and the cause is not a failure.
+  showError(msg.startsWith('The server closed the connection') ? msg : 'The connection stopped: ' + msg);
 }
 
 // ── STATE MACHINE ─────────────────────────────────────────────────────

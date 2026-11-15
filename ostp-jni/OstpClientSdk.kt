@@ -250,7 +250,7 @@ class OstpClientSdk private constructor(private val context: Context) {
                         }
                     }
                     CORE_STOPPED -> if (seenActive && _state.value !is TunnelState.Failed) {
-                        _state.value = TunnelState.Failed("Tunnel stopped")
+                        _state.value = TunnelState.Failed(snapshot.stopReason.ifEmpty { "Tunnel stopped" })
                     }
                     // Anything else is an unreadable snapshot: keep the last state.
                 }
@@ -303,12 +303,13 @@ class OstpClientSdk private constructor(private val context: Context) {
         networkCallbackJob?.cancel()
     }
 
-    private class Snapshot(val metrics: Metrics, val connectionState: Int)
+    /** [stopReason] is the plain-words reason when the server closed the session; empty otherwise. */
+    private class Snapshot(val metrics: Metrics, val connectionState: Int, val stopReason: String = "")
 
     private fun readSnapshot(): Snapshot {
         return try {
             val obj = JSONObject(getMetrics())
-            Snapshot(metricsOf(obj), obj.optInt("connection_state", -1))
+            Snapshot(metricsOf(obj), obj.optInt("connection_state", -1), obj.optString("stop_reason", ""))
         } catch (_: Exception) {
             Snapshot(Metrics(), -1)
         }
