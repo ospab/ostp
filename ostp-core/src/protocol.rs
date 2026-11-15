@@ -166,7 +166,13 @@ pub enum OstpEvent {
     /// v6 only: the stream is over on both sides; forget its state. Its id is
     /// not used again, so later frames of it are dropped.
     ReleaseStream(u32),
+    /// End the session. In v6 the `Close` frame carries reason 0 (`Normal`);
+    /// in v5 it is the empty `Close` frame of old.
     Close,
+    /// v6 only: end the session with a reason and an optional text (at most
+    /// `CLOSE_TEXT_MAX` bytes, cut on a character boundary if longer). A v5
+    /// session sends nothing and stays as it is: v5 has no reasons.
+    CloseWith(CloseReason, String),
     Tick,
 }
 
@@ -180,6 +186,11 @@ pub enum ProtocolAction {
     /// in both directions: nothing more is delivered and `Outbound` for it is
     /// refused.
     StreamReset(u32, ResetReason), // stream_id, reason
+    /// v6 only: the peer ended the session with an authenticated `Close`. The
+    /// machine is `Closed`; the datagram that acknowledges the `Close` is in
+    /// the same action batch and must still be sent. This is not a protocol
+    /// failure: the caller must not try to resume the session.
+    PeerClosed(CloseReason, String),
     HandshakePayload(Bytes, Option<Bytes>), // Passed from client's handshake, Optional response to send
     Multiple(Vec<ProtocolAction>),
     Noop,
@@ -202,6 +213,71 @@ impl ResetReason {
             _ => None,
         }
     }
+}
+
+/// Why a v6 session ended (the one-byte reason of the `Close` frame).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum CloseReason {
+    /// The peer stopped on purpose.
+    Normal = 0,
+    /// The server is restarting.
+    ServerRestarting = 1,
+    /// The key was revoked or removed.
+    KeyRevoked = 2,
+    /// The key's traffic limit is used up.
+    TrafficLimit = 3,
+    /// Too many sessions for the key: this one was the oldest.
+    TooManySessions = 4,
+    /// The server is shutting down.
+    ServerShutdown = 5,
+}
+
+impl CloseReason {
+    pub fn from_wire(byte: u8) -> Option<Self> {
+        match byte {
+            0 => Some(Self::Normal),
+            1 => Some(Self::ServerRestarting),
+            2 => Some(Self::KeyRevoked),
+            3 => Some(Self::TrafficLimit),
+            4 => Some(Self::TooManySessions),
+            5 => Some(Self::ServerShutdown),
+            _ => None,
+        }
+    }
+
+    pub fn to_wire(self) -> u8 {
+        self as u8
+    }
+}
+
+/// The longest text a `Close` frame carries, in bytes.
+pub const CLOSE_TEXT_MAX: usize = 64;
+
+/// `reason(1) | text(0..=64, UTF-8)`.
+fn encode_close_payload(reason: CloseReason, text: &str) -> Bytes {
+    let mut end = text.len().min(CLOSE_TEXT_MAX);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut out = Vec::with_capacity(1 + end);
+    out.push(reason.to_wire());
+    out.extend_from_slice(&text.as_bytes()[..end]);
+    Bytes::from(out)
+}
+
+/// An empty payload is reason 0; an unknown reason, a text over the limit or
+/// one that is not UTF-8 makes the frame invalid.
+fn decode_close_payload(payload: &[u8]) -> Result<(CloseReason, String), ProtocolError> {
+    let Some((&byte, text)) = payload.split_first() else {
+        return Ok((CloseReason::Normal, String::new()));
+    };
+    let reason = CloseReason::from_wire(byte).ok_or_else(|| ProtocolError::Framing("unknown close reason".to_string()))?;
+    if text.len() > CLOSE_TEXT_MAX {
+        return Err(ProtocolError::Framing("close text too long".to_string()));
+    }
+    let text = std::str::from_utf8(text).map_err(|_| ProtocolError::Framing("close text is not UTF-8".to_string()))?;
+    Ok((reason, text.to_string()))
 }
 
 /// Streams a receiver tracks at once (those with frames waiting or an order
@@ -656,7 +732,18 @@ impl ProtocolMachine {
             }
             (OstpState::Established, OstpEvent::Close) => {
                 self.state = OstpState::Closing;
-                self.build_tracked_datagram(0, FrameKind::Close, Bytes::new())
+                let payload = if self.v6 { encode_close_payload(CloseReason::Normal, "") } else { Bytes::new() };
+                self.build_tracked_datagram(0, FrameKind::Close, payload)
+                    .map(ProtocolAction::SendDatagram)
+            }
+            (OstpState::Established, OstpEvent::CloseWith(reason, text)) => {
+                if !self.v6 {
+                    return Ok(ProtocolAction::Noop);
+                }
+                self.state = OstpState::Closing;
+                // A tracked frame: resent by the tick until the peer
+                // acknowledges it or the retries run out (then `Closed`).
+                self.build_tracked_datagram(0, FrameKind::Close, encode_close_payload(reason, &text))
                     .map(ProtocolAction::SendDatagram)
             }
             (OstpState::Closing, OstpEvent::Inbound(raw)) => {
@@ -1111,7 +1198,12 @@ impl ProtocolMachine {
                 }
                 FrameKind::Datagram => app.push(ProtocolAction::DeliverDatagram(stream_id, packet.payload.clone())),
                 FrameKind::Close => {
-                    tracing::debug!("Received Close frame, terminating session");
+                    let (reason, text) = decode_close_payload(&packet.payload)?;
+                    tracing::debug!("Received Close frame (reason {}), terminating session", reason.to_wire());
+                    // Told once, and only by the side that did not close first.
+                    if self.state == OstpState::Established {
+                        app.push(ProtocolAction::PeerClosed(reason, text));
+                    }
                     self.state = OstpState::Closed;
                 }
                 FrameKind::Abandon => self.on_abandon_v6(&packet.payload, &mut app)?,
@@ -1137,7 +1229,10 @@ impl ProtocolMachine {
                 wire.push(ProtocolAction::SendDatagram(nack_frame));
             }
         }
-        if let Some(ack_frame) = self.build_ack_if_due()? {
+        // A Close is acknowledged at once: the receiver is Closed and will not
+        // get another chance (it ignores the Close the peer resends).
+        let ack = if kind == FrameKind::Close { self.force_build_ack()? } else { self.build_ack_if_due()? };
+        if let Some(ack_frame) = ack {
             wire.push(ProtocolAction::SendDatagram(ack_frame));
         }
 
@@ -3065,10 +3160,12 @@ mod tests {
         dgrams: Vec<(u32, Bytes)>,
         resets: Vec<(u32, ResetReason)>,
         wire: Vec<Bytes>,
+        closed: Vec<(CloseReason, String)>,
     }
 
     fn sort_out(a: ProtocolAction, o: &mut Out) {
         match a {
+            ProtocolAction::PeerClosed(r, t) => o.closed.push((r, t)),
             ProtocolAction::DeliverApp(s, b) => o.app.push((s, b)),
             ProtocolAction::DeliverDatagram(s, b) => o.dgrams.push((s, b)),
             ProtocolAction::StreamReset(s, r) => o.resets.push((s, r)),
@@ -3186,6 +3283,115 @@ mod tests {
         assert_eq!(&o.app[0].1[..], b"x");
         assert_eq!(&o.app[1].1[..], b"y");
         assert!(matches!(RelayMessage::decode(&o.app[2].1).unwrap(), RelayMessage::Close), "Close is last");
+    }
+
+    #[test]
+    fn a_session_close_carries_each_reason_and_its_text() {
+        let reasons = [
+            CloseReason::Normal,
+            CloseReason::ServerRestarting,
+            CloseReason::KeyRevoked,
+            CloseReason::TrafficLimit,
+            CloseReason::TooManySessions,
+            CloseReason::ServerShutdown,
+        ];
+        for (i, reason) in reasons.into_iter().enumerate() {
+            assert_eq!(reason.to_wire() as usize, i);
+            assert_eq!(CloseReason::from_wire(i as u8), Some(reason));
+            let (mut client, mut server) = do_handshake_v6();
+            let close = datagrams(server.on_event(OstpEvent::CloseWith(reason, format!("why {i}"))).unwrap()).remove(0);
+            assert_eq!(server.state(), OstpState::Closing);
+            let o = feed(&mut client, &close);
+            assert_eq!(o.closed, vec![(reason, format!("why {i}"))]);
+            assert_eq!(client.state(), OstpState::Closed);
+            assert!(!o.wire.is_empty(), "the Close is acknowledged in the same batch");
+            // The ACK reaches the closer: it is Closed too, nothing is left to resend.
+            for a in &o.wire {
+                feed(&mut server, a);
+            }
+            assert!(tick(&mut server).wire.is_empty());
+            assert_eq!(server.state(), OstpState::Closed);
+        }
+        assert_eq!(CloseReason::from_wire(6), None);
+    }
+
+    #[test]
+    fn a_plain_v6_close_is_reason_zero_and_the_closer_is_not_told_back() {
+        let (mut client, mut server) = do_handshake_v6();
+        let close = datagrams(client.on_event(OstpEvent::Close).unwrap()).remove(0);
+        let o = feed(&mut server, &close);
+        assert_eq!(o.closed, vec![(CloseReason::Normal, String::new())]);
+        // Both close at once: the one already Closing is not told.
+        let (mut a, mut b) = do_handshake_v6();
+        let ca = datagrams(a.on_event(OstpEvent::CloseWith(CloseReason::ServerShutdown, String::new())).unwrap()).remove(0);
+        let cb = datagrams(b.on_event(OstpEvent::Close).unwrap()).remove(0);
+        assert!(feed(&mut a, &cb).closed.is_empty());
+        assert!(feed(&mut b, &ca).closed.is_empty());
+        assert_eq!(a.state(), OstpState::Closed);
+    }
+
+    #[test]
+    fn the_close_text_is_cut_on_a_character_boundary_and_a_longer_one_is_refused() {
+        let (mut client, mut server) = do_handshake_v6();
+        // 40 two-byte characters: 80 bytes, cut to 64 (32 characters).
+        let long: String = "é".repeat(40);
+        let close = datagrams(server.on_event(OstpEvent::CloseWith(CloseReason::KeyRevoked, long)).unwrap()).remove(0);
+        let o = feed(&mut client, &close);
+        assert_eq!(o.closed[0].1, "é".repeat(32));
+        assert_eq!(o.closed[0].1.len(), CLOSE_TEXT_MAX);
+        // Cut inside a character: 63 ASCII bytes + one two-byte character -> 63 bytes.
+        let text = format!("{}é", "a".repeat(63));
+        assert_eq!(&encode_close_payload(CloseReason::Normal, &text)[1..], "a".repeat(63).as_bytes());
+
+        // A frame from a peer that does not cut is refused: the session stays up.
+        let (mut client, mut server) = do_handshake_v6();
+        let mut payload = vec![CloseReason::KeyRevoked.to_wire()];
+        payload.extend(vec![b'x'; CLOSE_TEXT_MAX + 1]);
+        let bad = server.build_tracked_datagram(0, FrameKind::Close, Bytes::from(payload)).unwrap();
+        assert!(client.on_event(OstpEvent::Inbound(bad)).is_err());
+        assert_eq!(client.state(), OstpState::Established);
+        let unknown = server.build_tracked_datagram(0, FrameKind::Close, Bytes::from_static(&[9])).unwrap();
+        assert!(client.on_event(OstpEvent::Inbound(unknown)).is_err());
+        let not_utf8 = server.build_tracked_datagram(0, FrameKind::Close, Bytes::from_static(&[2, 0xff, 0xfe])).unwrap();
+        assert!(client.on_event(OstpEvent::Inbound(not_utf8)).is_err());
+        assert_eq!(client.state(), OstpState::Established);
+    }
+
+    #[test]
+    fn a_lost_session_close_is_resent_until_acknowledged() {
+        let (mut client, mut server) = do_handshake_v6();
+        let first = datagrams(server.on_event(OstpEvent::CloseWith(CloseReason::TrafficLimit, "limit".into())).unwrap()).remove(0);
+        // Lost. After the retransmit wait the tick sends the same frame again.
+        assert!(tick(&mut server).wire.is_empty(), "not due yet");
+        for frame in server.sent_history.iter_mut() {
+            frame.last_sent = Instant::now() - Duration::from_secs(3);
+        }
+        let again = tick(&mut server).wire;
+        assert!(again.contains(&first), "the Close is resent");
+        assert_eq!(server.state(), OstpState::Closing, "still waiting for the acknowledgement");
+        let o = feed(&mut client, &again[0]);
+        assert_eq!(o.closed, vec![(CloseReason::TrafficLimit, "limit".to_string())]);
+        for a in &o.wire {
+            feed(&mut server, a);
+        }
+        assert!(tick(&mut server).wire.is_empty());
+        assert_eq!(server.state(), OstpState::Closed);
+    }
+
+    #[test]
+    fn a_v5_session_never_emits_a_close_with_a_reason() {
+        let (mut client, mut server) = do_handshake();
+        assert!(!server.is_v6());
+        let action = server.on_event(OstpEvent::CloseWith(CloseReason::KeyRevoked, "x".into())).unwrap();
+        assert!(datagrams(action).is_empty(), "nothing goes on the wire");
+        assert_eq!(server.state(), OstpState::Established, "and the session is untouched");
+        // The v5 Close stays the empty frame and is not reported as a reason.
+        let close = datagrams(client.on_event(OstpEvent::Close).unwrap()).remove(0);
+        let action = server.on_event(OstpEvent::Inbound(close)).unwrap();
+        let mut o = Out::default();
+        sort_out(action, &mut o);
+        assert!(o.closed.is_empty());
+        assert_eq!(server.state(), OstpState::Closed);
     }
 
     /// What stage 2 of the session layer relies on: a stream that is over on
