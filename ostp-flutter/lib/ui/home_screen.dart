@@ -223,6 +223,8 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin, 
         "server_addr": p?.serverAddr ?? '',
         "local_bind_addr": "0.0.0.0:0",
         "access_key": p?.accessKey ?? '',
+        // The server's key: with it the core speaks protocol v6, without it v5.
+        "server_pk": (p?.serverPk ?? '').isEmpty ? null : p!.serverPk,
         "handshake_timeout_ms": 10000,
         "io_timeout_ms": 5000,
         "mtu": mtu,

@@ -234,12 +234,17 @@ class SubscriptionStore {
   Future<int> _refreshOne(OstpSubscription sub, [AskToSend? askSend]) async {
     final doc = await _fetchAsking(sub.url, askSend);
     final links = <ShareLink>[];
+    String? badKey;
     for (final l in (doc['links'] as List? ?? const []).take(_maxLinks)) {
       try {
         links.add(ShareLink.parse(l as String));
+      } on FormatException catch (e) {
+        // A damaged server key is never turned into a v5 profile; if nothing
+        // else is usable, the user is told why.
+        if (e.message.contains('server key (pk)')) badKey ??= e.message;
       } catch (_) {}
     }
-    if (links.isEmpty) throw Exception('the subscription has no usable links');
+    if (links.isEmpty) throw Exception(badKey ?? 'the subscription has no usable links');
 
     final name = (doc['name'] as String?)?.trim() ?? '';
     final shown = name.isNotEmpty ? name : Uri.tryParse(sub.url)?.host ?? sub.url;
@@ -284,6 +289,7 @@ class SubscriptionStore {
         tlsInsecure: l.insecure,
         wsPath: l.path ?? '',
         subId: sub.id,
+        serverPk: l.pk ?? '',
         owndns: l.owndns,
         dnsall: l.dnsall,
         dnsChoice: prev?.dnsChoice ?? '',

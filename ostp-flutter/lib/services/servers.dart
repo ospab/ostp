@@ -150,6 +150,7 @@ class ServersApi {
           tlsSni: l.sni ?? '',
           tlsInsecure: l.insecure,
           wsPath: l.path ?? '',
+          serverPk: l.pk ?? '',
           owndns: l.owndns,
           dnsall: l.dnsall,
         ));

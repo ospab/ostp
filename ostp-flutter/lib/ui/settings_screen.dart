@@ -310,6 +310,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
           tlsSni: l.sni ?? '',
           tlsInsecure: l.insecure,
           wsPath: l.path ?? '',
+          serverPk: l.pk ?? '',
           owndns: l.owndns,
           dnsall: l.dnsall,
         ));
@@ -470,6 +471,13 @@ class _SettingsScreenState extends State<SettingsScreen> {
                     onChanged: (v) {
                       if (v != null) setDialogState(() => transportMode = v);
                     },
+                  ),
+                  // The protocol follows the server's key, which comes from the
+                  // link and is not edited here.
+                  Padding(
+                    padding: const EdgeInsets.only(top: 6),
+                    child: Text('Protocol: ${profile?.protocol ?? 'v5'}',
+                        style: const TextStyle(fontSize: 12, color: Colors.white54)),
                   ),
                   // TLS only applies to the UoT (TCP) transport, so the section
                   // is hidden under UDP. Reactive: switching Transport above
@@ -641,6 +649,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
     link.path = p.wsPath.isEmpty ? null : p.wsPath;
     link.owndns = p.owndns;
     link.dnsall = p.dnsall;
+    link.pk = p.serverPk.isEmpty ? null : p.serverPk;
     // Deliberately generic title — not "Share {name}": when a profile has no
     // custom name, `name` falls back to the raw server address, and this
     // dialog is exactly the wrong place to be casually displaying that

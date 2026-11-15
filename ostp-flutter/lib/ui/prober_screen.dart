@@ -86,6 +86,7 @@ class _ProberScreenState extends State<ProberScreen> {
       final requestJson = jsonEncode({
         'server_addr': profile.serverAddr,
         'access_key': profile.accessKey,
+        if (profile.serverPk.isNotEmpty) 'server_pk': profile.serverPk,
         if (_tlsRequest(profile) != null) 'tls': _tlsRequest(profile),
       });
       final String raw = await platform.invokeMethod('runProberMatrix', {'requestJson': requestJson}).timeout(_probeTimeout);
@@ -123,6 +124,7 @@ class _ProberScreenState extends State<ProberScreen> {
         'port': entry['port'],
         'transport': entry['transport'],
         'access_key': profile.accessKey,
+        if (profile.serverPk.isNotEmpty) 'server_pk': profile.serverPk,
         'max_ttl': maxTtl.clamp(1, 64),
         if (_tlsRequest(profile) != null) 'tls': _tlsRequest(profile),
       });

@@ -1,5 +1,6 @@
 import { shouldAskDnsNotice, effectiveDns, filtersDns } from './dns_notice.js';
 import { classifyFetchError, cardMessage, shouldAskToSend, SEND_DIALOG } from './device_limit.js';
+import { linkPk, protocolLabel } from './server_pk.js';
 import { initServers, renderServers, mountSshForm, confirmBox, fmtBytes } from './servers.js';
 
 // ── Tauri invoke shim ─────────────────────────────────────────────────
@@ -39,6 +40,7 @@ function invoke(cmd, args) {
 // Profile shape:
 // { id: string, name: string, server: string, key: string, transport: 'udp'|'uot',
 //   tls?: bool, tls_sni?: string, tls_insecure?: bool, ws_path?: string,
+//   server_pk?: string,   // the server's key (the link's pk): present = protocol v6, absent or '' = v5
 //   tun?: bool, dns?: string, owndns?: bool, dnsall?: bool,   // carried by share links, kept for export
 //   dns_choice?: 'operator'|'public'|'mine',   // the user's choice for a server that filters DNS (absent: ask)
 //   sub_id?: string }   // set on profiles owned by a subscription
@@ -195,6 +197,11 @@ function updateTlsVisibility() {
 }
 pmTransport.addEventListener('change', updateTlsVisibility);
 pmTls.addEventListener('change', updateTlsVisibility);
+
+// The protocol of the profile shown in the editor: v6 when it has the server's key.
+function setProtocolLine(p) {
+  $('pm-protocol').textContent = `Protocol: ${protocolLabel(p)}`;
+}
 
 function setTlsFields(p) {
   pmTls.checked = !!p.tls;
@@ -520,6 +527,8 @@ function buildConfig() {
     },
   };
   if (s.mtu) cfg.mtu = clampInt(s.mtu, 576, 1500, 1350);
+  // The server's key: with it the profile speaks protocol v6, without it v5.
+  if (active.server_pk) cfg.server_pk = active.server_pk;
   return cfg;
 }
 
@@ -924,6 +933,7 @@ function openProfileEditor(id) {
     pmTransport.value = p.transport || 'udp';
     setTlsFields(p);
     setDnsChoiceField(p);
+    setProtocolLine(p);
     btnProfileDelete.style.display = '';
   } else {
     profileModalTitle.textContent = 'New profile';
@@ -931,6 +941,7 @@ function openProfileEditor(id) {
     pmTransport.value = 'udp';
     setTlsFields({});
     setDnsChoiceField({});
+    setProtocolLine({});
     btnProfileDelete.style.display = 'none';
   }
   pmKey.type = 'password';
@@ -1063,7 +1074,8 @@ function parseOstpLink(raw) {
   const server = host.includes(':') ? `[${host}]:${port}` : `${host}:${port}`;
   if (server.length > LIMITS.server) throw new Error('The server address in the link is too long');
 
-  const out = { name: host, server, key, transport: 'udp', tls: false, tls_sni: '', tls_insecure: false, ws_path: '' };
+  // server_pk is '' for a v5 link; a link that has `pk` is protocol v6.
+  const out = { name: host, server, key, transport: 'udp', tls: false, tls_sni: '', tls_insecure: false, ws_path: '', server_pk: '' };
   for (const pair of query.split('&').filter(Boolean)) {
     const eq = pair.indexOf('=');
     const k = eq >= 0 ? pair.slice(0, eq) : pair;
@@ -1073,6 +1085,7 @@ function parseOstpLink(raw) {
     else if (k === 'sni') out.tls_sni = v;
     else if (k === 'insecure') out.tls_insecure = truthy(v);
     else if (k === 'path') out.ws_path = v;
+    else if (k === 'pk') out.server_pk = linkPk(v);
     else if (k === 'tun') { if (truthy(v)) out.tun = true; }
     else if (k === 'dns') { if (v.trim()) out.dns = v.trim().slice(0, LIMITS.server); }
     else if (k === 'owndns') { if (truthy(v)) out.owndns = true; }
@@ -1095,7 +1108,7 @@ function importFromLink(raw) {
     // Pre-fill editor
     editingProfileId = null;
     pendingLinkExtras = {};
-    for (const k of ['tun', 'dns', 'owndns', 'dnsall']) if (parsed[k]) pendingLinkExtras[k] = parsed[k];
+    for (const k of ['tun', 'dns', 'owndns', 'dnsall', 'server_pk']) if (parsed[k]) pendingLinkExtras[k] = parsed[k];
     profileModalTitle.textContent = 'New profile';
     pmName.value = parsed.name;
     pmServer.value = parsed.server;
@@ -1103,6 +1116,7 @@ function importFromLink(raw) {
     pmTransport.value = parsed.transport;
     setTlsFields(parsed);
     setDnsChoiceField(parsed);
+    setProtocolLine(parsed);
     btnProfileDelete.style.display = 'none';
     profileModal.classList.remove('hidden');
     showToast('Check the details, then press Save', 'ok');
@@ -1127,6 +1141,7 @@ function buildShareLink(p) {
   if (p.owndns) params.push('owndns=true');
   if (p.dnsall) params.push('dnsall=true');
   if (p.name) params.push(`name=${linkEncode(p.name)}`);
+  if (p.server_pk) params.push(`pk=${p.server_pk}`);
   return `ostp://${linkEncode(p.key)}@${p.server}?${params.join('&')}`;
 }
 
@@ -1202,12 +1217,15 @@ const finiteOrNull = v => (typeof v === 'number' && Number.isFinite(v) && v >= 0
 function applySubscription(sub, doc) {
   if (!isObj(doc)) throw new Error('the answer is not a subscription');
   const links = [];
+  let badKey = '';
   const rawLinks = Array.isArray(doc.links) ? doc.links.slice(0, MAX_SUB_LINKS) : [];
   for (const l of rawLinks) {
     if (typeof l !== 'string') continue;
-    try { links.push(parseOstpLink(l)); } catch { /* skip malformed */ }
+    try { links.push(parseOstpLink(l)); }
+    catch (e) { if (!badKey && /server key \(pk\)/.test(e.message)) badKey = e.message; /* other malformed links are skipped */ }
   }
-  if (!links.length) throw new Error('the subscription has no usable links');
+  // A link whose server key is damaged is not turned into a v5 profile; if nothing else is usable, say why.
+  if (!links.length) throw new Error(badKey || 'the subscription has no usable links');
   const others = profiles.filter(p => p.sub_id !== sub.id).length;
   if (others + links.length > MAX_PROFILES) throw new Error(`the app keeps up to ${MAX_PROFILES} profiles`);
 
@@ -1428,7 +1446,7 @@ async function runMatrix() {
   setProberBusy(true);
   prStatus(`Trying a handshake with ${p.server} on every address and carrier…`, 'busy');
   try {
-    const rows = await invoke('run_prober_matrix', { request: { server: p.server, key: p.key, tls: proberTls(p) } });
+    const rows = await invoke('run_prober_matrix', { request: { server: p.server, key: p.key, server_pk: p.server_pk || null, tls: proberTls(p) } });
     if (!rows) throw new Error('the prober needs the desktop app');
     lastMatrix = { profile: p, rows };
     const ok = rows.filter(r => r.outcome.success);
@@ -1462,7 +1480,7 @@ async function runTtl() {
   prStatus(`Scanning the path to ${target.address} (${carrierName(target.transport)}), up to 20 hops…`, 'busy');
   try {
     const rep = await invoke('run_prober_ttl', { request: {
-      address: target.address, port: target.port, transport: target.transport, key: p.key, tls: proberTls(p), max_ttl: 20 } });
+      address: target.address, port: target.port, transport: target.transport, key: p.key, server_pk: p.server_pk || null, tls: proberTls(p), max_ttl: 20 } });
     if (!rep) throw new Error('the prober needs the desktop app');
     const cells = rep.steps.map(s => `<span class="pr-ttl ${s.outcome}" title="${escHtml(s.preview || s.outcome)}">${s.ttl}</span>`).join('');
     let verdict;

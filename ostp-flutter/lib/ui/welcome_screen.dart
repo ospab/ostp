@@ -73,6 +73,7 @@ class _WelcomeScreenState extends State<WelcomeScreen> {
           tlsSni: l.sni ?? '',
           tlsInsecure: l.insecure,
           wsPath: l.path ?? '',
+          serverPk: l.pk ?? '',
           owndns: l.owndns,
           dnsall: l.dnsall,
         ));

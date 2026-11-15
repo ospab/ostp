@@ -1,8 +1,13 @@
+import 'server_key.dart';
+
 /// `ostp://` share-link codec — a port of ostp-core/src/share_link.rs.
 /// Keep the two (and the desktop GUI's copy) in step: same parameters, same
 /// order, same encoding.
 ///
-/// `ostp://KEY@HOST:PORT?type=uot&tls=1&sni=..&insecure=1&path=%2F..&tun=true&dns=..&owndns=true&dnsall=true&name=..`
+/// `ostp://KEY@HOST:PORT?type=uot&tls=1&sni=..&insecure=1&path=%2F..&tun=true&dns=..&owndns=true&dnsall=true&name=..&pk=..`
+///
+/// `pk` is the server's public key (protocol v6, base64url); a link without it
+/// is a v5 profile. A malformed `pk` is an error, never a v5 profile.
 class ShareLink {
   String key;
   String host;
@@ -18,6 +23,9 @@ class ShareLink {
   bool dnsall;
   String? name;
 
+  /// The server's public key (`pk`), base64url; null for a v5 link.
+  String? pk;
+
   ShareLink({
     required this.key,
     required this.host,
@@ -32,6 +40,7 @@ class ShareLink {
     this.owndns = false,
     this.dnsall = false,
     this.name,
+    this.pk,
   });
 
   /// `host:port`, bracketing IPv6 literals.
@@ -41,7 +50,13 @@ class ShareLink {
 
   static bool _truthy(String v) => const {'1', 'true', 'yes'}.contains(v.toLowerCase());
 
-  static String _decode(String s) => Uri.decodeComponent(s.replaceAll('+', ' '));
+  static String _decode(String s) {
+    try {
+      return Uri.decodeComponent(s.replaceAll('+', ' '));
+    } on ArgumentError {
+      throw const FormatException('the link has broken % escapes');
+    }
+  }
 
   static String? _nonEmpty(String v) => v.isEmpty ? null : v;
 
@@ -120,6 +135,13 @@ class ShareLink {
         case 'name':
           link.name = _nonEmpty(v);
           break;
+        case 'pk':
+          try {
+            link.pk = checkServerKey(v);
+          } on FormatException catch (e) {
+            throw FormatException('the link has an invalid server key (pk): ${e.message}');
+          }
+          break;
       }
     }
     // TLS and the upgrade path only exist on the TCP carrier.
@@ -146,6 +168,7 @@ class ShareLink {
     if (owndns) q.add('owndns=true');
     if (dnsall) q.add('dnsall=true');
     if (name != null) q.add('name=${_encode(name!)}');
+    if (pk != null) q.add('pk=$pk');
     return 'ostp://${_encode(key)}@$server?${q.join('&')}';
   }
 }

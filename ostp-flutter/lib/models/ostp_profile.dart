@@ -24,6 +24,10 @@ class OstpProfile {
   // are rewritten on every refresh of that subscription.
   String subId;
 
+  // The server's public key (the link's pk): present = protocol v6 (the
+  // client checks the server by it), '' = v5.
+  String serverPk;
+
   // Carried by the share link: the server runs its own resolver (owndns) or
   // answers every DNS query and refuses DoT/DoH (dnsall). Kept for export and
   // for the DNS notice. dnsChoice is what the user chose for such a server:
@@ -45,10 +49,14 @@ class OstpProfile {
     this.tlsInsecure = false,
     this.wsPath = '',
     this.subId = '',
+    this.serverPk = '',
     this.owndns = false,
     this.dnsall = false,
     this.dnsChoice = '',
   });
+
+  /// 'v6' when the profile has the server's key, else 'v5'.
+  String get protocol => serverPk.isEmpty ? 'v5' : 'v6';
 
   Map<String, dynamic> toJson() {
     return {
@@ -64,6 +72,7 @@ class OstpProfile {
       'tlsInsecure': tlsInsecure,
       'wsPath': wsPath,
       'subId': subId,
+      'serverPk': serverPk,
       'owndns': owndns,
       'dnsall': dnsall,
       'dnsChoice': dnsChoice,
@@ -84,6 +93,7 @@ class OstpProfile {
       tlsInsecure: json['tlsInsecure'] as bool? ?? false,
       wsPath: json['wsPath'] as String? ?? '',
       subId: json['subId'] as String? ?? '',
+      serverPk: json['serverPk'] as String? ?? '',
       owndns: json['owndns'] as bool? ?? false,
       dnsall: json['dnsall'] as bool? ?? false,
       dnsChoice: json['dnsChoice'] as String? ?? '',
