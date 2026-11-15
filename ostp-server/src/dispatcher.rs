@@ -117,10 +117,11 @@ pub struct Dispatcher {
     /// The transitional mode: v5 handshakes are accepted as well.
     accept_v5: bool,
     v6_secrets_cache: HashMap<String, ostp_core::crypto::V6Secrets>,
-    /// The reply to each accepted v6 handshake, by the SHA-256 of the client's
-    /// datagram, with the handshake's timestamp. A client whose reply was lost
-    /// sends the same datagram again; it gets the same reply instead of
-    /// silence (the replay check would drop it). Kept as long as the replay
+    /// The reply to each accepted v6 handshake, by the SHA-256 of its Noise
+    /// message (not of the datagram: nonce and padding vary between copies),
+    /// with the handshake's timestamp. A client whose reply was lost sends the
+    /// handshake again; it gets the same reply instead of silence (the replay
+    /// check would drop it). Kept as long as the replay
     /// cache keeps the handshake. The reply is encrypted to the client's
     /// ephemeral key, so resending it to someone who replays a captured
     /// handshake gives them nothing.
@@ -492,22 +493,6 @@ impl Dispatcher {
         // recognised. Computed once per datagram, not per candidate key.
         let junk_window = ostp_core::crypto::current_junk_window();
 
-        // A v6 handshake this server already answered, sent again because the
-        // reply was lost: the same reply, no second session.
-        let datagram_hash: Option<[u8; 32]> = self.server_key.map(|_| {
-            use sha2::{Digest, Sha256};
-            Sha256::digest(&packet).into()
-        });
-        if let Some(hash) = &datagram_hash {
-            if let Some((_, reply)) = self.hs_replies.get(hash) {
-                return Ok(DispatchOutcome::Accepted {
-                    responses: vec![reply.clone()],
-                    app_payloads: Vec::new(),
-                    peer_addr: peer,
-                });
-            }
-        }
-
         // v6 first for every key (a tag check, one HMAC), then v5 for every
         // key (the transitional mode).
         let mut attempts: Vec<(String, bool)> = Vec::with_capacity(keys_snapshot.len() * 2);
@@ -519,11 +504,26 @@ impl Dispatcher {
         }
 
         for (candidate_key, is_v6) in attempts {
+            let mut noise_hash: Option<[u8; 32]> = None;
             let (secrets, v6_cfg, candidate_session_id) = if is_v6 {
                 let v6 = self.cached_v6_secrets(&candidate_key);
-                let Some(sid) = ostp_core::protocol::v6_handshake_session_id(&v6.hs, &packet) else {
+                let Some((sid, hash)) = ostp_core::protocol::v6_handshake_identity(&v6.hs, &packet) else {
                     continue;
                 };
+                // A handshake this server already answered, sent again because
+                // the reply was lost: the same reply, no second session. It is
+                // found by the Noise message, not the whole datagram: the
+                // padding is not authenticated, so a damaged copy that was
+                // accepted must not hide the clean one, and a resend sealed
+                // anew (other nonce, other padding) is the same handshake.
+                if let Some((_, reply)) = self.hs_replies.get(&hash) {
+                    return Ok(DispatchOutcome::Accepted {
+                        responses: vec![reply.clone()],
+                        app_payloads: Vec::new(),
+                        peer_addr: peer,
+                    });
+                }
+                noise_hash = Some(hash);
                 let Some(private) = self.server_key else { continue };
                 let handshake = ostp_core::protocol::V6Handshake {
                     server: ostp_core::crypto::ServerStatic::Private(private),
@@ -691,7 +691,7 @@ impl Dispatcher {
                                 candidate_session_id, peer, if is_v6 { 6 } else { 5 }, self.peer_machines.len(), self.replay_cache.len()
                             );
 
-                            if let (true, Some(hash), Some(reply)) = (is_v6, datagram_hash, response_opt.as_ref()) {
+                            if let (Some(hash), Some(reply)) = (noise_hash, response_opt.as_ref()) {
                                 if self.hs_replies.len() >= REPLAY_CACHE_MAX {
                                     self.hs_replies.retain(|_, (cached_ts, _)| now.abs_diff(*cached_ts) <= 300);
                                 }
@@ -1101,6 +1101,53 @@ mod roaming_tests {
         }
         assert_eq!(dispatcher.active_sessions(), 1);
         client.on_event(OstpEvent::Inbound(again)).unwrap();
+        assert_eq!(client.state(), OstpState::Established);
+    }
+
+    /// Found in wirelab (hs-corrupt, seeds 1, 5, 10): the padding is not
+    /// authenticated, so a copy with a flipped padding bit is accepted; when
+    /// its reply is lost the clean copy (another datagram hash) used to miss
+    /// the cache and die in the replay check. The cache keys on the Noise
+    /// message now.
+    #[test]
+    fn a_damaged_padding_copy_does_not_block_the_clean_one() {
+        let (private, public) = ostp_core::crypto::noise::generate_server_key();
+        let mut dispatcher = new_dispatcher();
+        dispatcher.set_wire_versions(Some(private), false);
+        let (mut client, msg1) = v6_client(public);
+        let home = addr("203.0.113.5:4000");
+
+        let mut damaged = msg1.to_vec();
+        *damaged.last_mut().unwrap() ^= 1; // a bit of the padding
+        assert_ne!(&damaged[..], &msg1[..]);
+        // Accepted, and its reply is "lost": the client never sees it.
+        let lost = accepted_reply(dispatcher.on_datagram(home, Bytes::from(damaged)).unwrap()).expect("the damaged copy is accepted");
+        assert_eq!(dispatcher.active_sessions(), 1);
+
+        let answered = accepted_reply(dispatcher.on_datagram(home, msg1).unwrap()).expect("the clean copy is answered");
+        assert_eq!(answered, lost);
+        assert_eq!(dispatcher.active_sessions(), 1, "no second session");
+        client.on_event(OstpEvent::Inbound(answered)).unwrap();
+        assert_eq!(client.state(), OstpState::Established);
+    }
+
+    /// A resend sealed anew (other nonce, other padding) is the same handshake.
+    #[test]
+    fn a_resealed_handshake_gets_the_cached_reply() {
+        let (private, public) = ostp_core::crypto::noise::generate_server_key();
+        let mut dispatcher = new_dispatcher();
+        dispatcher.set_wire_versions(Some(private), false);
+        let (mut client, msg1) = v6_client(public);
+        let home = addr("203.0.113.5:4000");
+        let first = accepted_reply(dispatcher.on_datagram(home, msg1.clone()).unwrap()).expect("accepted");
+        for _ in 0..5 {
+            let again = client.handshake_resend().unwrap().expect("a v6 resend");
+            assert_ne!(again, msg1);
+            let reply = accepted_reply(dispatcher.on_datagram(home, again).unwrap()).expect("answered from the cache");
+            assert_eq!(reply, first);
+        }
+        assert_eq!(dispatcher.active_sessions(), 1);
+        client.on_event(OstpEvent::Inbound(first)).unwrap();
         assert_eq!(client.state(), OstpState::Established);
     }
 

@@ -96,6 +96,55 @@ async fn send_datagram(socket: &crate::transport::Transport, frame: &Bytes, _web
     socket.send(frame).await
 }
 
+/// The datagram for the next handshake send. The first send is `first` as the
+/// machine built it; each later one is a v6 handshake sealed anew (same Noise
+/// message, new nonce and padding). A v5 handshake, which has no such resend,
+/// goes out byte-identical every time.
+fn next_handshake_frame(machine: &ProtocolMachine, first: &Bytes, sent: &mut bool) -> Bytes {
+    let frame = if *sent {
+        match machine.handshake_resend() {
+            Ok(Some(fresh)) => fresh,
+            _ => first.clone(),
+        }
+    } else {
+        first.clone()
+    };
+    *sent = true;
+    frame
+}
+
+#[cfg(test)]
+mod handshake_resend_tests {
+    use super::*;
+
+    fn machine(pk: Option<[u8; 32]>) -> (ProtocolMachine, Bytes) {
+        let cfg = crate::wire::initiator_config(
+            b"key", pk, 9, ostp_core::build_handshake_payload(b"key", 9), TrafficProfile::JsonRpc, 1200,
+        );
+        let mut m = ProtocolMachine::new(cfg).unwrap();
+        let ProtocolAction::SendDatagram(first) = m.on_event(OstpEvent::Start).unwrap() else { panic!() };
+        (m, first)
+    }
+
+    #[test]
+    fn a_v6_handshake_is_sent_anew_each_time_and_a_v5_one_is_repeated() {
+        let (_, public) = ostp_core::crypto::noise::generate_server_key();
+        let (m, first) = machine(Some(public));
+        let mut sent = false;
+        let a = next_handshake_frame(&m, &first, &mut sent);
+        let b = next_handshake_frame(&m, &first, &mut sent);
+        let c = next_handshake_frame(&m, &first, &mut sent);
+        assert_eq!(a, first, "the first send is the machine's own datagram");
+        assert!(a != b && b != c && a != c, "v6 sends repeat");
+
+        let (m, first) = machine(None);
+        let mut sent = false;
+        for _ in 0..3 {
+            assert_eq!(next_handshake_frame(&m, &first, &mut sent), first, "v5 stays byte-identical");
+        }
+    }
+}
+
 fn collect_datagrams(action: ProtocolAction, out: &mut Vec<Bytes>) {
     match action {
         ProtocolAction::SendDatagram(frame) => out.push(frame),
@@ -1385,6 +1434,7 @@ impl Bridge {
                 socket.send_ttl_decoys(&decoys, effective_ttl).await;
             }
 
+            let mut handshake_sent = false;
             for attempt in 0..attempt_limit {
                 if attempt > 0 {
                     tx.send(UiEvent::Log(format!("Handshake attempt {} lost. Retransmitting...", attempt))).await.ok();
@@ -1395,10 +1445,16 @@ impl Bridge {
                 // multi-second one. The duplicate is harmless — whichever copy
                 // arrives first is processed, and the server's anti-replay drops
                 // the other. UoT rides reliable TCP, so one send there.
+                //
+                // Identical datagrams on the wire are a pattern, so for a v6
+                // profile every send after the first is the same Noise message
+                // sealed anew (other nonce, other padding). A v5 handshake
+                // resends the same bytes, as 0.4.x servers expect.
                 let sends = if is_uot { 1 } else { 2 };
                 for _ in 0..sends {
-                    if send_datagram(&socket, &handshake_frame, self.transport_mode == "udp").await.is_ok() {
-                        self.metrics.bytes_sent.fetch_add(handshake_frame.len() as u64, Ordering::Relaxed);
+                    let frame = next_handshake_frame(&machine, &handshake_frame, &mut handshake_sent);
+                    if send_datagram(&socket, &frame, self.transport_mode == "udp").await.is_ok() {
+                        self.metrics.bytes_sent.fetch_add(frame.len() as u64, Ordering::Relaxed);
                     }
                 }
 
@@ -1427,8 +1483,9 @@ impl Bridge {
                                 if attempt > 0 {
                                     tx.send(UiEvent::Log(format!("NAT64 handshake attempt {} lost. Retransmitting...", attempt))).await.ok();
                                 }
-                                if send_datagram(&fallback_socket, &handshake_frame, self.transport_mode == "udp").await.is_ok() {
-                                    self.metrics.bytes_sent.fetch_add(handshake_frame.len() as u64, Ordering::Relaxed);
+                                let frame = next_handshake_frame(&machine, &handshake_frame, &mut handshake_sent);
+                                if send_datagram(&fallback_socket, &frame, self.transport_mode == "udp").await.is_ok() {
+                                    self.metrics.bytes_sent.fetch_add(frame.len() as u64, Ordering::Relaxed);
                                 }
                                 match timeout(Duration::from_millis(1200), fallback_socket.recv(&mut buf)).await {
                                     Ok(Ok(n)) => {

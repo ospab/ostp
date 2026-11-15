@@ -114,6 +114,20 @@ pub fn v6_handshake_session_id(keys: &crate::crypto::HsKeys, datagram: &[u8]) ->
     Some(u32::from_be_bytes([sid[0], sid[1], sid[2], sid[3]]))
 }
 
+/// What identifies a v6 handshake whatever its nonce and padding: the session
+/// id and a SHA-256 of the Noise message. `None` without this key's tag or when
+/// the body is too short for its own length field. One HMAC and one ChaCha20
+/// pass, no curve operation: a server uses it to find a handshake it already
+/// answered (the reply cache) before any Noise work.
+pub fn v6_handshake_identity(keys: &crate::crypto::HsKeys, datagram: &[u8]) -> Option<(u32, [u8; 32])> {
+    use sha2::{Digest, Sha256};
+    let body = crate::crypto::handshake_v6::open(keys, crate::crypto::HsDirection::ClientToServer, datagram)?;
+    let sid = u32::from_be_bytes(body.get(..4)?.try_into().ok()?);
+    let noise_len = u16::from_be_bytes(body.get(4..6)?.try_into().ok()?) as usize;
+    let noise = body.get(6..6 + noise_len)?;
+    Some((sid, Sha256::digest(noise).into()))
+}
+
 /// The client's handshake payload: `timestamp(8) | session_id(4) | access_key`,
 /// big-endian, timestamp in unix seconds.
 pub fn build_handshake_payload(access_key: &[u8], session_id: u32) -> Vec<u8> {
@@ -232,6 +246,9 @@ pub struct ProtocolMachine {
     _mtu: usize,
     /// `Some`: the handshake datagrams are v6 (masked, tagged).
     v6_hs: Option<crate::crypto::HsKeys>,
+    /// The Noise message of the first handshake datagram a client built, kept
+    /// so a resend can be sealed again (`handshake_resend`).
+    first_noise: Option<Vec<u8>>,
 }
 
 // ── Gap recovery (see `ProtocolMachine::recover_stalled_gap`) ────────────────
@@ -343,7 +360,19 @@ impl ProtocolMachine {
             handshake_pad_max: config.handshake_pad_max.max(config.handshake_pad_min + 16),
             _mtu: mtu,
             v6_hs,
+            first_noise: None,
         })
+    }
+
+    /// A fresh sealing of the first handshake message, for a resend: the same
+    /// Noise message, a new nonce and new padding, so two copies on the wire
+    /// share no bytes. `None` for a v5 handshake (its resend stays
+    /// byte-identical, as 0.4.x servers expect) and before `Start`.
+    pub fn handshake_resend(&self) -> Result<Option<Bytes>, ProtocolError> {
+        match (&self.v6_hs, &self.first_noise) {
+            (Some(_), Some(noise)) => self.wrap_datagram_handshake(noise).map(Some),
+            _ => Ok(None),
+        }
     }
 
     /// Highest data nonce received that passed authentication, if any.
@@ -463,8 +492,9 @@ impl ProtocolMachine {
                         let mut out = vec![0_u8; 1024];
                         let n = self.noise.write_handshake(&self.handshake_payload, &mut out)?;
                         out.truncate(n);
-                        self.wrap_datagram_handshake(&out)
-                            .map(ProtocolAction::SendDatagram)
+                        let frame = self.wrap_datagram_handshake(&out)?;
+                        self.first_noise = Some(out);
+                        Ok(ProtocolAction::SendDatagram(frame))
                     }
                     NoiseRole::Responder => {
                         self.state = OstpState::Handshaking;
@@ -1564,6 +1594,55 @@ mod tests {
         // The reply once more (the server resent it): refused, session intact.
         assert!(client.on_event(OstpEvent::Inbound(reply)).is_err());
         assert_eq!(client.state(), OstpState::Established);
+    }
+
+    /// A resend of a v6 handshake is the same Noise message in a new outer
+    /// layer: no byte position keeps its value from one copy to the next, and
+    /// every copy opens to the same hello on a server machine.
+    #[test]
+    fn resealed_v6_handshakes_share_no_bytes_and_carry_the_same_hello() {
+        let (private, public) = crate::crypto::noise::generate_server_key();
+        let (ccfg, scfg) = v6_configs(private, public);
+        let mut client = ProtocolMachine::new(ccfg).unwrap();
+        assert!(client.handshake_resend().unwrap().is_none(), "nothing to resend before Start");
+        let ProtocolAction::SendDatagram(first) = client.on_event(OstpEvent::Start).unwrap() else { panic!() };
+
+        let rounds = 300;
+        let mut same = vec![0u32; first.len().min(48)];
+        let mut equal_total = 0usize;
+        let mut compared = 0usize;
+        let mut lengths = std::collections::HashSet::new();
+        for _ in 0..rounds {
+            let again = client.handshake_resend().unwrap().expect("a v6 resend");
+            lengths.insert(again.len());
+            for (i, (a, b)) in first.iter().zip(again.iter()).enumerate() {
+                compared += 1;
+                if a == b {
+                    equal_total += 1;
+                    if let Some(c) = same.get_mut(i) {
+                        *c += 1;
+                    }
+                }
+            }
+            // The same Noise message and hello: a server machine takes it.
+            let mut server = ProtocolMachine::new(scfg.clone()).unwrap();
+            let (payload, _) = server_reply(server.on_event(OstpEvent::Inbound(again)).unwrap());
+            assert_eq!(&payload[..], b"hello");
+        }
+        // Chance agreement is 1/256 a byte. A fixed byte (nonce, tag, session
+        // id, length, Noise message) would agree in every round.
+        assert!(equal_total * 100 < compared, "{equal_total} of {compared} bytes agree");
+        assert!(same.iter().all(|&n| n < 20), "a byte position stays the same: {same:?}");
+        assert!(lengths.len() > 10, "the padding length does not vary: {lengths:?}");
+    }
+
+    /// v5 resends stay byte-identical: a 0.4.x server keys on the payload, and
+    /// the wire is not to change.
+    #[test]
+    fn a_v5_handshake_has_no_resealed_resend() {
+        let mut client = ProtocolMachine::new(make_config(NoiseRole::Initiator)).unwrap();
+        client.on_event(OstpEvent::Start).unwrap();
+        assert!(client.handshake_resend().unwrap().is_none());
     }
 
     #[test]
