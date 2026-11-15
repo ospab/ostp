@@ -198,7 +198,7 @@ pub async fn handle_relay_message(
         }
         RelayMessage::ConnectOk => {}
         RelayMessage::Error(msg) => {
-            let _ = ui_event_tx.send(UiEvent::Log(format!("Relay error from [{session_id}:{stream_id}]: {msg}")));
+            let _ = ui_event_tx.send(crate::logs::client_stream_error(session_id, stream_id, &msg));
         }
         RelayMessage::Ping(ts) => {
             send_relay_to_stream(session_id, stream_id, RelayMessage::Pong(ts), dispatcher, socket, ui_event_tx, tcp_map).await?;
@@ -416,7 +416,7 @@ async fn send_one(
         }
         if !sent_tcp {
             if let Err(e) = socket.send_to(&frame, peer_addr).await {
-                tracing::debug!("send to {peer_addr} failed: {e}");
+                crate::logs::send_failed(peer_addr, &e);
             }
         }
     }

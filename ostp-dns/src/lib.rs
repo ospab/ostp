@@ -337,10 +337,19 @@ impl Dns {
         let filter = lists::build_filter(&settings, data_dir.as_deref());
         let log_size = settings.query_log_size;
         let activity = data_dir.as_deref().and_then(|d| read_activity(&d.join(ACTIVITY_FILE)));
-        let (since, counters, mut log) = match activity {
+        let (since, mut counters, mut log) = match activity {
             Some(a) => (a.since, a.counters, a.log),
             None => (unix_now(), Counters::default(), VecDeque::new()),
         };
+        // `strict` keeps no query history: what an earlier run wrote is dropped,
+        // and the file is rewritten without it at the first save.
+        let strict = ostp_core::logpriv::privacy() == ostp_core::logpriv::Privacy::Strict;
+        if strict {
+            log.clear();
+            counters.domains.clear();
+            counters.blocked_domains.clear();
+            counters.clients.clear();
+        }
         while log.len() > log_size {
             log.pop_front();
         }
@@ -355,7 +364,7 @@ impl Dns {
             data_dir,
             proxy: RwLock::new(None),
             since: Mutex::new(since),
-            dirty: AtomicBool::new(false),
+            dirty: AtomicBool::new(strict),
             upstream_slots: tokio::sync::Semaphore::new(MAX_UPSTREAM_QUERIES),
         })
     }
@@ -476,14 +485,23 @@ impl Dns {
     }
 
     fn record(&self, entry: LogEntry, upstream_ms: Option<u64>) {
-        let size = self.settings().query_log_size;
+        self.record_in(ostp_core::logpriv::privacy(), entry, upstream_ms);
+    }
+
+    fn record_in(&self, mode: ostp_core::logpriv::Privacy, entry: LogEntry, upstream_ms: Option<u64>) {
+        // `strict`: no query log, and no per-name or per-client tallies either;
+        // only the plain counters (total, blocked, cached...) are kept.
+        let keep_history = mode != ostp_core::logpriv::Privacy::Strict;
+        let size = if keep_history { self.settings().query_log_size } else { 0 };
         {
             let mut c = self.counters.lock().unwrap_or_else(|e| e.into_inner());
             c.total += 1;
             match entry.outcome {
                 Outcome::Blocked | Outcome::BlockedService => {
                     c.blocked += 1;
-                    bump(&mut c.blocked_domains, &entry.name);
+                    if keep_history {
+                        bump(&mut c.blocked_domains, &entry.name);
+                    }
                 }
                 Outcome::Rewritten | Outcome::SafeSearch => c.rewritten += 1,
                 Outcome::Cached => c.cached += 1,
@@ -494,8 +512,10 @@ impl Dns {
                 c.upstream_ms_sum += ms;
                 c.upstream_count += 1;
             }
-            bump(&mut c.domains, &entry.name);
-            bump(&mut c.clients, &entry.client);
+            if keep_history {
+                bump(&mut c.domains, &entry.name);
+                bump(&mut c.clients, &entry.client);
+            }
         }
         self.dirty.store(true, Ordering::Relaxed);
         if size > 0 {
@@ -728,7 +748,9 @@ impl Dns {
         let started = Instant::now();
         let entry = |outcome, rule: Option<String>, source: Option<String>, upstream: Option<String>| LogEntry {
             time: now_ms(),
-            client: client.to_string(),
+            // The log is on disk and in the panel: a client's address is cut
+            // to its network (full only in `debug`).
+            client: ostp_core::logpriv::fmt_ip(client),
             name: name.clone(),
             qtype: qtype_name(qtype),
             outcome,
@@ -802,7 +824,11 @@ impl Dns {
                 Some(answer)
             }
             Err(e) => {
-                tracing::debug!("DNS {name}: {e:#}");
+                tracing::debug!(
+                    "DNS {}: {}",
+                    ostp_core::logpriv::fmt_target(&name),
+                    ostp_core::logpriv::fmt_error(&format!("{e:#}"))
+                );
                 self.record(entry(Outcome::Failed, None, None, Some(format!("{e:#}"))), None);
                 with_rcode(&q, RCODE::ServerFailure)
             }
@@ -1039,6 +1065,25 @@ mod tests {
         s.block_doh_bypass = false;
         let dns = Dns::new(s, None);
         assert!(!dns.is_dns_bypass("8.8.8.8:443"));
+    }
+
+    #[test]
+    fn strict_keeps_no_query_history_and_normal_cuts_the_client_address() {
+        use ostp_core::logpriv::Privacy;
+        let strict = Dns::new(DnsSettings::default(), None);
+        strict.record_in(Privacy::Strict, entry("tracked.example", Outcome::Blocked), None);
+        assert!(strict.query_log(10, None).is_empty());
+        let stats = strict.stats();
+        assert_eq!((stats.total, stats.blocked), (1, 1), "the plain counters stay");
+        assert!(stats.top_domains.is_empty() && stats.top_blocked.is_empty() && stats.top_clients.is_empty());
+
+        let normal = Dns::new(DnsSettings::default(), None);
+        normal.record_in(Privacy::Normal, entry("tracked.example", Outcome::Allowed), None);
+        assert_eq!(normal.query_log(10, None).len(), 1);
+
+        // The address in an entry made by `handle` is the network, not the client.
+        let ip: IpAddr = "203.0.113.77".parse().unwrap();
+        assert_eq!(ostp_core::logpriv::fmt_ip(ip), "203.0.113.0/24");
     }
 
     fn entry(name: &str, outcome: Outcome) -> LogEntry {

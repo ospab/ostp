@@ -172,13 +172,16 @@ pub extern "system" fn Java_net_ostp_client_OstpClientSdk_nativeStartClient(
     };
 
     // Parse config from JSON
-    let config: ClientConfig = match serde_json::from_str(&config_str) {
+    let mut config: ClientConfig = match serde_json::from_str(&config_str) {
         Ok(cfg) => cfg,
         Err(e) => {
             add_log(format!("Failed to parse config JSON: {e}"));
             return jni::sys::JNI_FALSE;
         }
     };
+    // `debug` follows `log_privacy`, so the verbose lines are on only in `debug`.
+    config.settle_privacy();
+    ostp_core::logpriv::set_privacy(config.privacy());
 
     let debug = config.debug;
 

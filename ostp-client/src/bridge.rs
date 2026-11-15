@@ -326,8 +326,9 @@ impl Bridge {
     pub fn new(config: &ClientConfig, metrics: Arc<BridgeMetrics>) -> Result<Self> {
         // Fail at start, not at the first handshake, on a damaged key.
         config.ostp.server_public_key()?;
+        ostp_core::logpriv::set_privacy(config.privacy());
         Ok(Self {
-            debug: config.debug,
+            debug: config.privacy() == ostp_core::logpriv::Privacy::Debug,
             profile: TrafficProfile::JsonRpc,
             server_addr: config.ostp.server_addr.clone(),
             local_bind_addr: config.ostp.local_bind_addr.clone(),
@@ -556,7 +557,7 @@ impl Bridge {
                                     let _ = proxy_tx.send((stream_id, ProxyToClientMsg::Close));
                                 }
                                 RelayMessage::Error(msg) => {
-                                    let _ = tx.send(UiEvent::Log(format!("Relay error for stream {stream_id}: {msg}"))).await;
+                                    let _ = tx.send(UiEvent::Log(crate::logs::ui_relay_error(stream_id, &msg))).await;
                                     let _ = proxy_tx.send((stream_id, ProxyToClientMsg::Error(msg)));
                                 }
                                 RelayMessage::Pong(ts) => {
@@ -1145,7 +1146,7 @@ impl Bridge {
         }
         let (stream_id, relay_msg, is_close) = match ev {
             ProxyEvent::NewStream { stream_id, target } => {
-                let _ = tx.send(UiEvent::Log(format!("Proxy CONNECT stream_id={stream_id} target={target}"))).await;
+                let _ = tx.send(UiEvent::Log(crate::logs::ui_proxy_connect(stream_id, &target))).await;
                 (stream_id, RelayMessage::Connect(target), false)
             }
             ProxyEvent::UdpAssociate { stream_id } => {
@@ -1665,6 +1666,8 @@ impl Bridge {
 
 
     fn apply_runtime_config(&mut self, cfg: &ClientConfig) {
+        ostp_core::logpriv::set_privacy(cfg.privacy());
+        self.debug = cfg.privacy() == ostp_core::logpriv::Privacy::Debug;
         self.server_addr = cfg.ostp.server_addr.clone();
         self.local_bind_addr = cfg.ostp.local_bind_addr.clone();
         self.proxy_addr = cfg.local_proxy.bind_addr.clone();

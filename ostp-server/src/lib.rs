@@ -18,6 +18,7 @@ use tokio::time::{interval, Duration, Instant};
 pub(crate) type SessionBackpressure = Arc<RwLock<HashMap<u32, Arc<send_gate::SendGate>>>>;
 
 mod dispatcher;
+mod logs;
 pub mod outbound;
 pub mod api;
 pub mod config_io;
@@ -64,6 +65,9 @@ pub(crate) enum UiEvent {
     #[allow(dead_code)] Tx { peer: IpAddr, bytes: usize },
     UnauthorizedProbe { peer: IpAddr, bytes: usize },
     KeyCreated { key: String },
+    /// A line that is always logged.
+    Info(String),
+    /// A line that is logged only in `debug`.
     Log(String),
     #[allow(dead_code)]
     KeyCount(usize),
@@ -98,7 +102,9 @@ pub struct ServerParams {
     pub outbound: Option<OutboundConfig>,
     pub api_config: Option<ApiConfig>,
     pub fallback_config: Option<FallbackConfig>,
-    pub debug: bool,
+    /// What the log may say (`log.privacy`; see `ostp_core::logpriv`). `debug`
+    /// also turns on the verbose lines and the per-stream detail.
+    pub privacy: ostp_core::logpriv::Privacy,
     pub dns_config: Option<dns::DnsConfig>,
     pub config_path: Option<std::path::PathBuf>,
     /// Enabled `tls` section, resolved.
@@ -135,7 +141,7 @@ pub async fn run_server(params: ServerParams) -> Result<()> {
         outbound,
         api_config,
         fallback_config,
-        debug,
+        privacy,
         dns_config,
         config_path,
         tls,
@@ -145,6 +151,8 @@ pub async fn run_server(params: ServerParams) -> Result<()> {
         local_access,
         wire,
     } = params;
+    ostp_core::logpriv::set_privacy(privacy);
+    let debug = privacy == ostp_core::logpriv::Privacy::Debug;
     let mut keys_map = HashMap::new();
     for (key, meta) in access_keys {
         keys_map.insert(key, meta);
@@ -475,14 +483,9 @@ pub async fn run_server(params: ServerParams) -> Result<()> {
         let mut probe_suppressed: u64 = 0;
         while let Some(ev) = ui_event_rx.recv().await {
             match ev {
+                UiEvent::Info(msg) => tracing::info!("{msg}"),
                 UiEvent::Log(msg) => {
-                    // Essential logs always visible; debug logs gated behind flag
-                    let is_essential = msg.starts_with("Client ")
-                        || msg.starts_with("Listening")
-                        || msg.starts_with("Shutdown")
-                        || msg.starts_with("Session ")
-                        || msg.starts_with("Relay error");
-                    if debug || is_essential {
+                    if debug {
                         tracing::info!("{msg}");
                     }
                 }
@@ -505,7 +508,7 @@ pub async fn run_server(params: ServerParams) -> Result<()> {
                             }
                             probe_window_start = Some(now);
                             probe_suppressed = 0;
-                            tracing::debug!("Unauthorized probe from {peer} ({bytes} bytes)");
+                            logs::unauthorized_probe(peer, bytes);
                         } else {
                             probe_suppressed += 1;
                         }
@@ -786,7 +789,7 @@ async fn run_server_loop(
             cmd = ui_cmd_rx.recv() => {
                 match cmd {
                     Some(UiCommand::Shutdown) | None => {
-                        let _ = ui_event_tx.send(UiEvent::Log("Shutdown command received".to_string()));
+                        let _ = ui_event_tx.send(UiEvent::Info("Shutdown command received".to_string()));
                         break;
                     }
                 }
@@ -855,10 +858,10 @@ async fn run_server_loop(
                             // also tells the client that this stream uses flow control.
                             let _ = relay::send_relay_to_stream(session_id, stream_id, RelayMessage::Window(ostp_core::relay::INITIAL_STREAM_WINDOW), &mut dispatcher, &socket, &ui_event_tx, &tcp_map).await;
                         }
-                        let _ = ui_event_tx.send(UiEvent::Log(format!("Relay CONNECT ok for [{session_id}:{stream_id}] -> {target}")));
+                        let _ = ui_event_tx.send(logs::connect_ok(session_id, stream_id, &target));
                     }
                     Err(err) => {
-                        let _ = ui_event_tx.send(UiEvent::Log(format!("Relay error: CONNECT failed for [{session_id}:{stream_id}] -> {target}: {err}")));
+                        let _ = ui_event_tx.send(logs::connect_failed(session_id, stream_id, &target, &err));
                         let _ = relay::send_relay_to_stream(session_id, stream_id, RelayMessage::Error(format!("connect failed: {err}")), &mut dispatcher, &socket, &ui_event_tx, &tcp_map).await;
                     }
                 }
@@ -1057,15 +1060,12 @@ async fn handle_udp_packet(
             if !peer_available.get(&peer_ip).copied().unwrap_or(false) {
                 peer_available.insert(peer_ip, true);
                 let proto = if is_tcp { "TCP (UoT)" } else { "UDP" };
-                let _ = ui_event_tx.send(UiEvent::Log(format!("Client {peer_ip} connected via {proto}")));
+                let _ = ui_event_tx.send(logs::client_connected(peer_ip, proto));
             }
 
             if app_payloads.is_empty() && now.duration_since(*last_empty_app_log) > Duration::from_secs(5) {
                 *last_empty_app_log = now;
-                let _ = ui_event_tx.send(UiEvent::Log(format!(
-                    "Accepted datagrams from {peer_ip} with no app payloads (responses={})",
-                    responses.len()
-                )));
+                let _ = ui_event_tx.send(logs::no_app_payloads(peer_ip, responses.len()));
             }
             for resp in responses {
                 let mut sent_tcp = false;
@@ -1081,7 +1081,7 @@ async fn handle_udp_packet(
                 // consumed them, nobody would send them again.
                 if !sent_tcp {
                     if let Err(e) = socket.send_to(&resp, peer_addr).await {
-                        tracing::debug!("send to {peer_addr} failed: {e}");
+                        logs::send_failed(peer_addr, &e);
                     }
                 }
             }
@@ -1114,12 +1114,12 @@ async fn handle_udp_packet(
                     tcp_map,
                     session_backpressure,
                 ).await {
-                    tracing::debug!("relay message [{session_id}:{stream_id}] rejected: {e:#}");
+                    logs::relay_rejected(session_id, stream_id, &e);
                 }
             }
         }
         Err(err) => {
-            let _ = ui_event_tx.send(UiEvent::Log(format!("Protocol error for {peer}: {err}")));
+            let _ = ui_event_tx.send(logs::protocol_error(peer, &err));
         }
     }
     Ok(())
@@ -1141,7 +1141,7 @@ async fn handle_tick(
         let is_available = peer_available.get(peer_ip).copied().unwrap_or(false);
         if is_available && now.duration_since(*last_seen) > peer_timeout {
             peer_available.insert(*peer_ip, false);
-            let _ = ui_event_tx.send(UiEvent::Log(format!("Client {peer_ip} disconnected (timeout)")));
+            let _ = ui_event_tx.send(logs::client_timeout(*peer_ip));
         }
     }
     // Addresses of clients that came and went (mobile clients change theirs
@@ -1181,7 +1181,7 @@ async fn handle_tick(
         // and the cleanup of the dropped sessions below, leaking their streams.
         if !sent_tcp {
             if let Err(e) = socket.send_to(&frame, peer_addr).await {
-                tracing::debug!("send to {peer_addr} failed: {e}");
+                logs::send_failed(peer_addr, &e);
             }
         }
     }
@@ -1192,7 +1192,7 @@ async fn handle_tick(
         }
     }
     for sid in dropped_sessions {
-        let _ = ui_event_tx.send(UiEvent::Log(format!("Session {sid} expired, releasing resources")));
+        let _ = ui_event_tx.send(UiEvent::Info(format!("Session {sid} expired, releasing resources")));
         let mut streams_to_cancel = Vec::new();
         for &(session_id, stream_id) in remotes.keys() {
             if session_id == sid {

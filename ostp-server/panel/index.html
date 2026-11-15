@@ -562,7 +562,7 @@ const I18N = {
     confirm_clear: 'Clear activity?', confirm_clear_text: 'The activity list is emptied.',
     no_users: 'No users yet. Add one to get a link.', no_match: 'Nobody matches.',
     users_sub: '{total} users · {online} online', ov_sub: 'OSTP {version} · {host}',
-    host: 'Address', udp: 'UDP', tls: 'TLS', subscription: 'Subscriptions', sub_tab: 'Subscription', own_dns: 'Server DNS',
+    host: 'Address', udp: 'UDP', tls: 'TLS', subscription: 'Subscriptions', sub_tab: 'Subscription', own_dns: 'Server DNS', log_privacy: 'Log privacy',
     on: 'on', off: 'off', not_set: 'not set up', via_web: 'through a web server', builtin: 'built-in',
     sub_hint: 'Run `ostp cert issue` to set up a domain with TLS and subscriptions.',
     online_sub: '{active} used the server · {total} total', rate: '{rate}/s now',
@@ -672,7 +672,7 @@ const I18N = {
     confirm_clear: 'Очистить журнал?', confirm_clear_text: 'Список действий будет очищен.',
     no_users: 'Пользователей пока нет. Добавьте, чтобы получить ссылку.', no_match: 'Никого не найдено.',
     users_sub: 'Всего {total} · онлайн {online}', ov_sub: 'OSTP {version} · {host}',
-    host: 'Адрес', udp: 'UDP', tls: 'TLS', subscription: 'Подписки', sub_tab: 'Подписка', own_dns: 'DNS сервера',
+    host: 'Адрес', udp: 'UDP', tls: 'TLS', subscription: 'Подписки', sub_tab: 'Подписка', own_dns: 'DNS сервера', log_privacy: 'Приватность логов',
     on: 'вкл', off: 'выкл', not_set: 'не настроено', via_web: 'через веб-сервер', builtin: 'встроенный',
     sub_hint: 'Выполните `ostp cert issue`, чтобы настроить домен с TLS и подписками.',
     online_sub: 'пользовались: {active} · всего {total}', rate: 'сейчас {rate}/с',
@@ -1099,6 +1099,8 @@ function renderOverview() {
       ? `${pill(true, t('on'))} <span class="mono muted small">${esc(e.subscription_prefix)}/…</span>`
       : pill(false, t('off'))],
     [t('own_dns'), pill(e.dns_enabled, e.dns_enabled ? t('on') : t('off'))],
+    // Read-only: it is set with `ostp log privacy` on the server.
+    [t('log_privacy'), `<span class="mono">${esc(s.log_privacy)}</span>`],
   ].map(([k, v]) => `<div>${esc(k)}</div><div>${v}</div>`).join('') +
     (!e.subscription_prefix ? `<div></div><div class="muted small">${esc(t('sub_hint'))}</div>` : '');
 

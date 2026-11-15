@@ -17,7 +17,7 @@ fn log_to_file(msg: &str) {
         // Same shared ostp.log as everything else — not a separate ostpd.log.
         let path = ostp_client::logging::log_file_path();
         if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
-            let _ = writeln!(file, "[{}] {}", chrono::Local::now().format("%Y-%m-%d %H:%M:%S"), msg);
+            let _ = writeln!(file, "{}", ostp_client::logging::format_line("INFO", "ostpd", &msg));
         }
     });
 }

@@ -425,7 +425,7 @@ impl Dispatcher {
                 let highest_after = peer_state.machine.highest_authenticated_recv_nonce();
                 let raised_highest = highest_after.is_some() && highest_after != highest_before;
                 if peer_state.last_addr != peer && raised_highest {
-                    tracing::info!("Client roamed: session {} from {} to {}", session_id, peer_state.last_addr, peer);
+                    crate::logs::roamed(session_id, peer_state.last_addr, peer);
                     if self.addr_to_session.get(&peer_state.last_addr) == Some(&session_id) {
                         self.addr_to_session.remove(&peer_state.last_addr);
                     }
@@ -603,7 +603,7 @@ impl Dispatcher {
                         // far-off values and the wrapped result can look small.
                         let drift = now.abs_diff(ts);
                         if drift > 300 {
-                            tracing::warn!("Handshake rejected: timestamp drift {}s exceeds 300s limit (peer={})", drift, peer);
+                            crate::logs::handshake_drift(drift, peer);
                             continue;
                         }
 
@@ -634,7 +634,7 @@ impl Dispatcher {
                                 }
                             }
                             if self.peer_machines.len() >= MAX_SESSIONS {
-                                tracing::warn!("Max sessions reached ({}), rejecting handshake from {}", MAX_SESSIONS, peer);
+                                crate::logs::max_sessions(MAX_SESSIONS, peer);
                                 return Ok(DispatchOutcome::Unauthorized);
                             }
 
@@ -670,7 +670,7 @@ impl Dispatcher {
 
                             // Check traffic limit before accepting
                             if user_stats.is_over_limit() {
-                                tracing::warn!("User {} exceeded traffic limit, rejecting handshake from {}", key_fp(&candidate_key), peer);
+                                crate::logs::over_limit(&key_fp(&candidate_key), peer);
                                 return Ok(DispatchOutcome::Unauthorized);
                             }
 
@@ -687,9 +687,7 @@ impl Dispatcher {
                             self.trials.mark_known(peer.ip());
                             self.roaming.mark_known(peer.ip());
 
-                            tracing::info!("New session authenticated: sid={} peer={} v{} (active_sessions={}, replay_cache={})",
-                                candidate_session_id, peer, if is_v6 { 6 } else { 5 }, self.peer_machines.len(), self.replay_cache.len()
-                            );
+                            crate::logs::new_session(candidate_session_id, peer, is_v6, self.peer_machines.len(), self.replay_cache.len());
 
                             if let (Some(hash), Some(reply)) = (noise_hash, response_opt.as_ref()) {
                                 if self.hs_replies.len() >= REPLAY_CACHE_MAX {

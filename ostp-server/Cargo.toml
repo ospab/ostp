@@ -56,3 +56,4 @@ ostp-warp = { path = "../ostp-warp", features = ["testing"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt"] }

@@ -164,7 +164,7 @@ where
             tokio::spawn(async move {
                 let matcher = matcher_arc.read().await.clone();
                 if debug {
-                    tracing::debug!("TUN TCP {local} → {remote}");
+                    crate::logs::tun_tcp(local, remote);
                 }
 
                 // ── Sniff TLS ClientHello for SNI ─────────────────────────────
@@ -189,7 +189,7 @@ where
                     .await
                 {
                     if debug {
-                        tracing::info!("TUN TCP BYPASS (process {name}): {local} → {remote}");
+                        crate::logs::tun_bypass_process(&name, local, remote);
                     }
                     should_bypass = true;
                 }
@@ -200,11 +200,11 @@ where
                         crate::tunnel::sni_sniff::extract_sni(&sniff_buf[..sniff_len])
                     {
                         if debug {
-                            tracing::debug!("TUN SNI: {sni}");
+                            crate::logs::tun_sni(&sni);
                         }
                         if matcher.match_domain(&sni) {
                             if debug {
-                                tracing::info!("TUN TCP BYPASS (SNI domain): {sni} → {remote}");
+                                crate::logs::tun_bypass_sni(&sni, remote);
                             }
                             should_bypass = true;
                         }
@@ -214,7 +214,7 @@ where
                 // 3. Destination IP CIDR check (for IPs not in routing table / IPv6)
                 if !should_bypass && matcher.match_ip(&remote.ip()) {
                     if debug {
-                        tracing::info!("TUN TCP BYPASS (IP match): {remote}");
+                        crate::logs::tun_bypass_ip(remote);
                     }
                     should_bypass = true;
                 }
@@ -267,7 +267,7 @@ where
                             let _ = tokio::io::copy_bidirectional(&mut stream, &mut direct).await;
                         }
                         _ => {
-                            tracing::debug!("Direct bypass connect to {remote} failed");
+                            crate::logs::bypass_connect_failed(remote);
                         }
                     }
                     return;
@@ -381,7 +381,7 @@ pub async fn run_native_tunnel(
                 }
             }
             Err(e) => {
-                tracing::warn!("Failed to pre-resolve excluded domain {domain}: {e}");
+                crate::logs::preresolve_failed(&domain, &e);
             }
         };
     }

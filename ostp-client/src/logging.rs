@@ -30,15 +30,27 @@ pub fn invocation_is_daemon<I: IntoIterator<Item = String>>(args: I) -> bool {
         .any(|a| ONE_SHOT.contains(&a.as_str()))
 }
 
-/// Appends one timestamped line to the shared log file.
+/// One line in the format of every line of `ostp.log`, whether `tracing` or
+/// this module writes it: time (UTC), level, subsystem, message.
+pub fn format_line(level: &str, subsystem: &str, msg: &str) -> String {
+    format!(
+        "{} {:>5} {}: {}",
+        chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.6fZ"),
+        level,
+        subsystem,
+        msg
+    )
+}
+
+/// Appends one line (level INFO, subsystem `ostp_client`) to the shared log file.
 pub fn append_line(msg: &str) {
+    append_line_as("INFO", "ostp_client", msg);
+}
+
+/// Appends one line to the shared log file in the common format.
+pub fn append_line_as(level: &str, subsystem: &str, msg: &str) {
     if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(log_file_path()) {
-        let _ = writeln!(
-            file,
-            "[{}] {}",
-            chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
-            msg
-        );
+        let _ = writeln!(file, "{}", format_line(level, subsystem, msg));
     }
 }
 
@@ -115,7 +127,7 @@ fn last_mark(text: &[u8]) -> Option<usize> {
     let mut found = None;
     let mut line_start = 0;
     for line in text.split(|&b| b == b'\n') {
-        // The mark comes after append_line's "[timestamp] ".
+        // The mark comes after the time, level and subsystem at the line's start.
         if line.windows(mark.len()).any(|w| w == mark) {
             found = Some(line_start);
         }
@@ -139,8 +151,8 @@ pub fn setup_panic_hook() {
         let backtrace = std::backtrace::Backtrace::force_capture();
 
         let crash_msg = format!(
-            "[{}] PANIC at {}:{}\nMessage: {}\nBacktrace:\n{:?}",
-            chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
+            "{}  PANIC at {}:{}\nMessage: {}\nBacktrace:\n{:?}",
+            chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.6fZ"),
             location.file(),
             location.line(),
             msg,
@@ -215,9 +227,12 @@ pub fn init_tracing(
             cap_log_size();
         });
 
+        // Time, level, subsystem (the target), message: no source line, so a
+        // line reads the same in the file, on the terminal and in the journal.
         let fmt_layer = tracing_subscriber::fmt::layer()
             .with_target(true)
-            .with_line_number(true)
+            .with_line_number(false)
+            .with_file(false)
             .with_thread_ids(false)
             .with_thread_names(false)
             .with_ansi(false)
@@ -249,7 +264,15 @@ pub fn init_tracing(
 
 #[cfg(test)]
 mod tests {
-    use super::{from_line_boundary, last_mark};
+    use super::{format_line, from_line_boundary, last_mark};
+
+    #[test]
+    fn a_line_is_time_level_subsystem_message() {
+        let line = format_line("INFO", "ostp_client::runner", "Connection established");
+        let (time, rest) = line.split_once("  ").unwrap();
+        assert!(time.ends_with('Z') && time.contains('T'), "{line}");
+        assert_eq!(rest, "INFO ostp_client::runner: Connection established");
+    }
 
     #[test]
     fn cap_starts_on_a_whole_line() {

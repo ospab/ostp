@@ -206,7 +206,8 @@ pub async fn serve(listener: TcpListener, tunnel: Tunnel) {
         let tunnel = tunnel.clone();
         tokio::spawn(async move {
             if let Err(e) = handle(sock, tunnel, local).await {
-                tracing::debug!("warp socks {peer}: {e}");
+                // The error can name the site the client asked for.
+                tracing::debug!("warp socks {peer}: {}", ostp_core::logpriv::fmt_error(&e.to_string()));
             }
         });
     }

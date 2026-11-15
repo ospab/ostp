@@ -56,7 +56,7 @@ async fn start_server_on(binds: Vec<SocketAddr>) -> SocketAddr {
         outbound: None,
         api_config: None,
         fallback_config: None,
-        debug: false,
+        privacy: ostp_core::logpriv::Privacy::Normal,
         dns_config: None,
         config_path: None,
         tls: None,

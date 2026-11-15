@@ -18,3 +18,4 @@ pub mod wire;
 
 pub mod runner;
 pub mod logging;
+mod logs;

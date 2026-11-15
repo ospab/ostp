@@ -244,7 +244,8 @@ pub mod sys {
                     added.push((ip, gw, if_index));
                 }
                 Err(e) => {
-                    tracing::warn!("bypass route add {ip}/32 via {gw} (if {if_index}) failed: {e}");
+                    // `ip` is the address of an excluded site or of the server.
+                    tracing::warn!("bypass route add {} via {gw} (if {if_index}) failed: {e}", ostp_core::logpriv::fmt_target(format_args!("{ip}/32")));
                 }
             }
         }

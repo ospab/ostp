@@ -106,11 +106,11 @@ pub async fn serve_listener(listener: TcpListener, ctx: Arc<SniffCtx>) {
         // Loopback peers are a local web server fronting OSTP; they are limited
         // per forwarded client address once the request head is read.
         if !is_trusted_proxy(peer) && !ctx.limiter.check(peer.ip()) {
-            tracing::debug!("TCP rate limit exceeded for {}, dropping connection", peer.ip());
+            crate::logs::rate_limited(peer.ip());
             continue;
         }
         let Ok(permit) = ctx.pending.clone().try_acquire_owned() else {
-            tracing::debug!("too many unclassified TCP connections, dropping {peer}");
+            crate::logs::too_many_unclassified(peer);
             continue;
         };
 
@@ -118,7 +118,7 @@ pub async fn serve_listener(listener: TcpListener, ctx: Arc<SniffCtx>) {
         tokio::spawn(async move {
             let deadline = Instant::now() + CLASSIFY_TIMEOUT;
             if let Err(e) = handle_conn(stream, peer, ctx, permit, deadline).await {
-                tracing::debug!("TCP connection from {peer} closed: {e}");
+                crate::logs::connection_closed(peer, &e);
             }
         });
     }
@@ -148,7 +148,7 @@ where
             let tls = match timeout_at(deadline, acceptor.accept(Rewind::new(s, buf.freeze()))).await {
                 Ok(Ok(tls)) => tls,
                 Ok(Err(e)) => {
-                    tracing::debug!("TLS handshake from {peer} failed: {e}");
+                    crate::logs::tls_failed(peer, &e);
                     return Ok(());
                 }
                 Err(_) => return Ok(()),
@@ -183,7 +183,7 @@ where
     match classify(buf[0]) {
         Class::Uot | Class::Legacy => {
             let Some(unauth) = unauth_slot(&ctx, peer.ip(), peer) else {
-                tracing::debug!("too many unauthenticated connections from {}, dropping", peer.ip());
+                crate::logs::too_many_unauthenticated(peer.ip());
                 return Ok(());
             };
             drop(permit);
@@ -259,21 +259,18 @@ where
         if !ctx.limiter.check(real_ip) {
             // A bare close would reach the client as a 502 from the web
             // server; an explicit 429 says what happened.
-            tracing::info!("rate limit: too many connections from {real_ip} (via the local web server)");
+            crate::logs::rate_limited_forwarded(real_ip);
             s.write_all(TOO_MANY).await?;
             let _ = s.shutdown().await;
             return Ok(());
         }
     }
-    tracing::debug!(
-        "UoT upgrade from {} (via {peer})",
-        upgrade.forwarded_for.map(|ip| ip.to_string()).unwrap_or_else(|| peer.ip().to_string())
-    );
+    crate::logs::upgrade_from(upgrade.forwarded_for, peer);
 
     s.write_all(&build_upgrade_response(&ws_accept_key(&upgrade.ws_key))).await?;
     let leftover = buf.split_off(head_len).freeze();
     let Some(unauth) = unauth_slot(&ctx, upgrade.forwarded_for.unwrap_or(peer.ip()), peer) else {
-        tracing::debug!("too many unauthenticated connections from one source (peer {peer}), dropping");
+        crate::logs::too_many_unauthenticated(peer.ip());
         return Ok(());
     };
     drop(permit);

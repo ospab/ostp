@@ -8,6 +8,10 @@ pub struct ClientConfig {
     pub mode: String,
     #[serde(default)]
     pub debug: bool,
+    /// `log.privacy` of the config file. Absent: `debug` decides (see
+    /// [`ClientConfig::privacy`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log_privacy: Option<ostp_core::logpriv::Privacy>,
     pub ostp: OstpConfig,
     pub local_proxy: LocalProxyConfig,
     #[serde(default)]
@@ -30,6 +34,36 @@ pub struct ClientConfig {
 }
 
 fn default_tun_stack() -> String { "system".to_string() }
+
+impl ClientConfig {
+    /// What this run's log may say: `log.privacy` when the config has it, else
+    /// `debug` for the old `debug: true`, else `normal`.
+    pub fn privacy(&self) -> ostp_core::logpriv::Privacy {
+        use ostp_core::logpriv::Privacy;
+        self.log_privacy.unwrap_or(if self.debug { Privacy::Debug } else { Privacy::Normal })
+    }
+
+    /// Makes `debug` agree with [`ClientConfig::privacy`], for a config that did
+    /// not come through `ClientFileConfig::to_runtime` (the Android app's JSON).
+    pub fn settle_privacy(&mut self) {
+        self.debug = self.privacy() == ostp_core::logpriv::Privacy::Debug;
+    }
+}
+
+/// The `log` section of a config file (client, server and relay alike).
+#[derive(Debug, Default, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct LogCfg {
+    /// `strict`, `normal` (the default) or `debug`; see `ostp_core::logpriv`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub privacy: Option<ostp_core::logpriv::Privacy>,
+}
+
+impl LogCfg {
+    /// The mode a config asks for, `log` section and the old `debug` flag together.
+    pub fn resolve(log: Option<&LogCfg>, legacy_debug: bool) -> ostp_core::logpriv::Privacy {
+        ostp_core::logpriv::Privacy::resolve(log.and_then(|l| l.privacy), legacy_debug)
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ExclusionConfig {
@@ -166,6 +200,7 @@ impl Default for ClientConfig {
         Self {
             mode: "proxy".to_string(),
             debug: false,
+            log_privacy: None,
             ostp: OstpConfig::default(),
             local_proxy: LocalProxyConfig::default(),
             transport: TransportConfig::default(),
@@ -238,9 +273,13 @@ impl ClientFileConfig {
             bind_addr: self.socks5_bind.clone().unwrap_or_else(|| LocalProxyConfig::default().bind_addr),
             ..LocalProxyConfig::default()
         };
+        let log_privacy = self.log.as_ref().and_then(|l| l.privacy);
         ClientConfig {
             mode: if tun.map_or(false, |t| t.enable) { "tun" } else { "proxy" }.to_string(),
-            debug: self.debug.unwrap_or(false),
+            // The verbose lines follow the privacy mode: `debug` only in `debug`.
+            debug: ostp_core::logpriv::Privacy::resolve(log_privacy, self.debug.unwrap_or(false))
+                == ostp_core::logpriv::Privacy::Debug,
+            log_privacy,
             ostp,
             local_proxy,
             transport: self.transport.clone().unwrap_or_default().to_runtime(),
@@ -348,6 +387,9 @@ pub struct ServerConfig {
     pub bind_ip: Option<String>,
     pub access_keys: Vec<UserConfig>,
     pub debug: Option<bool>,
+    /// What the log may say about clients and destinations (`log.privacy`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log: Option<LogCfg>,
     pub outbound: Option<OutboundConfig>,
     pub api: Option<ApiConfig>,
     pub fallback: Option<FallbackCfg>,
@@ -626,6 +668,8 @@ pub struct RelayServerConfig {
     #[serde(default)]
     pub sync_interval_secs: u64,
     pub debug: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log: Option<LogCfg>,
 }
 
 /// Supports both a single string "0.0.0.0:50000" and an array
@@ -683,6 +727,9 @@ pub struct ClientFileConfig {
     pub socks5_bind: Option<String>,
     pub tun: Option<TunConfig>,
     pub debug: Option<bool>,
+    /// What the log may say about destinations (`log.privacy`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log: Option<LogCfg>,
     pub exclude: Option<ExcludeConfig>,
     pub mux: Option<MuxConfig>,
     pub transport: Option<TransportConfigRaw>,

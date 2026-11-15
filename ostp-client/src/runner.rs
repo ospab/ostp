@@ -14,7 +14,7 @@ fn log_to_core_file(msg: &str) {
     // not a separate ostp-core.log — see logging::LOG_FILE_NAME.
     let path = crate::logging::log_file_path();
     if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
-        let _ = writeln!(file, "[{}] {}", chrono::Local::now().format("%Y-%m-%d %H:%M:%S"), msg);
+        let _ = writeln!(file, "{}", crate::logging::format_line("INFO", "ostp_client::runner", msg));
     }
 }
 

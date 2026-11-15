@@ -41,7 +41,7 @@ pub async fn run_udp_nat(
                             if current.match_ip(&dst.ip()) {
                                 should_bypass = true;
                                 if debug {
-                                    tracing::info!("TUN UDP BYPASS (IP match): {} → {}", src, dst);
+                                    crate::logs::udp_nat_bypass_ip(src, dst);
                                 }
                             } else if let Some(name) = current
                                 .excluded_process(crate::tunnel::process_lookup::Proto::Udp, src)
@@ -49,7 +49,7 @@ pub async fn run_udp_nat(
                             {
                                 should_bypass = true;
                                 if debug {
-                                    tracing::info!("TUN UDP BYPASS (process {name}): {src} → {dst}");
+                                    crate::logs::udp_nat_bypass_process(&name, src, dst);
                                 }
                             }
 
@@ -63,13 +63,13 @@ pub async fn run_udp_nat(
                                     }
                                     let res = start_udp_bypass_session(src, p_if_idx, p_if_name, &mut session_rx, tx_clone).await;
                                     if res.is_err() {
-                                        tracing::debug!("UDP BYPASS session for {} ended: {:?}", src, res.err());
+                                        crate::logs::udp_session_ended("UDP BYPASS", src, &format!("{:?}", res.err()));
                                     }
                                 } else {
                                     tracing::debug!("Starting UDP NAT session for {}", src);
                                     let res = start_udp_session(src, proxy_addr_clone, &mut session_rx, tx_clone).await;
                                     if res.is_err() {
-                                        tracing::debug!("UDP NAT session for {} ended: {:?}", src, res.err());
+                                        crate::logs::udp_session_ended("UDP NAT", src, &format!("{:?}", res.err()));
                                     }
                                 }
                             });
@@ -242,7 +242,7 @@ async fn start_udp_session(
                         }
                         packet.extend_from_slice(&dst.port().to_be_bytes());
                         packet.extend_from_slice(&payload);
-                        tracing::debug!("udp_nat SENDING UDP ASSOCIATE payload len={} to relay_addr={} (original dst: {})", payload.len(), relay_addr, dst);
+                        crate::logs::udp_nat_send(payload.len(), relay_addr, dst);
                         let _ = udp.send_to(&packet, relay_addr).await;
                     }
                     Ok(None) => break,
@@ -278,12 +278,12 @@ async fn start_udp_session(
                             _ => continue,
                         };
                         let payload = buf[header_len..len].to_vec();
-                        tracing::debug!("udp_nat RECEIVED UDP ASSOCIATE REPLY from {} for {} len={}", remote_dst, client_src, payload.len());
+                        crate::logs::udp_nat_reply(remote_dst, client_src, payload.len());
                         use futures::SinkExt;
                         if let Err(e) = smoltcp_tx.lock().await.send((payload, remote_dst, client_src)).await {
                             tracing::error!("udp_nat failed to inject packet into smoltcp: {}", e);
                         } else {
-                            tracing::debug!("udp_nat successfully injected packet into smoltcp from {} to {}", remote_dst, client_src);
+                            crate::logs::udp_nat_injected(remote_dst, client_src);
                         }
                     }
                 }

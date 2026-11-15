@@ -168,6 +168,8 @@ struct ServerStatus {
     connections: u64,
     bytes_up: u64,
     bytes_down: u64,
+    /// `strict`, `normal` or `debug`: what this server's log may say.
+    log_privacy: &'static str,
     endpoint: Endpoint,
 }
 
@@ -811,6 +813,7 @@ async fn handle_status(
         connections,
         bytes_up: up,
         bytes_down: down,
+        log_privacy: ostp_core::logpriv::privacy().as_str(),
         endpoint: Endpoint {
             host: state.server_host.clone(),
             udp_port: state.server_port,

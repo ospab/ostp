@@ -482,9 +482,7 @@ async fn handle_udp_associate(
                 let target_port = match split_host_port(&target) { Some((_, p)) => p, None => 0 };
                 // Check if target should bypass the tunnel
                 if matcher.should_bypass_target(&target_host, target_port, connect_timeout).await {
-                    if true {
-                        tracing::debug!("proxy UDP BYPASS target={}", target);
-                    }
+                    crate::logs::udp_bypass(&target);
                     // Resolve target to find if it is IPv4 or IPv6
                     if let Ok(resolved_addrs) = tokio::net::lookup_host(&target).await {
                         if let Some(target_addr) = resolved_addrs.into_iter().next() {
@@ -525,15 +523,13 @@ async fn handle_udp_associate(
 
                             if let Some(s) = direct_socket {
                                 if let Err(e) = s.send_to(&payload, target_addr).await {
-                                    if true {
-                                        tracing::warn!("failed to send bypass UDP packet to {}: {}", target_addr, e);
-                                    }
+                                    crate::logs::udp_send_failed(target_addr, &e);
                                 }
                             }
                         }
                     }
                 } else {
-                    tracing::debug!("proxy.rs forwarding UDP DATA to server for target={} payload len={}", target, payload.len());
+                    crate::logs::udp_forward(&target, payload.len());
                     let _ = event_tx.send(ProxyEvent::UdpData { stream_id, target, payload }).await;
                 }
             }
@@ -565,10 +561,10 @@ async fn handle_udp_associate(
                             }
                             packet.extend_from_slice(&port.to_be_bytes());
                             packet.extend_from_slice(&data);
-                            tracing::debug!("proxy.rs forwarding UDP REPLY to client_addr={} from server for target={} payload len={}", client_addr, target, data.len());
+                            crate::logs::udp_reply(&target, data.len());
                             let _ = sock_tx.send_to(&packet, client_addr).await;
                         } else {
-                            tracing::error!("proxy.rs failed to parse target string as SocketAddr: {}", target);
+                            crate::logs::bad_target(&target);
                         }
                     }
                     Some(ProxyToClientMsg::Close) | Some(ProxyToClientMsg::Error(_)) | None => break,
@@ -756,7 +752,7 @@ async fn handle_proxy_client(
             ).await;
         }
 
-        tracing::debug!("proxy CONNECT stream_id={stream_id} target={target}");
+        crate::logs::proxy_connect_request(stream_id, &target);
         let target_host = if let Some((host, _)) = split_host_port(&target) { host } else { target.clone() };
         let target_port = match split_host_port(&target) { Some((_, p)) => p, None => 0 };
         if matcher.should_bypass_target(&target_host, target_port, connect_timeout).await {
@@ -843,9 +839,7 @@ async fn handle_proxy_client(
             extract_host_port(raw_uri, default_port)
         };
 
-        if true {
-            tracing::info!("proxy CONNECT stream_id={stream_id} target={target}");
-        }
+        crate::logs::proxy_connect(stream_id, &target);
         let target_host = if let Some((host, _)) = split_host_port(&target) { host } else { target.clone() };
         let target_port = match split_host_port(&target) { Some((_, p)) => p, None => 443 };
         if matcher.should_bypass_target(&target_host, target_port, connect_timeout).await {
@@ -988,9 +982,7 @@ async fn direct_connect_socks5(
     close_tx: mpsc::Sender<u16>,
     _debug: bool,
 ) -> Result<()> {
-    if true {
-        tracing::info!("proxy BYPASS stream_id={stream_id} target={target}");
-    }
+    crate::logs::proxy_bypass(stream_id, &target);
     let mut remote = connect_bypassing_tun(target, physical_if_index, physical_if_name).await?;
 
     client.write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await?;
@@ -1010,9 +1002,7 @@ async fn direct_connect_http(
     close_tx: mpsc::Sender<u16>,
     _debug: bool,
 ) -> Result<()> {
-    if true {
-        tracing::info!("proxy BYPASS stream_id={stream_id} target={target}");
-    }
+    crate::logs::proxy_bypass(stream_id, &target);
     let mut remote = connect_bypassing_tun(target, physical_if_index, physical_if_name).await?;
 
     if method == "CONNECT" {

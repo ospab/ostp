@@ -2313,6 +2313,7 @@ name = "ostp-dns"
 version = "0.4.8"
 dependencies = [
  "anyhow",
+ "ostp-core",
  "rand 0.8.5",
  "reqwest",
  "rustls",
@@ -2382,6 +2383,7 @@ dependencies = [
  "tokio-rustls",
  "tower-http",
  "tracing",
+ "tracing-subscriber",
  "uuid",
  "webpki-roots",
  "x25519-dalek",
@@ -2409,6 +2411,7 @@ version = "0.4.8"
 dependencies = [
  "anyhow",
  "libc",
+ "ostp-core",
  "tokio",
  "tracing",
  "tun",
@@ -2425,6 +2428,7 @@ dependencies = [
  "bytes",
  "futures",
  "netstack-smoltcp",
+ "ostp-core",
  "rand 0.8.5",
  "reqwest",
  "rustls",

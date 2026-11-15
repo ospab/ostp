@@ -11,6 +11,7 @@ mod dns_cmd;
 mod overnet_cmd;
 mod warp_cmd;
 mod key_cmd;
+mod log_cmd;
 mod changelog_cmd;
 mod manage_cmd;
 mod service_cmd;
@@ -157,7 +158,7 @@ enum Commands {
     Restart,
     /// Whether ostp is running, since when, and the last log lines
     Status,
-    /// Show the log: the service journal on Linux, ostp.log elsewhere
+    /// Show the log (the service journal on Linux, ostp.log elsewhere); `ostp log privacy` sets what it may say
     Log {
         /// Number of lines
         #[arg(short = 'n', long, default_value_t = 50)]
@@ -165,6 +166,8 @@ enum Commands {
         /// Keep printing new lines until Ctrl+C
         #[arg(short, long)]
         follow: bool,
+        #[command(subcommand)]
+        action: Option<log_cmd::LogAction>,
     },
     /// Upgrade the configuration file to the current schema (only when you run this command)
     Migrate {
@@ -264,6 +267,7 @@ fn parse_ostp_link(link: &str) -> Result<ClientConfig> {
         }),
 
         debug: Some(false),
+        log: None,
         exclude: None,
         mux: None,
         send_hwid: None,
@@ -1301,7 +1305,8 @@ async fn run_app() -> Result<()> {
             Commands::Stop => return service_cmd::run(service_cmd::Action::Stop),
             Commands::Restart => return service_cmd::run(service_cmd::Action::Restart),
             Commands::Status => return service_cmd::status(&args.config),
-            Commands::Log { lines, follow } => return service_cmd::log(lines, follow),
+            Commands::Log { action: Some(action), .. } => return log_cmd::run(action, &args.config),
+            Commands::Log { lines, follow, action: None } => return service_cmd::log(lines, follow),
             Commands::Changelog { all, last, version, lang } => {
                 return changelog_cmd::run(changelog_cmd::Options { all, last, version, lang });
             }
@@ -1781,7 +1786,9 @@ async fn run_app() -> Result<()> {
         AppMode::Server(server_cfg) => {
             let listen_addrs = server_cfg.listen.addresses();
             println!("{} Starting server on {:?}", "[ostp]".cyan().bold(), listen_addrs);
-            let debug = server_cfg.debug.unwrap_or(false);
+            let privacy = ostp_client::config::LogCfg::resolve(server_cfg.log.as_ref(), server_cfg.debug.unwrap_or(false));
+            // The service's own startup lines already follow the mode.
+            ostp_core::logpriv::set_privacy(privacy);
             let outbound = server_cfg.outbound.map(|o| ostp_server::OutboundConfig {
                 enabled: o.enabled,
                 protocol: o.protocol,
@@ -1871,7 +1878,7 @@ async fn run_app() -> Result<()> {
                 outbound,
                 api_config,
                 fallback_config,
-                debug,
+                privacy,
                 dns_config: dns_cfg,
                 config_path: Some(args.config),
                 tls,
@@ -1888,6 +1895,7 @@ async fn run_app() -> Result<()> {
         }
         AppMode::Relay(relay_cfg) => {
             let listen_addrs = relay_cfg.listen.addresses();
+            ostp_core::logpriv::set_privacy(ostp_client::config::LogCfg::resolve(relay_cfg.log.as_ref(), relay_cfg.debug.unwrap_or(false)));
             println!("{} Starting relay node on {:?}", "[ostp]".cyan().bold(), listen_addrs);
             println!("{} Upstream TCP: {}", "[ostp]".cyan().bold(), relay_cfg.upstream_tcp);
             println!("{} Upstream UDP: {}", "[ostp]".cyan().bold(), relay_cfg.upstream_udp);

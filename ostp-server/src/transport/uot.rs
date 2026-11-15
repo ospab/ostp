@@ -55,7 +55,7 @@ async fn handle_tcp_connection_with_idle<S>(
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    tracing::debug!("UoT client connected from {}", peer_addr);
+    crate::logs::uot_connected(peer_addr);
 
     // Register this connection in the map
     let (tx, mut rx) = mpsc::channel::<Bytes>(16384);
@@ -117,7 +117,7 @@ where
                     // deadline no longer applies, only `idle` does.
                     Err(_) if !authed && authenticated.load(Ordering::Relaxed) => continue,
                     Err(_) => {
-                        tracing::debug!("UoT client {} idle or unauthenticated for {:?}, closing", peer_addr, limit);
+                        crate::logs::uot_idle(peer_addr, limit);
                         break None;
                     }
                 }
@@ -145,7 +145,7 @@ where
             map.remove(&peer_addr);
         }
     }
-    tracing::debug!("UoT client disconnected: {}", peer_addr);
+    crate::logs::uot_disconnected(peer_addr);
     Ok(())
 }
 

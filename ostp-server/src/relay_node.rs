@@ -315,7 +315,7 @@ async fn serve_tcp_relay(listener: TcpListener, upstream: String, live: Arc<std:
         let live = live.clone();
         tokio::spawn(async move {
             if let Err(e) = splice_tcp(client, &upstream).await {
-                tracing::debug!("Relay TCP {peer} closed: {e}");
+                crate::logs::relay_tcp_closed(peer, &e);
             }
             live.fetch_sub(1, Ordering::Relaxed);
         });
