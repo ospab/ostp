@@ -308,7 +308,10 @@ where
                     return;
                 }
 
-                let _ = tokio::io::copy_bidirectional(&mut stream, &mut socks).await;
+                // A reset of the stream to the server reaches this side as a reset of
+                // the SOCKS connection (the proxy closes it with a zero linger time);
+                // the program's flow then gets a TCP RST, not the FIN a drop sends.
+                relay_flow(&mut stream, &mut socks, |s| s.abort()).await;
             });
         }
     });
@@ -325,6 +328,162 @@ where
     }
 
     Ok(())
+}
+
+/// Wraps the SOCKS side of a relayed flow and notes whether either direction
+/// failed with a connection reset (what the local proxy's zero-linger close of a
+/// reset stream looks like to a reader or a writer).
+#[cfg(any(target_os = "windows", target_os = "linux", target_os = "android", test))]
+struct ResetSpy<T> {
+    inner: T,
+    saw_reset: bool,
+}
+
+#[cfg(any(target_os = "windows", target_os = "linux", target_os = "android", test))]
+impl<T> ResetSpy<T> {
+    fn note<R>(&mut self, r: std::task::Poll<std::io::Result<R>>) -> std::task::Poll<std::io::Result<R>> {
+        if let std::task::Poll::Ready(Err(e)) = &r {
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted
+            ) {
+                self.saw_reset = true;
+            }
+        }
+        r
+    }
+}
+
+#[cfg(any(target_os = "windows", target_os = "linux", target_os = "android", test))]
+impl<T: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for ResetSpy<T> {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let r = std::pin::Pin::new(&mut self.inner).poll_read(cx, buf);
+        self.note(r)
+    }
+}
+
+#[cfg(any(target_os = "windows", target_os = "linux", target_os = "android", test))]
+impl<T: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for ResetSpy<T> {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        let r = std::pin::Pin::new(&mut self.inner).poll_write(cx, buf);
+        self.note(r)
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let r = std::pin::Pin::new(&mut self.inner).poll_flush(cx);
+        self.note(r)
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let r = std::pin::Pin::new(&mut self.inner).poll_shutdown(cx);
+        self.note(r)
+    }
+}
+
+/// Copies both ways between a TUN flow (`local`, the program's side) and the
+/// connection to the local SOCKS proxy (`socks`) until both ends are done.
+///
+/// A normal end leaves `local` to be dropped, which closes the flow with a FIN.
+/// If the SOCKS connection ended with a connection reset (a stream reset or an
+/// abort from the server), `abort` is called on `local` before it is dropped, so
+/// the program gets a TCP RST and sees a truncated transfer as a failure. An
+/// error on the local side alone does not call it: a flow that is already gone
+/// has nothing to reset.
+#[cfg(any(target_os = "windows", target_os = "linux", target_os = "android", test))]
+async fn relay_flow<A, B>(local: &mut A, socks: &mut B, abort: impl FnOnce(&mut A))
+where
+    A: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    B: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let mut spy = ResetSpy { inner: socks, saw_reset: false };
+    let _ = tokio::io::copy_bidirectional(local, &mut spy).await;
+    if spy.saw_reset {
+        abort(local);
+    }
+}
+
+#[cfg(test)]
+mod relay_tests {
+    use super::*;
+    use std::{
+        io,
+        pin::Pin,
+        task::{Context, Poll},
+    };
+    use tokio::io::{AsyncWriteExt, ReadBuf};
+
+    /// A SOCKS-side connection that fails its reads with `kind`, or ends cleanly.
+    struct FakeSocks {
+        read_error: Option<io::ErrorKind>,
+    }
+
+    impl tokio::io::AsyncRead for FakeSocks {
+        fn poll_read(self: Pin<&mut Self>, _: &mut Context<'_>, _: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+            match self.read_error {
+                Some(kind) => Poll::Ready(Err(kind.into())),
+                None => Poll::Ready(Ok(())), // EOF
+            }
+        }
+    }
+
+    impl tokio::io::AsyncWrite for FakeSocks {
+        fn poll_write(self: Pin<&mut Self>, _: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+            Poll::Ready(Ok(buf.len()))
+        }
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    async fn run(read_error: Option<io::ErrorKind>, close_local_first: bool) -> bool {
+        let (mut local, mut app) = tokio::io::duplex(1024);
+        if close_local_first {
+            // the program goes away: the local side ends (EOF), the other side stays quiet
+            app.shutdown().await.unwrap();
+        } else {
+            // keep the program's end open so only the SOCKS side decides the end
+            std::mem::forget(app);
+        }
+        let mut socks = FakeSocks { read_error };
+        let mut aborted = false;
+        relay_flow(&mut local, &mut socks, |_| aborted = true).await;
+        aborted
+    }
+
+    #[tokio::test]
+    async fn a_reset_of_the_socks_connection_aborts_the_flow() {
+        assert!(run(Some(io::ErrorKind::ConnectionReset), false).await);
+        assert!(run(Some(io::ErrorKind::ConnectionAborted), false).await);
+    }
+
+    #[tokio::test]
+    async fn a_normal_end_does_not_abort() {
+        // the SOCKS side ends with EOF and the program's side too: a FIN, not a RST
+        assert!(!run(None, true).await);
+    }
+
+    #[tokio::test]
+    async fn other_socks_errors_do_not_abort() {
+        assert!(!run(Some(io::ErrorKind::TimedOut), false).await);
+        assert!(!run(Some(io::ErrorKind::UnexpectedEof), false).await);
+    }
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
