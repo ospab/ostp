@@ -260,7 +260,15 @@ const inExIps       = $('in-ex-ips');
 const inExProcs     = $('in-ex-procs');
 const inAutoconnect = $('in-autoconnect');
 const inLaunchStartup = $('in-launch-startup');
-const inDebug       = $('in-debug');
+const inLogPrivacy  = $('in-log-privacy');
+const logPrivacyHint = $('log-privacy-hint');
+const LOG_PRIVACY_HINTS = {
+  normal: 'ostp.log has no sites or DNS names.',
+  debug:  'ostp.log has the sites you open and full addresses. Turn it off when you are done.',
+};
+// The old on/off "debug" setting means debug; anything else is normal.
+const logPrivacyOf = s => (s.logPrivacy === 'debug' || (!s.logPrivacy && s.debug)) ? 'debug' : 'normal';
+const showLogPrivacyHint = () => { logPrivacyHint.textContent = LOG_PRIVACY_HINTS[inLogPrivacy.value] || ''; };
 const inShowRtt     = $('in-show-rtt');
 const inShowSpeed   = $('in-show-speed');
 const inSendHwid    = $('in-send-hwid');
@@ -483,7 +491,7 @@ function buildConfig() {
     server: active.server,
     access_key: active.key,
     socks5_bind: s.socks || null,
-    debug: !!s.debug,
+    log: { privacy: logPrivacyOf(s) },
     transport: {
       mode: active.transport || 'udp',
       ttl_desync: !!s.ttlDesync,
@@ -1636,7 +1644,8 @@ function loadSettingsIntoForm() {
   inExProcs.value       = s.exProcs || '';
   inAutoconnect.checked = !!s.autoconnect;
   inLaunchStartup.checked = !!s.launchStartup;
-  inDebug.checked       = !!s.debug;
+  inLogPrivacy.value    = logPrivacyOf(s);
+  showLogPrivacyHint();
   inShowRtt.checked     = s.showRtt !== false;
   inShowSpeed.checked   = s.showSpeed !== false;
   $('in-update-check').checked = s.updateCheck !== false;
@@ -1686,7 +1695,7 @@ function collectAndSaveSettings() {
     exProcs:      inExProcs.value.trim(),
     autoconnect:  inAutoconnect.checked,
     launchStartup: inLaunchStartup.checked,
-    debug:        inDebug.checked,
+    logPrivacy:   inLogPrivacy.value,
     showRtt:      inShowRtt.checked,
     showSpeed:    inShowSpeed.checked,
     updateCheck:  $('in-update-check').checked,
@@ -1936,7 +1945,8 @@ window.addEventListener('DOMContentLoaded', async () => {
   wintunModal.addEventListener('click', e => { if (e.target === wintunModal) wintunModal.classList.add('hidden'); });
 
   // Client settings — wire all inputs
-  [inTun, inKillSwitch, inAutoconnect, inLaunchStartup, inDebug, inShowRtt, inShowSpeed, inSendHwid, inTtlDesync, $('in-update-check')]
+  inLogPrivacy.addEventListener('change', showLogPrivacyHint);
+  [inTun, inKillSwitch, inAutoconnect, inLaunchStartup, inLogPrivacy, inShowRtt, inShowSpeed, inSendHwid, inTtlDesync, $('in-update-check')]
     .filter(Boolean)
     .forEach(el => el.addEventListener('change', collectAndSaveSettings));
   [inMtu, inDns, inSocks, inExDomains, inExIps, inExProcs]

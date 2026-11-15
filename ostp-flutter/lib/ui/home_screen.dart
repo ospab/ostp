@@ -8,6 +8,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:package_info_plus/package_info_plus.dart';
 import '../models/connection_state_enum.dart';
 import '../models/dns_notice.dart';
+import '../models/log_privacy.dart';
 import '../models/ostp_profile.dart';
 import '../models/share_link.dart';
 import '../models/subscription.dart';
@@ -203,7 +204,7 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin, 
     final p = _activeProfile;
     final exDomains = widget.prefs.getString('ex_domains') ?? '';
     final exIps = widget.prefs.getString('ex_ips') ?? '';
-    final debugMode = widget.prefs.getBool('debug_mode') ?? false;
+    final logPrivacy = logPrivacyOf(widget.prefs);
     final mtu = (int.tryParse(widget.prefs.getString('mtu') ?? '') ?? 1140).clamp(576, 1500);
     final dnsServer = widget.prefs.getString('dns_server');
     // The VPN builder throws on anything but an IP literal, which would fail the start.
@@ -216,7 +217,8 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin, 
 
     return {
       "mode": "client",
-      "debug": debugMode,
+      "debug": logPrivacy == 'debug',
+      "log_privacy": logPrivacy,
       "ostp": {
         "server_addr": p?.serverAddr ?? '',
         "local_bind_addr": "0.0.0.0:0",

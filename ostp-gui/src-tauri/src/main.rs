@@ -58,8 +58,13 @@ fn detect_log_level_from_config() -> String {
 
     if let Ok(content) = std::fs::read_to_string(&config_path) {
         if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {
-            // debug: true overrides everything
-            if val.get("debug").and_then(|v| v.as_bool()).unwrap_or(false) {
+            // log.privacy, when the file has it, decides whether this is a debug
+            // run; without it the old debug: true still does.
+            let debug = match val.pointer("/log/privacy").and_then(|v| v.as_str()) {
+                Some(p) => p == "debug",
+                None => val.get("debug").and_then(|v| v.as_bool()).unwrap_or(false),
+            };
+            if debug {
                 return "debug".to_string();
             }
             // explicit log_level field

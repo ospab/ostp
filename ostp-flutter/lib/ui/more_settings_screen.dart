@@ -3,6 +3,7 @@ import 'package:flutter/services.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../models/device_limit.dart';
+import '../models/log_privacy.dart';
 import '../services/updates.dart' as updates;
 import 'app_routing_screen.dart';
 import 'logs_screen.dart';
@@ -22,7 +23,7 @@ class MoreSettingsScreen extends StatefulWidget {
 class _MoreSettingsScreenState extends State<MoreSettingsScreen> {
   late final TextEditingController _domainsCtrl;
   late final TextEditingController _ipsCtrl;
-  late bool _debugMode;
+  late String _logPrivacy;
   late bool _showSpeed;
   late bool _showRtt;
   late bool _autoUpdateCheck;
@@ -35,7 +36,7 @@ class _MoreSettingsScreenState extends State<MoreSettingsScreen> {
     final p = widget.prefs;
     _domainsCtrl = TextEditingController(text: p.getString('ex_domains') ?? '');
     _ipsCtrl = TextEditingController(text: p.getString('ex_ips') ?? '');
-    _debugMode = p.getBool('debug_mode') ?? false;
+    _logPrivacy = logPrivacyOf(p);
     _showSpeed = p.getBool('show_speed') ?? true;
     _showRtt = p.getBool('show_rtt') ?? true;
     _autoUpdateCheck = p.getBool(updates.autoUpdateCheckKey) ?? true;
@@ -54,7 +55,7 @@ class _MoreSettingsScreenState extends State<MoreSettingsScreen> {
     final p = widget.prefs;
     p.setString('ex_domains', _domainsCtrl.text.trim());
     p.setString('ex_ips', _ipsCtrl.text.trim());
-    p.setBool('debug_mode', _debugMode);
+    p.setString(logPrivacyKey, _logPrivacy);
     p.setBool('show_speed', _showSpeed);
     p.setBool('show_rtt', _showRtt);
     p.setBool(updates.autoUpdateCheckKey, _autoUpdateCheck);
@@ -78,6 +79,41 @@ class _MoreSettingsScreenState extends State<MoreSettingsScreen> {
         borderRadius: BorderRadius.circular(24),
         border: Border.all(color: Colors.white.withValues(alpha: 0.05)),
       );
+
+  /// What the log of this device may say: normal has no sites or DNS names;
+  /// debug writes them, with full addresses.
+  Widget _logPrivacyChoice() {
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 20),
+      child: Row(children: [
+        Expanded(
+          child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            const Text('Log privacy', style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
+            const SizedBox(height: 4),
+            Text(
+              _logPrivacy == 'debug'
+                  ? 'The log has the sites you open and full addresses. Turn it off when you are done.'
+                  : 'The log has no sites or DNS names.',
+              style: const TextStyle(fontSize: 13, color: Colors.white54),
+            ),
+          ]),
+        ),
+        DropdownButton<String>(
+          value: _logPrivacy,
+          underline: const SizedBox.shrink(),
+          items: const [
+            DropdownMenuItem(value: 'normal', child: Text('Normal')),
+            DropdownMenuItem(value: 'debug', child: Text('Debug')),
+          ],
+          onChanged: (v) {
+            if (v == null) return;
+            setState(() => _logPrivacy = v);
+            _save();
+          },
+        ),
+      ]),
+    );
+  }
 
   Widget _toggle(String title, String subtitle, bool value, ValueChanged<bool> onChanged) {
     return Padding(
@@ -212,7 +248,7 @@ class _MoreSettingsScreenState extends State<MoreSettingsScreen> {
               ),
               _toggle('Show Speed', 'Live download/upload speed on the home screen', _showSpeed, (v) => _showSpeed = v),
               _toggle('Show RTT', 'Live server ping on the home screen', _showRtt, (v) => _showRtt = v),
-              _toggle('Debug Mode', 'Verbose logging', _debugMode, (v) => _debugMode = v),
+              _logPrivacyChoice(),
             ]),
           ),
           const SizedBox(height: 28),
