@@ -1,6 +1,16 @@
 # Protocol v6: design for 0.5.0
 
-Status: draft, nothing here is implemented. The wire format in force is version 5 ([specification.md](specification.md)); 0.4.x stays on it. This page fixes what 0.5.0 changes and why, so the code is written against a plan.
+Status: draft. Section 1 (the handshake) is implemented on the `protocol-v6` branch; section 2 (the session layer) is not. The wire format in force in releases is still version 5 ([specification.md](specification.md)); 0.4.x stays on it. This page fixes what 0.5.0 changes and why, so the code is written against a plan.
+
+Implemented from section 1:
+- The handshake itself: `Noise NKpsk0`, the masked datagram with a 4-byte tag, the cached reply to a repeated handshake (§1.2 to §1.5); a dispatcher that tries v6 first and v5 behind the switch.
+- The server key (§1.1): config section `protocol` (`server_key`, `accept_v5`), created on a new install and, on an existing server, only by `ostp v6 key new`; `ostp v6 key` shows the public key, `ostp v6 v5 on|off` is the transitional switch; schema 7 adds the section without a key. The server reads it at start, so a change restarts the service.
+- The public key in profiles: `pk=` in `ostp://` links, therefore in subscriptions, the panel/API and `ostp links`; the client config field `server_pk`; a client with it speaks v6 in the bridge, the TTL probe and the prober, and never falls back to v5.
+- The error of a v6 client that gets no answer: it names the two causes (a server older than 0.5.0, a replaced key) and says to reissue the link. The server stays silent to unknown handshakes, so this is wording on the client side, not a wire message.
+- TTL-desync decoys keep working: their junk marker is the v5 one, a v6-only server drops them as unknown datagrams, a transitional server recognises the marker.
+- A damaged `pk` is refused, never read as "no key".
+
+Not done yet: the apps' own link parsers (JavaScript, Dart) do not carry `pk` yet; the wirelab scenarios; the open questions at the end.
 
 ## Decisions taken (2026-11-12)
 

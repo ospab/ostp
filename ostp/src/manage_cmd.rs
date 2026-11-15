@@ -195,6 +195,8 @@ fn install(config_path: &Path, port: u16, host: Option<&str>, user: &str) -> Res
             "listen": format!("0.0.0.0:{port}"),
             "access_keys": [{ "access_key": crate::generate_secure_key("hex"), "name": user }],
             "api": { "enabled": false, "bind": "127.0.0.1:9090", "webpath": "", "username": "", "password_hash": "" },
+            // A new server speaks v6 and, for 0.4.x clients, v5 too.
+            "protocol": crate::v6_cmd::new_section(),
             "debug": false
         });
         save(config_path, &v)?;

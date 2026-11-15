@@ -10,6 +10,7 @@ mod panel_cmd;
 mod dns_cmd;
 mod overnet_cmd;
 mod warp_cmd;
+mod v6_cmd;
 mod changelog_cmd;
 mod manage_cmd;
 mod service_cmd;
@@ -120,6 +121,11 @@ enum Commands {
     Warp {
         #[command(subcommand)]
         action: warp_cmd::WarpAction,
+    },
+    /// Protocol v6: the server key (shown in links as pk) and the transitional v5 mode (server only)
+    V6 {
+        #[command(subcommand)]
+        action: v6_cmd::V6Action,
     },
     /// Server state and everyday changes as JSON, for the desktop app (server only)
     #[command(hide = true)]
@@ -247,6 +253,7 @@ fn parse_ostp_link(link: &str) -> Result<ClientConfig> {
     Ok(ClientConfig {
         server: l.server(),
         access_key: l.key.clone(),
+        server_pk: l.pk.as_ref().map(ostp_core::server_key::encode_key),
         mtu: None,
         transport: Some(link_transport(&l)),
         socks5_bind: Some("127.0.0.1:1088".to_string()),
@@ -288,12 +295,15 @@ fn share_links_for(
         }
     });
 
+    // With a server key every link is a v6 profile; without one, v5 as before.
+    // A damaged key was refused when the server config was validated.
+    let pk = server_cfg.server_public_key().ok().flatten();
     let mut links = Vec::new();
     if let (Some(tls), Some(domain)) = (server_cfg.tls.as_ref().filter(|t| t.is_enabled()), &domain) {
         let path = if tls.frontend() != "builtin" { tls.ws_path.clone() } else { None };
-        links.push(("TLS", ShareLink::tls_for(key, domain, tls.public_port.unwrap_or(443), path, false)));
+        links.push(("TLS", ShareLink::tls_for(key, domain, tls.public_port.unwrap_or(443), path, false).with_pk(pk)));
     }
-    links.push(("UDP", ShareLink::new(key, &host, port)));
+    links.push(("UDP", ShareLink::new(key, &host, port).with_pk(pk)));
     links
 }
 
@@ -864,16 +874,16 @@ fn run_setup_wizard(config_path: &std::path::Path) -> Result<Option<PathBuf>> {
 
             // Try import from link first
             let use_link = wizard_yn("Do you have a share link (ostp://...)?", false);
-            let (server, access_key, transport) = if use_link {
+            let (server, access_key, transport, server_pk) = if use_link {
                 loop {
                     let link_str = wizard_prompt("Paste link", "");
                     match ostp_core::share_link::ShareLink::parse(&link_str) {
-                        Ok(l) => break (l.server(), l.key.clone(), link_transport(&l)),
+                        Ok(l) => break (l.server(), l.key.clone(), link_transport(&l), l.pk.as_ref().map(ostp_core::server_key::encode_key)),
                         Err(e) => wizard_warn(&format!("Not a valid ostp:// link: {e}")),
                     }
                 }
             } else {
-                ("127.0.0.1:50000".to_string(), "".to_string(), TransportConfigRaw { mode: Some("udp".into()), ..Default::default() })
+                ("127.0.0.1:50000".to_string(), "".to_string(), TransportConfigRaw { mode: Some("udp".into()), ..Default::default() }, None)
             };
 
             wizard_step(2, TOTAL, "Local proxy");
@@ -901,7 +911,7 @@ fn run_setup_wizard(config_path: &std::path::Path) -> Result<Option<PathBuf>> {
                 s.parse::<usize>().unwrap_or(5)
             } else { 1 };
 
-            let client_json = serde_json::json!({
+            let mut client_json = serde_json::json!({
                 "mode": "client",
                 "config_version": ostp_client::migrate::CURRENT_VERSION,
                 "log_level": "info",
@@ -927,6 +937,9 @@ fn run_setup_wizard(config_path: &std::path::Path) -> Result<Option<PathBuf>> {
                 },
                 "debug": false
             });
+            if let Some(pk) = &server_pk {
+                client_json["server_pk"] = serde_json::json!(pk);
+            }
 
             let actual_path = wizard_save_config(config_path, &client_json)?;
             println!();
@@ -997,11 +1010,14 @@ fn run_setup_wizard(config_path: &std::path::Path) -> Result<Option<PathBuf>> {
                 "fallback": { "enabled": false, "listen": "0.0.0.0:443", "target": "127.0.0.1:8080" },
                 "overnet": serde_json::to_value(ostp_server::OvernetConfig::default()).unwrap_or_default(),
                 "warp": serde_json::to_value(ostp_server::warp::WarpConfig::default()).unwrap_or_default(),
+                // A new server speaks v6 and, for 0.4.x clients, v5 too.
+                "protocol": v6_cmd::new_section(),
                 "debug": false
             });
             if let Some(ip) = &bind_ip {
                 server_json["bind_ip"] = serde_json::json!(ip);
             }
+            let server_pk = v6_cmd::public_key_of(&server_json["protocol"]);
 
             let actual_path = wizard_save_config(config_path, &server_json)?;
 
@@ -1016,7 +1032,7 @@ fn run_setup_wizard(config_path: &std::path::Path) -> Result<Option<PathBuf>> {
             println!();
             wizard_section("Share links for clients:");
             for (i, key) in access_keys.iter().enumerate() {
-                println!("  [{}] {}", i + 1, ostp_core::share_link::ShareLink::new(key, &host, port).to_uri());
+                println!("  [{}] {}", i + 1, ostp_core::share_link::ShareLink::new(key, &host, port).with_pk(server_pk).to_uri());
             }
 
             println!();
@@ -1092,11 +1108,14 @@ fn run_setup_wizard(config_path: &std::path::Path) -> Result<Option<PathBuf>> {
                 "fallback": { "enabled": false, "listen": "0.0.0.0:443", "target": "127.0.0.1:8080" },
                 "overnet": serde_json::to_value(ostp_server::OvernetConfig::default()).unwrap_or_default(),
                 "warp": serde_json::to_value(ostp_server::warp::WarpConfig::default()).unwrap_or_default(),
+                // A new server speaks v6 and, for 0.4.x clients, v5 too.
+                "protocol": v6_cmd::new_section(),
                 "debug": false
             });
             if let Some(ip) = &bind_ip {
                 server_json["bind_ip"] = serde_json::json!(ip);
             }
+            let server_pk = v6_cmd::public_key_of(&server_json["protocol"]);
 
             let actual_path = wizard_save_config(config_path, &server_json)?;
 
@@ -1108,7 +1127,7 @@ fn run_setup_wizard(config_path: &std::path::Path) -> Result<Option<PathBuf>> {
             println!();
             wizard_section("Share links for clients:");
             for (i, key) in access_keys.iter().enumerate() {
-                println!("  [{}] {}", i + 1, ostp_core::share_link::ShareLink::new(key, &host, port).to_uri());
+                println!("  [{}] {}", i + 1, ostp_core::share_link::ShareLink::new(key, &host, port).with_pk(server_pk).to_uri());
             }
 
             println!();
@@ -1283,6 +1302,7 @@ async fn run_app() -> Result<()> {
             Commands::Dns { action } => return dns_cmd::run(action, &args.config).await,
             Commands::Overnet { action } => return overnet_cmd::run(action, &args.config),
             Commands::Warp { action } => return warp_cmd::run(action, &args.config).await,
+            Commands::V6 { action } => return v6_cmd::run(action, &args.config),
             Commands::Start => return service_cmd::run(service_cmd::Action::Start),
             Commands::Stop => return service_cmd::run(service_cmd::Action::Stop),
             Commands::Restart => return service_cmd::run(service_cmd::Action::Restart),
@@ -1645,8 +1665,18 @@ async fn run_app() -> Result<()> {
     "endpoint": ""
   }},
 
+  // Wire protocol. server_key is this server's private key for protocol v6
+  // (a secret: keep this file readable by root only); `ostp v6 key` shows the
+  // public half, which links carry as pk=. accept_v5 keeps 0.4.x clients
+  // working next to v6 (the transitional mode; `ostp v6 v5 off` ends it).
+  "protocol": {{
+    "server_key": "{pk}",
+    "accept_v5": true
+  }},
+
   "debug": false
-}}"#, key, ws = cert_cmd::random_path(), cv = ostp_client::migrate::CURRENT_VERSION)
+}}"#, key, ws = cert_cmd::random_path(), cv = ostp_client::migrate::CURRENT_VERSION,
+            pk = v6_cmd::new_section()["server_key"].as_str().unwrap_or_default())
         } else if mode_str == "relay" {
             r#"{
   // OSTP Relay Node Configuration
@@ -1717,7 +1747,8 @@ async fn run_app() -> Result<()> {
                 if let AppMode::Server(s) = &config.mode {
                     let key = &s.access_keys[0];
                     let host = get_or_ask_public_ip(&args.config);
-                    let link = ostp_core::share_link::ShareLink::new(key.key(), &host, listen_addr_port(&s.listen.primary()));
+                    let link = ostp_core::share_link::ShareLink::new(key.key(), &host, listen_addr_port(&s.listen.primary()))
+                        .with_pk(s.server_public_key().ok().flatten());
                     println!("\n  Share link for client distribution:");
                     println!("  {}", link.to_uri());
                 }
@@ -1868,6 +1899,13 @@ async fn run_app() -> Result<()> {
                 .map(serde_json::from_value)
                 .transpose()
                 .map_err(|e| anyhow!("Invalid 'warp' section in server config: {e}"))?;
+            let wire = match &server_cfg.protocol {
+                Some(p) => ostp_server::WireSettings {
+                    server_key: p.private_key().map_err(|e| anyhow!("Invalid 'protocol' section in server config: {e}"))?,
+                    accept_v5: p.accept_v5,
+                },
+                None => ostp_server::WireSettings { server_key: None, accept_v5: true },
+            };
             ostp_server::run_server(ostp_server::ServerParams {
                 bind_addrs: listen_addrs,
                 server_public_ip: Some(host),
@@ -1884,6 +1922,7 @@ async fn run_app() -> Result<()> {
                 overnet: overnet_cfg,
                 warp: warp_cfg,
                 local_access: server_cfg.local_access,
+                wire,
             })
             .await?;
         }

@@ -23,6 +23,9 @@ The app checks GitHub for a newer stable or beta release when it opens (this can
 
 If the install fails, the dialog shows why and offers the release page instead.
 
+### Protocol version in a link (0.5.0)
+A link or subscription entry may carry `pk=<base64url>`: the server's static public key, 32 bytes, 43 characters without padding. A profile with `pk` speaks protocol v6 and the client checks the server by that key; a profile without it speaks v5. A link whose `pk` is not valid base64url of exactly 32 bytes is refused, not read as a v5 profile. An app keeps `pk` on the profile and writes it back when the profile is shared. The prober commands take the same value as an optional `server_pk`. A v6 profile never falls back to v5 by itself; if the server does not answer, the error says the server is older than 0.5.0 or its key was replaced, and the link has to be reissued.
+
 ### Servers that filter DNS
 A share link or subscription link carries `owndns=true` when the server runs its own resolver (10.1.0.1), and `dnsall=true` when the operator answers every DNS query whichever resolver it was sent to and refuses encrypted DNS (DoT, DoH). Both apps keep these flags on the profile and write them back when the profile is shared.
 

@@ -65,6 +65,8 @@ async fn start_server_on(binds: Vec<SocketAddr>) -> SocketAddr {
         warp: None,
         // The echo target listens on this machine's loopback.
         local_access: true,
+        // No server key: v5, as these tests always ran.
+        wire: ostp_server::WireSettings::default(),
     };
     tokio::spawn(async move {
         if let Err(e) = ostp_server::run_server(params).await {
