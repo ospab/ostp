@@ -199,6 +199,17 @@ One stream's throughput is bounded by 8 MiB per round trip, about 670 Mbit/s at 
 
 This is the layer that lets a single OSTP session carry an arbitrary number of concurrent proxied TCP connections and UDP flows: each is identified by its own sequence of `Connect`/`Data`/`Close` (or `UdpAssociate`/`UdpData`) messages multiplexed over the one encrypted nonce sequence, with the client's local SOCKS5/HTTP proxy or TUN adapter as the demultiplexing point on the client side.
 
+### 8.2 Protocol v6 (not in force on the 0.4.x wire)
+
+A v6 session (see [v6-session-design.md](v6-session-design.md)) changes the following in this layer; a v5 session and the text above stay as they are.
+
+- **Stream ids** are 32 bits (frame header v2). The client opens odd ids, the server even ones, an id is never reused in a session, and at most 1024 streams are open at a time. A stream is opened by its first message (`Connect` or `UdpAssociate`); the server answers an id it refuses (reused, wrong parity, limit) with `Error`.
+- **`Fin` (tag 13, no payload)** says "I will write no more" on the stream; the other direction keeps flowing. It rides in sequenced `Data`, so it arrives after every byte before it. The stream is over, and both sides release its state, when both have sent `Fin`. A program's end of stream (TCP FIN) is a `Fin`; the receiver passes it on as the end of the write side of its socket.
+- **`Close` (tag 4)** is the abort. In v6 it carries one reason byte (`[4, reason]`: 0 closed abruptly, 1 I/O error, 2 flow control broken); the receiver resets the connection it feeds (TCP RST) and releases the stream. `Error` ends a stream too. A v5 `Close` stays the single byte `[4]`.
+- **A reset stream** (the sender gave up on a frame of it, or the peer said so with `Abandon`) is treated like an abort: the program's connection is reset, the server closes the target. A reset of stream 0 ends the session.
+- **Flow control is part of every stream.** There is no `Features` exchange and no first `Window`: each direction of each stream starts with `INITIAL_STREAM_WINDOW` (8 MiB) and `Window(n)` only adds to it. A sender that goes past the allowance by more than a window (16 MiB waiting at the server) has its stream aborted; the server's 32 MiB reset of v5 does not apply.
+- **UDP** is `UdpData` carried in an unsequenced `Datagram` frame (kind 7) on the stream opened by `UdpAssociate`: not ordered, not retransmitted, counted against the congestion window.
+
 ---
 
 ## 9. Transport, Reliability, and Session Management
