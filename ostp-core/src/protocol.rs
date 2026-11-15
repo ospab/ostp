@@ -1,7 +1,7 @@
 use bytes::Bytes;
 use rand::Rng;
 use thiserror::Error;
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
 /// Upper bound on a single frame's retransmit timer, after exponential backoff
@@ -24,7 +24,10 @@ const RELIABLE_CARRIER_RTO: Duration = Duration::from_secs(5);
 
 use crate::congestion::CongestionController;
 use crate::crypto::{NoiseRole, NoiseSession, SessionCipher};
-use crate::framing::{AdaptivePadder, FrameHeader, FrameKind, FramedPacket, PaddingStrategy};
+use crate::framing::{
+    AdaptivePadder, FrameHeader, FrameKind, FramedPacket, FramedPacketV2, PaddingStrategy, DATAGRAM_OVERHEAD,
+    DATAGRAM_OVERHEAD_V6,
+};
 
 #[derive(Debug, Error)]
 pub enum ProtocolError {
@@ -154,17 +157,77 @@ pub enum OstpState {
 pub enum OstpEvent {
     Start,
     Inbound(Bytes),
-    Outbound(u16, Bytes), // stream_id, payload
+    /// A stream's payload, delivered reliably and in order within the stream.
+    /// A v5 session has 16-bit stream ids: a larger one is refused.
+    Outbound(u32, Bytes), // stream_id, payload
+    /// v6 only: a payload that is neither retransmitted nor ordered (UDP). It
+    /// counts against the congestion window; a lost one is simply lost.
+    OutboundDatagram(u32, Bytes), // stream_id, payload
+    /// v6 only: the stream is over on both sides; forget its state. Its id is
+    /// not used again, so later frames of it are dropped.
+    ReleaseStream(u32),
     Close,
     Tick,
 }
 
 pub enum ProtocolAction {
     SendDatagram(Bytes), // Fully formed datagram to send globally
-    DeliverApp(u16, Bytes), // stream_id, payload
+    DeliverApp(u32, Bytes), // stream_id, payload
+    /// v6 only: an unsequenced payload arrived (see `OstpEvent::OutboundDatagram`).
+    DeliverDatagram(u32, Bytes), // stream_id, payload
+    /// v6 only: the stream was reset. On the sender's side it gave up on a
+    /// frame of it; on the receiving side the peer said so. The stream is dead
+    /// in both directions: nothing more is delivered and `Outbound` for it is
+    /// refused.
+    StreamReset(u32, ResetReason), // stream_id, reason
     HandshakePayload(Bytes, Option<Bytes>), // Passed from client's handshake, Optional response to send
     Multiple(Vec<ProtocolAction>),
     Noop,
+}
+
+/// Why a stream was reset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum ResetReason {
+    /// The sender gave up retransmitting a frame of the stream: data was lost
+    /// for good. The app must not go on as if the stream were intact (a TCP
+    /// connection is reset, not left with a hole).
+    Lost = 1,
+}
+
+impl ResetReason {
+    fn from_wire(byte: u8) -> Option<Self> {
+        match byte {
+            1 => Some(Self::Lost),
+            _ => None,
+        }
+    }
+}
+
+/// Streams a receiver tracks at once (those with frames waiting or an order
+/// to keep): more are refused. The protocol limit on open streams is 1024
+/// (`streams::MAX_OPEN_STREAMS`); the slack is for streams that are closing.
+const MAX_TRACKED_STREAMS: usize = 2 * crate::streams::MAX_OPEN_STREAMS;
+/// Ids of dead (reset or released) streams remembered to drop their late
+/// frames; the lowest are forgotten first.
+const MAX_DEAD_STREAMS: usize = 8192;
+/// How long a datagram may stay unacknowledged before the sender counts it
+/// lost (in RTOs): it is never retransmitted, so the timer only frees its
+/// share of the congestion window.
+const DATAGRAM_LOSS_RTOS: u32 = 4;
+/// Nonces one `Abandon` frame is allowed to mark received at the receiver, so
+/// a frame cannot make it walk a huge range.
+const ABANDON_MAX_SPAN: u64 = 16384;
+/// Ranges one `Abandon` frame carries at most.
+const ABANDON_MAX_RANGES: usize = 32;
+
+/// A v6 receiver's state for one stream: the next `stream_seq` to deliver and
+/// the frames that arrived ahead of it.
+#[derive(Debug, Default)]
+struct StreamRx {
+    expected_seq: u32,
+    buffer: BTreeMap<u32, Bytes>,
+    buffered_bytes: usize,
 }
 
 pub struct ProtocolMachine {
@@ -251,6 +314,22 @@ pub struct ProtocolMachine {
     /// The Noise message of the first handshake datagram a client built, kept
     /// so a resend can be sealed again (`handshake_resend`).
     first_noise: Option<Vec<u8>>,
+    /// The session is v6 (`ProtocolConfig.v6` is set): 16-byte frame headers,
+    /// delivery order per stream, unsequenced datagrams, no skipping of gaps.
+    /// A v5 session never reads the fields below.
+    v6: bool,
+    /// Next `stream_seq` of each stream we send on.
+    send_seq: HashMap<u32, u32>,
+    /// Receiving side of each stream.
+    streams_rx: HashMap<u32, StreamRx>,
+    /// Frames waiting in `streams_rx` buffers, all streams together: bounded
+    /// by `max_reorder_buffer`.
+    stream_buffered: usize,
+    /// Reset or released streams: frames for them are acknowledged and dropped
+    /// and `Outbound` for them is refused.
+    dead_streams: BTreeSet<u32>,
+    /// The last `Abandon` sent in answer to a NACK, to rate-limit those.
+    last_abandon_answer: Instant,
 }
 
 // ── Gap recovery (see `ProtocolMachine::recover_stalled_gap`) ────────────────
@@ -289,6 +368,24 @@ struct SentFrame {
     last_sent: Instant,
     retries: u8,
     is_retransmittable: bool,
+    /// What the frame is, for a v6 sender that gives up on it or abandons it.
+    kind: FrameKind,
+    stream_id: u32,
+    /// An unsequenced datagram: counted in flight but never resent.
+    no_resend: bool,
+}
+
+/// What a frame being built is.
+#[derive(Clone, Copy)]
+struct FrameMeta {
+    kind: FrameKind,
+    stream_id: u32,
+    /// `stream_seq` (v6; 0 for every unsequenced kind).
+    seq: u32,
+    /// Charged to the congestion window and kept until acknowledged.
+    retransmittable: bool,
+    /// Never resent (a v6 datagram).
+    no_resend: bool,
 }
 
 impl ProtocolMachine {
@@ -314,7 +411,9 @@ impl ProtocolMachine {
         // congestion controller and anything under the padder's 64-byte
         // bucket panics in `clamp`, so a nonsense value is raised to the
         // smallest one the framing can use.
-        let mtu = config.mtu.max(crate::framing::DATAGRAM_OVERHEAD + 64);
+        let v6 = config.v6.is_some();
+        let overhead = if v6 { DATAGRAM_OVERHEAD_V6 } else { DATAGRAM_OVERHEAD };
+        let mtu = config.mtu.max(overhead + 64);
         let now = Instant::now();
 
         Ok(Self {
@@ -329,7 +428,7 @@ impl ProtocolMachine {
             sent_history: VecDeque::with_capacity(config.max_sent_history.max(1)),
             session_id: config.session_id,
             handshake_payload: config.handshake_payload,
-            padder: AdaptivePadder::new(mtu, config.max_padding, config.padding_strategy),
+            padder: AdaptivePadder::new(mtu, config.max_padding, config.padding_strategy).with_overhead(overhead),
             obfuscation_key: config.obfuscation_key,
             max_reorder: config.max_reorder.max(1),
             // A sender never has more than MAX_CWND_PACKETS frames in flight,
@@ -366,6 +465,12 @@ impl ProtocolMachine {
             _mtu: mtu,
             v6_hs,
             first_noise: None,
+            v6,
+            send_seq: HashMap::new(),
+            streams_rx: HashMap::new(),
+            stream_buffered: 0,
+            dead_streams: BTreeSet::new(),
+            last_abandon_answer: now.checked_sub(Duration::from_secs(1)).unwrap_or(now),
         })
     }
 
@@ -467,7 +572,8 @@ impl ProtocolMachine {
     /// The largest application payload one datagram carries within the
     /// configured MTU; split anything larger (see `relay::data_chunks`).
     pub fn max_payload(&self) -> usize {
-        self._mtu.saturating_sub(crate::framing::DATAGRAM_OVERHEAD).max(64)
+        let overhead = if self.v6 { DATAGRAM_OVERHEAD_V6 } else { DATAGRAM_OVERHEAD };
+        self._mtu.saturating_sub(overhead).max(64)
     }
 
     /// Whether the pacing bucket currently allows releasing another packet.
@@ -516,8 +622,28 @@ impl ProtocolMachine {
             }
             (OstpState::Handshaking, OstpEvent::Start) => Ok(ProtocolAction::Noop),
             (OstpState::Established, OstpEvent::Outbound(stream_id, app_data)) => {
+                if self.v6 {
+                    return self.build_stream_frame(stream_id, app_data).map(ProtocolAction::SendDatagram);
+                }
+                let stream_id = u16::try_from(stream_id)
+                    .map_err(|_| ProtocolError::State("a v5 session has 16-bit stream ids".to_string()))?;
                 self.build_tracked_datagram(stream_id, FrameKind::Data, app_data)
                     .map(ProtocolAction::SendDatagram)
+            }
+            (OstpState::Established, OstpEvent::OutboundDatagram(stream_id, payload)) => {
+                if !self.v6 {
+                    return Err(ProtocolError::State("unsequenced datagrams need a v6 session".to_string()));
+                }
+                // Counted in flight (the congestion window sees it), acknowledged
+                // like any frame, never resent.
+                let meta = FrameMeta { kind: FrameKind::Datagram, stream_id, seq: 0, retransmittable: true, no_resend: true };
+                self.build_frame(meta, payload).map(ProtocolAction::SendDatagram)
+            }
+            (OstpState::Established, OstpEvent::ReleaseStream(stream_id)) => {
+                if self.v6 {
+                    self.release_stream(stream_id);
+                }
+                Ok(ProtocolAction::Noop)
             }
             (OstpState::Established, OstpEvent::Inbound(raw)) => {
                 self.handle_inbound(raw)
@@ -655,7 +781,10 @@ impl ProtocolMachine {
     /// is a real cost, but the alternative is a permanently dead tunnel.
     fn recover_stalled_gap(&mut self) -> Vec<ProtocolAction> {
         let mut recovered = Vec::new();
-        if self.reorder_buffer.is_empty() {
+        // A v6 session never skips: a stream with a hole waits for the peer to
+        // reset it (`Abandon`), and the datagram-level holes are filled by the
+        // same frame.
+        if self.v6 || self.reorder_buffer.is_empty() {
             return recovered;
         }
 
@@ -811,8 +940,17 @@ impl ProtocolMachine {
             self.highest_authenticated_recv_nonce = Some(nonce);
         }
 
+        if self.v6 {
+            return self.handle_v6_frame(nonce, plaintext);
+        }
+
         let packet = FramedPacket::decode_zero_copy(Bytes::from(plaintext))?;
-        
+        // Kinds that exist only in v6 are unknown to a v5 session, as they
+        // are to a 0.4.x peer.
+        if matches!(packet.header.kind, FrameKind::Datagram | FrameKind::Abandon) {
+            return Err(ProtocolError::Framing("unknown frame kind".to_string()));
+        }
+
         let mut outbound_actions = Vec::new();
 
         // Fast path processing for Nacks: act immediately, bypass sequence queue
@@ -844,7 +982,7 @@ impl ProtocolMachine {
 
         let action = match packet.header.kind {
             FrameKind::Data => {
-                ProtocolAction::DeliverApp(packet.header.stream_id, packet.payload)
+                ProtocolAction::DeliverApp(u32::from(packet.header.stream_id), packet.payload)
             }
             FrameKind::Close => {
                 tracing::debug!("Received Close frame, terminating session");
@@ -916,6 +1054,398 @@ impl ProtocolMachine {
         }
     }
 
+    // ── v6: loss recovery per datagram, delivery order per stream ────────────
+    //
+    // The nonce space, ACK/NACK with SACK, the retransmit timer and the
+    // congestion controller are the same as in v5: `expected_recv_nonce` and
+    // `reorder_buffer` still say which datagrams arrived (the buffer only keeps
+    // the nonces here, the frames wait in the streams' own buffers). What moves
+    // is the delivery: a `Data` frame is delivered when its stream's
+    // `expected_seq` reaches it, whatever the other streams are missing.
+    //
+    // A hole is never skipped on the receiver's own say-so. When the sender
+    // gives up on a frame it says so (`Abandon`): the nonces will never come
+    // and, for a `Data` frame, its stream is reset.
+
+    fn handle_v6_frame(&mut self, nonce: u64, plaintext: Vec<u8>) -> Result<ProtocolAction, ProtocolError> {
+        let packet = FramedPacketV2::decode_zero_copy(Bytes::from(plaintext))?;
+        let kind = packet.header.kind;
+        let stream_id = packet.header.stream_id;
+
+        // Received before (a retransmit whose first copy arrived, a replay):
+        // nothing to deliver, and the peer is told what we have.
+        if self.reorder_buffer.contains_key(&nonce) {
+            return self.answer_duplicate();
+        }
+
+        let mut wire: Vec<ProtocolAction> = Vec::new();
+        let mut app: Vec<ProtocolAction> = Vec::new();
+
+        // What concerns our own sending acts at once, outside any order.
+        match kind {
+            FrameKind::Nack if packet.payload.len() >= 8 => self.on_nack_v6(&packet.payload, &mut wire),
+            FrameKind::Ack => {
+                let ranges = parse_ack_ranges(&packet.payload)?;
+                self.drop_acked_frames(&ranges);
+            }
+            _ => {}
+        }
+
+        let before = self.expected_recv_nonce;
+        // Out of order with no room for its nonce: dropped without being
+        // recorded, so it is not acknowledged and the sender resends it.
+        let full = nonce != self.expected_recv_nonce && self.reorder_buffer.len() >= self.max_reorder_buffer;
+        let mut record = !full;
+        if full {
+            tracing::debug!("Reorder buffer full, dropping frame nonce={}", nonce);
+        } else {
+            match kind {
+                FrameKind::Data => {
+                    record = self.admit_stream_data(stream_id, packet.header.stream_seq, packet.payload.clone(), &mut app);
+                }
+                FrameKind::Datagram => app.push(ProtocolAction::DeliverDatagram(stream_id, packet.payload.clone())),
+                FrameKind::Close => {
+                    tracing::debug!("Received Close frame, terminating session");
+                    self.state = OstpState::Closed;
+                }
+                FrameKind::Abandon => self.on_abandon_v6(&packet.payload, &mut app)?,
+                _ => {}
+            }
+        }
+
+        let held = record && self.record_nonce(nonce)?;
+        if matches!(kind, FrameKind::Data | FrameKind::Close | FrameKind::KeepAlive | FrameKind::Datagram | FrameKind::Abandon) {
+            self.ack_pending = true;
+        }
+
+        if self.expected_recv_nonce != before {
+            self.last_recv_advance = Instant::now();
+            self.gap_moved();
+        }
+        if held {
+            if self.gap_since.is_none() {
+                self.gap_since = Some(Instant::now());
+                self.gap_nacked = false;
+            }
+            if let Some(nack_frame) = self.nack_if_due() {
+                wire.push(ProtocolAction::SendDatagram(nack_frame));
+            }
+        }
+        if let Some(ack_frame) = self.build_ack_if_due()? {
+            wire.push(ProtocolAction::SendDatagram(ack_frame));
+        }
+
+        wire.extend(app);
+        Ok(match wire.len() {
+            0 => ProtocolAction::Noop,
+            1 => wire.pop().expect("one action"),
+            _ => ProtocolAction::Multiple(wire),
+        })
+    }
+
+    /// Marks `nonce` as received at the datagram level: the cumulative point
+    /// moves over it when it is the next one (and over the run behind it),
+    /// otherwise it waits in `reorder_buffer`. Returns whether it is now
+    /// waiting, i.e. a hole is open below it.
+    fn record_nonce(&mut self, nonce: u64) -> Result<bool, ProtocolError> {
+        if nonce < self.expected_recv_nonce {
+            return Ok(false);
+        }
+        if nonce == self.expected_recv_nonce {
+            let exhausted = || ProtocolError::Crypto("recv nonce sequence exhausted".to_string());
+            self.expected_recv_nonce = self.expected_recv_nonce.checked_add(1).ok_or_else(exhausted)?;
+            while self.reorder_buffer.remove(&self.expected_recv_nonce).is_some() {
+                self.expected_recv_nonce = self.expected_recv_nonce.checked_add(1).ok_or_else(exhausted)?;
+            }
+            return Ok(false);
+        }
+        if self.reorder_buffer.len() >= self.max_reorder_buffer {
+            return Ok(false);
+        }
+        self.reorder_buffer.insert(nonce, ProtocolAction::Noop);
+        Ok(true)
+    }
+
+    /// A duplicate datagram: the ACK we sent was probably lost or late.
+    fn answer_duplicate(&mut self) -> Result<ProtocolAction, ProtocolError> {
+        if self.last_ack_sent.elapsed() >= ANSWER_MIN_INTERVAL {
+            if let Some(ack_frame) = self.force_build_ack()? {
+                return Ok(ProtocolAction::SendDatagram(ack_frame));
+            }
+        }
+        Ok(ProtocolAction::Noop)
+    }
+
+    /// Delivers or holds a stream's `Data` frame by its `stream_seq`. Returns
+    /// whether the frame was taken (its nonce is then recorded and
+    /// acknowledged); `false` means there was no room and the sender must
+    /// resend it.
+    fn admit_stream_data(&mut self, stream_id: u32, seq: u32, payload: Bytes, app: &mut Vec<ProtocolAction>) -> bool {
+        // Frames of a stream that is over: acknowledged, not delivered. The
+        // last sequence number is never used, so the counter cannot wrap.
+        if self.dead_streams.contains(&stream_id) || seq == u32::MAX {
+            return true;
+        }
+        if !self.streams_rx.contains_key(&stream_id) && self.streams_rx.len() >= MAX_TRACKED_STREAMS {
+            tracing::debug!("Too many streams tracked, dropping frame of stream {}", stream_id);
+            return false;
+        }
+        let st = self.streams_rx.entry(stream_id).or_default();
+        if seq < st.expected_seq {
+            return true; // delivered already
+        }
+        if seq == st.expected_seq {
+            app.push(ProtocolAction::DeliverApp(stream_id, payload));
+            st.expected_seq += 1;
+            while let Some(next) = st.buffer.remove(&st.expected_seq) {
+                st.buffered_bytes -= next.len();
+                self.stream_buffered -= 1;
+                app.push(ProtocolAction::DeliverApp(stream_id, next));
+                st.expected_seq += 1;
+            }
+            return true;
+        }
+        if st.buffer.contains_key(&seq) {
+            return true; // held already
+        }
+        // Ahead of the stream's order: held, within the stream's window and
+        // the session's reorder buffer. A frame the stream's flow control
+        // allows always fits the first; the second only bounds a peer that
+        // sends many streams ahead of themselves.
+        if st.buffered_bytes + payload.len() > crate::relay::INITIAL_STREAM_WINDOW as usize
+            || self.stream_buffered >= self.max_reorder_buffer
+        {
+            tracing::debug!("Stream {} buffer full, dropping frame seq={}", stream_id, seq);
+            return false;
+        }
+        st.buffered_bytes += payload.len();
+        st.buffer.insert(seq, payload);
+        self.stream_buffered += 1;
+        true
+    }
+
+    /// The stream is over in both directions: its buffers go, and frames that
+    /// still arrive for it are acknowledged and dropped. Returns whether it was
+    /// alive until now.
+    fn kill_stream(&mut self, stream_id: u32) -> bool {
+        if let Some(st) = self.streams_rx.remove(&stream_id) {
+            self.stream_buffered -= st.buffer.len();
+        }
+        self.send_seq.remove(&stream_id);
+        let newly = self.dead_streams.insert(stream_id);
+        while self.dead_streams.len() > MAX_DEAD_STREAMS {
+            if let Some(&lowest) = self.dead_streams.iter().next() {
+                self.dead_streams.remove(&lowest);
+            }
+        }
+        newly
+    }
+
+    fn release_stream(&mut self, stream_id: u32) {
+        self.kill_stream(stream_id);
+    }
+
+    /// The peer NACKed `nonce` of ours: resend it, unless it is a datagram
+    /// (lost, never resent) or no longer in the history (then it is gone for
+    /// good and the peer is told, so its hole closes).
+    fn on_nack_v6(&mut self, payload: &[u8], wire: &mut Vec<ProtocolAction>) {
+        let Ok(raw) = <[u8; 8]>::try_from(&payload[..8]) else {
+            return;
+        };
+        let req_nonce = u64::from_be_bytes(raw);
+        let new_gap = self.last_nacked_nonce != Some(req_nonce);
+        self.last_nacked_nonce = Some(req_nonce);
+
+        let i = self.sent_history.partition_point(|f| f.nonce < req_nonce);
+        let is_datagram = self.sent_history.get(i).filter(|f| f.nonce == req_nonce).map(|f| f.no_resend);
+        match is_datagram {
+            Some(false) => {
+                if let Some(cached) = self.lookup_sent_frame(req_nonce) {
+                    tracing::debug!("NACK received: retransmitting nonce={}", req_nonce);
+                    if new_gap {
+                        self.cc.on_loss(cached.len() as u64);
+                    }
+                    self.cc.on_retransmit(cached.len() as u64);
+                    wire.push(ProtocolAction::SendDatagram(cached));
+                }
+            }
+            Some(true) => {
+                if let Some(lost) = self.sent_history.remove(i) {
+                    let len = lost.bytes.len() as u64;
+                    self.cc.on_discard(len);
+                    if new_gap {
+                        self.cc.on_loss(len);
+                    }
+                }
+                self.answer_abandon(req_nonce, wire);
+            }
+            None if req_nonce < self.send_nonce => {
+                tracing::debug!("NACK received: nonce={} is gone from sent_history", req_nonce);
+                self.answer_abandon(req_nonce, wire);
+            }
+            // A nonce we never sent: nothing to resend and nothing to abandon.
+            None => {}
+        }
+    }
+
+    /// Tells the peer that `nonce` will never come. At most one per
+    /// ANSWER_MIN_INTERVAL: a NACK that gets no answer is repeated by the
+    /// receiver's own timer.
+    fn answer_abandon(&mut self, nonce: u64, wire: &mut Vec<ProtocolAction>) {
+        if self.last_abandon_answer.elapsed() < ANSWER_MIN_INTERVAL {
+            return;
+        }
+        self.last_abandon_answer = Instant::now();
+        if let Ok(frames) = self.build_abandon(0, None, &[nonce]) {
+            wire.extend(frames.into_iter().map(ProtocolAction::SendDatagram));
+        }
+    }
+
+    /// `Abandon` frames for `nonces`: `stream_id(4) reason(1) count(1)` and
+    /// `count` ranges of `start(8) end(8)`. With a reason the frame is also a
+    /// reset of the stream and is retransmitted until acknowledged; without
+    /// one it only closes holes, and a lost copy is asked for again by the
+    /// receiver's NACK.
+    fn build_abandon(&mut self, stream_id: u32, reason: Option<ResetReason>, nonces: &[u64]) -> Result<Vec<Bytes>, ProtocolError> {
+        let mut sorted = nonces.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        let mut ranges: Vec<(u64, u64)> = Vec::new();
+        for n in sorted {
+            match ranges.last_mut() {
+                Some(last) if last.1.checked_add(1) == Some(n) => last.1 = n,
+                _ => ranges.push((n, n)),
+            }
+        }
+        let per_frame = (self.max_payload().saturating_sub(6) / 16).clamp(1, ABANDON_MAX_RANGES);
+        let mut frames = Vec::new();
+        for chunk in ranges.chunks(per_frame) {
+            let mut payload = Vec::with_capacity(6 + chunk.len() * 16);
+            payload.extend_from_slice(&stream_id.to_be_bytes());
+            payload.push(reason.map_or(0, |r| r as u8));
+            payload.push(chunk.len() as u8);
+            for &(start, end) in chunk {
+                payload.extend_from_slice(&start.to_be_bytes());
+                payload.extend_from_slice(&end.to_be_bytes());
+            }
+            let meta = FrameMeta {
+                kind: FrameKind::Abandon,
+                stream_id: 0,
+                seq: 0,
+                retransmittable: reason.is_some(),
+                no_resend: false,
+            };
+            frames.push(self.build_frame(meta, Bytes::from(payload))?);
+        }
+        Ok(frames)
+    }
+
+    /// The peer will never send these nonces: they count as received, and a
+    /// stream it names is reset.
+    fn on_abandon_v6(&mut self, payload: &[u8], app: &mut Vec<ProtocolAction>) -> Result<(), ProtocolError> {
+        if payload.len() < 6 {
+            return Err(ProtocolError::Framing("abandon payload too short".to_string()));
+        }
+        let stream_id = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
+        let reason = match payload[4] {
+            0 => None,
+            byte => Some(ResetReason::from_wire(byte).ok_or_else(|| ProtocolError::Framing("unknown reset reason".to_string()))?),
+        };
+        let count = payload[5] as usize;
+        if payload.len() < 6 + count * 16 {
+            return Err(ProtocolError::Framing("abandon payload truncated".to_string()));
+        }
+        let mut budget = ABANDON_MAX_SPAN;
+        for i in 0..count {
+            let at = 6 + i * 16;
+            let start = u64::from_be_bytes(payload[at..at + 8].try_into().expect("8 bytes"));
+            let end = u64::from_be_bytes(payload[at + 8..at + 16].try_into().expect("8 bytes"));
+            // Only what the receive window covers: nothing below it is
+            // pending, and nothing beyond it can be told apart from a lie.
+            let mut n = start.max(self.expected_recv_nonce);
+            let last = end.min(self.expected_recv_nonce.saturating_add(self.max_reorder));
+            while n <= last && budget > 0 {
+                self.record_nonce(n)?;
+                budget -= 1;
+                if n == u64::MAX {
+                    break;
+                }
+                n += 1;
+            }
+        }
+        if let Some(reason) = reason {
+            if self.kill_stream(stream_id) {
+                app.push(ProtocolAction::StreamReset(stream_id, reason));
+            }
+        }
+        Ok(())
+    }
+
+    /// v6, on the tick: frames the sender gives up on, and datagrams that
+    /// were not acknowledged in time.
+    ///
+    /// A `Data` frame given up on resets its stream (and only that one): every
+    /// frame of it still in flight is dropped too, and one `Abandon` carrying
+    /// all their nonces and the reason `Lost` goes to the peer, retransmitted
+    /// until acknowledged. The caller gets `StreamReset` as well. Frames of
+    /// other kinds are evicted as in v5; the receiver's NACK for the hole they
+    /// leave is answered with an `Abandon` (`on_nack_v6`).
+    fn v6_tick_losses(&mut self, now: Instant, base_rto: Duration, actions: &mut Vec<ProtocolAction>) -> Result<(), ProtocolError> {
+        let grace = self.retry_limit();
+        let give_up = self.frame_give_up;
+        let mut by_stream: BTreeMap<u32, Vec<u64>> = BTreeMap::new();
+        for f in self.sent_history.iter() {
+            let given_up = f.is_retransmittable
+                && !f.no_resend
+                && f.retries > grace
+                && now.duration_since(f.first_sent) >= give_up;
+            if given_up && f.kind == FrameKind::Data {
+                by_stream.entry(f.stream_id).or_default();
+            }
+        }
+        if !by_stream.is_empty() {
+            let mut freed = 0u64;
+            for f in self.sent_history.iter() {
+                if f.is_retransmittable && f.kind == FrameKind::Data {
+                    if let Some(nonces) = by_stream.get_mut(&f.stream_id) {
+                        nonces.push(f.nonce);
+                        freed += f.bytes.len() as u64;
+                    }
+                }
+            }
+            self.cc.on_discard(freed);
+            self.sent_history
+                .retain(|f| !(f.is_retransmittable && f.kind == FrameKind::Data && by_stream.contains_key(&f.stream_id)));
+            for (stream_id, nonces) in by_stream {
+                tracing::debug!("Gave up on a frame of stream {}: resetting it", stream_id);
+                self.kill_stream(stream_id);
+                for frame in self.build_abandon(stream_id, Some(ResetReason::Lost), &nonces)? {
+                    actions.push(ProtocolAction::SendDatagram(frame));
+                }
+                actions.push(ProtocolAction::StreamReset(stream_id, ResetReason::Lost));
+            }
+        }
+
+        // A datagram that nothing acknowledged by now is lost.
+        let lost_after = base_rto.saturating_mul(DATAGRAM_LOSS_RTOS).min(MAX_EFFECTIVE_RTO);
+        let mut lost = Vec::new();
+        let mut lost_bytes = 0u64;
+        for f in self.sent_history.iter().filter(|f| f.no_resend && now.duration_since(f.first_sent) >= lost_after) {
+            lost.push(f.nonce);
+            lost_bytes += f.bytes.len() as u64;
+        }
+        if !lost.is_empty() {
+            // The same age test as above, against the same `now`.
+            self.sent_history.retain(|f| !(f.no_resend && now.duration_since(f.first_sent) >= lost_after));
+            self.cc.on_discard(lost_bytes);
+            self.cc.on_loss(lost_bytes);
+            for frame in self.build_abandon(0, None, &lost)? {
+                actions.push(ProtocolAction::SendDatagram(frame));
+            }
+        }
+        Ok(())
+    }
+
     fn wrap_datagram_handshake(&self, noise_payload: &[u8]) -> Result<Bytes, ProtocolError> {
         // Anti-DPI: add random padding after the Noise payload to prevent
         // size fingerprinting. The padding range is derived from the access key
@@ -956,31 +1486,60 @@ impl ProtocolMachine {
     }
 
     fn build_tracked_datagram(&mut self, stream_id: u16, kind: FrameKind, payload: Bytes) -> Result<Bytes, ProtocolError> {
-        self.build_datagram(stream_id, kind, payload, true)
+        let meta = FrameMeta { kind, stream_id: u32::from(stream_id), seq: 0, retransmittable: true, no_resend: false };
+        self.build_frame(meta, payload)
     }
 
     fn build_control_datagram(&mut self, stream_id: u16, kind: FrameKind, payload: Bytes) -> Result<Bytes, ProtocolError> {
-        self.build_datagram(stream_id, kind, payload, false)
+        let meta = FrameMeta { kind, stream_id: u32::from(stream_id), seq: 0, retransmittable: false, no_resend: false };
+        self.build_frame(meta, payload)
     }
 
-    fn build_datagram(&mut self, stream_id: u16, kind: FrameKind, payload: Bytes, is_retransmittable: bool) -> Result<Bytes, ProtocolError> {
+    /// A v6 stream's `Data` frame: the next `stream_seq` of the stream, which
+    /// is spent only when the frame was built.
+    fn build_stream_frame(&mut self, stream_id: u32, payload: Bytes) -> Result<Bytes, ProtocolError> {
+        if self.dead_streams.contains(&stream_id) {
+            return Err(ProtocolError::State(format!("stream {stream_id} is reset or released")));
+        }
+        let seq = self.send_seq.get(&stream_id).copied().unwrap_or(0);
+        let next = seq
+            .checked_add(1)
+            .ok_or_else(|| ProtocolError::State("stream sequence exhausted".to_string()))?;
+        let meta = FrameMeta { kind: FrameKind::Data, stream_id, seq, retransmittable: true, no_resend: false };
+        let frame = self.build_frame(meta, payload)?;
+        self.send_seq.insert(stream_id, next);
+        Ok(frame)
+    }
+
+    fn build_frame(&mut self, meta: FrameMeta, payload: Bytes) -> Result<Bytes, ProtocolError> {
+        let FrameMeta { kind, stream_id, seq, retransmittable: is_retransmittable, no_resend } = meta;
         let padding = self.padder.build_padding(payload.len());
-        let header = FrameHeader {
-            version: 1,
-            kind,
-            stream_id,
-            payload_len: payload.len() as u32,
-            pad_len: padding.len() as u16,
+        let plaintext = if self.v6 {
+            // A frame never exceeds the path MTU.
+            if payload.len() > self.max_payload() {
+                return Err(ProtocolError::Framing(format!(
+                    "payload of {} bytes exceeds the {} a datagram carries",
+                    payload.len(),
+                    self.max_payload()
+                )));
+            }
+            FramedPacketV2::new(kind, stream_id, seq, payload, Bytes::from(padding))?.encode()
+        } else {
+            let header = FrameHeader {
+                version: 1,
+                kind,
+                stream_id: stream_id as u16,
+                payload_len: payload.len() as u32,
+                pad_len: padding.len() as u16,
+            };
+            FramedPacket {
+                header,
+                payload,
+                padding: Bytes::from(padding),
+            }
+            .encode()
         };
 
-        let packet = FramedPacket {
-            header,
-            payload,
-            padding: Bytes::from(padding),
-        };
-
-        let plaintext = packet.encode();
-        
         let cipher = self.send_cipher.as_ref().ok_or_else(|| {
             ProtocolError::State("missing send cipher".to_string())
         })?;
@@ -1001,7 +1560,7 @@ impl ProtocolMachine {
 
         let final_bytes = Bytes::from(out);
         
-        self.push_sent_frame(nonce, final_bytes.clone(), is_retransmittable);
+        self.push_sent_frame(nonce, final_bytes.clone(), FrameMeta { kind, stream_id, seq, retransmittable: is_retransmittable, no_resend });
 
         Ok(final_bytes)
     }
@@ -1109,6 +1668,11 @@ impl ProtocolMachine {
         let now = Instant::now();
         let base_rto = self.base_rto();
 
+        // ── v6: given-up streams and lost datagrams ──────────────────
+        if self.v6 {
+            self.v6_tick_losses(now, base_rto, &mut actions)?;
+        }
+
         // ── Zombie frame eviction ────────────────────────────────────
         // Past max_retries + 2 attempts AND FRAME_GIVE_UP since it was first
         // sent. A count alone gave up within ~30 s on a short path (small RTO),
@@ -1137,7 +1701,9 @@ impl ProtocolMachine {
         //   effective_rto = base_rto * 2^retries, capped at 2^6 = 64×
         let mut retransmit_budget: usize = self.cc.retransmit_budget();
         for frame in self.sent_history.iter_mut() {
-            if !frame.is_retransmittable {
+            // A v6 datagram is never resent (`no_resend` is false for every
+            // v5 frame).
+            if !frame.is_retransmittable || frame.no_resend {
                 continue;
             }
             // Out of budget for this tick — stop scanning rather than walking the
@@ -1181,7 +1747,7 @@ impl ProtocolMachine {
         // session is over even if the peer never sends its own Close (it
         // crashed, or the path died). It used to sit in Closing until the
         // caller's idle timeout.
-        if self.state == OstpState::Closing && !self.sent_history.iter().any(|f| f.is_retransmittable) {
+        if self.state == OstpState::Closing && !self.sent_history.iter().any(|f| f.is_retransmittable && !f.no_resend) {
             self.state = OstpState::Closed;
         }
 
@@ -1286,8 +1852,8 @@ impl ProtocolMachine {
         Some(frame.bytes.clone())
     }
 
-    fn push_sent_frame(&mut self, nonce: u64, bytes: Bytes, is_retransmittable: bool) {
-        if is_retransmittable {
+    fn push_sent_frame(&mut self, nonce: u64, bytes: Bytes, meta: FrameMeta) {
+        if meta.retransmittable {
             self.cc.on_send(bytes.len() as u64);
         }
         self.sent_history.push_back(SentFrame {
@@ -1296,7 +1862,10 @@ impl ProtocolMachine {
             first_sent: Instant::now(),
             last_sent: Instant::now(),
             retries: 0,
-            is_retransmittable,
+            is_retransmittable: meta.retransmittable,
+            kind: meta.kind,
+            stream_id: meta.stream_id,
+            no_resend: meta.no_resend,
         });
         if self.sent_history.len() > self.max_sent_history {
             let overflow = self.sent_history.len() - self.max_sent_history;
@@ -2467,5 +3036,427 @@ mod tests {
             let _ = client.on_event(OstpEvent::Inbound(a));
         }
         assert!(client.cc.smoothed_rtt() < Duration::from_secs(1), "a 3 s old ACK frame became an RTT sample (srtt {:?} -> {:?})", srtt, client.cc.smoothed_rtt());
+    }
+
+    // ── v6 session layer ─────────────────────────────────────────────────────
+
+    fn do_handshake_v6() -> (ProtocolMachine, ProtocolMachine) {
+        let (private, public) = crate::crypto::noise::generate_server_key();
+        let (ccfg, scfg) = v6_configs(private, public);
+        let mut client = ProtocolMachine::new(ccfg).unwrap();
+        let mut server = ProtocolMachine::new(scfg).unwrap();
+        let ProtocolAction::SendDatagram(msg1) = client.on_event(OstpEvent::Start).unwrap() else { panic!() };
+        let (_, reply) = server_reply(server.on_event(OstpEvent::Inbound(msg1)).unwrap());
+        client.on_event(OstpEvent::Inbound(reply)).unwrap();
+        assert!(client.v6 && server.v6);
+        (client, server)
+    }
+
+    /// What an action tree asks the caller to do, sorted.
+    #[derive(Default)]
+    struct Out {
+        app: Vec<(u32, Bytes)>,
+        dgrams: Vec<(u32, Bytes)>,
+        resets: Vec<(u32, ResetReason)>,
+        wire: Vec<Bytes>,
+    }
+
+    fn sort_out(a: ProtocolAction, o: &mut Out) {
+        match a {
+            ProtocolAction::DeliverApp(s, b) => o.app.push((s, b)),
+            ProtocolAction::DeliverDatagram(s, b) => o.dgrams.push((s, b)),
+            ProtocolAction::StreamReset(s, r) => o.resets.push((s, r)),
+            ProtocolAction::SendDatagram(d) => o.wire.push(d),
+            ProtocolAction::Multiple(l) => l.into_iter().for_each(|x| sort_out(x, o)),
+            _ => {}
+        }
+    }
+
+    fn feed(m: &mut ProtocolMachine, d: &Bytes) -> Out {
+        let mut o = Out::default();
+        sort_out(m.on_event(OstpEvent::Inbound(d.clone())).unwrap(), &mut o);
+        o
+    }
+
+    fn tick(m: &mut ProtocolMachine) -> Out {
+        let mut o = Out::default();
+        sort_out(m.on_event(OstpEvent::Tick).unwrap(), &mut o);
+        o
+    }
+
+    fn send(m: &mut ProtocolMachine, stream: u32, payload: &[u8]) -> Bytes {
+        datagrams(m.on_event(OstpEvent::Outbound(stream, Bytes::copy_from_slice(payload))).unwrap()).remove(0)
+    }
+
+    fn send_datagram(m: &mut ProtocolMachine, stream: u32, payload: &[u8]) -> Bytes {
+        datagrams(m.on_event(OstpEvent::OutboundDatagram(stream, Bytes::copy_from_slice(payload))).unwrap()).remove(0)
+    }
+
+    fn texts(o: &Out) -> Vec<(u32, String)> {
+        o.app.iter().map(|(s, b)| (*s, String::from_utf8_lossy(b).to_string())).collect()
+    }
+
+    #[test]
+    fn a_v6_datagram_carries_4_bytes_less_and_never_exceeds_the_mtu() {
+        let (c5, _) = do_handshake();
+        let (mut c6, mut s6) = do_handshake_v6();
+        assert_eq!(c5.max_payload() - c6.max_payload(), 4);
+        let max = c6.max_payload();
+        for _ in 0..50 {
+            let d = send(&mut s6, 2, &vec![1u8; max]);
+            assert!(d.len() <= 1400, "{} bytes over an MTU of 1400", d.len());
+        }
+        // One byte more does not fit a datagram: refused, not truncated or fragmented.
+        assert!(c6.on_event(OstpEvent::Outbound(1, Bytes::from(vec![0u8; max + 1]))).is_err());
+        assert!(c6.on_event(OstpEvent::OutboundDatagram(1, Bytes::from(vec![0u8; max + 1]))).is_err());
+        // A refused frame spends neither a sequence number nor a nonce that matters:
+        // the next frame of the stream is seq 0 and delivers.
+        let ok = send(&mut c6, 1, b"after");
+        assert_eq!(texts(&feed(&mut s6, &ok)), vec![(1, "after".to_string())]);
+    }
+
+    #[test]
+    fn stream_frames_are_delivered_in_order_per_stream() {
+        let (mut client, mut server) = do_handshake_v6();
+        let a: Vec<Bytes> = (0..4).map(|i| send(&mut client, 1, format!("a{i}").as_bytes())).collect();
+
+        assert_eq!(texts(&feed(&mut server, &a[0])), vec![(1, "a0".to_string())], "in order: at once");
+        assert!(feed(&mut server, &a[2]).app.is_empty(), "ahead of the order: held");
+        assert!(feed(&mut server, &a[3]).app.is_empty());
+        assert!(feed(&mut server, &a[3]).app.is_empty(), "the same frame again is not held twice");
+        assert_eq!(server.stream_buffered, 2);
+        assert_eq!(
+            texts(&feed(&mut server, &a[1])),
+            vec![(1, "a1".to_string()), (1, "a2".to_string()), (1, "a3".to_string())],
+            "the missing frame releases the ones behind it, in order"
+        );
+        assert_eq!(server.stream_buffered, 0);
+        for f in &a {
+            assert!(feed(&mut server, f).app.is_empty(), "a frame of the past is a duplicate");
+        }
+    }
+
+    #[test]
+    fn a_gap_in_one_stream_does_not_hold_another() {
+        let (mut client, mut server) = do_handshake_v6();
+        let a0 = send(&mut client, 1, b"a0");
+        let a1 = send(&mut client, 1, b"a1");
+        let a2 = send(&mut client, 1, b"a2");
+        let b0 = send(&mut client, 3, b"b0");
+        let b1 = send(&mut client, 3, b"b1");
+
+        // a0 is lost; everything else arrives.
+        assert!(feed(&mut server, &a1).app.is_empty());
+        assert_eq!(texts(&feed(&mut server, &b0)), vec![(3, "b0".to_string())], "stream 3 does not wait for stream 1");
+        assert_eq!(texts(&feed(&mut server, &b1)), vec![(3, "b1".to_string())]);
+        assert!(feed(&mut server, &a2).app.is_empty());
+        // The datagram-level hole (a0's nonce) is still open and still asked for.
+        assert_eq!(server.expected_recv_nonce, 0);
+        assert_eq!(
+            texts(&feed(&mut server, &a0)),
+            vec![(1, "a0".to_string()), (1, "a1".to_string()), (1, "a2".to_string())]
+        );
+        assert_eq!(server.expected_recv_nonce, 5, "the hole closed");
+    }
+
+    /// `Close` is a message inside a sequenced frame, so it is the last thing
+    /// delivered on its stream even when it arrives first.
+    #[test]
+    fn a_close_message_is_delivered_after_the_data_before_it() {
+        use crate::relay::RelayMessage;
+        let (mut client, mut server) = do_handshake_v6();
+        let d0 = send(&mut client, 5, b"x");
+        let d1 = send(&mut client, 5, b"y");
+        let close = datagrams(
+            client
+                .on_event(OstpEvent::Outbound(5, Bytes::from(RelayMessage::Close.encode())))
+                .unwrap(),
+        )
+        .remove(0);
+        assert!(feed(&mut server, &close).app.is_empty(), "the Close arrived first and waits");
+        assert!(feed(&mut server, &d1).app.is_empty());
+        let o = feed(&mut server, &d0);
+        assert_eq!(o.app.len(), 3);
+        assert_eq!(&o.app[0].1[..], b"x");
+        assert_eq!(&o.app[1].1[..], b"y");
+        assert!(matches!(RelayMessage::decode(&o.app[2].1).unwrap(), RelayMessage::Close), "Close is last");
+    }
+
+    #[test]
+    fn a_streams_buffer_is_bounded_by_its_window() {
+        let (mut client, mut server) = do_handshake_v6();
+        server.max_reorder = 1 << 20;
+        server.max_reorder_buffer = 10_000;
+        let size = 1300usize;
+        let make = |i: u32| {
+            let mut p = vec![0u8; size];
+            p[..4].copy_from_slice(&i.to_be_bytes());
+            p
+        };
+        let held_max = crate::relay::INITIAL_STREAM_WINDOW as usize / size;
+        let total = held_max as u32 + 150;
+        let frames: Vec<Bytes> = (0..=total).map(|i| send(&mut client, 1, &make(i))).collect();
+
+        // seq 0 is lost; the rest arrive, more than the window holds.
+        let mut rejected = Vec::new();
+        for (i, f) in frames.iter().enumerate().skip(1) {
+            assert!(feed(&mut server, f).app.is_empty());
+            if server.stream_buffered < i {
+                rejected.push(i);
+                break;
+            }
+        }
+        for f in frames.iter().skip(rejected[0] + 1) {
+            feed(&mut server, f);
+        }
+        let st = &server.streams_rx[&1];
+        assert!(st.buffered_bytes <= crate::relay::INITIAL_STREAM_WINDOW as usize);
+        assert_eq!(server.stream_buffered, held_max, "the window holds this many frames");
+        assert_eq!(server.reorder_buffer.len(), held_max, "a frame that was not taken is not acknowledged either");
+
+        // seq 0 arrives and the held ones go; what was refused is resent and goes too.
+        let mut got = feed(&mut server, &frames[0]).app;
+        assert_eq!(got.len(), held_max + 1);
+        for f in frames.iter().skip(held_max + 1) {
+            got.extend(feed(&mut server, f).app);
+        }
+        assert_eq!(got.len(), total as usize + 1, "nothing lost");
+        for (i, (_, p)) in got.iter().enumerate() {
+            assert_eq!(u32::from_be_bytes(p[..4].try_into().unwrap()), i as u32, "in order");
+        }
+    }
+
+    #[test]
+    fn the_total_of_the_streams_buffers_is_bounded_by_the_session_limit() {
+        let (mut client, mut server) = do_handshake_v6();
+        server.max_reorder_buffer = 10;
+        // 20 streams; the first frame of each is lost and the second arrives.
+        let mut second = Vec::new();
+        for s in 1..=20u32 {
+            send(&mut client, s, b"first");
+            second.push(send(&mut client, s, b"second"));
+        }
+        for f in &second {
+            assert!(feed(&mut server, f).app.is_empty());
+        }
+        assert_eq!(server.stream_buffered, 10);
+        assert_eq!(server.reorder_buffer.len(), 10);
+    }
+
+    #[test]
+    fn a_v6_receiver_never_skips_a_hole() {
+        let (mut client, mut server) = do_handshake_v6();
+        let a0 = send(&mut client, 1, b"a0");
+        let a1 = send(&mut client, 1, b"a1");
+        let a2 = send(&mut client, 1, b"a2");
+        assert_eq!(feed(&mut server, &a0).app.len(), 1);
+        assert!(feed(&mut server, &a2).app.is_empty());
+        // The v5 receiver skips after the sender's retransmit budget; v6 does not.
+        server.last_recv_advance = Instant::now() - Duration::from_secs(3600);
+        assert!(feed(&mut server, &a0).app.is_empty());
+        assert!(tick(&mut server).app.is_empty());
+        assert_eq!(texts(&feed(&mut server, &a1)), vec![(1, "a1".to_string()), (1, "a2".to_string())]);
+    }
+
+    #[test]
+    fn a_datagram_is_delivered_once_and_outside_every_order() {
+        let (mut client, mut server) = do_handshake_v6();
+        let s0 = send(&mut client, 1, b"s0");
+        let d = send_datagram(&mut client, 9, b"udp");
+        // The datagram arrives although the stream's first frame did not.
+        let o = feed(&mut server, &d);
+        assert_eq!(o.dgrams, vec![(9, Bytes::from_static(b"udp"))]);
+        assert!(o.app.is_empty());
+        assert!(feed(&mut server, &d).dgrams.is_empty(), "a duplicate datagram is not delivered twice");
+        assert_eq!(texts(&feed(&mut server, &s0)).len(), 1);
+    }
+
+    #[test]
+    fn a_lost_datagram_is_not_resent_and_does_not_hold_back_stream_data() {
+        let (mut client, mut server) = do_handshake_v6();
+        let d = send_datagram(&mut client, 9, b"udp"); // lost
+        let s0 = send(&mut client, 1, b"s0");
+        let s1 = send(&mut client, 1, b"s1");
+        assert_eq!(client.in_flight_count(), 3, "a datagram counts against the window");
+
+        // The stream's data is delivered at once, behind the datagram's hole.
+        let mut to_client = Vec::new();
+        for (f, name) in [(&s0, "s0"), (&s1, "s1")] {
+            let o = feed(&mut server, f);
+            assert_eq!(texts(&o), vec![(1, name.to_string())]);
+            to_client.extend(o.wire);
+        }
+        assert_eq!(server.expected_recv_nonce, 0, "the datagram's nonce is a hole");
+
+        // The receiver NACKs the hole; the sender does not resend a datagram.
+        server.gap_since = Some(Instant::now() - REORDER_WINDOW_MAX);
+        server.last_nack_sent = Instant::now() - Duration::from_secs(1);
+        server.last_ack_sent = Instant::now() - Duration::from_secs(1);
+        to_client.extend(tick(&mut server).wire);
+        let mut answers = Vec::new();
+        for w in &to_client {
+            answers.extend(feed(&mut client, w).wire);
+        }
+        assert!(!answers.contains(&d), "a lost datagram is not resent");
+        assert!(!answers.is_empty(), "but the receiver is told it will never come");
+        assert_eq!(client.in_flight_count(), 0, "the datagram left the window with the acknowledged frames");
+
+        for a in &answers {
+            feed(&mut server, a);
+        }
+        assert!(server.expected_recv_nonce >= 3, "the hole is closed: {}", server.expected_recv_nonce);
+        assert!(server.reorder_buffer.is_empty());
+        // The stream goes on.
+        let s2 = send(&mut client, 1, b"s2");
+        assert_eq!(texts(&feed(&mut server, &s2)), vec![(1, "s2".to_string())]);
+    }
+
+    #[test]
+    fn a_datagram_is_not_resent_on_the_timer_but_data_is() {
+        let (mut client, mut server) = do_handshake_v6();
+        let d = send_datagram(&mut client, 9, b"udp");
+        let s = send(&mut client, 1, b"data");
+        for f in client.sent_history.iter_mut() {
+            f.last_sent = Instant::now() - Duration::from_secs(2);
+        }
+        let t = tick(&mut client);
+        assert!(t.wire.contains(&s), "stream data is resent on the timer");
+        assert!(!t.wire.contains(&d), "a datagram is not");
+
+        // Unacknowledged for long enough, the datagram is counted lost and
+        // leaves the window; the peer is told.
+        for f in client.sent_history.iter_mut().filter(|f| f.no_resend) {
+            f.first_sent = Instant::now() - Duration::from_secs(30);
+        }
+        let t = tick(&mut client);
+        assert!(!t.wire.contains(&d));
+        assert!(client.sent_history.iter().all(|f| !f.no_resend));
+        assert_eq!(client.in_flight_count(), 1, "only the stream's frame is left in flight");
+        for w in &t.wire {
+            feed(&mut server, w);
+        }
+        assert_eq!(server.expected_recv_nonce, 1, "the datagram's hole is closed, the stream's frame is still due");
+        assert_eq!(texts(&feed(&mut server, &s)), vec![(1, "data".to_string())]);
+    }
+
+    #[test]
+    fn giving_up_on_a_frame_resets_that_stream_on_both_ends_and_no_other() {
+        let (mut client, mut server) = do_handshake_v6();
+        let f0 = send(&mut client, 1, b"f0"); // lost for good
+        let f1 = send(&mut client, 1, b"f1");
+        let g0 = send(&mut client, 3, b"g0");
+        let g1 = send(&mut client, 3, b"g1");
+
+        assert!(feed(&mut server, &f1).app.is_empty(), "held behind f0");
+        let mut acks = Vec::new();
+        for g in [&g0, &g1] {
+            let o = feed(&mut server, g);
+            assert_eq!(o.app.len(), 1, "stream 3 is not held by stream 1");
+            acks.extend(o.wire);
+        }
+        server.last_ack_sent = Instant::now() - Duration::from_secs(1);
+        acks.extend(tick(&mut server).wire);
+        for a in &acks {
+            feed(&mut client, a);
+        }
+        assert_eq!(client.in_flight_count(), 1, "only f0 is unacknowledged");
+
+        // The sender runs out of patience with f0.
+        for f in client.sent_history.iter_mut() {
+            f.retries = 50;
+            f.first_sent = Instant::now() - Duration::from_secs(400);
+        }
+        let t = tick(&mut client);
+        assert_eq!(t.resets, vec![(1, ResetReason::Lost)], "the sender knows it gave up, and only on stream 1");
+        assert!(!t.wire.is_empty(), "and tells the receiver");
+        assert!(client.on_event(OstpEvent::Outbound(1, Bytes::from_static(b"more"))).is_err(), "stream 1 is dead");
+        let g2 = send(&mut client, 3, b"g2"); // stream 3 goes on
+        assert_eq!(client.in_flight_count(), 2, "the reset frame, until acknowledged, and g2");
+
+        // The receiver learns it from the frame it can receive.
+        let mut resets = Vec::new();
+        for w in &t.wire {
+            resets.extend(feed(&mut server, w).resets);
+        }
+        assert_eq!(resets, vec![(1, ResetReason::Lost)]);
+        assert!(server.streams_rx.get(&1).is_none(), "its buffer is gone");
+        assert_eq!(server.stream_buffered, 0);
+        assert!(server.reorder_buffer.is_empty(), "f0's hole is closed");
+        assert!(server.on_event(OstpEvent::Outbound(1, Bytes::from_static(b"x"))).is_err(), "dead in both directions");
+        // A straggler of the dead stream, and the other stream's next frame.
+        assert!(feed(&mut server, &f0).app.is_empty());
+        assert_eq!(texts(&feed(&mut server, &g2)), vec![(3, "g2".to_string())]);
+
+        // The reset is retransmitted until acknowledged.
+        server.last_ack_sent = Instant::now() - Duration::from_secs(1);
+        for a in tick(&mut server).wire {
+            feed(&mut client, &a);
+        }
+        assert_eq!(client.in_flight_count(), 0);
+    }
+
+    #[test]
+    fn a_lost_reset_is_retransmitted() {
+        let (mut client, mut server) = do_handshake_v6();
+        send(&mut client, 1, b"f0");
+        for f in client.sent_history.iter_mut() {
+            f.retries = 50;
+            f.first_sent = Instant::now() - Duration::from_secs(400);
+        }
+        let lost = tick(&mut client);
+        assert_eq!(lost.resets.len(), 1);
+        // That datagram never arrives. A later tick past the RTO sends it again.
+        for f in client.sent_history.iter_mut() {
+            f.last_sent = Instant::now() - Duration::from_secs(60);
+        }
+        let again = tick(&mut client);
+        assert!(!again.wire.is_empty(), "the reset is resent");
+        let mut resets = Vec::new();
+        for w in &again.wire {
+            resets.extend(feed(&mut server, w).resets);
+        }
+        assert_eq!(resets, vec![(1, ResetReason::Lost)]);
+    }
+
+    #[test]
+    fn a_nack_for_a_nonce_that_is_gone_is_answered_with_an_abandon() {
+        let (mut client, mut server) = do_handshake_v6();
+        let a = send(&mut client, 1, b"a");
+        let b = send(&mut client, 1, b"b");
+        // a is lost, then forgotten by the sender's history.
+        client.sent_history.pop_front();
+        feed(&mut server, &b);
+        server.gap_since = Some(Instant::now() - REORDER_WINDOW_MAX);
+        server.last_nack_sent = Instant::now() - Duration::from_secs(1);
+        let nack = tick(&mut server).wire;
+        let mut back = Vec::new();
+        for n in &nack {
+            back.extend(feed(&mut client, n).wire);
+        }
+        assert!(!back.contains(&a));
+        assert!(!back.is_empty());
+        for x in &back {
+            feed(&mut server, x);
+        }
+        assert!(server.reorder_buffer.is_empty() && server.expected_recv_nonce >= 2, "the hole is closed");
+        // A nonce the sender never used is not abandoned.
+        let before = client.send_nonce;
+        let mut wire = Vec::new();
+        client.on_nack_v6(&(before + 100).to_be_bytes(), &mut wire);
+        assert!(wire.is_empty());
+    }
+
+    #[test]
+    fn a_v5_session_knows_nothing_of_v6_things() {
+        let (mut client, mut server) = do_handshake();
+        assert!(!client.v6);
+        assert!(client.on_event(OstpEvent::OutboundDatagram(1, Bytes::from_static(b"x"))).is_err());
+        assert!(client.on_event(OstpEvent::Outbound(70_000, Bytes::from_static(b"x"))).is_err());
+        // 16-bit ids still work, and the frame is the 12-byte-header one:
+        // v5's max payload is unchanged.
+        let f = send(&mut client, 65_535, b"x");
+        let o = feed(&mut server, &f);
+        assert_eq!(texts(&o), vec![(65_535, "x".to_string())]);
+        assert_eq!(client.max_payload(), 1400 - DATAGRAM_OVERHEAD);
     }
 }

@@ -456,7 +456,10 @@ impl Dispatcher {
                             resps.push(frame);
                         }
                         ProtocolAction::DeliverApp(stream_id, data) => {
-                            loads.push((sid, stream_id, data));
+                            // 16-bit stream ids until stage 2 wires the v6 rules.
+                            if let Ok(stream_id) = u16::try_from(stream_id) {
+                                loads.push((sid, stream_id, data));
+                            }
                         }
                         ProtocolAction::Multiple(list) => {
                             for item in list {
@@ -738,7 +741,7 @@ impl Dispatcher {
 
         let addr = peer_state.last_addr;
         let key = peer_state.access_key.clone();
-        match peer_state.machine.on_event(OstpEvent::Outbound(stream_id, payload))? {
+        match peer_state.machine.on_event(OstpEvent::Outbound(u32::from(stream_id), payload))? {
             ProtocolAction::SendDatagram(frame) => {
                 // Track outbound bytes per user
                 track_user_bytes_down(&self.user_stats, &self.access_keys, &key, frame.len() as u64);
