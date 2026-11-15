@@ -144,9 +144,59 @@ impl StreamIds {
     }
 }
 
+/// The two halves of a stream, for the `Fin` half-close: each side says once
+/// that it will write no more, and the stream is over when both have. `Close`
+/// (an abort) does not go through this: it ends the stream at once.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct HalfClose {
+    local_fin: bool,
+    remote_fin: bool,
+}
+
+impl HalfClose {
+    /// We sent our `Fin`. True when that finished the stream.
+    pub fn local_fin(&mut self) -> bool {
+        self.local_fin = true;
+        self.finished()
+    }
+
+    /// The peer's `Fin` arrived. True when that finished the stream.
+    pub fn remote_fin(&mut self) -> bool {
+        self.remote_fin = true;
+        self.finished()
+    }
+
+    pub fn local_done(&self) -> bool {
+        self.local_fin
+    }
+
+    pub fn remote_done(&self) -> bool {
+        self.remote_fin
+    }
+
+    pub fn finished(&self) -> bool {
+        self.local_fin && self.remote_fin
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_stream_finishes_only_when_both_sides_sent_fin() {
+        let mut h = HalfClose::default();
+        assert!(!h.finished());
+        assert!(!h.local_fin(), "one side is not enough");
+        assert!(h.local_done() && !h.remote_done());
+        assert!(!h.local_fin(), "a repeated Fin changes nothing");
+        assert!(h.remote_fin(), "the second Fin finishes it");
+        assert!(h.finished());
+
+        let mut h = HalfClose::default();
+        assert!(!h.remote_fin(), "either order");
+        assert!(h.local_fin());
+    }
 
     #[test]
     fn the_client_opens_odd_ids_and_the_server_even_ones() {

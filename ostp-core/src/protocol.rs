@@ -594,6 +594,12 @@ impl ProtocolMachine {
         self.state
     }
 
+    /// Whether this session speaks protocol v6 (set by the handshake; a v5
+    /// session has 16-bit stream ids and none of the v6 events).
+    pub fn is_v6(&self) -> bool {
+        self.v6
+    }
+
     pub fn on_event(&mut self, event: OstpEvent) -> Result<ProtocolAction, ProtocolError> {
         match (self.state, event) {
             (OstpState::Init, OstpEvent::Start) => {
@@ -3180,6 +3186,85 @@ mod tests {
         assert_eq!(&o.app[0].1[..], b"x");
         assert_eq!(&o.app[1].1[..], b"y");
         assert!(matches!(RelayMessage::decode(&o.app[2].1).unwrap(), RelayMessage::Close), "Close is last");
+    }
+
+    /// What stage 2 of the session layer relies on: a stream that is over on
+    /// both sides is released, so a long session can open far more streams than
+    /// the receiver tracks at once.
+    #[test]
+    fn more_streams_than_the_receiver_tracks_can_be_opened_one_after_another() {
+        use crate::relay::RelayMessage;
+        use crate::streams::{HalfClose, Side, StreamIds};
+        let (mut client, mut server) = do_handshake_v6();
+        let mut cids = StreamIds::new(Side::Client);
+        let mut sids = StreamIds::new(Side::Server);
+        let total = 3 * MAX_TRACKED_STREAMS / 2 + 100;
+        assert!(total > MAX_TRACKED_STREAMS);
+        let fin = || Bytes::from(RelayMessage::Fin.encode());
+        // The frame goes to `to`; what `to` sends back (ACKs) goes to `from`,
+        // and so on until it is quiet: a nonce nobody sees is a hole forever.
+        fn deliver(to: &mut ProtocolMachine, from: &mut ProtocolMachine, frame: &Bytes) -> Out {
+            let out = feed(to, frame);
+            let mut a = out.wire.clone();
+            let mut b: Vec<Bytes> = Vec::new();
+            while !a.is_empty() || !b.is_empty() {
+                for f in a.drain(..) {
+                    b.extend(feed(from, &f).wire);
+                }
+                for f in std::mem::take(&mut b) {
+                    a.extend(feed(to, &f).wire);
+                }
+            }
+            out
+        }
+        let mut first_request = None;
+        for i in 0..total {
+            let id = cids.open_local().unwrap();
+            sids.accept_remote(id).unwrap();
+            let mut chalf = HalfClose::default();
+            let mut shalf = HalfClose::default();
+
+            // Connect and a request, then the client's Fin.
+            let req = send(&mut client, id, format!("request {i}").as_bytes());
+            if i == 0 {
+                first_request = Some(req.clone());
+            }
+            let o = deliver(&mut server, &mut client, &req);
+            assert_eq!(
+                texts(&o),
+                vec![(id, format!("request {i}"))],
+                "stream {i} (id {id}) delivered; tracked {}, dead {}, expected nonce {}",
+                server.streams_rx.len(),
+                server.dead_streams.len(),
+                server.expected_recv_nonce
+            );
+            let f = datagrams(client.on_event(OstpEvent::Outbound(id, fin())).unwrap()).remove(0);
+            chalf.local_fin();
+            let o = deliver(&mut server, &mut client, &f);
+            assert!(!o.app.is_empty(), "the client's Fin of stream {i} (id {id}) was not delivered");
+            assert!(matches!(RelayMessage::decode(&o.app[0].1).unwrap(), RelayMessage::Fin));
+            shalf.remote_fin();
+
+            // The reply and the server's Fin.
+            let rep = send(&mut server, id, b"reply");
+            assert_eq!(texts(&deliver(&mut client, &mut server, &rep)), vec![(id, "reply".to_string())]);
+            let f = datagrams(server.on_event(OstpEvent::Outbound(id, fin())).unwrap()).remove(0);
+            assert!(shalf.local_fin(), "the server's side is finished");
+            let o = deliver(&mut client, &mut server, &f);
+            assert!(matches!(RelayMessage::decode(&o.app[0].1).unwrap(), RelayMessage::Fin));
+            assert!(chalf.remote_fin(), "the client's side is finished");
+
+            // Both sides release it.
+            sids.close(id).unwrap();
+            server.on_event(OstpEvent::ReleaseStream(id)).unwrap();
+            cids.close(id).unwrap();
+            client.on_event(OstpEvent::ReleaseStream(id)).unwrap();
+            assert!(cids.open_count() == 0 && sids.open_count() == 0);
+        }
+        assert!(server.streams_rx.len() <= 1 && client.streams_rx.len() <= 1, "released streams keep no state");
+        // A late copy of a released stream's first frame is dropped, not delivered again.
+        let first = first_request.expect("the first request was kept");
+        assert!(feed(&mut server, &first).app.is_empty());
     }
 
     #[test]

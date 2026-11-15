@@ -21,7 +21,23 @@ pub enum RelayMessage {
     /// bytes of `Data` on it. Only after both sides announced
     /// FEATURE_FLOW_CONTROL.
     Window(u32),
+    /// v6 only: "I will write no more on this stream". The other direction
+    /// keeps flowing; the stream ends when both sides sent one. It rides in
+    /// sequenced `Data`, so it arrives after every byte before it.
+    Fin,
+    /// v6 only: the stream is aborted (the program or the target dropped the
+    /// connection), with the reason (`ABORT_*`). Tag 4 like `Close`; a v5 peer
+    /// never gets it.
+    Abort(u8),
 }
+
+/// `RelayMessage::Abort` reasons.
+/// The program or the target closed the connection abruptly.
+pub const ABORT_CLOSED: u8 = 0;
+/// An I/O error on the program's or the target's side.
+pub const ABORT_IO_ERROR: u8 = 1;
+/// The peer sent more than the stream's window allowed.
+pub const ABORT_FLOW_CONTROL: u8 = 2;
 
 /// Per-stream flow control (`Window`).
 pub const FEATURE_FLOW_CONTROL: u32 = 1;
@@ -48,6 +64,8 @@ impl RelayMessage {
             RelayMessage::UdpAssociate => vec![9],
             RelayMessage::Features(bits) => encode_with_len(11, &bits.to_be_bytes()),
             RelayMessage::Window(bytes) => encode_with_len(12, &bytes.to_be_bytes()),
+            RelayMessage::Fin => vec![13],
+            RelayMessage::Abort(reason) => vec![4, *reason],
             RelayMessage::UdpData(addr, data) => {
                 let addr_bytes = addr.as_bytes();
                 let mut buf = Vec::with_capacity(1 + 2 + addr_bytes.len() + 2 + data.len());
@@ -75,7 +93,11 @@ impl RelayMessage {
             }
             2 => Ok(RelayMessage::Data(decode_with_len(&input[1..])?.to_vec())),
             3 => Ok(RelayMessage::KeepAlive),
-            4 => Ok(RelayMessage::Close),
+            4 => Ok(match input.get(1) {
+                Some(&reason) => RelayMessage::Abort(reason),
+                None => RelayMessage::Close,
+            }),
+            13 => Ok(RelayMessage::Fin),
             5 => Ok(RelayMessage::ConnectOk),
             6 => {
                 let payload = decode_with_len(&input[1..])?;
@@ -174,6 +196,17 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn fin_and_abort_are_new_tags_and_close_is_unchanged() {
+        assert_eq!(RelayMessage::Fin.encode(), vec![13]);
+        assert!(matches!(RelayMessage::decode(&[13]).unwrap(), RelayMessage::Fin));
+        assert_eq!(RelayMessage::Abort(ABORT_IO_ERROR).encode(), vec![4, 1]);
+        assert!(matches!(RelayMessage::decode(&[4, 2]).unwrap(), RelayMessage::Abort(2)));
+        // The v5 close is the one byte it always was and still decodes as it did.
+        assert_eq!(RelayMessage::Close.encode(), vec![4]);
+        assert!(matches!(RelayMessage::decode(&[4]).unwrap(), RelayMessage::Close));
+    }
 
     #[test]
     fn test_connect_roundtrip() {
