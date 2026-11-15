@@ -903,7 +903,7 @@ fn assess(f: &Findings) -> (f32, String, Vec<String>) {
         advice.push("A server at a blocked hoster is unreachable from here. Use a hoster this network reaches, or a relay on an address it allows.".into());
     }
     if f.random_dropped && !f.whitelist {
-        advice.push("OSTP over UDP and plain TCP (UoT) look like random data, which this network drops: use the TLS transport with your domain.".into());
+        advice.push("OSTP over UDP and plain TCP (UoT) look like random data, which this network drops: use the TLS carrier with your domain.".into());
     } else if (f.foreign_filtered || f.frozen) && !f.whitelist && !f.hosting_unreachable {
         advice.push("Recognised protocols to foreign servers are filtered while random data passes: OSTP over UDP or UoT is the carrier to use; TLS may stall here.".into());
     }
@@ -1072,7 +1072,7 @@ mod assess_tests {
         let (score, verdict, advice) = assess(&serious);
         assert_eq!(score, 0.8);
         assert!(verdict.contains("Unrecognised data"));
-        assert!(advice[0].contains("TLS transport"));
+        assert!(advice[0].contains("TLS carrier"));
         assert_eq!(assess(&Findings { whitelist: true, ..Default::default() }).0, 1.0);
     }
 

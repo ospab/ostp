@@ -13,7 +13,7 @@ The **Ospab Stealth Transport Protocol (OSTP)** is a multiplexed, encrypted tran
 
 OpenVPN and WireGuard are identified by DPI through static magic bytes, fixed handshake sizes and predictable sequences. OSTP masks each packet with a key derived from the shared secret and randomizes frame boundaries, so datagrams look like random data and the wire carries no plaintext version marker or magic byte.
 
-OSTP is transport-agnostic at the datagram level: the same masked/encrypted datagram is carried either directly over UDP, or — for networks that block or throttle unrecognized UDP — inside a plain TCP byte stream (**UoT**, "UDP-over-TCP"; see §9). Neither transport adds any protocol-identifying header of its own.
+OSTP is the transport protocol; what lies under it is the *carrier*. OSTP is carrier-agnostic at the datagram level: the same masked/encrypted datagram is carried either directly over UDP, or — for networks that block or throttle unrecognized UDP — inside a plain TCP byte stream (**UoT**, "UDP-over-TCP"; see §9). Neither carrier adds any protocol-identifying header of its own.
 
 ---
 
@@ -219,7 +219,7 @@ OSTP provides reliability over an inherently unreliable datagram substrate using
 
 Any datagram (UDP) or UoT frame that starts with the time-windowed `junk_marker` of §6.1 for one of the server's keys, in the current or the previous window, is junk: the server drops it silently while trying candidate keys, before "unauthorized probe" logging. Clients send it as TTL-desync decoys over UDP (see [`obfuscation.md`](obfuscation.md)); clients before 0.4.7 could also send it as filler frames ahead of a UoT handshake, which current clients no longer do. A server keeps dropping it for as long as it accepts PROTOCOL_VERSION 5.
 
-### 9.3 Transport Modes and Session Multiplexing
+### 9.3 Carriers and Session Multiplexing
 
 * **UDP** (default): each OSTP datagram is one UDP datagram.
 * **UoT (UDP-over-TCP):** each OSTP datagram is carried inside a plain TCP byte stream, framed with a 2-byte big-endian length prefix (`u16`, sufficient since OSTP datagrams are MTU-bounded and always well under 64 KiB). No protocol mimicry is attempted — the TCP stream carries only length-prefixed opaque blobs, following the project's "no recognizable header at all" stance rather than impersonating TLS/HTTP.
@@ -231,7 +231,7 @@ Because delivery is strictly gated on the next expected nonce, a single frame th
 
 ### 9.5 Congestion Control
 
-A per-session controller, independent of TCP congestion control on any carrier transport, limits the data in flight:
+A per-session controller, independent of TCP congestion control on any carrier, limits the data in flight:
 
 * **Slow start:** starts at 32 MTU-sized packets and grows exponentially per ACKed byte. One isolated loss (Wi-Fi noise, an LTE handover blip) cuts the window by 20% and stays in slow start. Slow start ends on 3 or more losses within a rolling 500 ms, or when the smoothed RTT reaches twice the minimum RTT.
 * **Congestion avoidance:** CUBIC (RFC 9438, multiplicative decrease 0.7, scaling constant 0.4). A smoothed RTT of four times the minimum RTT is treated as a standing queue and the window is reduced to drain it.
@@ -245,12 +245,12 @@ The server treats `session_id`, not the source `IP:port`, as the durable session
 
 For UoT the address is that of the TCP connection, so a new TCP connection is a new address just like a new UDP port.
 
-The client moves the session to a new connection of the same transport:
+The client moves the session to a new connection of the same carrier:
 
 1. **When:** on a network change (`NetworkChanged`), after 10s without an authenticated datagram from the server, when every UoT TCP connection was closed or reset, and after resume from sleep.
-2. **How:** it opens a new connection over the same transport, swaps the socket under the session and resets the path estimates (RTT, congestion window); keys, nonces, streams and the reorder buffer stay. Every unacknowledged frame is retransmitted at once. A packet with a fresh nonce (`Ping`) goes first so the server moves the session's address.
+2. **How:** it opens a new connection over the same carrier, swaps the socket under the session and resets the path estimates (RTT, congestion window); keys, nonces, streams and the reorder buffer stay. Every unacknowledged frame is retransmitted at once. A packet with a fresh nonce (`Ping`) goes first so the server moves the session's address.
 3. **Confirmation:** the move succeeds when an authenticated datagram arrives over the new path within `max(4s, 4×RTT)`. Otherwise the client logs that the server did not answer and does not try another move for 30s.
-4. **No automation beyond that:** the transport never changes on its own, and a failed move starts neither a reconnect nor a new handshake. The transport is the user's choice. The server deliberately stays silent to packets of an unknown session (an explicit "unknown session" answer would let any scanner confirm it is talking to an OSTP server), so "session expired" and "transport blocked" look the same to the client.
+4. **No automation beyond that:** the carrier never changes on its own, and a failed move starts neither a reconnect nor a new handshake. The carrier is the user's choice. The server deliberately stays silent to packets of an unknown session (an explicit "unknown session" answer would let any scanner confirm it is talking to an OSTP server), so "session expired" and "carrier blocked" look the same to the client.
 
 ### 9.7 Session Keepalive and Recovery
 

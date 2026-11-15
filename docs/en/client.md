@@ -10,28 +10,34 @@ The client takes your applications' traffic, sends it through an encrypted sessi
 
 **TUN.** On Windows (Wintun), Linux and macOS the client can create a virtual adapter and take all of the machine's IP traffic. A user-space TCP/IP stack (`netstack-smoltcp`) rebuilds TCP and UDP flows from the packets and feeds them into the session as `RelayMessage`s (see [specification.md](specification.md)). The desktop app creates the adapter in the separate `ostpd` process, so the app itself does not run elevated (see [integrations.md](integrations.md)). `tun.kill_switch` removes the physical default route, so traffic cannot leave outside the tunnel when it drops (Linux and macOS). On Windows it is ignored and the desktop app does not offer it: the blackhole route it used there never took priority over the real default route. A firewall-based kill switch for Windows is planned for 0.5.0.
 
-## Transports
+## Carriers
 
-`transport.mode` in the config:
+OSTP is the transport protocol. What lies under it (UDP, or TCP with optional TLS and an HTTP upgrade) is the *carrier* (see [carriers-design.md](carriers-design.md)). The `carrier` section of the config chooses it, with `mode`:
+
+```json
+"carrier": { "mode": "uot", "tls": true, "tls_sni": "vpn.example.com" }
+```
+
+New configs (`ostp import`, the setup wizard, the apps) write `carrier`. The old section name `transport` has the same fields and is still read, in old configs and old subscriptions, and nothing rewrites it in your file; if a file has both, `carrier` wins field by field. `ostp://` links keep `type=` as before. (A client older than 0.5.0 ignores `carrier` and falls back to UDP, so a config written by 0.5.0 needs its section renamed back to `transport` to be used by an older client.)
 
 - `udp` (default): one OSTP datagram per UDP datagram, from a single socket kept for the whole session so the NAT mapping stays put.
 - `uot`: the same datagrams over one TCP connection, each with a 2-byte length prefix. For networks that block or throttle unknown UDP. Nothing is imitated; the stream is length-prefixed opaque data.
 - `uot` with `tls`: UoT inside real TLS to the server's domain, directly on 443 or through nginx/apache/caddy with `ws_path`. The certificate is checked against the Mozilla roots; `tls_insecure` turns that off for testing. See [tls.md](tls.md).
 
-Another option of the `transport` block: `ttl_desync*` (UDP only, decoy datagrams that expire before the server). `junk_pc`, `junk_ps`, `tcp_fragmentation`, `frag_chunk` and `frag_sleep` were removed in 0.4.7 and are ignored; `ostp migrate` deletes them. Details in [obfuscation.md](obfuscation.md).
+Another option of the `carrier` block: `ttl_desync*` (UDP only, decoy datagrams that expire before the server). `junk_pc`, `junk_ps`, `tcp_fragmentation`, `frag_chunk` and `frag_sleep` were removed in 0.4.7 and are ignored; `ostp migrate` deletes them. Details in [obfuscation.md](obfuscation.md).
 
-There is no STUN/TURN client. Strict NATs are handled by roaming on `session_id` (see [server.md](server.md)) and by `uot`.
+There is no STUN/TURN client. Strict NATs are handled by roaming on `session_id` (see [server.md](server.md)) and by the `uot` carrier.
 
 ## Silence and recovery
 
-The client does not switch transport or server on its own; that is the user's choice. Within one transport it recovers like this:
+The client does not switch carrier or server on its own; that is the user's choice. Within one carrier it recovers like this:
 
-- When a session has heard nothing authenticated from the server for 10 seconds (or two keepalive intervals, if longer), it moves to a new socket of the same transport, without a new handshake.
-- If the moved session gets no answer within a few round trips, the client checks whether the server answers at all with a full handshake to the same server and transport. While it does not (the network is down), the session and every open app connection are kept, and the tries alternate between moving the session again and a handshake, after 1, 2, 5, 10, 20 and then every 30 seconds, until one succeeds or the user stops the tunnel. When the network comes back, the kept session is moved and the connections continue; they are reset only if the server no longer knows the session (it keeps an idle one for 10 minutes; the client gives it up after 5).
+- When a session has heard nothing authenticated from the server for 10 seconds (or two keepalive intervals, if longer), it moves to a new socket of the same carrier, without a new handshake.
+- If the moved session gets no answer within a few round trips, the client checks whether the server answers at all with a full handshake to the same server and carrier. While it does not (the network is down), the session and every open app connection are kept, and the tries alternate between moving the session again and a handshake, after 1, 2, 5, 10, 20 and then every 30 seconds, until one succeeds or the user stops the tunnel. When the network comes back, the kept session is moved and the connections continue; they are reset only if the server no longer knows the session (it keeps an idle one for 10 minutes; the client gives it up after 5).
 - After an outage both ends start over on the path (window, round-trip time) and resend what was lost at once, instead of climbing back from the small window the outage left.
 - In proxy mode without the kill switch, the system proxy is released after 45 seconds without a connection so the computer keeps internet access, and set again when the tunnel is back. With the kill switch on, it stays set.
 - On resume from sleep, or after a network change, recovery starts at once instead of waiting for the timers.
-- A first connection that fails (wrong key, address or transport) is not retried: the tunnel stops and shows the error.
+- A first connection that fails (wrong key, address or carrier) is not retried: the tunnel stops and shows the error.
 
 Ordinary TCP errors (`ConnectionReset`, `BrokenPipe`, `UnexpectedEof`) are not written to the log.
 

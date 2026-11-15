@@ -9,7 +9,7 @@ OSTP is an encrypted tunnel written in Rust, for networks that filter traffic (D
 traffic, or only the apps and sites you choose, through your own server. The protocol, the server, the command-line tool and the desktop and
 Android apps are in this repository.
 
-What it looks like on the wire depends on the transport you pick:
+What it looks like on the wire depends on the carrier you pick (what lies under OSTP):
 
 - **UDP**: every byte, headers included, is indistinguishable from random data; reliability is OSTP's own (selective ACK/NACK, congestion control).
 - **UoT** (UDP over TCP): the same packets over a plain TCP connection, for networks that block or throttle unknown UDP.
@@ -62,7 +62,7 @@ Keep the link in quotes, or the shell will cut it at `&` or `?`.
 **3. Optional, on a server with a domain:**
 
 ```bash
-ostp cert issue --domain vpn.example.com   # HTTPS and a Let's Encrypt certificate, TLS transport on 443
+ostp cert issue --domain vpn.example.com   # HTTPS and a Let's Encrypt certificate, TLS carrier on 443
 ostp sub enable                            # per-user subscription links the apps can refresh
 ostp panel enable                          # web panel and management API
 ostp dns enable                            # filtering DNS for connected clients
@@ -74,13 +74,13 @@ Details: [Domains and TLS](docs/en/tls.md), [Server](docs/en/server.md), [Client
 
 ## What is in it
 
-- Three transports: UDP, UoT (UDP over TCP) and TLS on 443 with a real certificate, directly or behind a web server.
+- Three carriers under OSTP: UDP, UoT (UDP over TCP) and TLS on 443 with a real certificate, directly or behind a web server.
 - Anything that is not a valid client gets the fallback website or a decoy answer.
 - Local SOCKS5/HTTP proxy (and the Windows system proxy), or a TUN adapter (with a kill switch on Linux and macOS).
 - Domains, IP ranges and, on Windows and Linux, processes can be excluded from the tunnel.
 - When the network changes or a path stalls, the session moves to a new socket without a new handshake.
 - Per-user subscription links, a web panel with a REST API, and a filtering DNS for connected clients.
-- A network prober that tries every transport against your server and locates filtering equipment by TTL.
+- A network prober that tries every carrier against your server and locates filtering equipment by TTL.
 - The server's outgoing traffic can go through a SOCKS5 proxy by rule or leave from a chosen address.
 - Optional `.ov` sites through [overnet](https://github.com/ospab/overnet), off by default.
 

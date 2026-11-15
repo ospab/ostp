@@ -233,7 +233,8 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin, 
         "bind_addr": localBind,
         "connect_timeout_ms": 15000,
       },
-      "transport": {
+      // The carrier is what lies under OSTP: UDP, or TCP (UoT) with optional TLS.
+      "carrier": {
         "mode": p?.transportMode ?? 'udp',
         "ttl_desync": p?.ttlDesync ?? false,
         "ttl_desync_auto": true,

@@ -463,7 +463,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   const SizedBox(height: 16),
                   DropdownButtonFormField<String>(
                     value: transportMode,
-                    decoration: const InputDecoration(labelText: 'Transport'),
+                    decoration: const InputDecoration(labelText: 'Carrier'),
                     items: const [
                       DropdownMenuItem(value: 'udp', child: Text('UDP')),
                       DropdownMenuItem(value: 'uot', child: Text('TCP (UoT)')),
@@ -479,8 +479,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
                     child: Text('Protocol: ${profile?.protocol ?? 'v5'}',
                         style: const TextStyle(fontSize: 12, color: Colors.white54)),
                   ),
-                  // TLS only applies to the UoT (TCP) transport, so the section
-                  // is hidden under UDP. Reactive: switching Transport above
+                  // TLS only applies to the UoT (TCP) carrier, so the section
+                  // is hidden under UDP. Reactive: switching Carrier above
                   // calls setDialogState, which rebuilds this.
                   if (transportMode == 'uot') ...[
                     const Divider(height: 32),

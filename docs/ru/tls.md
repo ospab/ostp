@@ -131,7 +131,7 @@ ostp cert issue --domain vpn.example.com --email admin@example.com --agree-tos -
 
 ## Клиенты
 
-Опции транспорта (только для UoT):
+Опции носителя (только для UoT; раздел `carrier` конфигурации клиента, прежде `transport`, который по-прежнему читается):
 
 | Поле | Значение |
 |---|---|

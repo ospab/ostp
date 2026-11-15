@@ -255,7 +255,8 @@ fn parse_ostp_link(link: &str) -> Result<ClientConfig> {
         access_key: l.key.clone(),
         server_pk: l.pk.as_ref().map(ostp_core::server_key::encode_key),
         mtu: None,
-        transport: Some(link_transport(&l)),
+        carrier: Some(link_carrier(&l)),
+        transport: None,
         socks5_bind: Some("127.0.0.1:1088".to_string()),
         tun: Some(TunConfig {
             enable: l.tun,
@@ -518,7 +519,8 @@ fn qr_browser(clients: &[QrClient]) -> Result<()> {
     Ok(())
 }
 
-fn link_transport(l: &ostp_core::share_link::ShareLink) -> TransportConfigRaw {
+/// The carrier section a link describes (`type=` of the link is the carrier).
+fn link_carrier(l: &ostp_core::share_link::ShareLink) -> TransportConfigRaw {
     TransportConfigRaw {
         mode: Some(l.transport.as_str().to_string()),
         tls: l.tls.then_some(true),
@@ -875,11 +877,11 @@ fn run_setup_wizard(config_path: &std::path::Path) -> Result<Option<PathBuf>> {
 
             // Try import from link first
             let use_link = wizard_yn("Do you have a share link (ostp://...)?", false);
-            let (server, access_key, transport, server_pk) = if use_link {
+            let (server, access_key, carrier, server_pk) = if use_link {
                 loop {
                     let link_str = wizard_prompt("Paste link", "");
                     match ostp_core::share_link::ShareLink::parse(&link_str) {
-                        Ok(l) => break (l.server(), l.key.clone(), link_transport(&l), l.pk.as_ref().map(ostp_core::server_key::encode_key)),
+                        Ok(l) => break (l.server(), l.key.clone(), link_carrier(&l), l.pk.as_ref().map(ostp_core::server_key::encode_key)),
                         Err(e) => wizard_warn(&format!("Not a valid ostp:// link: {e}")),
                     }
                 }
@@ -931,7 +933,7 @@ fn run_setup_wizard(config_path: &std::path::Path) -> Result<Option<PathBuf>> {
                     "ips": [],
                     "processes": []
                 },
-                "transport": transport,
+                "carrier": carrier,
                 "mux": {
                     "enabled": mux_enable,
                     "sessions": mux_sessions
@@ -1683,8 +1685,8 @@ async fn run_app() -> Result<()> {
     "processes": []
   }},
   
-  // Transport Mode: "udp" (default) or "uot" (UDP over TCP, no mimicry)
-  "transport": {{
+  // Carrier under OSTP: "udp" (default) or "uot" (OSTP over TCP, optionally in TLS)
+  "carrier": {{
     "mode": "udp"
   }},
   

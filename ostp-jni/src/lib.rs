@@ -527,7 +527,7 @@ pub extern "system" fn Java_net_ostp_client_OstpClientSdk_runProberTtlScan(
         Err(e) => return error_jstring(&mut env, &format!("invalid address: {e}")),
     };
     let Some(transport) = ostp_client::prober::TransportKind::parse(&req.transport) else {
-        return error_jstring(&mut env, &format!("unknown transport: {}", req.transport));
+        return error_jstring(&mut env, &format!("unknown carrier: {}", req.transport));
     };
 
     let server_pk = match ostp_client::prober::parse_server_pk(req.server_pk.as_deref()) {

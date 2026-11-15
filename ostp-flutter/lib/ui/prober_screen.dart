@@ -7,7 +7,7 @@ import '../models/ostp_profile.dart';
 
 /// Network diagnostics, in two parts:
 ///
-///  - ostp-specific: which resolved address x transport combination for the
+///  - ostp-specific: which resolved address x carrier combination for the
 ///    active profile actually completes a real, authenticated handshake
 ///    (using the profile's own access key — no separate/anonymous probe
 ///    endpoint), and — for a chosen combo — roughly where along the path a

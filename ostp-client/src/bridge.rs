@@ -778,7 +778,7 @@ impl Bridge {
                     }
                     let reason = format!(
                         "The server did not answer on the new path within {} s (session expired, or this \
-                         transport is blocked on this network)",
+                         carrier is blocked on this network)",
                         deadline.as_secs()
                     );
                     self.begin_reconnect(&reason, true, tx, proxy_tx).await;

@@ -131,7 +131,7 @@ The TLS settings are read at start: restart the service after changing them. `os
 
 ## Clients
 
-Transport options (UoT only):
+Carrier options (UoT only; the `carrier` section of the client config, formerly `transport`, which is still read):
 
 | Field | Meaning |
 |---|---|

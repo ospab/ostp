@@ -499,7 +499,8 @@ function buildConfig() {
     access_key: active.key,
     socks5_bind: s.socks || null,
     log: { privacy: logPrivacyOf(s) },
-    transport: {
+    // The carrier is what lies under OSTP: UDP, or TCP (UoT) with optional TLS.
+    carrier: {
       mode: active.transport || 'udp',
       ttl_desync: !!s.ttlDesync,
       ttl_desync_auto: true,

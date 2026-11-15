@@ -118,7 +118,7 @@ class _LogsScreenState extends State<LogsScreen> {
       buffer.writeln();
       buffer.writeln('--- Network Prober results ---');
       if (matrix != null) {
-        buffer.writeln('Address x transport matrix:');
+        buffer.writeln('Address x carrier matrix:');
         buffer.writeln(matrix);
       }
       if (ttl != null) {

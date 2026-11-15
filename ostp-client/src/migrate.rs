@@ -349,7 +349,16 @@ pub fn migrate(input: Value) -> Result<Migration> {
 
     let typed: crate::config::UnifiedConfig = serde_json::from_value(out.clone())
         .map_err(|e| anyhow!("the migrated config does not match the schema ({e}); nothing was written. This is a bug in the migrator, please report it"))?;
-    let known = serde_json::to_value(&typed)?;
+    let mut known = serde_json::to_value(&typed)?;
+    // `carrier` and `transport` are not written when unset, but both are keys
+    // of the schema: a typo of either still gets its suggestion.
+    if kind == ConfigKind::Client {
+        if let Some(k) = known.as_object_mut() {
+            for key in ["carrier", "transport"] {
+                k.entry(key).or_insert(Value::Null);
+            }
+        }
+    }
     let mut unknown_keys = Vec::new();
     find_unknown(&out, &known, "", &mut unknown_keys);
 
@@ -622,6 +631,35 @@ mod tests {
         let m = run(current.clone());
         assert!(m.is_up_to_date(), "{:?}", m.changes);
         assert_eq!(m.output, current);
+    }
+
+    /// `carrier` is a key of the schema: a current config with it is left alone,
+    /// and an old `transport` section is not renamed by migration.
+    #[test]
+    fn carrier_is_known_and_transport_is_not_renamed() {
+        let with_carrier = json!({
+            "mode": "client", "config_version": CURRENT_VERSION,
+            "server": "vpn.example.com:443", "access_key": "k",
+            "carrier": { "mode": "uot", "tls": true }
+        });
+        let m = run(with_carrier.clone());
+        assert!(m.is_up_to_date() && m.unknown_keys.is_empty(), "{:?} {:?}", m.changes, m.unknown_keys);
+        assert_eq!(m.output, with_carrier);
+
+        let with_transport = json!({
+            "mode": "client", "config_version": CURRENT_VERSION,
+            "server": "vpn.example.com:443", "access_key": "k",
+            "transport": { "mode": "uot", "tls": true }
+        });
+        let m = run(with_transport.clone());
+        assert!(m.is_up_to_date() && m.unknown_keys.is_empty(), "{:?} {:?}", m.changes, m.unknown_keys);
+        assert_eq!(m.output, with_transport, "the old section name is kept as the user wrote it");
+        assert_eq!(find_typo("carier"), Some("carrier".to_string()));
+    }
+
+    fn find_typo(key: &str) -> Option<String> {
+        let m = run(json!({ "mode": "client", "config_version": CURRENT_VERSION, "server": "h:1", "access_key": "k", key: { "mode": "uot" } }));
+        m.unknown_keys.iter().find(|u| u.path == key).and_then(|u| u.suggestion.clone())
     }
 
     #[test]

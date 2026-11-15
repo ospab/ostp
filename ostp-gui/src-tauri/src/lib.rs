@@ -832,7 +832,7 @@ struct TtlRequest {
 async fn run_prober_ttl(request: TtlRequest) -> Result<serde_json::Value, String> {
     let ip: std::net::IpAddr = request.address.parse().map_err(|e| format!("invalid address: {e}"))?;
     let transport = ostp_client::prober::TransportKind::parse(&request.transport)
-        .ok_or_else(|| format!("unknown transport: {}", request.transport))?;
+        .ok_or_else(|| format!("unknown carrier: {}", request.transport))?;
     let server_pk = ostp_client::prober::parse_server_pk(request.server_pk.as_deref())?;
     off_thread(std::time::Duration::from_secs(60), move || async move {
         let report = ostp_client::prober::run_ttl_scan(

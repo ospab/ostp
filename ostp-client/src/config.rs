@@ -14,7 +14,9 @@ pub struct ClientConfig {
     pub log_privacy: Option<ostp_core::logpriv::Privacy>,
     pub ostp: OstpConfig,
     pub local_proxy: LocalProxyConfig,
-    #[serde(default)]
+    /// The carrier under OSTP (UDP, or UoT/TCP with optional TLS). The Rust
+    /// name stays `transport`; JSON from the apps may say `carrier`.
+    #[serde(default, alias = "carrier")]
     pub transport: TransportConfig,
     #[serde(default)]
     pub exclusions: ExclusionConfig,
@@ -108,8 +110,10 @@ pub struct LocalProxyConfig {
     pub connect_timeout_ms: u64,
 }
 
-/// `mode` is "udp" (default) or "uot" (UDP over TCP). UoT can run inside real TLS to the
-/// server's own domain (`tls`).
+/// The runtime settings of the carrier, what lies under OSTP (the name
+/// `TransportConfig` is older and stays in the code). `mode` is "udp" (default)
+/// or "uot" (OSTP over TCP). UoT can run inside real TLS to the server's own
+/// domain (`tls`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TransportConfig {
     /// "udp" or "uot"
@@ -282,7 +286,7 @@ impl ClientFileConfig {
             log_privacy,
             ostp,
             local_proxy,
-            transport: self.transport.clone().unwrap_or_default().to_runtime(),
+            transport: self.carrier_settings().to_runtime(),
             exclusions: ExclusionConfig {
                 domains: self.exclude.as_ref().and_then(|e| e.domains.clone()).unwrap_or_default(),
                 ips: self.exclude.as_ref().and_then(|e| e.ips.clone()).unwrap_or_default(),
@@ -732,6 +736,13 @@ pub struct ClientFileConfig {
     pub log: Option<LogCfg>,
     pub exclude: Option<ExcludeConfig>,
     pub mux: Option<MuxConfig>,
+    /// What lies under OSTP: `udp`, or `uot` (TCP, optionally TLS). What new
+    /// configs write. See [`ClientFileConfig::carrier_settings`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub carrier: Option<TransportConfigRaw>,
+    /// The old name of `carrier`, read forever (old configs and subscriptions);
+    /// new configs do not write it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transport: Option<TransportConfigRaw>,
     /// Send a device ID when fetching a subscription; absent means off.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -760,8 +771,28 @@ pub struct TransportConfigRaw {
     pub ws_path: Option<String>,
 }
 
+impl ClientFileConfig {
+    /// The carrier settings of the file: the `carrier` section, with the old
+    /// `transport` section filling in every field `carrier` leaves out. A file
+    /// with only one of them (all real files) reads as that one.
+    pub fn carrier_settings(&self) -> TransportConfigRaw {
+        let (c, t) = (self.carrier.clone().unwrap_or_default(), self.transport.clone().unwrap_or_default());
+        TransportConfigRaw {
+            mode: c.mode.or(t.mode),
+            ttl_desync: c.ttl_desync.or(t.ttl_desync),
+            ttl_desync_ttl: c.ttl_desync_ttl.or(t.ttl_desync_ttl),
+            ttl_desync_count: c.ttl_desync_count.or(t.ttl_desync_count),
+            ttl_desync_auto: c.ttl_desync_auto.or(t.ttl_desync_auto),
+            tls: c.tls.or(t.tls),
+            tls_sni: c.tls_sni.or(t.tls_sni),
+            tls_insecure: c.tls_insecure.or(t.tls_insecure),
+            ws_path: c.ws_path.or(t.ws_path),
+        }
+    }
+}
+
 impl TransportConfigRaw {
-    /// The runtime transport settings this file section describes.
+    /// The runtime carrier settings this file section describes.
     pub fn to_runtime(&self) -> TransportConfig {
         let d = TransportConfig::default();
         TransportConfig {
@@ -966,6 +997,64 @@ mod tests {
         assert_eq!(rt.transport.mode, "uot");
         assert!(rt.transport.tls);
         assert_eq!(rt.transport.tls_sni, None, "an empty SNI means unset");
+    }
+
+    /// The new `carrier` section reads like the old `transport` one.
+    #[test]
+    fn the_carrier_section_is_read_and_the_old_transport_section_still_is() {
+        let new = client_file(
+            r#"{"mode":"client","server":"s:1","access_key":"k",
+                "carrier":{"mode":"uot","tls":true,"tls_sni":"a.example","ws_path":"/x"}}"#,
+        )
+        .to_runtime();
+        let old = client_file(
+            r#"{"mode":"client","server":"s:1","access_key":"k",
+                "transport":{"mode":"uot","tls":true,"tls_sni":"a.example","ws_path":"/x"}}"#,
+        )
+        .to_runtime();
+        for rt in [&new, &old] {
+            assert_eq!(rt.transport.mode, "uot");
+            assert!(rt.transport.tls);
+            assert_eq!(rt.transport.tls_sni.as_deref(), Some("a.example"));
+            assert_eq!(rt.transport.ws_path.as_deref(), Some("/x"));
+        }
+        // Neither section: UDP, as before.
+        assert_eq!(client_file(r#"{"mode":"client","server":"s:1","access_key":"k"}"#).to_runtime().transport.mode, "udp");
+    }
+
+    /// A file that has both (hand-edited): `carrier` wins field by field, and
+    /// `transport` fills in what `carrier` leaves out.
+    #[test]
+    fn carrier_wins_over_transport_field_by_field() {
+        let rt = client_file(
+            r#"{"mode":"client","server":"s:1","access_key":"k",
+                "transport":{"mode":"uot","tls":true,"tls_sni":"old.example"},
+                "carrier":{"mode":"udp","tls_sni":"new.example"}}"#,
+        )
+        .to_runtime();
+        assert_eq!(rt.transport.mode, "udp");
+        assert_eq!(rt.transport.tls_sni.as_deref(), Some("new.example"));
+        assert!(rt.transport.tls, "taken from transport: carrier does not say");
+    }
+
+    /// New configs write `carrier` only, and what they write reads back.
+    #[test]
+    fn a_config_written_with_carrier_has_no_transport_section() {
+        let f = client_file(r#"{"mode":"client","server":"s:1","access_key":"k","carrier":{"mode":"uot"}}"#);
+        let text = serde_json::to_string(&f).unwrap();
+        assert!(text.contains("\"carrier\"") && !text.contains("\"transport\""), "{text}");
+    }
+
+    /// The Android app hands the core a runtime ClientConfig; `carrier` is read there too.
+    #[test]
+    fn the_runtime_config_accepts_carrier_as_an_alias() {
+        let rt = client_file(r#"{"mode":"client","server":"s:1","access_key":"k","carrier":{"mode":"uot","tls":true}}"#).to_runtime();
+        let mut v = serde_json::to_value(&rt).unwrap();
+        let t = v.as_object_mut().unwrap().remove("transport").unwrap();
+        v["carrier"] = t;
+        let back: ClientConfig = serde_json::from_value(v).unwrap();
+        assert_eq!(back.transport.mode, "uot");
+        assert!(back.transport.tls);
     }
 
     /// The minimal client and server shapes the template emits must also load,
