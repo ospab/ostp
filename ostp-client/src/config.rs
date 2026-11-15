@@ -53,6 +53,9 @@ pub struct OstpConfig {
     pub local_bind_addr: String,
     #[serde(alias = "auth_token")]
     pub access_key: String,
+    /// The server's public key (base64url) when the profile is v6.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_pk: Option<String>,
     pub handshake_timeout_ms: u64,
     pub io_timeout_ms: u64,
     #[serde(default = "default_mtu")]
@@ -140,6 +143,7 @@ impl Default for OstpConfig {
             server_addr: "127.0.0.1:50000".to_string(),
             local_bind_addr: "0.0.0.0:0".to_string(),
             access_key: String::new(),
+            server_pk: None,
             handshake_timeout_ms: 5000,
             io_timeout_ms: 2500,
             mtu: default_mtu(),
@@ -206,6 +210,17 @@ impl ClientConfig {
     }
 }
 
+impl OstpConfig {
+    /// The server's public key when this profile is v6. A key that does not
+    /// decode is an error, never a silent v5 profile.
+    pub fn server_public_key(&self) -> Result<Option<[u8; 32]>> {
+        self.server_pk
+            .as_deref()
+            .map(|k| ostp_core::server_key::decode_key(k).map_err(|e| anyhow::anyhow!("the profile's server key (pk) is invalid: {e}")))
+            .transpose()
+    }
+}
+
 impl ClientFileConfig {
     /// The one place the file's client section becomes the runtime config, and so the
     /// one set of defaults: CLI, GUI and hot reload all call it and override only what
@@ -215,6 +230,7 @@ impl ClientFileConfig {
         let ostp = OstpConfig {
             server_addr: self.server.clone(),
             access_key: self.access_key.clone(),
+            server_pk: self.server_pk.clone().filter(|k| !k.trim().is_empty()),
             mtu: self.mtu.unwrap_or_else(default_mtu),
             ..OstpConfig::default()
         };
@@ -297,10 +313,16 @@ impl UnifiedConfig {
                     let webpath = cfg.api.as_ref().and_then(|a| a.webpath.as_deref());
                     sub.validate(cfg.domain.as_deref(), cfg.tls.as_ref(), webpath)?;
                 }
+                if let Some(p) = &cfg.protocol {
+                    p.private_key()?;
+                }
             }
             AppMode::Client(cfg) => {
                 if cfg.access_key.is_empty() {
                     anyhow::bail!("a client config needs an access_key");
+                }
+                if let Some(pk) = cfg.server_pk.as_deref() {
+                    ostp_core::server_key::decode_key(pk).map_err(|e| anyhow::anyhow!("server_pk is not a valid server public key: {e}"))?;
                 }
             }
             AppMode::Relay(cfg) => {
@@ -353,6 +375,61 @@ pub struct ServerConfig {
     /// OSTP. Off: only the internet. Cloud metadata stays closed either way.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub local_access: bool,
+    /// Wire protocol settings (v6): the server key and the transitional mode.
+    /// Absent: v5 only, as in 0.4.x.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol: Option<ProtocolCfg>,
+}
+
+/// The `protocol` section of a server config.
+#[derive(Deserialize, Serialize, Clone, PartialEq, Eq)]
+pub struct ProtocolCfg {
+    /// The server's static X25519 private key, base64url (43 characters).
+    /// A secret like the access keys: the file is written readable by root
+    /// only, and the key is never printed or logged. Absent: no v6.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_key: Option<String>,
+    /// Keep accepting v5 clients next to v6 (the transitional mode; goes away
+    /// in 0.6). Ignored while there is no `server_key`.
+    #[serde(default = "default_true")]
+    pub accept_v5: bool,
+}
+
+impl Default for ProtocolCfg {
+    fn default() -> Self {
+        Self { server_key: None, accept_v5: true }
+    }
+}
+
+/// Never prints the private key, so a `{:?}` of a whole config cannot leak it.
+impl std::fmt::Debug for ProtocolCfg {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProtocolCfg")
+            .field("server_key", &self.server_key.as_ref().map(|_| "<hidden>"))
+            .field("accept_v5", &self.accept_v5)
+            .finish()
+    }
+}
+
+impl ServerConfig {
+    /// The public half of the server key: what goes into links as `pk`.
+    /// `None` when the server has no key (v5 only).
+    pub fn server_public_key(&self) -> Result<Option<[u8; 32]>> {
+        Ok(match &self.protocol {
+            Some(p) => p.private_key()?.map(|k| ostp_core::crypto::noise::server_public_key(&k)),
+            None => None,
+        })
+    }
+}
+
+impl ProtocolCfg {
+    /// The private key as bytes; an error names the section, never the value.
+    pub fn private_key(&self) -> Result<Option<[u8; 32]>> {
+        self.server_key
+            .as_deref()
+            .map(|k| ostp_core::server_key::decode_key(k).map_err(|e| anyhow::anyhow!("protocol.server_key is not a valid key: {e}")))
+            .transpose()
+    }
 }
 
 /// Per-user subscription URLs: `https://<domain>[:port]<path>/<token>`
@@ -597,6 +674,11 @@ pub struct FallbackCfg {
 pub struct ClientFileConfig {
     pub server: String,
     pub access_key: String,
+    /// The server's static public key, base64url (the link's `pk`). With it
+    /// this profile speaks protocol v6 and checks the server; without it, v5.
+    /// The client never switches between the two by itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_pk: Option<String>,
     pub mtu: Option<usize>,
     pub socks5_bind: Option<String>,
     pub tun: Option<TunConfig>,

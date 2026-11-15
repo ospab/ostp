@@ -785,6 +785,9 @@ fn relaunch(exe: &std::path::Path) -> Result<(), String> {
 struct ProberRequest {
     server: String,
     key: String,
+    /// The profile's server public key (protocol v6); absent for a v5 profile.
+    #[serde(default)]
+    server_pk: Option<String>,
     #[serde(default)]
     tls: Option<ostp_client::prober::ProbeTls>,
     #[serde(default)]
@@ -798,9 +801,10 @@ async fn run_prober_matrix(request: ProberRequest) -> Result<serde_json::Value, 
     if request.server.len() > 255 || request.key.len() > 512 {
         return Err("the server address or the key is too long".into());
     }
+    let server_pk = ostp_client::prober::parse_server_pk(request.server_pk.as_deref())?;
     off_thread(std::time::Duration::from_secs(60), move || async move {
         let timeout = std::time::Duration::from_millis(request.timeout_ms.unwrap_or(3000).clamp(300, 10_000));
-        let entries = ostp_client::prober::run_matrix(&request.server, request.key.as_bytes(), timeout, request.tls)
+        let entries = ostp_client::prober::run_matrix(&request.server, request.key.as_bytes(), server_pk, timeout, request.tls)
             .await
             .map_err(|e| e.to_string())?;
         serde_json::to_value(entries).map_err(|e| e.to_string())
@@ -814,6 +818,9 @@ struct TtlRequest {
     port: u16,
     transport: String,
     key: String,
+    /// The profile's server public key (protocol v6); absent for a v5 profile.
+    #[serde(default)]
+    server_pk: Option<String>,
     #[serde(default)]
     tls: Option<ostp_client::prober::ProbeTls>,
     #[serde(default)]
@@ -826,12 +833,14 @@ async fn run_prober_ttl(request: TtlRequest) -> Result<serde_json::Value, String
     let ip: std::net::IpAddr = request.address.parse().map_err(|e| format!("invalid address: {e}"))?;
     let transport = ostp_client::prober::TransportKind::parse(&request.transport)
         .ok_or_else(|| format!("unknown transport: {}", request.transport))?;
+    let server_pk = ostp_client::prober::parse_server_pk(request.server_pk.as_deref())?;
     off_thread(std::time::Duration::from_secs(60), move || async move {
         let report = ostp_client::prober::run_ttl_scan(
             ip,
             request.port,
             transport,
             request.key.as_bytes(),
+            server_pk,
             request.max_ttl.unwrap_or(20).clamp(1, 64),
             std::time::Duration::from_millis(900),
             request.tls,

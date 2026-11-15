@@ -14,6 +14,7 @@ pub mod sysproxy;
 pub mod transport;
 pub mod ttl_probe;
 pub mod tunnel;
+pub mod wire;
 
 pub mod runner;
 pub mod logging;

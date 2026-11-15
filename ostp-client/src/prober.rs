@@ -20,7 +20,7 @@ use rand::Rng;
 use serde::Serialize;
 use tokio::net::UdpSocket;
 
-use ostp_core::{NoiseRole, OstpEvent, PaddingStrategy, ProtocolAction, ProtocolConfig, ProtocolMachine, TrafficProfile};
+use ostp_core::{OstpEvent, ProtocolAction, ProtocolMachine, TrafficProfile};
 
 use crate::debug_preview::describe_foreign_bytes;
 use crate::transport::{connect_uot, Transport, UotOptions};
@@ -29,6 +29,18 @@ use crate::transport::{connect_uot, Transport, UotOptions};
 /// whether the attempt succeeds — the live client's actual MTU setting is
 /// irrelevant here, so a fixed sane default keeps the prober self-contained.
 const PROBE_MTU: usize = 1140;
+
+/// The server's public key from a request (`server_pk`, base64url), for the
+/// apps' probe commands. Absent or empty: a v5 profile. A key that does not
+/// decode is an error, never a silent v5 probe.
+pub fn parse_server_pk(text: Option<&str>) -> Result<Option<[u8; 32]>, String> {
+    match text.map(str::trim).filter(|t| !t.is_empty()) {
+        None => Ok(None),
+        Some(t) => ostp_core::server_key::decode_key(t)
+            .map(Some)
+            .map_err(|e| format!("the profile's server key (pk) is invalid: {e}")),
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -116,24 +128,22 @@ pub async fn attempt_handshake(
     port: u16,
     transport: TransportKind,
     access_key: &[u8],
+    server_pk: Option<[u8; 32]>,
     ttl: Option<u32>,
     attempt_timeout: Duration,
     tls: Option<&ProbeTls>,
 ) -> AttemptOutcome {
-    let secrets = ostp_core::crypto::derive_all_secrets(access_key);
     let session_id: u32 = rand::thread_rng().gen();
     let handshake_payload = ostp_core::build_handshake_payload(access_key, session_id);
 
-    let mut machine = match ProtocolMachine::new(ProtocolConfig {
-        psk: secrets.psk,
+    let mut machine = match ProtocolMachine::new(crate::wire::initiator_config(
+        access_key,
+        server_pk,
         session_id,
         handshake_payload,
-        padding_strategy: PaddingStrategy::Profile(TrafficProfile::JsonRpc),
-        obfuscation_key: secrets.obfuscation_key,
-        handshake_pad_min: secrets.handshake_pad_min,
-        handshake_pad_max: secrets.handshake_pad_max,
-        ..ProtocolConfig::with_defaults(NoiseRole::Initiator, PROBE_MTU)
-    }) {
+        TrafficProfile::JsonRpc,
+        PROBE_MTU,
+    )) {
         Ok(m) => m,
         Err(e) => return AttemptOutcome { success: false, rtt_ms: None, error: Some(format!("protocol init error: {e}")), foreign_bytes: None },
     };
@@ -199,7 +209,12 @@ pub async fn attempt_handshake(
         }
         Err(_) => {
             let foreign_bytes = drain_foreign(&mut foreign_rx).await;
-            AttemptOutcome { success: false, rtt_ms: None, error: Some("timed out waiting for a response".into()), foreign_bytes }
+            let error = match server_pk {
+                // A v6 profile: silence has two causes of its own on top of the network.
+                Some(_) => "timed out waiting for a response (v6 profile: the server is older than 0.5.0 or its server key changed, or the path drops it)".to_string(),
+                None => "timed out waiting for a response".to_string(),
+            };
+            AttemptOutcome { success: false, rtt_ms: None, error: Some(error), foreign_bytes }
         }
     }
 }
@@ -224,6 +239,7 @@ pub struct MatrixEntry {
 pub async fn run_matrix(
     server_addr: &str,
     access_key: &[u8],
+    server_pk: Option<[u8; 32]>,
     attempt_timeout: Duration,
     tls: Option<ProbeTls>,
 ) -> anyhow::Result<Vec<MatrixEntry>> {
@@ -253,7 +269,7 @@ pub async fn run_matrix(
     let mut results = Vec::with_capacity(candidates.len() * transports.len());
     for (kind, ip, port) in candidates {
         for &transport in &transports {
-            let outcome = attempt_handshake(ip, port, transport, access_key, None, attempt_timeout, tls.as_ref()).await;
+            let outcome = attempt_handshake(ip, port, transport, access_key, server_pk, None, attempt_timeout, tls.as_ref()).await;
             results.push(MatrixEntry {
                 address: ip.to_string(),
                 port,
@@ -318,6 +334,7 @@ pub async fn run_ttl_scan(
     port: u16,
     transport: TransportKind,
     access_key: &[u8],
+    server_pk: Option<[u8; 32]>,
     max_ttl: u32,
     attempt_timeout: Duration,
     tls: Option<ProbeTls>,
@@ -327,7 +344,7 @@ pub async fn run_ttl_scan(
     let mut first_genuine_ttl = None;
 
     for ttl in 1..=max_ttl.max(1) {
-        let outcome = attempt_handshake(target_ip, port, transport, access_key, Some(ttl), attempt_timeout, tls.as_ref()).await;
+        let outcome = attempt_handshake(target_ip, port, transport, access_key, server_pk, Some(ttl), attempt_timeout, tls.as_ref()).await;
         let (kind, preview) = if outcome.success {
             first_genuine_ttl.get_or_insert(ttl);
             (TtlOutcomeKind::Genuine, None)

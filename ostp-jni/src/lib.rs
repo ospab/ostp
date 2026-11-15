@@ -425,6 +425,9 @@ pub extern "system" fn Java_net_ostp_client_OstpClientSdk_addLog(
 struct ProberMatrixRequest {
     server_addr: String,
     access_key: String,
+    /// The profile's server public key (protocol v6); absent for a v5 profile.
+    #[serde(default)]
+    server_pk: Option<String>,
     /// Set for a TLS profile: probe UoT inside TLS instead.
     #[serde(default)]
     tls: Option<ostp_client::prober::ProbeTls>,
@@ -455,10 +458,15 @@ pub extern "system" fn Java_net_ostp_client_OstpClientSdk_runProberMatrix(
         Err(e) => return error_jstring(&mut env, &format!("invalid request json: {e}")),
     };
 
+    let server_pk = match ostp_client::prober::parse_server_pk(req.server_pk.as_deref()) {
+        Ok(k) => k,
+        Err(e) => return error_jstring(&mut env, &e),
+    };
     let result = match Runtime::new() {
         Ok(rt) => rt.block_on(ostp_client::prober::run_matrix(
             &req.server_addr,
             req.access_key.as_bytes(),
+            server_pk,
             std::time::Duration::from_millis(req.timeout_ms),
             req.tls,
         )),
@@ -477,6 +485,9 @@ struct ProberTtlRequest {
     port: u16,
     transport: String,
     access_key: String,
+    /// The profile's server public key (protocol v6); absent for a v5 profile.
+    #[serde(default)]
+    server_pk: Option<String>,
     #[serde(default)]
     tls: Option<ostp_client::prober::ProbeTls>,
     #[serde(default = "default_max_ttl")]
@@ -516,12 +527,17 @@ pub extern "system" fn Java_net_ostp_client_OstpClientSdk_runProberTtlScan(
         return error_jstring(&mut env, &format!("unknown transport: {}", req.transport));
     };
 
+    let server_pk = match ostp_client::prober::parse_server_pk(req.server_pk.as_deref()) {
+        Ok(k) => k,
+        Err(e) => return error_jstring(&mut env, &e),
+    };
     let report = match Runtime::new() {
         Ok(rt) => rt.block_on(ostp_client::prober::run_ttl_scan(
             target_ip,
             req.port,
             transport,
             req.access_key.as_bytes(),
+            server_pk,
             req.max_ttl,
             std::time::Duration::from_millis(req.timeout_ms),
             req.tls,

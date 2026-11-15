@@ -6,7 +6,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use ostp_core::relay::RelayMessage;
-use ostp_core::{NoiseRole, OstpEvent, PaddingStrategy, ProtocolAction, ProtocolConfig, ProtocolMachine, TrafficProfile};
+use ostp_core::{OstpEvent, ProtocolAction, ProtocolMachine, TrafficProfile};
 use rand::Rng;
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, watch};
@@ -129,7 +129,7 @@ impl Drop for SessionState {
 /// drop it as a duplicate. Returns an empty vec on the (unexpected) construction
 /// error — the probe simply treats that TTL step as unanswered.
 fn build_probe_handshake(
-    secrets: &ostp_core::crypto::DerivedSecrets,
+    server_pk: Option<[u8; 32]>,
     access_key: &[u8],
     profile: TrafficProfile,
     mtu: usize,
@@ -137,16 +137,9 @@ fn build_probe_handshake(
     let session_id: u32 = rand::random();
     let handshake_payload = ostp_core::build_handshake_payload(access_key, session_id);
 
-    let mut machine = match ProtocolMachine::new(ProtocolConfig {
-        psk: secrets.psk,
-        session_id,
-        handshake_payload,
-        padding_strategy: PaddingStrategy::Profile(profile),
-        obfuscation_key: secrets.obfuscation_key,
-        handshake_pad_min: secrets.handshake_pad_min,
-        handshake_pad_max: secrets.handshake_pad_max,
-        ..ProtocolConfig::with_defaults(NoiseRole::Initiator, mtu)
-    }) {
+    let mut machine = match ProtocolMachine::new(crate::wire::initiator_config(
+        access_key, server_pk, session_id, handshake_payload, profile, mtu,
+    )) {
         Ok(m) => m,
         Err(_) => return Vec::new(),
     };
@@ -231,6 +224,8 @@ pub struct Bridge {
     local_bind_addr: String,
     proxy_addr: String,
     access_key: Bytes,
+    /// The server's public key (base64url) when the profile is v6.
+    server_pk: Option<String>,
     handshake_timeout_ms: u64,
     io_timeout_ms: u64,
     pub debug: bool,
@@ -280,6 +275,8 @@ pub struct Bridge {
 
 impl Bridge {
     pub fn new(config: &ClientConfig, metrics: Arc<BridgeMetrics>) -> Result<Self> {
+        // Fail at start, not at the first handshake, on a damaged key.
+        config.ostp.server_public_key()?;
         Ok(Self {
             debug: config.debug,
             profile: TrafficProfile::JsonRpc,
@@ -287,6 +284,7 @@ impl Bridge {
             local_bind_addr: config.ostp.local_bind_addr.clone(),
             proxy_addr: config.local_proxy.bind_addr.clone(),
             access_key: Bytes::from(config.ostp.access_key.clone()),
+            server_pk: config.ostp.server_pk.clone(),
             handshake_timeout_ms: config.ostp.handshake_timeout_ms,
             io_timeout_ms: config.ostp.io_timeout_ms,
 
@@ -602,6 +600,7 @@ impl Bridge {
                 match ClientConfig::reload_from_json_near_binary() {
                     Ok(cfg) => {
                         let old_server = self.server_addr.clone();
+                        let old_pk = self.server_pk.clone();
                         let old_mode = self.mode.clone();
                         let old_transport = self.transport_mode.clone();
                         let old_carrier = (self.tls, self.tls_sni.clone(), self.tls_insecure, self.ws_path.clone());
@@ -609,6 +608,7 @@ impl Bridge {
                         self.apply_runtime_config(&cfg);
 
                         let requires_restart = self.server_addr != old_server ||
+                                               self.server_pk != old_pk ||
                                                self.mode != old_mode ||
                                                self.transport_mode != old_transport ||
                                                (self.tls, self.tls_sni.clone(), self.tls_insecure, self.ws_path.clone()) != old_carrier;
@@ -1236,7 +1236,17 @@ impl Bridge {
     ) -> Result<(crate::transport::Transport, ProtocolMachine, f64)> {
         let handshake_payload = ostp_core::build_handshake_payload(&self.access_key, session_id);
 
-        let secrets = ostp_core::crypto::derive_all_secrets(&self.access_key);
+        // `Some`: a v6 profile. A key that does not decode is an error here,
+        // never a silent v5 handshake.
+        let server_pk = match self.server_pk.as_deref() {
+            Some(k) => Some(
+                ostp_core::server_key::decode_key(k)
+                    .map_err(|e| anyhow::anyhow!("the profile's server key (pk) is invalid: {e}"))?,
+            ),
+            None => None,
+        };
+        // Set when a server stayed silent to the handshake of a v6 profile.
+        let mut v6_silent = false;
 
         let mut resolved_addrs: Vec<std::net::SocketAddr> = match timeout(RESOLVE_TIMEOUT, tokio::net::lookup_host(&self.server_addr)).await {
             Ok(Ok(addrs)) => addrs.collect(),
@@ -1288,16 +1298,14 @@ impl Bridge {
                 }
             };
 
-            let mut machine = ProtocolMachine::new(ProtocolConfig {
-                psk: secrets.psk,
+            let mut machine = ProtocolMachine::new(crate::wire::initiator_config(
+                &self.access_key,
+                server_pk,
                 session_id,
-                handshake_payload: handshake_payload.clone(),
-                padding_strategy: PaddingStrategy::Profile(self.profile),
-                obfuscation_key: secrets.obfuscation_key,
-                handshake_pad_min: secrets.handshake_pad_min,
-                handshake_pad_max: secrets.handshake_pad_max,
-                ..ProtocolConfig::with_defaults(NoiseRole::Initiator, self.mtu)
-            })?;
+                handshake_payload.clone(),
+                self.profile,
+                self.mtu,
+            ))?;
             // UoT and TLS ride TCP: no timer-driven resends (TCP over TCP).
             machine.set_reliable_carrier(self.transport_mode != "udp");
 
@@ -1341,11 +1349,10 @@ impl Bridge {
                 // to the configured fixed TTL rather than skipping desync.
                 let effective_ttl = if self.ttl_desync_auto {
                     if self.ttl_desync_measured.is_none() {
-                        let sec = secrets.clone();
                         let key = self.access_key.clone();
                         let profile = self.profile;
                         let mtu = self.mtu;
-                        let make_hs = move || build_probe_handshake(&sec, &key, profile, mtu);
+                        let make_hs = move || build_probe_handshake(server_pk, &key, profile, mtu);
                         if let Some(hops) = crate::ttl_probe::measure_hops(target_addr, make_hs).await {
                             let t = crate::ttl_probe::decoy_ttl_for(hops);
                             self.ttl_desync_measured = Some(t);
@@ -1408,6 +1415,7 @@ impl Bridge {
             let (final_socket, size) = if success {
                 (socket, size)
             } else {
+                v6_silent |= server_pk.is_some();
                 if let (std::net::IpAddr::V4(ipv4), false) = (target_ip, nat64_attempted) {
                     nat64_attempted = true;
                     tx.send(UiEvent::Log("Direct IPv4 handshake timed out. Trying NAT64 fallback...".to_string())).await.ok();
@@ -1480,6 +1488,11 @@ impl Bridge {
             return Ok((socket, machine, rtt_ms));
         }
 
+        // A v6 profile whose handshake got no answer: say what that means
+        // (older server, or its key changed) instead of a bare timeout.
+        if v6_silent {
+            return Err(anyhow::anyhow!(crate::wire::v6_unanswered(&self.server_addr)));
+        }
         Err(last_err)
     }
 
@@ -1599,6 +1612,7 @@ impl Bridge {
         self.local_bind_addr = cfg.ostp.local_bind_addr.clone();
         self.proxy_addr = cfg.local_proxy.bind_addr.clone();
         self.access_key = Bytes::from(cfg.ostp.access_key.clone());
+        self.server_pk = cfg.ostp.server_pk.clone();
         self.handshake_timeout_ms = cfg.ostp.handshake_timeout_ms;
         self.io_timeout_ms = cfg.ostp.io_timeout_ms;
         self.mode = cfg.mode.clone(); // Bug fix: mode was never updated on hot-reload
