@@ -1,6 +1,6 @@
 use anyhow::Result;
 use bytes::Bytes;
-use ostp_core::{OstpEvent, OstpState, ProtocolAction, ProtocolConfig, ProtocolMachine};
+use ostp_core::{CloseReason, OstpEvent, OstpState, ProtocolAction, ProtocolConfig, ProtocolMachine};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, RwLock};
@@ -136,7 +136,32 @@ pub struct Dispatcher {
     /// Streams the core reset on a tick (this side gave up on a frame), for the
     /// server loop to close their targets; see `take_resets`.
     pending_resets: Vec<(u32, u32)>,
+    /// v6 sessions the server ended with a `Close` (reason known): kept apart
+    /// from the live ones only to resend the `Close` until the client
+    /// acknowledges it, at most `CLOSE_GRACE`. They carry no streams and take
+    /// no part in anything else.
+    closing: HashMap<u32, ClosingSession>,
+    /// `Close` frames built since the last tick, sent by it.
+    pending_frames: Vec<(Bytes, SocketAddr)>,
+    /// Set when the server is stopping: no new session is accepted, only the
+    /// acknowledgements of the `Close` frames are read.
+    closing_only: bool,
 }
+
+/// A session that was sent a `Close`, until it is acknowledged.
+struct ClosingSession {
+    machine: ProtocolMachine,
+    addr: SocketAddr,
+    obfuscation_key: [u8; 8],
+    since: std::time::Instant,
+}
+
+/// How long a `Close` is resent before the server gives up on it. The core
+/// resends after 0.1, 0.2, 0.4, 0.8, 1.6 s ...: five or six copies in this
+/// time. A client that is really gone never acknowledges; it is not waited for.
+const CLOSE_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+/// Sessions kept for `Close` retransmission at once; more are sent once only.
+const MAX_CLOSING: usize = 256;
 
 /// Server-wide key trials per second for sources not seen authenticating.
 /// It bounds what a flood costs: TRIAL_RATE × number of keys X25519 a second.
@@ -193,6 +218,9 @@ impl Dispatcher {
             v6_secrets_cache: HashMap::new(),
             hs_replies: HashMap::new(),
             pending_resets: Vec::new(),
+            closing: HashMap::new(),
+            pending_frames: Vec::new(),
+            closing_only: false,
         }
     }
 
@@ -405,7 +433,7 @@ impl Dispatcher {
                 if !key_valid || user_stats.is_over_limit() {
                     tracing::info!("Dropping session {} for key {} (valid={}, over_limit={})",
                         session_id, key_fp(&access_key), key_valid, user_stats.is_over_limit());
-                    self.drop_session(session_id);
+                    self.drop_session_with(session_id, if key_valid { CloseReason::TrafficLimit } else { CloseReason::KeyRevoked });
                     return Ok(DispatchOutcome::Unauthorized);
                 }
             }
@@ -494,6 +522,15 @@ impl Dispatcher {
                     peer_addr: reply_addr,
                 });
             }
+        }
+
+        // A session that was sent a Close: its acknowledgement is read, nothing
+        // else is answered.
+        if !self.closing.is_empty() && self.feed_closing(peer, &packet) {
+            return Ok(DispatchOutcome::Junk);
+        }
+        if self.closing_only {
+            return Ok(DispatchOutcome::Unauthorized);
         }
 
         // Not an existing session — this is the expensive O(N_keys) trial path.
@@ -681,7 +718,7 @@ impl Dispatcher {
                             if mine.len() >= MAX_SESSIONS_PER_KEY {
                                 if let Some(&(oldest, _)) = mine.iter().min_by_key(|(_, seen)| *seen) {
                                     tracing::info!("Key {} has {} sessions, dropping the oldest ({})", key_fp(&candidate_key), mine.len(), oldest);
-                                    self.drop_session(oldest);
+                                    self.drop_session_with(oldest, CloseReason::TooManySessions);
                                 }
                             }
 
@@ -859,25 +896,57 @@ impl Dispatcher {
         // Clear expired/invalid sessions from internal state
         for sid in &expired {
             let peer_state_opt = self.peer_machines.get(sid);
-            let reason = if let Some(ps) = peer_state_opt {
+            // Only a key that is gone or a limit that is used up is told to
+            // the client; a session closed by the client or idle for ten
+            // minutes has nobody to tell.
+            let (reason, close) = if let Some(ps) = peer_state_opt {
                 let key_valid = self.access_keys.read().unwrap_or_else(|e| e.into_inner()).contains_key(&ps.access_key);
                 let user_stats = self.get_or_create_user_stats(&ps.access_key);
                 if ps.machine.state() == OstpState::Closed {
-                    "closed by the client"
+                    ("closed by the client", None)
                 } else if now.duration_since(ps.last_seen) > timeout_dur {
-                    "inactive >10min"
+                    ("inactive >10min", None)
                 } else if !key_valid {
-                    "key deleted"
+                    ("key deleted", Some(CloseReason::KeyRevoked))
                 } else if user_stats.is_over_limit() {
-                    "traffic limit exceeded"
+                    ("traffic limit exceeded", Some(CloseReason::TrafficLimit))
                 } else {
-                    "unknown"
+                    ("unknown", None)
                 }
             } else {
-                "unknown"
+                ("unknown", None)
             };
             tracing::info!("Session {} closed ({}), releasing", sid, reason);
-            self.drop_session(*sid);
+            match close {
+                Some(close) => self.drop_session_with(*sid, close),
+                None => self.drop_session(*sid),
+            }
+        }
+
+        // The Close frames of sessions dropped since the last tick, then the
+        // resends of those not yet acknowledged.
+        frames.append(&mut self.pending_frames);
+        let mut finished = Vec::new();
+        for (&sid, c) in self.closing.iter_mut() {
+            if c.machine.state() == OstpState::Closed || now.duration_since(c.since) > CLOSE_GRACE {
+                finished.push(sid);
+                continue;
+            }
+            let mut queue = vec![c.machine.on_event(OstpEvent::Tick)];
+            while let Some(current) = queue.pop() {
+                match current {
+                    Ok(ProtocolAction::Multiple(list)) => queue.extend(list.into_iter().map(Ok)),
+                    Ok(ProtocolAction::SendDatagram(frame)) => frames.push((frame, c.addr)),
+                    _ => {}
+                }
+            }
+            // The tick may have seen the acknowledgement.
+            if c.machine.state() == OstpState::Closed {
+                finished.push(sid);
+            }
+        }
+        for sid in finished {
+            self.closing.remove(&sid);
         }
 
         // Drive ticks for remaining active sessions
@@ -931,18 +1000,87 @@ impl Dispatcher {
         sem.try_acquire_owned().ok()
     }
 
+    /// Forgets the session without a word to the client (it is gone, idle,
+    /// closed by itself, or a v5 one).
     pub fn drop_session(&mut self, session_id: u32) {
-        if let Some(state) = self.peer_machines.remove(&session_id) {
-            // A newer session of the same client may have taken this address;
-            // removing its entry would push every packet of it onto the slow
-            // roaming scan.
-            if self.addr_to_session.get(&state.last_addr) == Some(&session_id) {
-                self.addr_to_session.remove(&state.last_addr);
-            }
-            self.dropped.push(session_id);
-            let stats = self.get_or_create_user_stats(&state.access_key);
-            let _ = stats.connections.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| Some(n.saturating_sub(1)));
+        let _ = self.remove_session(session_id);
+    }
+
+    /// Forgets the session and, if it is an established v6 one, tells the
+    /// client why with an authenticated `Close`. The frame goes out with the
+    /// next tick and is resent until acknowledged (`CLOSE_GRACE`). A v5
+    /// session gets nothing, as before.
+    pub fn drop_session_with(&mut self, session_id: u32, reason: CloseReason) {
+        let Some(mut state) = self.remove_session(session_id) else { return };
+        if !state.machine.is_v6() {
+            return;
         }
+        if let Ok(ProtocolAction::SendDatagram(frame)) = state.machine.on_event(OstpEvent::CloseWith(reason, String::new())) {
+            self.pending_frames.push((frame, state.last_addr));
+            if self.closing.len() < MAX_CLOSING {
+                self.closing.insert(
+                    session_id,
+                    ClosingSession {
+                        machine: state.machine,
+                        addr: state.last_addr,
+                        obfuscation_key: state.obfuscation_key,
+                        since: std::time::Instant::now(),
+                    },
+                );
+            }
+        }
+    }
+
+    /// The server is stopping: every v6 session is told (`reason`), and from
+    /// here on no new session is accepted. The frames go out with the next
+    /// ticks, which the caller keeps running for a moment (`closing_pending`).
+    pub fn close_all(&mut self, reason: CloseReason) {
+        self.closing_only = true;
+        let sids: Vec<u32> = self.peer_machines.keys().copied().collect();
+        for sid in sids {
+            self.drop_session_with(sid, reason);
+        }
+    }
+
+    /// Sessions whose `Close` is not yet acknowledged.
+    pub fn closing_pending(&self) -> usize {
+        self.closing.len() + self.pending_frames.len()
+    }
+
+    /// An authenticated packet of a session that was sent a `Close` (its
+    /// acknowledgement). Whether the packet belonged to one.
+    fn feed_closing(&mut self, peer: SocketAddr, packet: &Bytes) -> bool {
+        if packet.len() < 12 {
+            return false;
+        }
+        for (&sid, c) in self.closing.iter_mut() {
+            if c.addr != peer {
+                continue;
+            }
+            let mut header = [0u8; 12];
+            header.copy_from_slice(&packet[0..12]);
+            ostp_core::crypto::deobfuscate_header_inplace(&mut header, &packet[12..], &c.obfuscation_key, false);
+            if u32::from_be_bytes([header[0], header[1], header[2], header[3]]) == sid {
+                // Authenticated by the machine; what it answers is dropped.
+                let _ = c.machine.on_event(OstpEvent::Inbound(packet.clone()));
+                return true;
+            }
+        }
+        false
+    }
+
+    fn remove_session(&mut self, session_id: u32) -> Option<PeerState> {
+        let state = self.peer_machines.remove(&session_id)?;
+        // A newer session of the same client may have taken this address;
+        // removing its entry would push every packet of it onto the slow
+        // roaming scan.
+        if self.addr_to_session.get(&state.last_addr) == Some(&session_id) {
+            self.addr_to_session.remove(&state.last_addr);
+        }
+        self.dropped.push(session_id);
+        let stats = self.get_or_create_user_stats(&state.access_key);
+        let _ = stats.connections.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| Some(n.saturating_sub(1)));
+        Some(state)
     }
 }
 
@@ -1340,6 +1478,173 @@ mod roaming_tests {
         assert_eq!(dispatcher.active_sessions(), 1);
         client.on_event(OstpEvent::Inbound(first)).unwrap();
         assert_eq!(client.state(), OstpState::Established);
+    }
+
+    // ── The session Close (v6) ───────────────────────────────────────────────
+
+    /// What a client does with `frames`: the Close it was told, and the
+    /// datagrams it answers with.
+    fn client_reads(client: &mut ProtocolMachine, frames: &[Bytes]) -> (Option<(CloseReason, String)>, Vec<Bytes>) {
+        fn walk(a: ProtocolAction, closed: &mut Option<(CloseReason, String)>, out: &mut Vec<Bytes>) {
+            match a {
+                ProtocolAction::PeerClosed(r, t) => *closed = Some((r, t)),
+                ProtocolAction::SendDatagram(d) => out.push(d),
+                ProtocolAction::Multiple(l) => l.into_iter().for_each(|x| walk(x, closed, out)),
+                _ => {}
+            }
+        }
+        let mut closed = None;
+        let mut out = Vec::new();
+        for f in frames {
+            if let Ok(a) = client.on_event(OstpEvent::Inbound(f.clone())) {
+                walk(a, &mut closed, &mut out);
+            }
+        }
+        (closed, out)
+    }
+
+    fn frames_to(frames: &[(Bytes, SocketAddr)], to: SocketAddr) -> Vec<Bytes> {
+        frames.iter().filter(|(_, a)| *a == to).map(|(f, _)| f.clone()).collect()
+    }
+
+    fn remove_key(dispatcher: &Dispatcher) {
+        dispatcher.access_keys.write().unwrap().remove(KEY);
+    }
+
+    #[test]
+    fn removing_a_key_sends_close_2_to_its_v6_session_which_is_resent_until_acknowledged() {
+        let (mut dispatcher, mut client, home) = connected_v6();
+        remove_key(&dispatcher);
+        let (frames, dropped) = dispatcher.on_tick();
+        assert_eq!(dropped, vec![SID]);
+        assert_eq!(dispatcher.active_sessions(), 0, "the session is forgotten at once");
+        let to_client = frames_to(&frames, home);
+        assert_eq!(to_client.len(), 1);
+
+        // Lost: after the retransmit wait the same Close comes again.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let (again, _) = dispatcher.on_tick();
+        assert!(!frames_to(&again, home).is_empty(), "an unacknowledged Close is resent");
+        assert_eq!(dispatcher.closing_pending(), 1);
+
+        let (closed, answers) = client_reads(&mut client, &to_client);
+        assert_eq!(closed, Some((CloseReason::KeyRevoked, String::new())));
+        // The acknowledgement ends the resending; it is not an unknown packet.
+        for a in answers {
+            assert!(matches!(dispatcher.on_datagram(home, a).unwrap(), DispatchOutcome::Junk));
+        }
+        let (rest, _) = dispatcher.on_tick();
+        assert!(frames_to(&rest, home).is_empty());
+        assert_eq!(dispatcher.closing_pending(), 0);
+    }
+
+    #[test]
+    fn removing_a_key_sends_nothing_to_a_v5_session() {
+        let home = addr("198.51.100.1:40000");
+        let (mut dispatcher, _client) = established(home);
+        remove_key(&dispatcher);
+        let (frames, dropped) = dispatcher.on_tick();
+        assert_eq!(dropped, vec![SID]);
+        assert!(frames_to(&frames, home).is_empty(), "a v5 client is left in silence, as before");
+        assert_eq!(dispatcher.closing_pending(), 0);
+    }
+
+    #[test]
+    fn the_traffic_limit_sends_close_3() {
+        let (mut dispatcher, mut client, home) = connected_v6();
+        // A packet is counted; a limit of one byte is then used up.
+        let d = datagram_frame(&mut client, 9, b"x");
+        dispatcher.on_datagram(home, d).unwrap();
+        dispatcher.set_user_limit(KEY, Some(1));
+        let (frames, _) = dispatcher.on_tick();
+        let (closed, _) = client_reads(&mut client, &frames_to(&frames, home));
+        assert_eq!(closed.map(|c| c.0), Some(CloseReason::TrafficLimit));
+        assert_eq!(dispatcher.active_sessions(), 0);
+    }
+
+    fn v6_client_with_sid(server_public: [u8; 32], sid: u32) -> (ProtocolMachine, Bytes) {
+        let v6 = ostp_core::crypto::derive_v6_secrets(KEY.as_bytes());
+        let mut cfg = base_config(NoiseRole::Initiator);
+        cfg.session_id = sid;
+        cfg.psk = v6.base.psk;
+        cfg.obfuscation_key = v6.base.obfuscation_key;
+        cfg.handshake_pad_min = v6.base.handshake_pad_min;
+        cfg.handshake_pad_max = v6.base.handshake_pad_max;
+        let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        let mut payload = ts.to_be_bytes().to_vec();
+        payload.extend_from_slice(&sid.to_be_bytes());
+        payload.extend_from_slice(KEY.as_bytes());
+        cfg.handshake_payload = payload;
+        cfg.v6 = Some(ostp_core::protocol::V6Handshake {
+            server: ostp_core::crypto::ServerStatic::Public(server_public),
+            hs: v6.hs,
+        });
+        let mut client = ProtocolMachine::new(cfg).unwrap();
+        let msg1 = first_datagram(client.on_event(OstpEvent::Start).unwrap());
+        (client, msg1)
+    }
+
+    #[test]
+    fn the_per_key_cap_sends_close_4_to_the_evicted_session_only() {
+        let (private, public) = ostp_core::crypto::noise::generate_server_key();
+        let mut dispatcher = new_dispatcher();
+        dispatcher.set_wire_versions(Some(private), true);
+        let mut clients = Vec::new();
+        for i in 0..=MAX_SESSIONS_PER_KEY as u32 {
+            let (mut client, msg1) = v6_client_with_sid(public, SID + i);
+            let from = addr(&format!("203.0.113.{}:4000", i + 1));
+            let reply = accepted_reply(dispatcher.on_datagram(from, msg1).unwrap()).expect("accepted");
+            client.on_event(OstpEvent::Inbound(reply)).unwrap();
+            clients.push((client, from));
+            // The oldest is told apart by when it was last seen.
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert_eq!(dispatcher.active_sessions(), MAX_SESSIONS_PER_KEY, "the 33rd took the place of the oldest");
+        let (frames, dropped) = dispatcher.on_tick();
+        assert_eq!(dropped, vec![SID]);
+        let (first, first_addr) = {
+            let (c, a) = &mut clients[0];
+            (c, *a)
+        };
+        let (closed, _) = client_reads(first, &frames_to(&frames, first_addr));
+        assert_eq!(closed.map(|c| c.0), Some(CloseReason::TooManySessions));
+        for (i, (client, from)) in clients.iter_mut().enumerate().skip(1) {
+            let (closed, _) = client_reads(client, &frames_to(&frames, *from));
+            assert!(closed.is_none(), "session {i} is not told anything");
+        }
+    }
+
+    #[test]
+    fn a_stopping_server_sends_close_5_and_takes_no_new_session() {
+        let (mut dispatcher, mut client, home) = connected_v6();
+        dispatcher.close_all(CloseReason::ServerShutdown);
+        let (frames, _) = dispatcher.on_tick();
+        let (closed, _) = client_reads(&mut client, &frames_to(&frames, home));
+        assert_eq!(closed.map(|c| c.0), Some(CloseReason::ServerShutdown));
+
+        let (_, public) = ostp_core::crypto::noise::generate_server_key();
+        let (_, msg1) = v6_client_with_sid(public, SID + 1);
+        assert!(matches!(dispatcher.on_datagram(addr("203.0.113.77:4000"), msg1).unwrap(), DispatchOutcome::Unauthorized));
+        assert_eq!(dispatcher.active_sessions(), 0);
+    }
+
+    /// Stealth: an unauthenticated packet gets nothing, even from the address
+    /// of a session that is being closed.
+    #[test]
+    fn a_packet_that_does_not_authenticate_gets_no_close() {
+        let (mut dispatcher, mut client, home) = connected_v6();
+        let datagram = datagram_frame(&mut client, 9, b"x");
+        remove_key(&dispatcher);
+        let _ = dispatcher.on_tick();
+        let mut forged = datagram.to_vec();
+        let last = forged.len() - 1;
+        forged[last] ^= 0xff;
+        // Right header, broken tag: swallowed, and no new Close is built for it.
+        let _ = dispatcher.on_datagram(home, Bytes::from(forged));
+        let stranger = addr("192.0.2.200:9999");
+        assert!(matches!(dispatcher.on_datagram(stranger, Bytes::from(vec![7u8; 90])).unwrap(), DispatchOutcome::Unauthorized));
+        let (frames, _) = dispatcher.on_tick();
+        assert!(frames_to(&frames, stranger).is_empty());
     }
 
     fn reply_addr(outcome: DispatchOutcome) -> SocketAddr {

@@ -494,7 +494,7 @@ pub async fn run_server(params: ServerParams) -> Result<()> {
         tokio::spawn(tls::acme::renewal_task(t.clone(), store, resolver));
     }
 
-    let (_ui_cmd_tx, ui_cmd_rx) = mpsc::unbounded_channel::<UiCommand>();
+    let (ui_cmd_tx, ui_cmd_rx) = mpsc::unbounded_channel::<UiCommand>();
     let (ui_event_tx, mut ui_event_rx) = mpsc::unbounded_channel::<UiEvent>();
 
     // Headless event logger
@@ -551,8 +551,17 @@ pub async fn run_server(params: ServerParams) -> Result<()> {
                 tracing::error!("Server error: {e}");
             }
         }
-        _ = wait_for_shutdown_signal() => {
+        // SIGTERM (what `systemctl stop` and `restart` send) or Ctrl-C: the
+        // loop is told to stop, so it can send each v6 session its `Close`
+        // first; if it has not finished in `SHUTDOWN_GRACE`, the process stops
+        // anyway.
+        _ = async {
+            let _ = wait_for_shutdown_signal().await;
             tracing::info!("Shutdown signal received");
+            let _ = ui_cmd_tx.send(UiCommand::Shutdown);
+            tokio::time::sleep(SHUTDOWN_GRACE).await;
+        } => {
+            tracing::warn!("The server loop did not stop in time, stopping anyway");
         }
     }
 
@@ -812,6 +821,36 @@ async fn run_server_loop(
                 match cmd {
                     Some(UiCommand::Shutdown) | None => {
                         let _ = ui_event_tx.send(UiEvent::Info("Shutdown command received".to_string()));
+                        // Every v6 session is told the server is stopping. The
+                        // service manager's stop and restart both arrive here
+                        // as SIGTERM, so the server cannot tell them apart:
+                        // the reason is always 5, never 1.
+                        dispatcher.close_all(ostp_core::CloseReason::ServerShutdown);
+                        let until = Instant::now() + CLOSE_FLUSH;
+                        while Instant::now() < until {
+                            if let Err(e) = handle_tick(
+                                &mut dispatcher, &tcp_map, &socket, &mut remotes, &ui_event_tx,
+                                &mut peer_last_seen, &mut peer_available, &session_backpressure
+                            ).await {
+                                tracing::error!("handle_tick error: {}", e);
+                            }
+                            if dispatcher.closing_pending() == 0 {
+                                break;
+                            }
+                            // Acknowledgements of the Close frames; a resend
+                            // is due on the next turn.
+                            let wait = tokio::time::sleep(Duration::from_millis(10));
+                            tokio::pin!(wait);
+                            loop {
+                                tokio::select! {
+                                    _ = &mut wait => break,
+                                    received = udp_rx.recv() => match received {
+                                        Some((packet, peer)) => { let _ = dispatcher.on_datagram(peer, packet); }
+                                        None => break,
+                                    },
+                                }
+                            }
+                        }
                         break;
                     }
                 }
@@ -935,6 +974,12 @@ async fn run_server_loop(
 /// (and the traffic limits that depend on them) survive restarts and updates.
 pub const STATS_FILE: &str = ".ostp_stats.json";
 const STATS_INTERVAL: Duration = Duration::from_secs(30);
+/// How long a stopping server waits for its `Close` frames to be acknowledged
+/// (and resends them). Short on purpose: a restart should not be slowed down
+/// by clients that are gone.
+const CLOSE_FLUSH: Duration = Duration::from_millis(1500);
+/// The longest the process waits for the loop to finish after the signal.
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(3);
 
 /// Datagrams waiting for the server loop. A datagram can be 64 KiB, so the old
 /// 100000 slots were gigabytes in theory; 8192 is 11 MiB of ordinary (~1.4 KiB)

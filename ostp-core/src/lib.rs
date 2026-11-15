@@ -17,4 +17,4 @@ pub mod subscription;
 pub use crypto::NoiseRole;
 pub use fmt::fmt_bytes;
 pub use framing::{TrafficProfile, PaddingStrategy};
-pub use protocol::{build_handshake_payload, OstpEvent, OstpState, ProtocolAction, ProtocolConfig, ProtocolMachine};
+pub use protocol::{build_handshake_payload, CloseReason, CLOSE_TEXT_MAX, OstpEvent, OstpState, ProtocolAction, ProtocolConfig, ProtocolMachine};
