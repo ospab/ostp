@@ -134,7 +134,7 @@ ostp [--config PATH] [COMMAND]
 | `connect <URL>` | Connect once with an `ostp://` link |
 | `import <URL>` | Save an `ostp://` link or a subscription URL to the config |
 | `links [qr]` | Print the users' `ostp://` links, or show them as QR codes |
-| `gk` | Generate an access key (`--format hex\|base64`, `-n` count) |
+| `key` | Server key and access keys (server): status, `gen` (`--format hex\|base64`, `-n` count), `server [new]`, `legacy on\|off` |
 | `cert issue\|status\|renew` | Domain, HTTPS and the Let's Encrypt certificate (server) |
 | `sub status\|enable\|disable\|set\|urls` | Subscription links (server) |
 | `panel status\|enable\|disable\|set\|passwd\|token` | Web panel and management API (server) |

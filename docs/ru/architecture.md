@@ -12,7 +12,7 @@ OSTP (Ospab Stealth Transport Protocol) — зашифрованный тунн�
 6. **ostp-jni**: JNI-привязки для Android (нативные методы `OstpClientSdk`: старт/стоп клиента, метрики, логи, пробер, подписки, управление сервером), встраивающие клиентский движок в приложение Flutter/Android через изолированные среды выполнения Tokio.
 7. **ostp-dns**: фильтрующий DNS-резолвер, который сервер держит для своих клиентов (списки блокировки, правила, подмены, кэш).
 8. **ostp-ssh**: SSH-клиент, которым оба приложения ставят OSTP на сервер и управляют им: вход по паролю или ключу, запомненный ключ хоста, команды от root, локальный проброс порта к веб-панели и список сохранённых серверов с запечатанными секретами (см. [`integrations.md`](integrations.md)).
-9. **ostp**: единый CLI-бинарник — запускает движок в режиме сервера, клиента или relay, а также хостит подкоманды `setup`/`init`/`gk`/`links`/`connect`/`migrate`/`update`/`cert`/`sub`/`panel`/`dns`/`manage`/`changelog` (см. [`client.md`](client.md) / [`server.md`](server.md)).
+9. **ostp**: единый CLI-бинарник — запускает движок в режиме сервера, клиента или relay, а также хостит подкоманды `setup`/`init`/`key`/`links`/`connect`/`migrate`/`update`/`cert`/`sub`/`panel`/`dns`/`manage`/`changelog` (см. [`client.md`](client.md) / [`server.md`](server.md)).
 
 Ещё две прикладные оболочки используют эти крейты, но лежат вне Cargo-workspace: **ostp-gui** (десктоп-приложение на Tauri для Windows и Linux) и **ostp-flutter** (кроссплатформенное мобильное приложение, Android — через `ostp-jni`). См. [`integrations.md`](integrations.md).
 

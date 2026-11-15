@@ -12,7 +12,7 @@ OSTP (Ospab Stealth Transport Protocol) is an encrypted tunnel written in Rust o
 6. **ostp-jni**: Android JNI bindings (`OstpClientSdk` native methods: start/stop client, metrics, logs, prober, subscriptions, server management) that embed the client engine inside the Flutter/Android app via isolated Tokio runtimes.
 7. **ostp-dns**: The filtering DNS resolver the server runs for its clients (block lists, rules, rewrites, cache).
 8. **ostp-ssh**: The SSH client both apps use to install OSTP on a server and manage it: password or key sign-in, a pinned host key, commands as root, a local port forward to the web panel, and the saved-servers list with sealed secrets (see [`integrations.md`](integrations.md#your-own-server-from-the-apps)).
-9. **ostp**: The unified CLI binary — runs the engine in server, client, or relay mode, and hosts the `setup`/`init`/`gk`/`links`/`connect`/`import`/`migrate`/`update`/`cert`/`sub`/`panel`/`dns`/`overnet`/`manage`/`changelog` subcommands (see [`client.md`](client.md) / [`server.md`](server.md)).
+9. **ostp**: The unified CLI binary — runs the engine in server, client, or relay mode, and hosts the `setup`/`init`/`key`/`links`/`connect`/`import`/`migrate`/`update`/`cert`/`sub`/`panel`/`dns`/`overnet`/`manage`/`changelog` subcommands (see [`client.md`](client.md) / [`server.md`](server.md)).
 
 Two further application shells consume these crates but live outside the Cargo workspace: **ostp-gui** (a Tauri desktop app for Windows and Linux) and **ostp-flutter** (the cross-platform mobile app, Android via `ostp-jni`). See [`integrations.md`](integrations.md).
 

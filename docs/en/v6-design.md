@@ -4,7 +4,8 @@ Status: draft. Section 1 (the handshake) is implemented on the `protocol-v6` bra
 
 Implemented from section 1:
 - The handshake itself: `Noise NKpsk0`, the masked datagram with a 4-byte tag, the cached reply to a repeated handshake (§1.2 to §1.5); a dispatcher that tries v6 first and v5 behind the switch.
-- The server key (§1.1): config section `protocol` (`server_key`, `accept_v5`), created on a new install and, on an existing server, only by `ostp v6 key new`; `ostp v6 key` shows the public key, `ostp v6 v5 on|off` is the transitional switch; schema 7 adds the section without a key. The server reads it at start, so a change restarts the service.
+- The server key (§1.1): config section `protocol` (`server_key`, `accept_v5`), created on a new install and, on an existing server, only by `ostp key server new`; `ostp key` shows the public key, `ostp key legacy on|off` is the transitional switch (legacy clients: older than 0.5.0). There is no schema bump: a config without the section means a server with no key, which speaks v5 only, as before. The server reads it at start, so a change restarts the service.
+- Key derivation (§1.6): v6 secrets come from HKDF-SHA256 with public labels; v5 derivation is untouched.
 - The public key in profiles: `pk=` in `ostp://` links, therefore in subscriptions, the panel/API and `ostp links`; the client config field `server_pk`; a client with it speaks v6 in the bridge, the TTL probe and the prober, and never falls back to v5.
 - The error of a v6 client that gets no answer: it names the two causes (a server older than 0.5.0, a replaced key) and says to reissue the link. The server stays silent to unknown handshakes, so this is wording on the client side, not a wire message.
 - TTL-desync decoys keep working: their junk marker is the v5 one, a v6-only server drops them as unknown datagrams, a transitional server recognises the marker.
@@ -43,8 +44,13 @@ Today the server does one X25519 per access key for every datagram it cannot pla
 ### 1.4 Retransmitted handshake
 A lost server reply makes the client resend, and the server drops the resend as a replay. In v6 the server keeps its reply for the replay window and answers a repeated first message with the same reply, without creating a second session. This is a probing surface (an attacker with a captured first message gets the reply again), but the reply is encrypted to a key the attacker does not have, so it gives nothing.
 
+The reply is found by the Noise message (a hash of it), not by the whole datagram. The padding is not authenticated, so a copy with a damaged padding is accepted; if its reply is lost, the clean copy has to be answered from the same cache entry and not die in the replay check. The lookup costs one HMAC and one ChaCha20 pass (tag check and unmasking), no curve operation, so padding variants of a captured handshake no longer cost the server a Noise read each. The client does not resend identical bytes either: every send is the same Noise message sealed anew, with a new nonce and new padding in the key-derived range, so repeated datagrams share nothing on the wire.
+
 ### 1.5 Version
 `PROTOCOL_VERSION` becomes 6 and, as in v5, goes into the IKM, never onto the wire. The transitional server tries v6 first and v5 second on a datagram it cannot place.
+
+### 1.6 Key derivation
+The v6 secrets come from HKDF-SHA256 (RFC 5869) with public labels, as decision 3 says: `PRK = HKDF-Extract(salt = "ostp v6", IKM = access key)`, and each output is `HKDF-Expand(PRK, label)` with its own label (`ostp v6 psk`, `ostp v6 obfuscation`, `ostp v6 handshake padding`, `ostp v6 handshake mask`, `ostp v6 handshake tag`). The labels carry no secret; the access key is the only secret, as before. The padding range mapping is unchanged. The v5 derivation (salt and info taken from the hash of the access key) is untouched, so a 0.4.x peer derives what it always did. A fixed test vector pins the outputs.
 
 ## 2. Session layer
 Each item has a problem in 0.4.x and a direction; the details are on [v6-session-design.md](v6-session-design.md), which comes before code.

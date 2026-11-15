@@ -134,7 +134,7 @@ ostp [--config ПУТЬ] [КОМАНДА]
 | `connect <URL>` | Подключиться один раз по ссылке `ostp://` |
 | `import <URL>` | Сохранить в конфиг ссылку `ostp://` или ссылку подписки |
 | `links [qr]` | Вывести ссылки `ostp://` пользователей или показать их QR-кодами |
-| `gk` | Создать ключ доступа (`--format hex\|base64`, `-n` количество) |
+| `key` | Ключ сервера и ключи доступа (сервер): состояние, `gen` (`--format hex\|base64`, `-n` количество), `server [new]`, `legacy on\|off` |
 | `cert issue\|status\|renew` | Домен, HTTPS и сертификат Let's Encrypt (сервер) |
 | `sub status\|enable\|disable\|set\|urls` | Ссылки подписки (сервер) |
 | `panel status\|enable\|disable\|set\|passwd\|token` | Веб-панель и API управления (сервер) |
