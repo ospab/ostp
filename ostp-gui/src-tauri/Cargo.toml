@@ -42,3 +42,8 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg",
 base64 = "0.22"
 
 rlimit = "0.11.0"
+
+# netstack-smoltcp 0.2.4 with TcpStream::abort (a TCP RST), from the repository's
+# third_party; the root workspace carries the same patch.
+[patch.crates-io]
+netstack-smoltcp = { path = "../../third_party/netstack-smoltcp" }
