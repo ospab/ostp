@@ -48,7 +48,7 @@ pub fn v6_unanswered(server_addr: &str) -> String {
     format!(
         "{server_addr} did not answer the protocol v6 handshake. This profile carries the server's key, so it speaks v6; \
          the server is either older than 0.5.0 or its server key has changed. Ask for a new link or subscription \
-         (the server's owner can see the key with `ostp v6 key`). If the address or the network is the problem, \
+         (the server's owner can see the key with `ostp key`). If the address or the network is the problem, \
          the same silence looks like this too."
     )
 }

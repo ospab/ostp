@@ -184,9 +184,9 @@ pub async fn run_server(params: ServerParams) -> Result<()> {
     // Only the public half is ever used outside the dispatcher (links, logs).
     let server_pk = wire.server_key.as_ref().map(ostp_core::crypto::noise::server_public_key);
     match (&server_pk, wire.accept_v5) {
-        (Some(_), true) => tracing::info!("Wire: protocol v6 with a server key; v5 clients are still accepted (transitional mode)"),
-        (Some(_), false) => tracing::info!("Wire: protocol v6 only; v5 clients are refused"),
-        (None, _) => tracing::info!("Wire: protocol v5 only (no server key in the config; `ostp v6 key new` creates one)"),
+        (Some(_), true) => tracing::info!("Wire: protocol v6 with a server key; clients older than 0.5.0 are still accepted (`ostp key legacy off` ends it)"),
+        (Some(_), false) => tracing::info!("Wire: protocol v6 only; clients older than 0.5.0 are refused"),
+        (None, _) => tracing::info!("Wire: old handshake only (no server key in the config; `ostp key server new` creates one)"),
     }
 
     // Traffic per user carries over restarts and updates: without this every

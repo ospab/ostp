@@ -181,7 +181,7 @@ impl Client {
     }
 }
 
-/// A `protocol` section as `ostp v6 key new` writes it, and its public key.
+/// A `protocol` section as `ostp key server new` writes it, and its public key.
 fn section(accept_v5: bool) -> (serde_json::Value, [u8; 32]) {
     let (private, public) = ostp_core::crypto::noise::generate_server_key();
     (

@@ -18,7 +18,7 @@ pub fn log_file_path() -> PathBuf {
 /// one-shot subcommand. Only the daemon trims the log at startup.
 pub fn invocation_is_daemon<I: IntoIterator<Item = String>>(args: I) -> bool {
     const ONE_SHOT: &[&str] = &[
-        "gk", "generate-key", "check", "init", "setup", "links", "import",
+        "key", "gk", "generate-key", "check", "init", "setup", "links", "import",
         "update", "migrate", "proxy-env", "proxy-env-clear", "uninstall",
         "cert", "sub", "panel", "dns", "overnet", "warp", "manage", "changelog", "cl", "hash-password", "hp",
         "start", "stop", "restart", "status", "log",

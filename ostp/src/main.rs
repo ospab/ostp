@@ -10,7 +10,7 @@ mod panel_cmd;
 mod dns_cmd;
 mod overnet_cmd;
 mod warp_cmd;
-mod v6_cmd;
+mod key_cmd;
 mod changelog_cmd;
 mod manage_cmd;
 mod service_cmd;
@@ -46,8 +46,8 @@ enum Commands {
         /// The password to hash. Omit to be prompted (keeps it out of shell history).
         password: Option<String>,
     },
-    /// Generate a new secure access key
-    #[command(name = "gk", alias = "generate-key")]
+    /// Old name of `ostp key gen`, kept so existing scripts work
+    #[command(name = "gk", alias = "generate-key", hide = true)]
     GenerateKey {
         /// Format for generated key (hex, base64)
         #[arg(long, default_value = "hex")]
@@ -122,10 +122,10 @@ enum Commands {
         #[command(subcommand)]
         action: warp_cmd::WarpAction,
     },
-    /// Protocol v6: the server key (shown in links as pk) and the transitional v5 mode (server only)
-    V6 {
+    /// Keys: new access keys, the server's own key (the pk of links), legacy clients (server only)
+    Key {
         #[command(subcommand)]
-        action: v6_cmd::V6Action,
+        action: Option<key_cmd::KeyAction>,
     },
     /// Server state and everyday changes as JSON, for the desktop app (server only)
     #[command(hide = true)]
@@ -179,9 +179,6 @@ struct LegacyArgs {
     config: PathBuf,
     init: Option<String>,
     setup: bool,
-    generate_key: bool,
-    format: String,
-    count: usize,
     links: bool,
     check: bool,
     url: Option<String>,
@@ -598,7 +595,7 @@ async fn main() -> Result<()> {
     // Many concurrent connections otherwise hit EMFILE.
     let _ = rlimit::increase_nofile_limit(1048576);
     ostp_client::logging::setup_panic_hook();
-    // One-shot commands (`ostp gk`, `ostp check`) must not truncate a running daemon's log.
+    // One-shot commands (`ostp key gen`, `ostp check`) must not truncate a running daemon's log.
     let is_daemon = ostp_client::logging::invocation_is_daemon(std::env::args());
     let _log_guard = ostp_client::logging::init_tracing("info", "ostp-cli", env!("CARGO_PKG_VERSION"), is_daemon);
 
@@ -1011,13 +1008,13 @@ fn run_setup_wizard(config_path: &std::path::Path) -> Result<Option<PathBuf>> {
                 "overnet": serde_json::to_value(ostp_server::OvernetConfig::default()).unwrap_or_default(),
                 "warp": serde_json::to_value(ostp_server::warp::WarpConfig::default()).unwrap_or_default(),
                 // A new server speaks v6 and, for 0.4.x clients, v5 too.
-                "protocol": v6_cmd::new_section(),
+                "protocol": key_cmd::new_section(),
                 "debug": false
             });
             if let Some(ip) = &bind_ip {
                 server_json["bind_ip"] = serde_json::json!(ip);
             }
-            let server_pk = v6_cmd::public_key_of(&server_json["protocol"]);
+            let server_pk = key_cmd::public_key_of(&server_json["protocol"]);
 
             let actual_path = wizard_save_config(config_path, &server_json)?;
 
@@ -1109,13 +1106,13 @@ fn run_setup_wizard(config_path: &std::path::Path) -> Result<Option<PathBuf>> {
                 "overnet": serde_json::to_value(ostp_server::OvernetConfig::default()).unwrap_or_default(),
                 "warp": serde_json::to_value(ostp_server::warp::WarpConfig::default()).unwrap_or_default(),
                 // A new server speaks v6 and, for 0.4.x clients, v5 too.
-                "protocol": v6_cmd::new_section(),
+                "protocol": key_cmd::new_section(),
                 "debug": false
             });
             if let Some(ip) = &bind_ip {
                 server_json["bind_ip"] = serde_json::json!(ip);
             }
-            let server_pk = v6_cmd::public_key_of(&server_json["protocol"]);
+            let server_pk = key_cmd::public_key_of(&server_json["protocol"]);
 
             let actual_path = wizard_save_config(config_path, &server_json)?;
 
@@ -1239,9 +1236,6 @@ async fn run_app() -> Result<()> {
         config: raw_args.config.clone(),
         init: None,
         setup: false,
-        generate_key: false,
-        format: "hex".to_string(),
-        count: 1,
         links: false,
         check: false,
         url: None,
@@ -1284,7 +1278,7 @@ async fn run_app() -> Result<()> {
                 println!();
                 return Ok(());
             }
-            Commands::GenerateKey { format, count } => { args.generate_key = true; args.format = format; args.count = count; }
+            Commands::GenerateKey { format, count } => return key_cmd::gen(&args.config, &format, count),
             Commands::Links { view: Some(_), all } => return cmd_links_qr(&args.config, all),
             Commands::Links { view: None, .. } => { args.links = true; }
             Commands::Check => { args.check = true; }
@@ -1302,7 +1296,7 @@ async fn run_app() -> Result<()> {
             Commands::Dns { action } => return dns_cmd::run(action, &args.config).await,
             Commands::Overnet { action } => return overnet_cmd::run(action, &args.config),
             Commands::Warp { action } => return warp_cmd::run(action, &args.config).await,
-            Commands::V6 { action } => return v6_cmd::run(action, &args.config),
+            Commands::Key { action } => return key_cmd::run(action, &args.config),
             Commands::Start => return service_cmd::run(service_cmd::Action::Start),
             Commands::Stop => return service_cmd::run(service_cmd::Action::Stop),
             Commands::Restart => return service_cmd::run(service_cmd::Action::Restart),
@@ -1334,7 +1328,6 @@ async fn run_app() -> Result<()> {
     }
     // No config and no other command: start the wizard.
     if !args.config.exists()
-        && !args.generate_key
         && args.init.is_none()
         && args.url.is_none()
         && args.import.is_none()
@@ -1375,42 +1368,6 @@ async fn run_app() -> Result<()> {
         println!("unset http_proxy");
         println!("unset https_proxy");
         println!("unset all_proxy");
-        return Ok(());
-    }
-
-    if args.generate_key {
-        let mut new_keys = Vec::new();
-        for _ in 0..args.count {
-            let key = generate_secure_key(&args.format);
-            println!("{}", key);
-            new_keys.push(key);
-        }
-
-        // On a server config the new keys are appended to access_keys.
-        if args.config.exists() {
-            if let Ok(content) = fs::read_to_string(&args.config) {
-                let mut stripped = json_comments::StripComments::new(content.as_bytes());
-                let mut content_str = String::new();
-                use std::io::Read;
-                if stripped.read_to_string(&mut content_str).is_ok() {
-                    if let Ok(mut json_val) = serde_json::from_str::<serde_json::Value>(&content_str) {
-                        if let Some(mode) = json_val.get("mode").and_then(|m| m.as_str()) {
-                            if mode == "server" {
-                                if let Some(access_keys) = json_val.get_mut("access_keys").and_then(|a| a.as_array_mut()) {
-                                    for key in new_keys {
-                                        access_keys.push(serde_json::Value::String(key));
-                                    }
-                                    if let Ok(new_content) = serde_json::to_string_pretty(&json_val) {
-                                        let _ = ostp_server::config_io::save_config(&args.config, &new_content, false);
-                                        println!("[ostp] Added to access_keys in {:?}", args.config);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
         return Ok(());
     }
 
@@ -1665,10 +1622,10 @@ async fn run_app() -> Result<()> {
     "endpoint": ""
   }},
 
-  // Wire protocol. server_key is this server's private key for protocol v6
-  // (a secret: keep this file readable by root only); `ostp v6 key` shows the
-  // public half, which links carry as pk=. accept_v5 keeps 0.4.x clients
-  // working next to v6 (the transitional mode; `ostp v6 v5 off` ends it).
+  // Wire protocol. server_key is this server's private key (a secret: keep
+  // this file readable by root only); `ostp key` shows the public half, which
+  // links carry as pk=. accept_v5 keeps legacy clients (older than 0.5.0)
+  // working next to current ones; `ostp key legacy off` ends it.
   "protocol": {{
     "server_key": "{pk}",
     "accept_v5": true
@@ -1676,7 +1633,7 @@ async fn run_app() -> Result<()> {
 
   "debug": false
 }}"#, key, ws = cert_cmd::random_path(), cv = ostp_client::migrate::CURRENT_VERSION,
-            pk = v6_cmd::new_section()["server_key"].as_str().unwrap_or_default())
+            pk = key_cmd::new_section()["server_key"].as_str().unwrap_or_default())
         } else if mode_str == "relay" {
             r#"{
   // OSTP Relay Node Configuration
