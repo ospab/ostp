@@ -45,6 +45,18 @@ A server can limit the devices of a subscription (see [tls.md](tls.md), *Device 
 
 Only `ostp import https://…/sub/…` and the apps' subscription fetch use it, and only at that moment; the tunnel never sends it. What goes out is the headers `x-hwid`, `x-device-os` (for example `Windows 11`, `Linux`, `macOS`, `Android 14`) and `x-device-model` (the CPU architecture on a computer, `Build.MODEL` on Android; never the computer's name). `x-hwid` is `hex(HMAC-SHA256(key = the system's machine identifier, message = "ostp-hwid:" + the server's host))` cut to 32 characters. The machine identifier is `MachineGuid` on Windows, `IOPlatformUUID` on macOS, `/etc/machine-id` on Linux and `ANDROID_ID` on Android; it is the HMAC key and is never sent or logged. With `send_hwid` off, `ostp import` of a subscription that limits devices stops with a message that says how to turn it on.
 
+## Privacy of logs
+
+`ostp.log` (next to the program; on Android, the app's log screen) follows one setting, `log.privacy` in the client config, the same key as on the server (see [server.md](server.md), *Privacy of logs*):
+
+```json
+"log": { "privacy": "normal" }
+```
+
+- `normal` (default) and `strict`: no destinations in the log. A line says that a stream opened or a connection bypassed the tunnel, not which site; SNI names, the sites' addresses and the names of excluded domains are not written; the reason a stream failed is its kind (`timed out`, `connection refused`, `name not resolved`...), not the text of the error. The client has no client addresses or DNS query log of its own, so `strict` writes the same as `normal`.
+- `debug`: everything, with the destinations. Only when you ask for it (*Log privacy* in the apps, or `"debug": true`, which still means this when `log.privacy` is absent); it does not turn itself off.
+- The address of your own server is still written: it is yours.
+
 ## Exclusions
 
 The `exclude` block lists what bypasses the tunnel and goes out directly:

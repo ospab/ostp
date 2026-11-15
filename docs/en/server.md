@@ -109,6 +109,37 @@ ostp key legacy on|off                # accept clients older than 0.5.0 next to 
 
 ---
 
+## Privacy of logs: `ostp log privacy`
+
+One setting decides what the server's log (the journal, `ostp.log`) may say about destinations and clients. The same key, `log.privacy`, exists in the client config.
+
+```
+ostp log                              # show the log (as before)
+ostp log privacy                      # the current mode and what it writes
+ostp log privacy strict|normal|debug  # set it, restart the running service (--no-restart skips that)
+```
+
+```json
+"log": { "privacy": "normal" }
+```
+
+| | `strict` | `normal` (default) | `debug` |
+|---|---|---|---|
+| Destinations: hosts and ports of sites, SNI and DNS names, relay targets | never | never | in full |
+| A connect that failed | `CONNECT failed for stream [s:n]: timed out` (the kind of error only) | the same | with the target and the error text |
+| A client's address | a tag, `peer-` and 8 hex digits: an HMAC of the address with a random salt that changes at 00:00 UTC and is held in memory only; the same client has the same tag all day, and nothing links two days | the network: `203.0.113.0/24` (IPv6: `/48`), no port | in full, with the port |
+| DNS query log (the panel's DNS tab, `.ostp_dns_activity.json`) | not kept: no queries, no per-name or per-client tallies; the totals (queries, blocked, cached, failed) stay, and what an earlier run wrote is dropped at start | kept, with the client's network instead of its address | kept in full |
+| Per-stream detail (every CONNECT, every payload) | no | no | yes |
+
+- `debug` is only for finding a fault, and only on request. It never turns itself off, and clients are not told. Without `log.privacy`, the old `"debug": true` still means `debug`; with it, `log.privacy` decides and `debug` is ignored.
+- Nothing a mode changes touches what billing and limits need: per-user traffic, last seen, devices and the device limit, traffic limits.
+- The mode is read at start: a change needs a restart. The panel shows it on the overview page, read-only.
+- `RUST_LOG` raises or lowers the level of what is logged, not what it says: the lines that name a destination or a client go through the same rule at every level.
+- How long the journal keeps its lines is journald's setting (`SystemMaxUse`, `MaxRetentionSec`), not OSTP's.
+- Every line of `ostp.log` has the same shape on the server and the client: time (UTC), level, subsystem, message.
+
+---
+
 ## Built-in DNS: `ostp dns`
 
 A filtering resolver for clients connected to the server (the `ostp-dns` crate): ad and tracker blocking by lists, your own rules and names, much like AdGuard Home. It is not a DNS tunnel and does not carry OSTP traffic.
