@@ -94,7 +94,7 @@ pub(crate) fn unauthorized_probe(peer: IpAddr, bytes: usize) {
     tracing::debug!(target: "ostp_server", "Unauthorized probe from {} ({bytes} bytes)", fmt_ip(peer));
 }
 
-pub(crate) fn relay_rejected(session_id: u32, stream_id: u16, e: &anyhow::Error) {
+pub(crate) fn relay_rejected(session_id: u32, stream_id: u32, e: &anyhow::Error) {
     // The reasons name the target a client asked for ("10.0.0.1:80: closed to clients").
     tracing::debug!(target: "ostp_server::relay", "relay message [{session_id}:{stream_id}] rejected: {}", fmt_error(&format!("{e:#}")));
 }
@@ -118,13 +118,13 @@ pub(crate) fn no_app_payloads(ip: IpAddr, responses: usize) -> UiEvent {
     UiEvent::Log(format!("Accepted datagrams from {} with no app payloads (responses={responses})", fmt_ip(ip)))
 }
 
-pub(crate) fn connect_ok(session_id: u32, stream_id: u16, target: &str) -> UiEvent {
+pub(crate) fn connect_ok(session_id: u32, stream_id: u32, target: &str) -> UiEvent {
     UiEvent::Log(format!("Relay CONNECT ok for [{session_id}:{stream_id}] -> {}", fmt_target(target)))
 }
 
 /// A connect the server could not make. Always logged; `normal` and `strict`
 /// say which stream and what kind of failure, not where to.
-pub(crate) fn connect_failed(session_id: u32, stream_id: u16, target: &str, err: &str) -> UiEvent {
+pub(crate) fn connect_failed(session_id: u32, stream_id: u32, target: &str, err: &str) -> UiEvent {
     if is_debug() {
         UiEvent::Info(format!("Relay error: CONNECT failed for [{session_id}:{stream_id}] -> {target}: {err}"))
     } else {
@@ -133,7 +133,7 @@ pub(crate) fn connect_failed(session_id: u32, stream_id: u16, target: &str, err:
 }
 
 /// The client reported an error on a stream; its text can name a target.
-pub(crate) fn client_stream_error(session_id: u32, stream_id: u16, msg: &str) -> UiEvent {
+pub(crate) fn client_stream_error(session_id: u32, stream_id: u32, msg: &str) -> UiEvent {
     if is_debug() {
         UiEvent::Info(format!("Relay error from [{session_id}:{stream_id}]: {msg}"))
     } else {

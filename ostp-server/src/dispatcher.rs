@@ -22,7 +22,11 @@ pub enum DispatchOutcome {
     Junk,
     Accepted {
         responses: Vec<Bytes>,
-        app_payloads: Vec<(u32, u16, Bytes)>, // session_id, stream_id, payload
+        app_payloads: Vec<(u32, u32, Bytes)>, // session_id, stream_id, payload
+        /// v6: unsequenced payloads (UDP), same shape as `app_payloads`.
+        datagrams: Vec<(u32, u32, Bytes)>,
+        /// v6: streams the peer reset (session_id, stream_id).
+        resets: Vec<(u32, u32)>,
         peer_addr: SocketAddr,
     },
 }
@@ -81,6 +85,9 @@ pub struct PeerState {
     pub access_key: String,
     /// The client announced FEATURE_FLOW_CONTROL: its new streams get windows.
     pub flow_control: bool,
+    /// v6: the streams of this session by id (the client's odd ids), to hold
+    /// the limit and refuse a reused id. Unused by a v5 session.
+    pub streams: ostp_core::streams::StreamIds,
 }
 
 pub struct Dispatcher {
@@ -126,6 +133,9 @@ pub struct Dispatcher {
     /// ephemeral key, so resending it to someone who replays a captured
     /// handshake gives them nothing.
     hs_replies: HashMap<[u8; 32], (u64, Bytes)>,
+    /// Streams the core reset on a tick (this side gave up on a frame), for the
+    /// server loop to close their targets; see `take_resets`.
+    pending_resets: Vec<(u32, u32)>,
 }
 
 /// Server-wide key trials per second for sources not seen authenticating.
@@ -182,6 +192,7 @@ impl Dispatcher {
             accept_v5: true,
             v6_secrets_cache: HashMap::new(),
             hs_replies: HashMap::new(),
+            pending_resets: Vec::new(),
         }
     }
 
@@ -444,37 +455,42 @@ impl Dispatcher {
 
                 let mut responses = Vec::new();
                 let mut app_payloads = Vec::new();
+                let mut datagrams = Vec::new();
+                let mut resets = Vec::new();
 
                 fn collect_action(
                     act: ProtocolAction,
                     sid: u32,
                     resps: &mut Vec<Bytes>,
-                    loads: &mut Vec<(u32, u16, Bytes)>,
+                    loads: &mut Vec<(u32, u32, Bytes)>,
+                    dgrams: &mut Vec<(u32, u32, Bytes)>,
+                    resets: &mut Vec<(u32, u32)>,
                 ) {
                     match act {
                         ProtocolAction::SendDatagram(frame) => {
                             resps.push(frame);
                         }
-                        ProtocolAction::DeliverApp(stream_id, data) => {
-                            // 16-bit stream ids until stage 2 wires the v6 rules.
-                            if let Ok(stream_id) = u16::try_from(stream_id) {
-                                loads.push((sid, stream_id, data));
-                            }
-                        }
+                        // A v5 session's ids are 16 bits already: the core
+                        // read them from a 16-bit header field.
+                        ProtocolAction::DeliverApp(stream_id, data) => loads.push((sid, stream_id, data)),
+                        ProtocolAction::DeliverDatagram(stream_id, data) => dgrams.push((sid, stream_id, data)),
+                        ProtocolAction::StreamReset(stream_id, _reason) => resets.push((sid, stream_id)),
                         ProtocolAction::Multiple(list) => {
                             for item in list {
-                                collect_action(item, sid, resps, loads);
+                                collect_action(item, sid, resps, loads, dgrams, resets);
                             }
                         }
                         _ => {}
                     }
                 }
 
-                collect_action(action, session_id, &mut responses, &mut app_payloads);
+                collect_action(action, session_id, &mut responses, &mut app_payloads, &mut datagrams, &mut resets);
 
                 return Ok(DispatchOutcome::Accepted {
                     responses,
                     app_payloads,
+                    datagrams,
+                    resets,
                     peer_addr: reply_addr,
                 });
             }
@@ -523,6 +539,8 @@ impl Dispatcher {
                     return Ok(DispatchOutcome::Accepted {
                         responses: vec![reply.clone()],
                         app_payloads: Vec::new(),
+                        datagrams: Vec::new(),
+                        resets: Vec::new(),
                         peer_addr: peer,
                     });
                 }
@@ -684,6 +702,7 @@ impl Dispatcher {
                                 last_seen: std::time::Instant::now(),
                                 access_key: candidate_key.clone(),
                                 flow_control: false,
+                                streams: ostp_core::streams::StreamIds::new(ostp_core::streams::Side::Server),
                             });
                             self.addr_to_session.insert(peer, candidate_session_id);
                             user_stats.connections.fetch_add(1, Ordering::Relaxed);
@@ -706,6 +725,8 @@ impl Dispatcher {
                             return Ok(DispatchOutcome::Accepted {
                                 responses: response_opt.into_iter().collect(),
                                 app_payloads: Vec::new(),
+                                datagrams: Vec::new(),
+                                resets: Vec::new(),
                                 peer_addr: peer,
                             });
                         }
@@ -717,9 +738,10 @@ impl Dispatcher {
         Ok(DispatchOutcome::Unauthorized)
     }
 
-    /// The largest payload one datagram of this session carries.
+    /// Whether the streams of this session have flow-control windows: always
+    /// in v6, in v5 only when the client announced it (FEATURE_FLOW_CONTROL).
     pub fn flow_control(&self, session_id: u32) -> bool {
-        self.peer_machines.get(&session_id).is_some_and(|ps| ps.flow_control)
+        self.peer_machines.get(&session_id).is_some_and(|ps| ps.flow_control || ps.machine.is_v6())
     }
 
     pub fn set_flow_control(&mut self, session_id: u32) {
@@ -728,11 +750,44 @@ impl Dispatcher {
         }
     }
 
+    /// Whether the session speaks protocol v6 (false for an unknown one).
+    pub fn is_v6(&self, session_id: u32) -> bool {
+        self.peer_machines.get(&session_id).is_some_and(|ps| ps.machine.is_v6())
+    }
+
+    /// The largest payload one datagram of this session carries.
     pub fn max_payload(&self, session_id: u32) -> Option<usize> {
         self.peer_machines.get(&session_id).map(|ps| ps.machine.max_payload())
     }
 
-    pub fn outbound_to_session(&mut self, session_id: u32, stream_id: u16, payload: Bytes) -> Result<Option<(Bytes, SocketAddr)>> {
+    /// v6: the client opens a stream. Refused (the reason is for the client)
+    /// when the id is not an odd one, was used before, or 1024 are open.
+    pub fn open_stream(&mut self, session_id: u32, stream_id: u32) -> Result<(), ostp_core::streams::StreamError> {
+        match self.peer_machines.get_mut(&session_id) {
+            Some(ps) => ps.streams.accept_remote(stream_id),
+            None => Err(ostp_core::streams::StreamError::NotOpen),
+        }
+    }
+
+    /// v6: the stream is over on this side (both `Fin`, or a `Close` or reset):
+    /// its state is released, and later frames of it are dropped. A no-op for
+    /// a v5 session and for a stream that is not open.
+    pub fn release_stream(&mut self, session_id: u32, stream_id: u32) {
+        if let Some(ps) = self.peer_machines.get_mut(&session_id) {
+            if !ps.machine.is_v6() {
+                return;
+            }
+            let _ = ps.streams.close(stream_id);
+            let _ = ps.machine.on_event(OstpEvent::ReleaseStream(stream_id));
+        }
+    }
+
+    /// Streams the core reset on its own tick since the last call.
+    pub fn take_resets(&mut self) -> Vec<(u32, u32)> {
+        std::mem::take(&mut self.pending_resets)
+    }
+
+    pub fn outbound_to_session(&mut self, session_id: u32, stream_id: u32, payload: Bytes) -> Result<Option<(Bytes, SocketAddr)>> {
         let peer_state = if let Some(existing) = self.peer_machines.get_mut(&session_id) {
             existing
         } else {
@@ -741,9 +796,25 @@ impl Dispatcher {
 
         let addr = peer_state.last_addr;
         let key = peer_state.access_key.clone();
-        match peer_state.machine.on_event(OstpEvent::Outbound(u32::from(stream_id), payload))? {
+        match peer_state.machine.on_event(OstpEvent::Outbound(stream_id, payload))? {
             ProtocolAction::SendDatagram(frame) => {
                 // Track outbound bytes per user
+                track_user_bytes_down(&self.user_stats, &self.access_keys, &key, frame.len() as u64);
+                Ok(Some((frame, addr)))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// v6: a payload that is not retransmitted or ordered (UDP).
+    pub fn datagram_to_session(&mut self, session_id: u32, stream_id: u32, payload: Bytes) -> Result<Option<(Bytes, SocketAddr)>> {
+        let Some(peer_state) = self.peer_machines.get_mut(&session_id) else {
+            return Ok(None);
+        };
+        let addr = peer_state.last_addr;
+        let key = peer_state.access_key.clone();
+        match peer_state.machine.on_event(OstpEvent::OutboundDatagram(stream_id, payload))? {
+            ProtocolAction::SendDatagram(frame) => {
                 track_user_bytes_down(&self.user_stats, &self.access_keys, &key, frame.len() as u64);
                 Ok(Some((frame, addr)))
             }
@@ -810,7 +881,7 @@ impl Dispatcher {
         }
 
         // Drive ticks for remaining active sessions
-        for peer_state in self.peer_machines.values_mut() {
+        for (&sid, peer_state) in self.peer_machines.iter_mut() {
             let action = match peer_state.machine.on_event(OstpEvent::Tick) {
                 Ok(a) => a,
                 Err(e) => {
@@ -829,6 +900,10 @@ impl Dispatcher {
                     }
                     ProtocolAction::SendDatagram(frame) => {
                         frames.push((frame, peer_state.last_addr));
+                    }
+                    // This side gave up on a frame of the stream (v6).
+                    ProtocolAction::StreamReset(stream_id, _reason) => {
+                        self.pending_resets.push((sid, stream_id));
                     }
                     _ => {}
                 }
@@ -1034,6 +1109,89 @@ mod roaming_tests {
                 assert_eq!(&app_payloads[0].2[..], b"hello");
             }
             _ => panic!("the data was not accepted"),
+        }
+    }
+
+    fn connected_v6() -> (Dispatcher, ProtocolMachine, SocketAddr) {
+        let (private, public) = ostp_core::crypto::noise::generate_server_key();
+        let mut dispatcher = new_dispatcher();
+        dispatcher.set_wire_versions(Some(private), true);
+        let (mut client, msg1) = v6_client(public);
+        let home = addr("203.0.113.5:4000");
+        let reply = accepted_reply(dispatcher.on_datagram(home, msg1).unwrap()).expect("the v6 handshake is accepted");
+        client.on_event(OstpEvent::Inbound(reply)).unwrap();
+        (dispatcher, client, home)
+    }
+
+    #[test]
+    fn a_v6_session_has_windows_and_a_stream_limit_and_releases_streams() {
+        let (mut dispatcher, _client, _) = connected_v6();
+        assert!(dispatcher.is_v6(SID));
+        assert!(dispatcher.flow_control(SID), "v6 streams have windows without the FEATURE message");
+        for i in 0..ostp_core::streams::MAX_OPEN_STREAMS as u32 {
+            dispatcher.open_stream(SID, 2 * i + 1).unwrap();
+        }
+        assert_eq!(dispatcher.open_stream(SID, 5001), Err(ostp_core::streams::StreamError::TooManyOpen));
+        assert_eq!(dispatcher.open_stream(SID, 1), Err(ostp_core::streams::StreamError::Reused), "an open id");
+        assert_eq!(dispatcher.open_stream(SID, 2), Err(ostp_core::streams::StreamError::WrongParity), "the server's parity");
+        dispatcher.release_stream(SID, 1);
+        dispatcher.open_stream(SID, 5001).expect("a released stream frees a slot");
+        assert_eq!(dispatcher.open_stream(SID, 1), Err(ostp_core::streams::StreamError::Reused), "a released id is not reusable");
+    }
+
+    #[test]
+    fn a_v5_session_has_no_flow_control_until_announced_and_no_stream_rules() {
+        let (private, _) = ostp_core::crypto::noise::generate_server_key();
+        let mut dispatcher = new_dispatcher();
+        dispatcher.set_wire_versions(Some(private), true);
+        let secrets = ostp_core::crypto::derive_all_secrets(KEY.as_bytes());
+        let mut cfg = base_config(NoiseRole::Initiator);
+        cfg.session_id = SID;
+        cfg.psk = secrets.psk;
+        cfg.obfuscation_key = secrets.obfuscation_key;
+        cfg.handshake_pad_min = secrets.handshake_pad_min;
+        cfg.handshake_pad_max = secrets.handshake_pad_max;
+        cfg.handshake_payload = handshake_payload();
+        let mut client = ProtocolMachine::new(cfg).unwrap();
+        let msg1 = first_datagram(client.on_event(OstpEvent::Start).unwrap());
+        accepted_reply(dispatcher.on_datagram(addr("203.0.113.5:4000"), msg1).unwrap()).expect("v5 accepted");
+        assert!(!dispatcher.is_v6(SID));
+        assert!(!dispatcher.flow_control(SID));
+        dispatcher.set_flow_control(SID);
+        assert!(dispatcher.flow_control(SID));
+        dispatcher.release_stream(SID, 7); // a no-op, not an error
+    }
+
+    #[test]
+    fn a_v6_datagram_arrives_as_a_datagram_in_both_directions() {
+        let (mut dispatcher, mut client, home) = connected_v6();
+        let dgram = datagram_frame(&mut client, 9, b"udp payload");
+        match dispatcher.on_datagram(home, dgram).unwrap() {
+            DispatchOutcome::Accepted { app_payloads, datagrams, .. } => {
+                assert!(app_payloads.is_empty(), "a datagram is not stream data");
+                assert_eq!(datagrams.len(), 1);
+                assert_eq!((datagrams[0].0, datagrams[0].1, &datagrams[0].2[..]), (SID, 9, &b"udp payload"[..]));
+            }
+            _ => panic!("the datagram was not accepted"),
+        }
+        // A datagram goes back the same way.
+        let (frame, to) = dispatcher.datagram_to_session(SID, 9, Bytes::from_static(b"reply")).unwrap().expect("sent");
+        assert_eq!(to, home);
+        fn find(a: ProtocolAction) -> Option<Bytes> {
+            match a {
+                ProtocolAction::DeliverDatagram(9, p) => Some(p),
+                ProtocolAction::Multiple(list) => list.into_iter().find_map(find),
+                _ => None,
+            }
+        }
+        let got = find(client.on_event(OstpEvent::Inbound(frame)).unwrap()).expect("the client got the datagram");
+        assert_eq!(&got[..], b"reply");
+    }
+
+    fn datagram_frame(client: &mut ProtocolMachine, stream: u32, payload: &'static [u8]) -> Bytes {
+        match client.on_event(OstpEvent::OutboundDatagram(stream, Bytes::from_static(payload))).unwrap() {
+            ProtocolAction::SendDatagram(d) => d,
+            _ => panic!("no datagram"),
         }
     }
 

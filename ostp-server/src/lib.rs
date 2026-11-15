@@ -76,11 +76,33 @@ pub(crate) enum UiEvent {
 /// Bytes a stream may have waiting for its target to accept them. Without a
 /// limit a client sending faster than the target reads (an upload to a slow
 /// site, or on purpose) grew the server's memory without bound. Past it the
-/// stream is reset; per-stream flow control is for protocol v6.
+/// stream is reset. This is the v5 rule: in a v6 session the stream's window
+/// (`ostp_core::relay::INITIAL_STREAM_WINDOW`) holds the sender instead, see
+/// `V6_QUEUED_UPLOAD_LIMIT`.
 pub(crate) const MAX_QUEUED_UPLOAD: usize = 32 * 1024 * 1024;
 
+/// A v6 sender never has more than its window unwritten at the target, so a
+/// stream with more than twice that waiting broke the flow control; only then
+/// is it reset. A slow target never reaches it.
+pub(crate) const V6_QUEUED_UPLOAD_LIMIT: usize = 2 * ostp_core::relay::INITIAL_STREAM_WINDOW as usize;
+
+/// What a task that reads a target hands to the server loop.
+pub(crate) enum StreamOut {
+    Data(Vec<u8>),
+    /// v6: the target sent its last byte (half-close).
+    Fin,
+    /// The target's connection ended or failed: `Close` in a v5 session, an
+    /// abort with a reason in v6.
+    Close,
+}
+
 pub(crate) struct RemoteState {
-    pub data_tx: mpsc::UnboundedSender<Bytes>,
+    /// The queue to the task that writes to the target; `None` once the
+    /// client's `Fin` has closed it (the task then shuts the target's write
+    /// side down after the last queued byte).
+    pub data_tx: Option<mpsc::UnboundedSender<Bytes>>,
+    /// v6: which halves of the stream have sent `Fin`.
+    pub halves: ostp_core::streams::HalfClose,
     /// Bytes in `data_tx` not yet written to the target.
     pub queued: Arc<std::sync::atomic::AtomicUsize>,
     pub udp_tx: Option<mpsc::Sender<(String, Bytes)>>,
@@ -638,13 +660,13 @@ async fn run_server_loop(
     router: std::sync::Arc<crate::router::Router>,
     stats_file: Option<std::path::PathBuf>,
 ) -> Result<()> {
-    let mut remotes: HashMap<(u32, u16), RemoteState> = HashMap::new();
-    let (stream_tx, mut stream_rx) = mpsc::unbounded_channel::<(u32, u16, Vec<u8>)>();
-    let (udp_reply_tx, mut udp_reply_rx) = mpsc::channel::<(u32, u16, String, Vec<u8>)>(UDP_REPLY_QUEUE);
+    let mut remotes: HashMap<(u32, u32), RemoteState> = HashMap::new();
+    let (stream_tx, mut stream_rx) = mpsc::unbounded_channel::<(u32, u32, StreamOut)>();
+    let (udp_reply_tx, mut udp_reply_rx) = mpsc::channel::<(u32, u32, String, Vec<u8>)>(UDP_REPLY_QUEUE);
     // Flow control: bytes of a stream written to its target, to be granted
     // back to the client as a `Window`.
-    let (grant_tx, mut grant_rx) = mpsc::unbounded_channel::<(u32, u16, u32)>();
-    let (connect_tx, mut connect_rx) = mpsc::unbounded_channel::<(u32, u16, String, Result<(tokio::net::tcp::OwnedWriteHalf, mpsc::Sender<()>, Option<Arc<send_gate::StreamWindow>>), String>)>();
+    let (grant_tx, mut grant_rx) = mpsc::unbounded_channel::<(u32, u32, u32)>();
+    let (connect_tx, mut connect_rx) = mpsc::unbounded_channel::<(u32, u32, String, Result<(tokio::net::tcp::OwnedWriteHalf, mpsc::Sender<()>, Option<Arc<send_gate::StreamWindow>>), String>)>();
 
     let tcp_map = std::sync::Arc::new(tokio::sync::RwLock::new(HashMap::new()));
 
@@ -807,14 +829,31 @@ async fn run_server_loop(
                     }
                 }
             }
-            Some((session_id, stream_id, data)) = stream_rx.recv() => {
-                if data.is_empty() {
-                    let _ = relay::send_relay_to_stream(session_id, stream_id, RelayMessage::Close, &mut dispatcher, &socket, &ui_event_tx, &tcp_map).await;
-                    if let Some(state) = remotes.remove(&(session_id, stream_id)) {
-                        let _ = state.cancel_tx.try_send(());
+            Some((session_id, stream_id, out)) = stream_rx.recv() => {
+                match out {
+                    StreamOut::Data(data) => {
+                        let _ = relay::send_relay_to_stream(session_id, stream_id, RelayMessage::Data(data), &mut dispatcher, &socket, &ui_event_tx, &tcp_map).await;
                     }
-                } else {
-                    let _ = relay::send_relay_to_stream(session_id, stream_id, RelayMessage::Data(data), &mut dispatcher, &socket, &ui_event_tx, &tcp_map).await;
+                    StreamOut::Fin => {
+                        // The target will send no more; the client may still
+                        // send. The stream is over when it has said so too.
+                        let finished = remotes.get_mut(&(session_id, stream_id)).map(|r| r.halves.local_fin());
+                        if let Some(finished) = finished {
+                            let _ = relay::send_relay_to_stream(session_id, stream_id, RelayMessage::Fin, &mut dispatcher, &socket, &ui_event_tx, &tcp_map).await;
+                            if finished {
+                                relay::end_stream(session_id, stream_id, &mut remotes, &mut dispatcher);
+                            }
+                        }
+                    }
+                    StreamOut::Close => {
+                        let msg = if dispatcher.is_v6(session_id) {
+                            RelayMessage::Abort(ostp_core::relay::ABORT_IO_ERROR)
+                        } else {
+                            RelayMessage::Close
+                        };
+                        let _ = relay::send_relay_to_stream(session_id, stream_id, msg, &mut dispatcher, &socket, &ui_event_tx, &tcp_map).await;
+                        relay::end_stream(session_id, stream_id, &mut remotes, &mut dispatcher);
+                    }
                 }
             }
             Some((session_id, stream_id, bytes)) = grant_rx.recv() => {
@@ -850,12 +889,20 @@ async fn run_server_loop(
                                     }
                                 }
                             }
+                            // The queue is closed: the client said it will write
+                            // no more (v6 `Fin`) or the stream ended. After the
+                            // last queued byte the target gets its end of
+                            // stream; its reply still comes back.
+                            let _ = tokio::io::AsyncWriteExt::shutdown(&mut writer_task).await;
                         });
-                        remotes.insert((session_id, stream_id), RemoteState { data_tx, queued, udp_tx: None, cancel_tx, is_dns: false, window });
+                        let v6 = dispatcher.is_v6(session_id);
+                        remotes.insert((session_id, stream_id), RemoteState { data_tx: Some(data_tx), halves: Default::default(), queued, udp_tx: None, cancel_tx, is_dns: false, window });
                         let _ = relay::send_relay_to_stream(session_id, stream_id, RelayMessage::ConnectOk, &mut dispatcher, &socket, &ui_event_tx, &tcp_map).await;
-                        if flow_control {
-                            // The client's upload on this stream: its first window. It
+                        if flow_control && !v6 {
+                            // v5, client's upload on this stream: its first window. It
                             // also tells the client that this stream uses flow control.
+                            // In v6 the window is part of every stream and starts at
+                            // `INITIAL_STREAM_WINDOW` on both sides without a message.
                             let _ = relay::send_relay_to_stream(session_id, stream_id, RelayMessage::Window(ostp_core::relay::INITIAL_STREAM_WINDOW), &mut dispatcher, &socket, &ui_event_tx, &tcp_map).await;
                         }
                         let _ = ui_event_tx.send(logs::connect_ok(session_id, stream_id, &target));
@@ -863,6 +910,8 @@ async fn run_server_loop(
                     Err(err) => {
                         let _ = ui_event_tx.send(logs::connect_failed(session_id, stream_id, &target, &err));
                         let _ = relay::send_relay_to_stream(session_id, stream_id, RelayMessage::Error(format!("connect failed: {err}")), &mut dispatcher, &socket, &ui_event_tx, &tcp_map).await;
+                        // The stream never started (v6: its slot is given back).
+                        dispatcher.release_stream(session_id, stream_id);
                     }
                 }
             }
@@ -1026,11 +1075,11 @@ async fn handle_udp_packet(
     dispatcher: &mut Dispatcher,
     tcp_map: &std::sync::Arc<tokio::sync::RwLock<HashMap<std::net::SocketAddr, tokio::sync::mpsc::Sender<Bytes>>>>,
     socket: &transport::udp::UdpSockets,
-    remotes: &mut HashMap<(u32, u16), RemoteState>,
+    remotes: &mut HashMap<(u32, u32), RemoteState>,
     ui_event_tx: &mpsc::UnboundedSender<UiEvent>,
-    stream_tx: mpsc::UnboundedSender<(u32, u16, Vec<u8>)>,
-    udp_reply_tx: mpsc::Sender<(u32, u16, String, Vec<u8>)>,
-    connect_tx: mpsc::UnboundedSender<(u32, u16, String, Result<(tokio::net::tcp::OwnedWriteHalf, mpsc::Sender<()>, Option<Arc<send_gate::StreamWindow>>), String>)>,
+    stream_tx: mpsc::UnboundedSender<(u32, u32, StreamOut)>,
+    udp_reply_tx: mpsc::Sender<(u32, u32, String, Vec<u8>)>,
+    connect_tx: mpsc::UnboundedSender<(u32, u32, String, Result<(tokio::net::tcp::OwnedWriteHalf, mpsc::Sender<()>, Option<Arc<send_gate::StreamWindow>>), String>)>,
     router: std::sync::Arc<crate::router::Router>,
     peer_last_seen: &mut HashMap<IpAddr, Instant>,
     peer_available: &mut HashMap<IpAddr, bool>,
@@ -1043,7 +1092,7 @@ async fn handle_udp_packet(
         Ok(DispatchOutcome::Unauthorized) => {
             let _ = ui_event_tx.send(UiEvent::UnauthorizedProbe { peer: peer.ip(), bytes: size });
         }
-        Ok(DispatchOutcome::Accepted { responses, app_payloads, peer_addr }) => {
+        Ok(DispatchOutcome::Accepted { responses, app_payloads, datagrams, resets, peer_addr }) => {
             let peer_ip = peer_addr.ip();
             let now = Instant::now();
             peer_last_seen.insert(peer_ip, now);
@@ -1117,6 +1166,27 @@ async fn handle_udp_packet(
                     logs::relay_rejected(session_id, stream_id, &e);
                 }
             }
+            // v6 datagrams (UDP): not ordered with the streams, only UdpData
+            // is allowed on them.
+            for (session_id, stream_id, payload) in datagrams {
+                match RelayMessage::decode(&payload) {
+                    Ok(msg @ RelayMessage::UdpData(..)) => {
+                        if let Err(e) = relay::handle_message(
+                            peer_addr, session_id, stream_id, msg, dispatcher, socket, remotes, ui_event_tx,
+                            stream_tx.clone(), udp_reply_tx.clone(), connect_tx.clone(), router.clone(), tcp_map, session_backpressure,
+                        ).await {
+                            logs::relay_rejected(session_id, stream_id, &e);
+                        }
+                    }
+                    _ => {
+                        let _ = ui_event_tx.send(UiEvent::Log(format!("Datagram of stream [{session_id}:{stream_id}] is not UDP data, dropped")));
+                    }
+                }
+            }
+            // The peer reset these streams (v6): the targets are closed.
+            for (session_id, stream_id) in resets {
+                relay::reset_stream(session_id, stream_id, remotes, dispatcher, ui_event_tx);
+            }
         }
         Err(err) => {
             let _ = ui_event_tx.send(logs::protocol_error(peer, &err));
@@ -1129,7 +1199,7 @@ async fn handle_tick(
     dispatcher: &mut Dispatcher,
     tcp_map: &std::sync::Arc<tokio::sync::RwLock<HashMap<std::net::SocketAddr, tokio::sync::mpsc::Sender<Bytes>>>>,
     socket: &transport::udp::UdpSockets,
-    remotes: &mut HashMap<(u32, u16), RemoteState>,
+    remotes: &mut HashMap<(u32, u32), RemoteState>,
     ui_event_tx: &mpsc::UnboundedSender<UiEvent>,
     peer_last_seen: &mut HashMap<IpAddr, Instant>,
     peer_available: &mut HashMap<IpAddr, bool>,
@@ -1184,6 +1254,10 @@ async fn handle_tick(
                 logs::send_failed(peer_addr, &e);
             }
         }
+    }
+    // Streams this side gave up on (v6): their targets are closed.
+    for (session_id, stream_id) in dispatcher.take_resets() {
+        relay::reset_stream(session_id, stream_id, remotes, dispatcher, ui_event_tx);
     }
     if !dropped_sessions.is_empty() {
         let mut map = session_backpressure.write().unwrap_or_else(|e| e.into_inner());
