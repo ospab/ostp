@@ -157,6 +157,41 @@ fn collect_datagrams(action: ProtocolAction, out: &mut Vec<Bytes>) {
     }
 }
 
+/// What an action tree from the core asks of the bridge.
+#[derive(Default)]
+struct Collected {
+    frames: Vec<Bytes>,
+    /// Stream payloads, in delivery order.
+    streams: Vec<(u32, Bytes)>,
+    /// Unsequenced payloads (v6 UDP).
+    datagrams: Vec<(u32, Bytes)>,
+    /// Streams reset by the peer or given up on by us (v6).
+    resets: Vec<u32>,
+}
+
+impl Collected {
+    fn from(action: ProtocolAction) -> Self {
+        let mut c = Collected::default();
+        c.add(action);
+        c
+    }
+
+    fn add(&mut self, action: ProtocolAction) {
+        match action {
+            ProtocolAction::SendDatagram(frame) => self.frames.push(frame),
+            ProtocolAction::DeliverApp(stream, payload) => self.streams.push((stream, payload)),
+            ProtocolAction::DeliverDatagram(stream, payload) => self.datagrams.push((stream, payload)),
+            ProtocolAction::StreamReset(stream, _reason) => self.resets.push(stream),
+            ProtocolAction::Multiple(list) => {
+                for item in list {
+                    self.add(item);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 struct SessionState {
     socket: crate::transport::Transport,
     machine: ProtocolMachine,
@@ -165,6 +200,34 @@ struct SessionState {
     rx_task: tokio::task::AbortHandle,
     /// Last authenticated datagram from the server on this session.
     last_recv: Instant,
+    /// v6: the ids of this session's streams (odd for the client, never
+    /// reused, at most 1024 open).
+    ids: ostp_core::streams::StreamIds,
+    /// v5: where the search for a free 16-bit stream id goes on.
+    next_v5_id: u16,
+}
+
+impl SessionState {
+    fn new(socket: crate::transport::Transport, machine: ProtocolMachine, rx_task: tokio::task::AbortHandle) -> Self {
+        SessionState {
+            socket,
+            machine,
+            rx_task,
+            last_recv: Instant::now(),
+            ids: ostp_core::streams::StreamIds::new(ostp_core::streams::Side::Client),
+            next_v5_id: 1,
+        }
+    }
+}
+
+/// A local connection (the proxy's id) and the stream that carries it.
+struct Route {
+    session: usize,
+    /// The id on the wire: 16 bits in a v5 session, a `StreamIds` id in v6.
+    wire: u32,
+    v6: bool,
+    /// v6: which sides have sent their `Fin`.
+    halves: ostp_core::streams::HalfClose,
 }
 
 impl Drop for SessionState {
@@ -315,7 +378,12 @@ pub struct Bridge {
     link: Link,
     sessions: Vec<SessionState>,
     udp_rx: Option<mpsc::Receiver<(usize, Bytes)>>,
-    stream_map: std::collections::HashMap<u16, usize>,
+    /// Local connection (the proxy's id) -> its stream, and back.
+    routes: std::collections::HashMap<u32, Route>,
+    by_wire: std::collections::HashMap<(usize, u32), u32>,
+    /// Streams the core reset where no caller was there to take it (a session
+    /// move), as (session, wire id); applied by the next retransmit tick.
+    pending_resets: Vec<(usize, u32)>,
     proxy_guard: Option<crate::sysproxy::SystemProxyGuard>,
     /// Whether this run has been connected before, to word the logs and to
     /// clear stale proxy events only on a reconnect.
@@ -369,7 +437,9 @@ impl Bridge {
             link: Link::Idle,
             sessions: Vec::new(),
             udp_rx: None,
-            stream_map: std::collections::HashMap::new(),
+            routes: std::collections::HashMap::new(),
+            by_wire: std::collections::HashMap::new(),
+            pending_resets: Vec::new(),
             proxy_guard: None,
             established_once: false,
         })
@@ -381,7 +451,7 @@ impl Bridge {
         mut bridge_rx: mpsc::Receiver<BridgeCommand>,
         mut shutdown: watch::Receiver<bool>,
         mut proxy_rx: mpsc::Receiver<ProxyEvent>,
-        proxy_tx: mpsc::UnboundedSender<(u16, ProxyToClientMsg)>,
+        proxy_tx: mpsc::UnboundedSender<(u32, ProxyToClientMsg)>,
     ) -> Result<()> {
         let mut metrics_tick = interval(Duration::from_millis(500));
         let mut keepalive_tick = interval(Duration::from_secs(self.keepalive_interval_sec.clamp(1, 3600)));
@@ -489,7 +559,7 @@ impl Bridge {
         &mut self,
         udp_msg: Option<(usize, Bytes)>,
         tx: &mpsc::Sender<UiEvent>,
-        proxy_tx: &mpsc::UnboundedSender<(u16, ProxyToClientMsg)>,
+        proxy_tx: &mpsc::UnboundedSender<(u32, ProxyToClientMsg)>,
     ) {
         let Some((session_index, inbound)) = udp_msg else {
             // Every receiver ended: with UoT the TCP connections were closed or
@@ -532,78 +602,207 @@ impl Bridge {
             session.last_recv = Instant::now();
         }
 
-        let mut actions_queue = std::collections::VecDeque::new();
-        actions_queue.push_back(initial_action);
-
-        while let Some(current_action) = actions_queue.pop_front() {
-            match current_action {
-                ProtocolAction::Multiple(nested) => {
-                    for a in nested {
-                        actions_queue.push_back(a);
+        let Collected { frames, streams, datagrams, resets } = Collected::from(initial_action);
+        for frame in frames {
+            let _ = send_datagram(&session.socket, &frame, false).await;
+            self.metrics.bytes_sent.fetch_add(frame.len() as u64, Ordering::Relaxed);
+        }
+        for (wire_stream_id, dec_payload) in streams {
+            self.on_stream_payload(session_index, wire_stream_id, dec_payload, tx, proxy_tx).await;
+        }
+        for (wire_stream_id, payload) in datagrams {
+            // Only UDP rides on a datagram.
+            match RelayMessage::decode(&payload) {
+                Ok(RelayMessage::UdpData(target, data)) => {
+                    if let Some(&local) = self.by_wire.get(&(session_index, wire_stream_id)) {
+                        let _ = proxy_tx.send((local, ProxyToClientMsg::UdpData(target, Bytes::from(data))));
                     }
                 }
-                ProtocolAction::DeliverApp(wire_stream_id, dec_payload) => {
-                    // Callers still use 16-bit stream ids until the v6 id
-                    // rules are wired in (stage 2).
-                    let Ok(stream_id) = u16::try_from(wire_stream_id) else {
-                        continue;
-                    };
-                    match RelayMessage::decode(&dec_payload) {
-                        Ok(relay_msg) => {
-                            match relay_msg {
-                                RelayMessage::ConnectOk => {
-                                    let _ = tx.send(UiEvent::Log(format!("Relay CONNECT OK stream_id={stream_id}"))).await;
-                                    let _ = proxy_tx.send((stream_id, ProxyToClientMsg::ConnectOk));
-                                }
-                                RelayMessage::Data(data) => {
-                                    let _ = proxy_tx.send((stream_id, ProxyToClientMsg::Data(Bytes::from(data))));
-                                }
-                                RelayMessage::Close => {
-                                    let _ = proxy_tx.send((stream_id, ProxyToClientMsg::Close));
-                                }
-                                RelayMessage::Error(msg) => {
-                                    let _ = tx.send(UiEvent::Log(crate::logs::ui_relay_error(stream_id, &msg))).await;
-                                    let _ = proxy_tx.send((stream_id, ProxyToClientMsg::Error(msg)));
-                                }
-                                RelayMessage::Pong(ts) => {
-                                    let now = SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
-                                    // The ping carries the wall clock, so a clock step
-                                    // between ping and pong reads as an RTT of hours
-                                    // (and stretches the move deadline with it).
-                                    let rtt = now.saturating_sub(ts);
-                                    if rtt <= MAX_PLAUSIBLE_RTT_MS {
-                                        self.last_rtt_ms = rtt as f64;
-                                        self.metrics.rtt_ms.store(rtt as u32, Ordering::Relaxed);
-                                    }
-                                }
-                                RelayMessage::UdpAssociate => {}
-                                RelayMessage::UdpData(target, data) => {
-                                    let _ = proxy_tx.send((stream_id, ProxyToClientMsg::UdpData(target, Bytes::from(data))));
-                                }
-                                RelayMessage::Window(bytes) => {
-                                    let _ = proxy_tx.send((stream_id, ProxyToClientMsg::Window(bytes)));
-                                }
-                                RelayMessage::Features(bits) => {
-                                    // Which streams use flow control the server says
-                                    // per stream, with its first `Window`.
-                                    tracing::debug!("server features: {bits:#x}");
-                                }
-                                RelayMessage::KeepAlive | RelayMessage::Ping(_) | RelayMessage::Connect(_) => {}
-                            }
-                        }
-                        Err(err) => {
-                            let _ = tx.send(UiEvent::Log(format!("Relay decode error for stream {stream_id}: {err}"))).await;
-                            let _ = proxy_tx.send((stream_id, ProxyToClientMsg::Error("relay decode failed".to_string())));
-                        }
-                    }
-                }
-                ProtocolAction::SendDatagram(frame) => {
-                    let _ = send_datagram(&session.socket, &frame, false).await;
-                    self.metrics.bytes_sent.fetch_add(frame.len() as u64, Ordering::Relaxed);
-                }
-                _ => {}
+                _ => tracing::debug!("a datagram of stream {wire_stream_id} is not UDP data, dropped"),
             }
         }
+        for wire_stream_id in resets {
+            self.on_stream_reset(session_index, wire_stream_id, tx, proxy_tx).await;
+        }
+    }
+
+    /// A message the server sent on a stream (or, for stream 0, on the
+    /// session's own control stream).
+    async fn on_stream_payload(
+        &mut self,
+        session_index: usize,
+        wire_stream_id: u32,
+        payload: Bytes,
+        tx: &mpsc::Sender<UiEvent>,
+        proxy_tx: &mpsc::UnboundedSender<(u32, ProxyToClientMsg)>,
+    ) {
+        let relay_msg = match RelayMessage::decode(&payload) {
+            Ok(m) => m,
+            Err(err) => {
+                let _ = tx.send(UiEvent::Log(format!("Relay decode error for stream {wire_stream_id}: {err}"))).await;
+                if let Some(&local) = self.by_wire.get(&(session_index, wire_stream_id)) {
+                    let _ = proxy_tx.send((local, ProxyToClientMsg::Error("relay decode failed".to_string())));
+                }
+                return;
+            }
+        };
+        // The answer to a ping comes on the control stream and belongs to no
+        // local connection.
+        if let RelayMessage::Pong(ts) = relay_msg {
+            let now = SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
+            // The ping carries the wall clock, so a clock step
+            // between ping and pong reads as an RTT of hours
+            // (and stretches the move deadline with it).
+            let rtt = now.saturating_sub(ts);
+            if rtt <= MAX_PLAUSIBLE_RTT_MS {
+                self.last_rtt_ms = rtt as f64;
+                self.metrics.rtt_ms.store(rtt as u32, Ordering::Relaxed);
+            }
+            return;
+        }
+        if let RelayMessage::Features(bits) = relay_msg {
+            // v5: which streams use flow control the server says per stream,
+            // with its first `Window`.
+            tracing::debug!("server features: {bits:#x}");
+            return;
+        }
+        // Every other message is about a local connection. One that is gone
+        // (finished, aborted, reset) has nobody to go to: its late messages
+        // are dropped, which is what releasing a v6 stream means.
+        let Some(&local) = self.by_wire.get(&(session_index, wire_stream_id)) else {
+            return;
+        };
+        let Some(route) = self.routes.get_mut(&local) else { return };
+        let v6 = route.v6;
+        let abort_reason = match &relay_msg {
+            RelayMessage::Abort(reason) => Some(*reason),
+            _ => None,
+        };
+        match relay_msg {
+            RelayMessage::ConnectOk => {
+                let _ = tx.send(UiEvent::Log(format!("Relay CONNECT OK stream_id={local}"))).await;
+                let msg = if v6 { ProxyToClientMsg::ConnectOkV6 } else { ProxyToClientMsg::ConnectOk };
+                let _ = proxy_tx.send((local, msg));
+            }
+            RelayMessage::Data(data) => {
+                let _ = proxy_tx.send((local, ProxyToClientMsg::Data(Bytes::from(data))));
+            }
+            RelayMessage::Fin => {
+                // The peer's end of stream. The stream is over when ours was sent too.
+                let finished = route.halves.remote_fin();
+                let _ = proxy_tx.send((local, ProxyToClientMsg::Fin));
+                if finished {
+                    self.release_route(local);
+                }
+            }
+            RelayMessage::Close | RelayMessage::Abort(_) => {
+                // v5: the end of the stream, as it always was. v6: an abort,
+                // which the program must see as a reset.
+                if let Some(reason) = abort_reason {
+                    let _ = tx.send(UiEvent::Log(format!("Stream {local} aborted by the server (reason {reason})"))).await;
+                }
+                let msg = if v6 { ProxyToClientMsg::Reset } else { ProxyToClientMsg::Close };
+                let _ = proxy_tx.send((local, msg));
+                self.release_route(local);
+            }
+            RelayMessage::Error(msg) => {
+                let _ = tx.send(UiEvent::Log(crate::logs::ui_relay_error(local, &msg))).await;
+                let _ = proxy_tx.send((local, ProxyToClientMsg::Error(msg)));
+                // In v6 an error ends the stream (a refused connect, a broken
+                // window); in v5 the route stays until the program closes.
+                if v6 {
+                    self.release_route(local);
+                }
+            }
+            RelayMessage::UdpData(target, data) => {
+                let _ = proxy_tx.send((local, ProxyToClientMsg::UdpData(target, Bytes::from(data))));
+            }
+            RelayMessage::Window(bytes) => {
+                let _ = proxy_tx.send((local, ProxyToClientMsg::Window(bytes)));
+            }
+            RelayMessage::UdpAssociate
+            | RelayMessage::KeepAlive
+            | RelayMessage::Ping(_)
+            | RelayMessage::Connect(_)
+            | RelayMessage::Pong(_)
+            | RelayMessage::Features(_) => {}
+        }
+    }
+
+    /// The core reset a stream (v6): the peer said so, or this side gave up on
+    /// a frame of it. Stream 0 is the session's control stream: without it the
+    /// session is unusable and ends like a dead one.
+    async fn on_stream_reset(
+        &mut self,
+        session_index: usize,
+        wire_stream_id: u32,
+        tx: &mpsc::Sender<UiEvent>,
+        proxy_tx: &mpsc::UnboundedSender<(u32, ProxyToClientMsg)>,
+    ) {
+        if wire_stream_id == 0 {
+            self.begin_reconnect("The session's control stream was lost", false, tx, proxy_tx).await;
+            return;
+        }
+        let Some(&local) = self.by_wire.get(&(session_index, wire_stream_id)) else {
+            return;
+        };
+        let _ = tx.send(UiEvent::Log(format!("Stream {local} reset: data was lost for good"))).await;
+        let _ = proxy_tx.send((local, ProxyToClientMsg::Reset));
+        self.release_route(local);
+    }
+
+    fn clear_routes(&mut self) {
+        self.routes.clear();
+        self.by_wire.clear();
+        self.pending_resets.clear();
+    }
+
+    /// The stream of a local connection is over on this side: forgotten, and
+    /// in v6 its id closed and its state released (no later frame of it is
+    /// delivered).
+    fn release_route(&mut self, local: u32) {
+        let Some(route) = self.routes.remove(&local) else { return };
+        self.by_wire.remove(&(route.session, route.wire));
+        if route.v6 {
+            if let Some(session) = self.sessions.get_mut(route.session) {
+                let _ = session.ids.close(route.wire);
+                let _ = session.machine.on_event(OstpEvent::ReleaseStream(route.wire));
+            }
+        }
+    }
+
+    /// Gives a new local connection a stream on one of the sessions. In v6 the
+    /// id comes from the session's `StreamIds` (and the limit of 1024 open
+    /// streams applies); in v5 it is the next free 16-bit one.
+    fn open_route(&mut self, local: u32) -> std::result::Result<(), String> {
+        let count = self.sessions.len();
+        if count == 0 {
+            return Err("reconnecting".to_string());
+        }
+        let index = rand::thread_rng().gen_range(0..count);
+        let session = &mut self.sessions[index];
+        let (wire, v6) = if session.machine.is_v6() {
+            let wire = session
+                .ids
+                .open_local()
+                .map_err(|e| format!("{e} ({} at most per session)", ostp_core::streams::MAX_OPEN_STREAMS))?;
+            (wire, true)
+        } else {
+            // 16 bits on the wire in v5; the id of a stream still open is skipped.
+            let mut found = None;
+            for _ in 0..u16::MAX {
+                let candidate = session.next_v5_id;
+                session.next_v5_id = if candidate == u16::MAX { 1 } else { candidate + 1 };
+                if !self.by_wire.contains_key(&(index, u32::from(candidate))) {
+                    found = Some(candidate);
+                    break;
+                }
+            }
+            (u32::from(found.ok_or_else(|| "too many open streams".to_string())?), false)
+        };
+        self.by_wire.insert((index, wire), local);
+        self.routes.insert(local, Route { session: index, wire, v6, halves: Default::default() });
+        Ok(())
     }
 
     /// Returns false when the bridge should stop.
@@ -612,7 +811,7 @@ impl Bridge {
         cmd: Option<BridgeCommand>,
         bridge_rx: &mut mpsc::Receiver<BridgeCommand>,
         tx: &mpsc::Sender<UiEvent>,
-        proxy_tx: &mpsc::UnboundedSender<(u16, ProxyToClientMsg)>,
+        proxy_tx: &mpsc::UnboundedSender<(u32, ProxyToClientMsg)>,
     ) -> bool {
         match cmd {
             Some(BridgeCommand::ToggleTunnel) => {
@@ -704,7 +903,7 @@ impl Bridge {
         self.sessions.clear();
         self.standby = None;
         self.udp_rx = None;
-        self.stream_map.clear();
+        self.clear_routes();
         self.proxy_guard = None;
         self.link = Link::Idle;
         self.established_once = false;
@@ -729,7 +928,7 @@ impl Bridge {
     async fn check_link(
         &mut self,
         tx: &mpsc::Sender<UiEvent>,
-        proxy_tx: &mpsc::UnboundedSender<(u16, ProxyToClientMsg)>,
+        proxy_tx: &mpsc::UnboundedSender<(u32, ProxyToClientMsg)>,
     ) {
         match self.link {
             Link::Up => {
@@ -822,7 +1021,7 @@ impl Bridge {
         &mut self,
         reason: &str,
         tx: &mpsc::Sender<UiEvent>,
-        proxy_tx: &mpsc::UnboundedSender<(u16, ProxyToClientMsg)>,
+        proxy_tx: &mpsc::UnboundedSender<(u32, ProxyToClientMsg)>,
     ) {
         // The hop count to the server may differ on the new network.
         self.ttl_desync_measured = None;
@@ -848,7 +1047,7 @@ impl Bridge {
         reason: &str,
         keep_session: bool,
         tx: &mpsc::Sender<UiEvent>,
-        proxy_tx: &mpsc::UnboundedSender<(u16, ProxyToClientMsg)>,
+        proxy_tx: &mpsc::UnboundedSender<(u32, ProxyToClientMsg)>,
     ) {
         if !keep_session {
             self.drop_sessions(tx, proxy_tx);
@@ -871,7 +1070,7 @@ impl Bridge {
     fn drop_sessions(
         &mut self,
         tx: &mpsc::Sender<UiEvent>,
-        proxy_tx: &mpsc::UnboundedSender<(u16, ProxyToClientMsg)>,
+        proxy_tx: &mpsc::UnboundedSender<(u32, ProxyToClientMsg)>,
     ) {
         self.standby = None;
         if self.sessions.is_empty() {
@@ -879,7 +1078,7 @@ impl Bridge {
         }
         self.sessions.clear();
         self.udp_rx = None;
-        self.stream_map.clear();
+        self.clear_routes();
         self.reset_proxy_streams(tx, proxy_tx, "reconnect");
     }
 
@@ -891,7 +1090,7 @@ impl Bridge {
         bridge_rx: &mut mpsc::Receiver<BridgeCommand>,
         shutdown: &mut watch::Receiver<bool>,
         tx: &mpsc::Sender<UiEvent>,
-        proxy_tx: &mpsc::UnboundedSender<(u16, ProxyToClientMsg)>,
+        proxy_tx: &mpsc::UnboundedSender<(u32, ProxyToClientMsg)>,
         proxy_rx: &mut mpsc::Receiver<ProxyEvent>,
     ) -> bool {
         let Link::Down { since, attempt, handshake_next, .. } = self.link else { return true };
@@ -1001,7 +1200,7 @@ impl Bridge {
             match self.perform_handshake_with_id(tx, session_id).await {
                 Ok((socket, machine, rtt)) => {
                     let rx_task = spawn_session_receiver(socket.clone(), sessions.len(), udp_tx.clone());
-                    sessions.push(SessionState { socket, machine, rx_task, last_recv: Instant::now() });
+                    sessions.push(SessionState::new(socket, machine, rx_task));
                     rtt_sum += rtt;
                 }
                 // All sessions use the same server and path: when none has got
@@ -1022,7 +1221,7 @@ impl Bridge {
         &mut self,
         established: Established,
         tx: &mpsc::Sender<UiEvent>,
-        proxy_tx: &mpsc::UnboundedSender<(u16, ProxyToClientMsg)>,
+        proxy_tx: &mpsc::UnboundedSender<(u32, ProxyToClientMsg)>,
         proxy_rx: Option<&mut mpsc::Receiver<ProxyEvent>>,
     ) {
         self.standby = None;
@@ -1031,7 +1230,7 @@ impl Bridge {
         self.last_rtt_ms = established.rtt_ms;
         self.link = Link::Up;
         self.last_sample_at = Instant::now();
-        self.stream_map.clear();
+        self.clear_routes();
 
         if self.established_once {
             // Streams of the lost session are gone, and so are the requests
@@ -1078,6 +1277,10 @@ impl Bridge {
     async fn send_features(&mut self) {
         let payload = Bytes::from(RelayMessage::Features(ostp_core::relay::FEATURE_FLOW_CONTROL).encode());
         for session in self.sessions.iter_mut() {
+            // Flow control is part of every v6 stream: nothing to negotiate.
+            if session.machine.is_v6() {
+                continue;
+            }
             if let Ok(ProtocolAction::SendDatagram(frame)) = session.machine.on_event(OstpEvent::Outbound(0, payload.clone())) {
                 let _ = send_datagram(&session.socket, &frame, false).await;
                 self.metrics.bytes_sent.fetch_add(frame.len() as u64, Ordering::Relaxed);
@@ -1101,18 +1304,20 @@ impl Bridge {
     async fn handle_retransmit(
         &mut self,
         tx: &mpsc::Sender<UiEvent>,
-        proxy_tx: &mpsc::UnboundedSender<(u16, ProxyToClientMsg)>,
+        proxy_tx: &mpsc::UnboundedSender<(u32, ProxyToClientMsg)>,
     ) {
         let mut fatal_err = None;
-        for session in self.sessions.iter_mut() {
+        // Streams this side gave up on (v6): (session, wire id).
+        let mut resets: Vec<(usize, u32)> = std::mem::take(&mut self.pending_resets);
+        for (index, session) in self.sessions.iter_mut().enumerate() {
             match session.machine.on_event(OstpEvent::Tick) {
                 Ok(action) => {
-                    let mut frames = Vec::new();
-                    collect_datagrams(action, &mut frames);
-                    for frame in frames {
+                    let collected = Collected::from(action);
+                    for frame in collected.frames {
                         let _ = send_datagram(&session.socket, &frame, false).await;
                         self.metrics.bytes_sent.fetch_add(frame.len() as u64, Ordering::Relaxed);
                     }
+                    resets.extend(collected.resets.into_iter().map(|stream| (index, stream)));
                 }
                 Err(e) => {
                     fatal_err = Some(e);
@@ -1124,6 +1329,10 @@ impl Bridge {
         if let Some(e) = fatal_err {
             let _ = tx.send(UiEvent::Log(format!("Protocol tick fatal error: {e}"))).await;
             self.begin_reconnect("Protocol error", false, tx, proxy_tx).await;
+            return;
+        }
+        for (index, stream) in resets {
+            self.on_stream_reset(index, stream, tx, proxy_tx).await;
         }
     }
 
@@ -1132,15 +1341,9 @@ impl Bridge {
         &mut self,
         proxy_ev: Option<ProxyEvent>,
         tx: &mpsc::Sender<UiEvent>,
-        proxy_tx: &mpsc::UnboundedSender<(u16, ProxyToClientMsg)>,
+        proxy_tx: &mpsc::UnboundedSender<(u32, ProxyToClientMsg)>,
     ) {
         let Some(ev) = proxy_ev else { return };
-        // A grant for a stream that is gone has nobody to go to.
-        if let ProxyEvent::Consumed { stream_id, .. } = &ev {
-            if !self.stream_map.contains_key(stream_id) {
-                return;
-            }
-        }
         // No session while reconnecting: fail new streams at once so the apps
         // retry instead of waiting on a tunnel that cannot carry them.
         if self.sessions.is_empty() {
@@ -1149,32 +1352,91 @@ impl Bridge {
             }
             return;
         }
-        let (stream_id, relay_msg, is_close) = match ev {
+        // What to do, and for which local connection.
+        enum Do {
+            /// First message of a stream: it gets its id now.
+            Open(RelayMessage),
+            Stream(RelayMessage),
+            /// UDP: a datagram in v6, a stream message in v5.
+            Datagram(RelayMessage),
+            Fin,
+            Close,
+            Gone,
+        }
+        let (local, action) = match ev {
             ProxyEvent::NewStream { stream_id, target } => {
                 let _ = tx.send(UiEvent::Log(crate::logs::ui_proxy_connect(stream_id, &target))).await;
-                (stream_id, RelayMessage::Connect(target), false)
+                (stream_id, Do::Open(RelayMessage::Connect(target)))
             }
             ProxyEvent::UdpAssociate { stream_id } => {
                 let _ = tx.send(UiEvent::Log(format!("Proxy UDP ASSOCIATE stream_id={stream_id}"))).await;
-                (stream_id, RelayMessage::UdpAssociate, false)
+                (stream_id, Do::Open(RelayMessage::UdpAssociate))
             }
             ProxyEvent::UdpData { stream_id, target, payload } => {
-                (stream_id, RelayMessage::UdpData(target, payload.to_vec()), false)
+                (stream_id, Do::Datagram(RelayMessage::UdpData(target, payload.to_vec())))
             }
-            ProxyEvent::Data { stream_id, payload } => (stream_id, RelayMessage::Data(payload.to_vec()), false),
+            ProxyEvent::Data { stream_id, payload } => (stream_id, Do::Stream(RelayMessage::Data(payload.to_vec()))),
+            ProxyEvent::Fin { stream_id } => (stream_id, Do::Fin),
             ProxyEvent::Close { stream_id } => {
                 let _ = tx.send(UiEvent::Log(format!("Proxy CLOSE stream_id={stream_id}"))).await;
-                (stream_id, RelayMessage::Close, true)
+                (stream_id, Do::Close)
             }
-            ProxyEvent::Consumed { stream_id, bytes } => (stream_id, RelayMessage::Window(bytes), false),
+            ProxyEvent::Gone { stream_id } => (stream_id, Do::Gone),
+            ProxyEvent::Consumed { stream_id, bytes } => (stream_id, Do::Stream(RelayMessage::Window(bytes))),
         };
-        let len = self.sessions.len();
-        let session_index = *self.stream_map.entry(stream_id).or_insert_with(|| {
-            rand::thread_rng().gen_range(0..len)
-        });
-        if is_close {
-            self.stream_map.remove(&stream_id);
-        }
+        let is_gone = matches!(action, Do::Gone);
+        let relay_msg = match action {
+            Do::Open(msg) => {
+                if let Err(why) = self.open_route(local) {
+                    // Refused here, at once, with the reason: never a silent hang.
+                    let _ = tx.send(UiEvent::Log(format!("Connection refused: {why}"))).await;
+                    let _ = proxy_tx.send((local, ProxyToClientMsg::Error(why)));
+                    return;
+                }
+                msg
+            }
+            Do::Stream(msg) | Do::Datagram(msg) => msg,
+            Do::Fin => RelayMessage::Fin,
+            // The program's connection ended on an error (or the download
+            // cap): an abort, with the reason in v6.
+            Do::Close => RelayMessage::Abort(ostp_core::relay::ABORT_IO_ERROR),
+            // The proxy is done with the connection; if its stream is still
+            // open this aborts it.
+            Do::Gone => RelayMessage::Abort(ostp_core::relay::ABORT_CLOSED),
+        };
+        let is_datagram = matches!(relay_msg, RelayMessage::UdpData(..));
+        // A connection that has no stream (finished, aborted, reset, refused)
+        // has nobody to send to: its late events are dropped.
+        let Some(route) = self.routes.get_mut(&local) else { return };
+        let (session_index, stream_id, v6) = (route.session, route.wire, route.v6);
+        // Whether the stream is over on our side once this is sent.
+        let mut end_after = false;
+        let relay_msg = match relay_msg {
+            RelayMessage::Fin => {
+                // The program's end of stream: a half-close. Only a v6 stream gets one.
+                if !v6 {
+                    return;
+                }
+                end_after = route.halves.local_fin();
+                RelayMessage::Fin
+            }
+            RelayMessage::Abort(reason) => {
+                end_after = true;
+                if v6 {
+                    let why = if is_gone { "the local connection is gone" } else { "the local connection failed" };
+                    let _ = tx.send(UiEvent::Log(format!("Stream {local} aborted: {why} (reason {reason})"))).await;
+                    RelayMessage::Abort(reason)
+                } else if is_gone {
+                    // v5 has nothing to say about a connection that vanished
+                    // (it never did): the route is only forgotten.
+                    self.release_route(local);
+                    return;
+                } else {
+                    RelayMessage::Close
+                }
+            }
+            other => other,
+        };
         let session = &mut self.sessions[session_index];
         // Stream data goes out in datagrams that fit the MTU: reads from
         // local apps are up to 64 KiB, which as one datagram was a burst of
@@ -1188,7 +1450,13 @@ impl Bridge {
         };
         for relay_msg in messages {
             let out_payload = Bytes::from(relay_msg.encode());
-            match session.machine.on_event(OstpEvent::Outbound(u32::from(stream_id), out_payload)) {
+            let event = if is_datagram && v6 {
+                // UDP of a v6 session: not resent, not ordered.
+                OstpEvent::OutboundDatagram(stream_id, out_payload)
+            } else {
+                OstpEvent::Outbound(stream_id, out_payload)
+            };
+            match session.machine.on_event(event) {
                 Ok(ProtocolAction::SendDatagram(frame)) => {
                     if send_datagram(&session.socket, &frame, self.transport_mode == "udp" ).await.is_ok() {
                         self.metrics.bytes_sent.fetch_add(frame.len() as u64, Ordering::Relaxed);
@@ -1219,6 +1487,9 @@ impl Bridge {
                 }
             }
         }
+        if end_after {
+            self.release_route(local);
+        }
     }
 
 
@@ -1226,7 +1497,7 @@ impl Bridge {
     fn reset_proxy_streams(
         &self,
         tx: &mpsc::Sender<UiEvent>,
-        proxy_tx: &mpsc::UnboundedSender<(u16, ProxyToClientMsg)>,
+        proxy_tx: &mpsc::UnboundedSender<(u32, ProxyToClientMsg)>,
         reason: &str,
     ) {
         if proxy_tx
@@ -1639,7 +1910,10 @@ impl Bridge {
                 collect_datagrams(action, &mut frames);
             }
             if let Ok(action) = session.machine.on_event(OstpEvent::Tick) {
-                collect_datagrams(action, &mut frames);
+                let collected = Collected::from(action);
+                frames.extend(collected.frames);
+                // A stream given up on right here is reset by the next tick of the loop.
+                self.pending_resets.extend(collected.resets.into_iter().map(|stream| (index, stream)));
             }
             for frame in frames {
                 if send_datagram(&session.socket, &frame, false).await.is_ok() {

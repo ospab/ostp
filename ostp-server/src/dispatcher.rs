@@ -1188,6 +1188,38 @@ mod roaming_tests {
         assert_eq!(&got[..], b"reply");
     }
 
+    /// What the server does with a reset (the peer's, or this side giving up on
+    /// a frame): the target is closed and the stream released; a reset of
+    /// stream 0 ends the session.
+    #[test]
+    fn a_stream_reset_closes_its_target_and_stream_0_ends_the_session() {
+        let (mut dispatcher, _client, _) = connected_v6();
+        let (ui_tx, _ui_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut remotes = HashMap::new();
+        dispatcher.open_stream(SID, 3).unwrap();
+        let (cancel_tx, mut cancel_rx) = tokio::sync::mpsc::channel(1);
+        remotes.insert(
+            (SID, 3),
+            crate::RemoteState {
+                data_tx: None,
+                halves: Default::default(),
+                queued: Default::default(),
+                udp_tx: None,
+                cancel_tx,
+                is_dns: false,
+                window: None,
+            },
+        );
+        crate::relay::reset_stream(SID, 3, &mut remotes, &mut dispatcher, &ui_tx);
+        assert!(remotes.is_empty(), "the stream's target is dropped");
+        assert!(cancel_rx.try_recv().is_ok(), "its reader is told to stop");
+        assert_eq!(dispatcher.open_stream(SID, 3), Err(ostp_core::streams::StreamError::Reused), "the id is spent");
+        assert_eq!(dispatcher.active_sessions(), 1, "another stream's reset does not end the session");
+
+        crate::relay::reset_stream(SID, 0, &mut remotes, &mut dispatcher, &ui_tx);
+        assert_eq!(dispatcher.active_sessions(), 0, "without the control stream the session is over");
+    }
+
     fn datagram_frame(client: &mut ProtocolMachine, stream: u32, payload: &'static [u8]) -> Bytes {
         match client.on_event(OstpEvent::OutboundDatagram(stream, Bytes::from_static(payload))).unwrap() {
             ProtocolAction::SendDatagram(d) => d,

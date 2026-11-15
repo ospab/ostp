@@ -23,26 +23,26 @@ fn detail(d: impl Display) -> String {
 
 // The text of a UI event (the log screen of the apps, `[ostp]` lines of the CLI).
 
-pub(crate) fn ui_proxy_connect(stream_id: u16, target: &str) -> String {
+pub(crate) fn ui_proxy_connect(stream_id: u32, target: &str) -> String {
     format!("Proxy CONNECT stream_id={stream_id}{}", target_suffix(target))
 }
 
 /// What the server answered to a stream: its text can name the target.
-pub(crate) fn ui_relay_error(stream_id: u16, msg: &str) -> String {
+pub(crate) fn ui_relay_error(stream_id: u32, msg: &str) -> String {
     format!("Relay error for stream {stream_id}: {}", fmt_error(msg))
 }
 
 // The local proxy.
 
-pub(crate) fn proxy_connect(stream_id: u16, target: &str) {
+pub(crate) fn proxy_connect(stream_id: u32, target: &str) {
     tracing::info!(target: TUNNEL, "proxy CONNECT stream_id={stream_id}{}", target_suffix(target));
 }
 
-pub(crate) fn proxy_connect_request(stream_id: u16, target: &str) {
+pub(crate) fn proxy_connect_request(stream_id: u32, target: &str) {
     tracing::debug!(target: TUNNEL, "proxy CONNECT stream_id={stream_id}{}", target_suffix(target));
 }
 
-pub(crate) fn proxy_bypass(stream_id: u16, target: &str) {
+pub(crate) fn proxy_bypass(stream_id: u32, target: &str) {
     tracing::info!(target: TUNNEL, "proxy BYPASS stream_id={stream_id}{}", target_suffix(target));
 }
 

@@ -194,14 +194,16 @@ async fn create_udp_socket_bypassing_tun(
     Ok(socket)
 }
 
-/// Local connections open at once. Stream ids are 16 bits and the id search
-/// below only ends while one is free; the cap also keeps a runaway program
-/// from taking every descriptor of the machine.
+/// Local connections open at once. The cap keeps a runaway program from taking
+/// every descriptor of the machine (the tunnel's own limit per session is
+/// lower: `ostp_core::streams::MAX_OPEN_STREAMS`).
 const MAX_LOCAL_STREAMS: usize = 20_000;
-/// Download bytes waiting for a local program to read them. The server sends
-/// as fast as the window allows whether or not the program reads (per-stream
-/// flow control is for protocol v6), so a stalled reader would otherwise grow
-/// the client's memory by the whole download. Past it the stream is reset.
+/// Download bytes waiting for a local program to read them. Toward a server
+/// without flow control (v5 before 0.4.7) the server sends as fast as the
+/// path allows whether or not the program reads, so a stalled reader would
+/// otherwise grow the client's memory by the whole download; past it the
+/// stream is reset. With flow control (every v6 stream) the window keeps the
+/// queue under 8 MiB and this is never reached.
 const MAX_QUEUED_DOWNLOAD: usize = 32 * 1024 * 1024;
 /// How long a local program gets to send its first byte (browsers keep
 /// pre-opened sockets idle for a while) and to finish a SOCKS5 or HTTP request.
@@ -229,7 +231,7 @@ pub async fn run_local_socks5_proxy(
     debug: bool,
     mut shutdown: watch::Receiver<bool>,
     proxy_events_tx: mpsc::Sender<ProxyEvent>,
-    mut client_msgs_rx: mpsc::UnboundedReceiver<(u16, ProxyToClientMsg)>,
+    mut client_msgs_rx: mpsc::UnboundedReceiver<(u32, ProxyToClientMsg)>,
 ) -> Result<()> {
     let connect_timeout = Duration::from_millis(cfg.connect_timeout_ms.max(1));
     let listener = TcpListener::bind(&cfg.bind_addr)
@@ -253,8 +255,8 @@ pub async fn run_local_socks5_proxy(
     let (connect_tx, mut connect_rx) = mpsc::channel(128);
     let max_chunk = ostp.mtu.saturating_sub(150).max(512);
 
-    let mut next_stream_id: u16 = 1;
-    let mut active_streams: HashMap<u16, StreamSlot> = HashMap::new();
+    let mut next_stream_id: u32 = 1;
+    let mut active_streams: HashMap<u32, StreamSlot> = HashMap::new();
 
     loop {
         tokio::select! {
@@ -357,7 +359,14 @@ pub async fn run_local_socks5_proxy(
                 }
             }
             Some(stream_id) = connect_rx.recv() => {
-                active_streams.remove(&stream_id);
+                // The connection is over, however it ended. The bridge is told
+                // once: a v6 stream it still holds is aborted and released.
+                if active_streams.remove(&stream_id).is_some() {
+                    let events = proxy_events_tx.clone();
+                    tokio::spawn(async move {
+                        let _ = events.send(ProxyEvent::Gone { stream_id }).await;
+                    });
+                }
             }
         }
     }
@@ -385,8 +394,8 @@ fn extract_host_port(uri: &str, default_port: u16) -> String {
 }
 
 struct StreamGuard {
-    stream_id: u16,
-    close_tx: mpsc::Sender<u16>,
+    stream_id: u32,
+    close_tx: mpsc::Sender<u32>,
 }
 
 impl Drop for StreamGuard {
@@ -402,10 +411,10 @@ impl Drop for StreamGuard {
 async fn handle_udp_associate(
     mut client_tcp: TcpStream,
     udp_socket: tokio::net::UdpSocket,
-    stream_id: u16,
+    stream_id: u32,
     event_tx: mpsc::Sender<ProxyEvent>,
     mut rx: mpsc::UnboundedReceiver<ProxyToClientMsg>,
-    close_tx: mpsc::Sender<u16>,
+    close_tx: mpsc::Sender<u32>,
     debug: bool,
     matcher: ExclusionMatcher,
     connect_timeout: Duration,
@@ -567,7 +576,7 @@ async fn handle_udp_associate(
                             crate::logs::bad_target(&target);
                         }
                     }
-                    Some(ProxyToClientMsg::Close) | Some(ProxyToClientMsg::Error(_)) | None => break,
+                    Some(ProxyToClientMsg::Close) | Some(ProxyToClientMsg::Reset) | Some(ProxyToClientMsg::Error(_)) | None => break,
                     _ => {}
                 }
             }
@@ -638,11 +647,11 @@ fn spawn_direct_udp_reader(
 
 async fn handle_proxy_client(
     mut client: TcpStream,
-    stream_id: u16,
+    stream_id: u32,
     event_tx: mpsc::Sender<ProxyEvent>,
     mut rx: mpsc::UnboundedReceiver<ProxyToClientMsg>,
     queued: Arc<std::sync::atomic::AtomicUsize>,
-    close_tx: mpsc::Sender<u16>,
+    close_tx: mpsc::Sender<u32>,
     connect_timeout: Duration,
     debug: bool,
     mut matcher: ExclusionMatcher,
@@ -670,6 +679,9 @@ async fn handle_proxy_client(
 
     let target: String;
     let is_socks5 = first_byte[0] == 0x05;
+    // Whether the stream behind this connection is a v6 one (see
+    // `ProxyToClientMsg::ConnectOkV6`): half-close, flow control from the start.
+    let v6: bool;
 
     if is_socks5 {
         // ── SOCKS5 Handshake ──────────────────────────────────────────
@@ -769,7 +781,8 @@ async fn handle_proxy_client(
         event_tx.send(ProxyEvent::NewStream { stream_id, target: target.clone() }).await?;
 
         match timeout(connect_timeout, rx.recv()).await {
-            Ok(Some(ProxyToClientMsg::ConnectOk)) => {
+            Ok(Some(ok @ (ProxyToClientMsg::ConnectOk | ProxyToClientMsg::ConnectOkV6))) => {
+                v6 = matches!(ok, ProxyToClientMsg::ConnectOkV6);
                 // SUCCESS: version, 0=success, reserved, IPv4 type, 4 bytes addr, 2 bytes port
                 client.write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await?;
             }
@@ -858,7 +871,8 @@ async fn handle_proxy_client(
         event_tx.send(ProxyEvent::NewStream { stream_id, target: target.clone() }).await?;
 
         match timeout(connect_timeout, rx.recv()).await {
-            Ok(Some(ProxyToClientMsg::ConnectOk)) => {
+            Ok(Some(ok @ (ProxyToClientMsg::ConnectOk | ProxyToClientMsg::ConnectOkV6))) => {
+                v6 = matches!(ok, ProxyToClientMsg::ConnectOkV6);
                 if method == "CONNECT" {
                     // For CONNECT, tell client the tunnel is ready
                     client.write_all(b"HTTP/1.1 200 Connection Established\r\nProxy-Agent: ostp/1.0\r\n\r\n").await?;
@@ -896,12 +910,31 @@ async fn handle_proxy_client(
     // `consumed` what reached the program since the last grant to the server.
     let mut flow_control = false;
     let mut credit: i64 = i64::MAX;
+    // A v6 stream has a window from the start, without a `Window` message.
+    if v6 {
+        flow_control = true;
+        credit = ostp_core::relay::INITIAL_STREAM_WINDOW as i64;
+    }
     let mut consumed: u32 = 0;
+    // v6 half-close: the program closed its side (we sent `Fin`), or the peer
+    // sent its own `Fin`. The connection ends when both have.
+    let mut local_eof = false;
+    let mut remote_fin = false;
     loop {
-        let read_limit = credit.clamp(0, tcp_buf.len() as i64) as usize;
+        let read_limit = if local_eof { 0 } else { credit.clamp(0, tcp_buf.len() as i64) as usize };
         tokio::select! {
             read_res = client.read(&mut tcp_buf[..read_limit]), if read_limit > 0 => {
                 match read_res {
+                    Ok(0) if v6 => {
+                        // The program will send no more but still reads: the
+                        // other direction goes on.
+                        let _ = event_tx.send(ProxyEvent::Fin { stream_id }).await;
+                        tracing::debug!("proxy FIN stream_id={stream_id}");
+                        local_eof = true;
+                        if remote_fin {
+                            break;
+                        }
+                    }
                     Ok(0) => {
                         let _ = event_tx.send(ProxyEvent::Close { stream_id }).await;
                         if true {
@@ -957,10 +990,26 @@ async fn handle_proxy_client(
                             credit = bytes as i64;
                         }
                     }
+                    Some(ProxyToClientMsg::Fin) => {
+                        // The peer will send no more: the program gets its end
+                        // of stream (after every byte before it, which came
+                        // first), and may still write.
+                        remote_fin = true;
+                        let _ = client.shutdown().await;
+                        if local_eof {
+                            break;
+                        }
+                    }
+                    Some(ProxyToClientMsg::Reset) => {
+                        // Aborted or lost: the program must see a reset, not an
+                        // orderly end of a truncated stream.
+                        reset_connection(&client);
+                        break;
+                    }
                     Some(ProxyToClientMsg::Close) | Some(ProxyToClientMsg::Error(_)) | None => {
                         break;
                     }
-                    Some(ProxyToClientMsg::ConnectOk) | Some(ProxyToClientMsg::UdpData(_, _)) => {} // ignored after connect phase
+                    Some(ProxyToClientMsg::ConnectOk) | Some(ProxyToClientMsg::ConnectOkV6) | Some(ProxyToClientMsg::UdpData(_, _)) => {} // ignored after connect phase
                 }
             }
         }
@@ -973,13 +1022,21 @@ async fn handle_proxy_client(
 
 use ostp_core::net::split_host_port;
 
+/// Closes the program's connection with a reset (RST) instead of a FIN: a
+/// zero linger time makes the close abort the connection.
+fn reset_connection(client: &TcpStream) {
+    if let Err(e) = socket2::SockRef::from(client).set_linger(Some(Duration::ZERO)) {
+        tracing::debug!("could not set a zero linger to reset the connection: {e}");
+    }
+}
+
 async fn direct_connect_socks5(
     mut client: TcpStream,
-    stream_id: u16,
+    stream_id: u32,
     target: &str,
     physical_if_index: Option<u32>,
     physical_if_name: &Option<String>,
-    close_tx: mpsc::Sender<u16>,
+    close_tx: mpsc::Sender<u32>,
     _debug: bool,
 ) -> Result<()> {
     crate::logs::proxy_bypass(stream_id, &target);
@@ -993,13 +1050,13 @@ async fn direct_connect_socks5(
 
 async fn direct_connect_http(
     mut client: TcpStream,
-    stream_id: u16,
+    stream_id: u32,
     target: &str,
     method: &str,
     header_bytes: Vec<u8>,
     physical_if_index: Option<u32>,
     physical_if_name: &Option<String>,
-    close_tx: mpsc::Sender<u16>,
+    close_tx: mpsc::Sender<u32>,
     _debug: bool,
 ) -> Result<()> {
     crate::logs::proxy_bypass(stream_id, &target);

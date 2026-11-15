@@ -5,8 +5,15 @@
 //! (UDP and UoT); the transitional mode serves a v5 client; and a v6 profile
 //! that meets a server without v6, or with another key, ends in the clear
 //! error instead of a bare timeout.
+//!
+//! The session layer (stage 2) is checked through the whole chain: a SOCKS5
+//! client talks to the real local proxy, which feeds the real bridge, which
+//! talks to the real server and a target: half-close, thousands of streams in
+//! one session, the stream limit, a UDP flow whose lost datagram is not
+//! resent, and an abort that reaches the program as a reset.
 
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -18,12 +25,12 @@ use ostp_client::tunnel::{ProxyEvent, ProxyToClientMsg};
 use ostp_core::share_link::ShareLink;
 use portable_atomic::{AtomicU32, AtomicU64, AtomicU8};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{mpsc, watch};
 use tokio::time::timeout;
 
 const KEY: &str = "v6-wire-e2e-key";
-const STREAM: u16 = 7;
+const STREAM: u32 = 7;
 
 fn free_port() -> u16 {
     loop {
@@ -38,6 +45,13 @@ fn free_port() -> u16 {
 /// A server whose wire settings come from a config's `protocol` section, the
 /// way `ostp` reads them. `None`: a config without the section.
 async fn start_server(protocol: Option<serde_json::Value>) -> SocketAddr {
+    start_server_bound(protocol, None).await
+}
+
+/// `bind_ip`: the address the server's own outgoing sockets use. The UDP
+/// tests need `127.0.0.1`: without it the association's socket is `[::]`,
+/// which on Windows is IPv6-only and cannot send to an IPv4 target.
+async fn start_server_bound(protocol: Option<serde_json::Value>, bind_ip: Option<&str>) -> SocketAddr {
     let addr: SocketAddr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
     let mut cfg = serde_json::json!({
         "listen": addr.to_string(),
@@ -54,7 +68,7 @@ async fn start_server(protocol: Option<serde_json::Value>) -> SocketAddr {
     let params = ostp_server::ServerParams {
         bind_addrs: vec![addr.to_string()],
         server_public_ip: None,
-        bind_ip: None,
+        bind_ip: bind_ip.map(str::to_string),
         access_keys: vec![(KEY.to_string(), ostp_server::api::UserMeta { name: None, limit_bytes: None, max_devices: None })],
         outbound: None,
         api_config: None,
@@ -105,7 +119,7 @@ async fn start_echo() -> SocketAddr {
 struct Client {
     _cmd: mpsc::Sender<BridgeCommand>,
     proxy_ev: mpsc::Sender<ProxyEvent>,
-    to_app: mpsc::UnboundedReceiver<(u16, ProxyToClientMsg)>,
+    to_app: mpsc::UnboundedReceiver<(u32, ProxyToClientMsg)>,
     logs: Arc<Mutex<Vec<String>>>,
     _shutdown: watch::Sender<bool>,
 }
@@ -165,7 +179,8 @@ impl Client {
     async fn echo_through(&mut self, target: SocketAddr, data: &'static [u8]) {
         self.proxy_ev.send(ProxyEvent::NewStream { stream_id: STREAM, target: target.to_string() }).await.unwrap();
         match timeout(Duration::from_secs(5), self.to_app.recv()).await {
-            Ok(Some((STREAM, ProxyToClientMsg::ConnectOk))) => {}
+            // A v6 stream says so in its ConnectOk.
+            Ok(Some((STREAM, ProxyToClientMsg::ConnectOk | ProxyToClientMsg::ConnectOkV6))) => {}
             _ => panic!("no ConnectOk; log:\n{}", self.log_text()),
         }
         self.proxy_ev.send(ProxyEvent::Data { stream_id: STREAM, payload: Bytes::from_static(data) }).await.unwrap();
@@ -262,4 +277,514 @@ fn a_damaged_server_key_is_refused_without_echoing_it() {
     let p: ProtocolCfg = serde_json::from_value(serde_json::json!({ "server_key": "SECRETSECRET", "accept_v5": true })).unwrap();
     let e = p.private_key().unwrap_err().to_string();
     assert!(!e.contains("SECRETSECRET"), "{e}");
+}
+
+// ── The session layer through the whole chain ────────────────────────────────
+
+/// A SOCKS5 listener (the real local proxy), the real bridge and, behind it,
+/// whatever server address it is given.
+struct Tunnel {
+    socks: SocketAddr,
+    logs: Arc<Mutex<Vec<String>>>,
+    _cmd: mpsc::Sender<BridgeCommand>,
+    _shutdown: watch::Sender<bool>,
+    _exclusions: watch::Sender<ostp_client::config::ExclusionConfig>,
+}
+
+impl Tunnel {
+    async fn start(server: SocketAddr, pk: Option<[u8; 32]>) -> Tunnel {
+        let link = link_to(server, pk);
+        let socks: SocketAddr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
+        let mut cfg = ClientConfig::default();
+        // Not "proxy": that would point the system's proxy setting at the test.
+        cfg.mode = "tun".to_string();
+        cfg.local_proxy.bind_addr = socks.to_string();
+        cfg.ostp.server_addr = link.server();
+        cfg.ostp.access_key = link.key.clone();
+        cfg.ostp.server_pk = link.pk.as_ref().map(ostp_core::server_key::encode_key);
+        cfg.transport.mode = "udp".to_string();
+        cfg.multiplex.enabled = false;
+        let metrics = Arc::new(BridgeMetrics {
+            bytes_sent: AtomicU64::new(0),
+            bytes_recv: AtomicU64::new(0),
+            connection_state: AtomicU8::new(0),
+            rtt_ms: AtomicU32::new(0),
+        });
+        let bridge = Bridge::new(&cfg, metrics).unwrap();
+        let (ui_tx, mut ui_rx) = mpsc::channel(65536);
+        let (cmd_tx, cmd_rx) = mpsc::channel(16);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (proxy_ev_tx, proxy_ev_rx) = mpsc::channel(256);
+        let (to_app_tx, to_app_rx) = mpsc::unbounded_channel();
+        let (excl_tx, excl_rx) = watch::channel(cfg.exclusions.clone());
+        tokio::spawn(bridge.run(ui_tx, cmd_rx, shutdown_rx.clone(), proxy_ev_rx, to_app_tx));
+        tokio::spawn(ostp_client::tunnel::run_local_socks5_proxy(
+            cfg.local_proxy.clone(),
+            cfg.ostp.clone(),
+            excl_rx,
+            false,
+            shutdown_rx,
+            proxy_ev_tx,
+            to_app_rx,
+        ));
+        let logs = Arc::new(Mutex::new(Vec::new()));
+        {
+            let logs = logs.clone();
+            tokio::spawn(async move {
+                while let Some(ev) = ui_rx.recv().await {
+                    if let UiEvent::Log(line) = ev {
+                        logs.lock().unwrap().push(line);
+                    }
+                }
+            });
+        }
+        cmd_tx.send(BridgeCommand::ToggleTunnel).await.unwrap();
+        let t = Tunnel { socks, logs, _cmd: cmd_tx, _shutdown: shutdown_tx, _exclusions: excl_tx };
+        assert!(t.wait_log("Connection established", Duration::from_secs(10)).await, "log:\n{}", t.log_text());
+        for _ in 0..100 {
+            if TcpStream::connect(socks).await.is_ok() {
+                return t;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("the local proxy did not start on {socks}");
+    }
+
+    async fn wait_log(&self, needle: &str, within: Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + within;
+        while tokio::time::Instant::now() < deadline {
+            if self.logs.lock().unwrap().iter().any(|l| l.contains(needle)) {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        false
+    }
+
+    fn log_text(&self) -> String {
+        self.logs.lock().unwrap().join("\n")
+    }
+
+    /// A connection to `target` through the tunnel, as a SOCKS5 client makes
+    /// it. `Err` is the SOCKS reply code of a refusal.
+    async fn connect(&self, target: SocketAddr) -> Result<TcpStream, u8> {
+        // Thousands of short connections can use up the machine's ephemeral
+        // ports (Windows keeps closed ones for two minutes): wait for one.
+        let mut s = {
+            let mut tries = 0;
+            loop {
+                match TcpStream::connect(self.socks).await {
+                    Ok(s) => break s,
+                    Err(e) if e.kind() == std::io::ErrorKind::AddrInUse && tries < 100 => {
+                        tries += 1;
+                        tokio::time::sleep(Duration::from_millis(250)).await;
+                    }
+                    Err(e) => panic!("cannot connect to the local proxy: {e}"),
+                }
+            }
+        };
+        s.write_all(&[5, 1, 0]).await.unwrap();
+        let mut method = [0u8; 2];
+        s.read_exact(&mut method).await.unwrap();
+        let ip = match target.ip() {
+            std::net::IpAddr::V4(ip) => ip.octets(),
+            _ => panic!("IPv4 targets only"),
+        };
+        let mut req = vec![5, 1, 0, 1];
+        req.extend_from_slice(&ip);
+        req.extend_from_slice(&target.port().to_be_bytes());
+        s.write_all(&req).await.unwrap();
+        let mut rep = [0u8; 10];
+        match timeout(Duration::from_secs(20), s.read_exact(&mut rep)).await {
+            Ok(Ok(_)) if rep[1] == 0 => Ok(s),
+            Ok(Ok(_)) => Err(rep[1]),
+            _ => Err(255),
+        }
+    }
+}
+
+async fn v6_tunnel() -> (Tunnel, SocketAddr) {
+    let (protocol, public) = section(false);
+    let server = start_server(Some(protocol)).await;
+    (Tunnel::start(server, Some(public)).await, server)
+}
+
+/// Reads to the end of the stream, then answers with the number of bytes it
+/// got (8 bytes) and `reply_len` bytes of a pattern, then closes: what a
+/// request/response server does after a client that has shut its write side.
+async fn start_reply_after_eof(reply_len: usize) -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let (mut s, _) = listener.accept().await.unwrap();
+            tokio::spawn(async move {
+                let mut got = 0u64;
+                let mut buf = vec![0u8; 64 * 1024];
+                loop {
+                    match s.read(&mut buf).await {
+                        Ok(0) => break,
+                        Ok(n) => got += n as u64,
+                        Err(_) => return,
+                    }
+                }
+                let mut reply = got.to_be_bytes().to_vec();
+                reply.extend((0..reply_len).map(|i| (i % 251) as u8));
+                let _ = s.write_all(&reply).await;
+                let _ = s.shutdown().await;
+            });
+        }
+    });
+    addr
+}
+
+/// The app sends a request, shuts down its write side and still receives the
+/// whole reply. Before the half-close a program's end of stream closed the
+/// stream and the reply was lost.
+#[tokio::test(flavor = "multi_thread")]
+async fn half_close_the_app_shuts_its_write_side_and_still_gets_the_whole_reply() {
+    let (tunnel, _) = v6_tunnel().await;
+    let reply_len = 400_000;
+    let target = start_reply_after_eof(reply_len).await;
+    let mut app = tunnel.connect(target).await.unwrap_or_else(|c| panic!("refused ({c}); log:\n{}", tunnel.log_text()));
+
+    let request: Vec<u8> = (0..300_000).map(|i| (i % 241) as u8).collect();
+    app.write_all(&request).await.unwrap();
+    app.shutdown().await.unwrap(); // FIN: "I will write no more"
+
+    let mut reply = Vec::new();
+    timeout(Duration::from_secs(30), app.read_to_end(&mut reply))
+        .await
+        .unwrap_or_else(|_| panic!("the reply did not arrive; got {} bytes; log:\n{}", reply.len(), tunnel.log_text()))
+        .unwrap_or_else(|e| panic!("an orderly end of stream was expected, got {e}; got {} bytes; log:\n{}", reply.len(), tunnel.log_text()));
+    assert_eq!(reply.len(), 8 + reply_len, "the whole reply");
+    assert_eq!(u64::from_be_bytes(reply[..8].try_into().unwrap()), request.len() as u64, "the target got the whole request before its end");
+    assert!(reply[8..].iter().enumerate().all(|(i, b)| *b == (i % 251) as u8), "the reply is intact");
+}
+
+/// The other direction: the target finishes first, the app still writes.
+#[tokio::test(flavor = "multi_thread")]
+async fn half_close_the_target_finishes_and_the_app_may_still_write() {
+    let (tunnel, _) = v6_tunnel().await;
+    // Sends its greeting and closes its write side; then reads what the app
+    // sends until the app is done, and reports how much that was.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let target = listener.local_addr().unwrap();
+    let (done_tx, mut done_rx) = mpsc::unbounded_channel::<usize>();
+    tokio::spawn(async move {
+        let (mut s, _) = listener.accept().await.unwrap();
+        s.write_all(b"greeting").await.unwrap();
+        s.shutdown().await.unwrap();
+        let mut total = 0;
+        let mut buf = vec![0u8; 16 * 1024];
+        while let Ok(n) = s.read(&mut buf).await {
+            if n == 0 {
+                break;
+            }
+            total += n;
+        }
+        let _ = done_tx.send(total);
+    });
+    let mut app = tunnel.connect(target).await.unwrap();
+    let mut greeting = [0u8; 8];
+    timeout(Duration::from_secs(10), app.read_exact(&mut greeting)).await.unwrap().unwrap();
+    assert_eq!(&greeting, b"greeting");
+    // The target's end of stream arrives as an end of stream, and the app can still write.
+    let mut rest = Vec::new();
+    timeout(Duration::from_secs(10), app.read_to_end(&mut rest)).await.unwrap().unwrap();
+    assert!(rest.is_empty());
+    app.write_all(&vec![9u8; 100_000]).await.unwrap();
+    app.shutdown().await.unwrap();
+    let total = timeout(Duration::from_secs(10), done_rx.recv()).await.unwrap().unwrap();
+    assert_eq!(total, 100_000, "the write after the target's end of stream reached it");
+}
+
+/// One session carries far more streams than the receiver tracks at once
+/// (2048): finished streams are released. Without that, the streams after the
+/// 2048th get no answer. (Each stream is two short TCP connections of the
+/// machine, so running this twice within two minutes can wait on the
+/// ephemeral ports.)
+#[tokio::test(flavor = "multi_thread")]
+async fn more_than_3000_streams_in_one_session() {
+    let (tunnel, _) = v6_tunnel().await;
+    let echo = start_echo().await;
+    let tunnel = Arc::new(tunnel);
+    let mut workers = Vec::new();
+    for w in 0..8u8 {
+        let tunnel = tunnel.clone();
+        workers.push(tokio::spawn(async move {
+            for i in 0..400u32 {
+                let mut app = tunnel.connect(echo).await.unwrap_or_else(|c| panic!("worker {w} stream {i} refused ({c}); log:\n{}", tunnel.log_text()));
+                let msg = [w, (i >> 8) as u8, i as u8, 1, 2, 3, 4, 5];
+                app.write_all(&msg).await.unwrap();
+                let mut back = [0u8; 8];
+                timeout(Duration::from_secs(10), app.read_exact(&mut back))
+                    .await
+                    .unwrap_or_else(|_| panic!("worker {w} stream {i}: no echo; log:\n{}", tunnel.log_text()))
+                    .unwrap();
+                assert_eq!(back, msg);
+                // Dropped: its end of stream finishes the stream on both sides.
+            }
+        }));
+    }
+    for h in workers {
+        timeout(Duration::from_secs(240), h).await.expect("3200 streams in time").unwrap();
+    }
+    assert!(!tunnel.log_text().contains("refused"), "no stream was refused:\n{}", tunnel.log_text());
+    // And the session still takes a new one.
+    let mut app = tunnel.connect(echo).await.unwrap();
+    app.write_all(b"still here").await.unwrap();
+    let mut back = [0u8; 10];
+    timeout(Duration::from_secs(10), app.read_exact(&mut back)).await.unwrap().unwrap();
+    assert_eq!(&back, b"still here");
+}
+
+/// At the limit of open streams the new connection is refused at once with a
+/// clear error; a stream that ends gives its slot back.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_1024_open_streams_limit_refuses_the_next_connection_and_frees_with_the_end() {
+    let (tunnel, _) = v6_tunnel().await;
+    let echo = start_echo().await;
+    let mut open = Vec::new();
+    for i in 0..ostp_core::streams::MAX_OPEN_STREAMS {
+        match tunnel.connect(echo).await {
+            Ok(s) => open.push(s),
+            Err(c) => panic!("connection {i} refused ({c}) below the limit; log:\n{}", tunnel.log_text()),
+        }
+    }
+    let started = std::time::Instant::now();
+    let refused = tunnel.connect(echo).await.err().expect("the 1025th connection is refused");
+    assert_ne!(refused, 0);
+    assert!(started.elapsed() < Duration::from_secs(5), "refused at once, not after a timeout");
+    assert!(
+        tunnel.wait_log("too many open streams", Duration::from_secs(2)).await,
+        "the reason is logged; log tail:\n{}",
+        tunnel.log_text().lines().rev().take(5).collect::<Vec<_>>().join("\n")
+    );
+    // Some end; their slots come back.
+    drop(open.drain(..20));
+    let mut ok = false;
+    for _ in 0..50 {
+        if tunnel.connect(echo).await.is_ok() {
+            ok = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(ok, "a finished stream frees its slot; log:\n{}", tunnel.log_text());
+}
+
+/// What the program sees when the target's connection is reset: a reset, not
+/// a quiet end of stream that looks like a complete reply.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_aborted_stream_reaches_the_app_as_a_reset() {
+    let (tunnel, _) = v6_tunnel().await;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let target = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (mut s, _) = listener.accept().await.unwrap();
+        let mut b = [0u8; 1];
+        let _ = s.read(&mut b).await;
+        s.write_all(b"partial reply").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        #[allow(deprecated)] // the test wants exactly the reset
+        s.set_linger(Some(Duration::ZERO)).unwrap();
+        drop(s); // RST to the server
+    });
+    let mut app = tunnel.connect(target).await.unwrap();
+    app.write_all(b"x").await.unwrap();
+    let mut got = Vec::new();
+    let mut buf = [0u8; 64];
+    let end = loop {
+        match timeout(Duration::from_secs(10), app.read(&mut buf)).await {
+            Ok(Ok(0)) => break Ok(()),
+            Ok(Ok(n)) => got.extend_from_slice(&buf[..n]),
+            Ok(Err(e)) => break Err(e),
+            Err(_) => panic!("neither a reset nor an end; log:\n{}", tunnel.log_text()),
+        }
+    };
+    assert_eq!(&got, b"partial reply");
+    let e = end.expect_err("the program must see a reset, not an orderly end");
+    assert_eq!(e.kind(), std::io::ErrorKind::ConnectionReset, "{e}");
+}
+
+/// A UDP relay that can be told to drop everything, standing in for a path
+/// that loses packets: client -> relay -> server.
+async fn start_lossy_relay(server: SocketAddr, blackout: Arc<AtomicBool>) -> SocketAddr {
+    let sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    let addr = sock.local_addr().unwrap();
+    let to_server = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    let client: Arc<Mutex<Option<SocketAddr>>> = Arc::new(Mutex::new(None));
+    {
+        let (sock, to_server, client, blackout) = (sock.clone(), to_server.clone(), client.clone(), blackout.clone());
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 65535];
+            while let Ok((n, from)) = sock.recv_from(&mut buf).await {
+                *client.lock().unwrap() = Some(from);
+                if !blackout.load(Ordering::Relaxed) {
+                    let _ = to_server.send_to(&buf[..n], server).await;
+                }
+            }
+        });
+    }
+    tokio::spawn(async move {
+        let mut buf = vec![0u8; 65535];
+        while let Ok((n, _)) = to_server.recv_from(&mut buf).await {
+            let to = *client.lock().unwrap();
+            if let (Some(to), false) = (to, blackout.load(Ordering::Relaxed)) {
+                let _ = sock.send_to(&buf[..n], to).await;
+            }
+        }
+    });
+    addr
+}
+
+/// A UDP target that echoes and remembers everything it was sent.
+async fn start_udp_echo() -> (SocketAddr, Arc<Mutex<Vec<Vec<u8>>>>) {
+    let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let addr = sock.local_addr().unwrap();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let log = seen.clone();
+    tokio::spawn(async move {
+        let mut buf = vec![0u8; 65535];
+        while let Ok((n, from)) = sock.recv_from(&mut buf).await {
+            log.lock().unwrap().push(buf[..n].to_vec());
+            let _ = sock.send_to(&buf[..n], from).await;
+        }
+    });
+    (addr, seen)
+}
+
+/// A SOCKS5 UDP association through the tunnel.
+struct UdpFlow {
+    _control: TcpStream,
+    sock: UdpSocket,
+    relay: SocketAddr,
+}
+
+impl UdpFlow {
+    async fn open(tunnel: &Tunnel) -> UdpFlow {
+        let mut control = TcpStream::connect(tunnel.socks).await.unwrap();
+        control.write_all(&[5, 1, 0]).await.unwrap();
+        let mut method = [0u8; 2];
+        control.read_exact(&mut method).await.unwrap();
+        control.write_all(&[5, 3, 0, 1, 0, 0, 0, 0, 0, 0]).await.unwrap();
+        let mut rep = [0u8; 10];
+        control.read_exact(&mut rep).await.unwrap();
+        assert_eq!(rep[1], 0, "UDP ASSOCIATE accepted");
+        let relay = SocketAddr::from(([127, 0, 0, 1], u16::from_be_bytes([rep[8], rep[9]])));
+        UdpFlow { _control: control, sock: UdpSocket::bind("127.0.0.1:0").await.unwrap(), relay }
+    }
+
+    async fn send(&self, target: SocketAddr, payload: &[u8]) {
+        let ip = match target.ip() {
+            std::net::IpAddr::V4(ip) => ip.octets(),
+            _ => unreachable!(),
+        };
+        let mut packet = vec![0, 0, 0, 1];
+        packet.extend_from_slice(&ip);
+        packet.extend_from_slice(&target.port().to_be_bytes());
+        packet.extend_from_slice(payload);
+        self.sock.send_to(&packet, self.relay).await.unwrap();
+    }
+
+    async fn recv(&self, within: Duration) -> Option<Vec<u8>> {
+        let mut buf = vec![0u8; 65535];
+        match timeout(within, self.sock.recv_from(&mut buf)).await {
+            Ok(Ok((n, _))) if n > 10 => Some(buf[10..n].to_vec()),
+            _ => None,
+        }
+    }
+}
+
+/// UDP rides in datagrams: it works over a v6 session, and a datagram lost on
+/// the path is lost, not resent when the path comes back, while stream data
+/// sent in the same blackout is delivered (it is resent). (The give-up and
+/// reset of a stream after minutes of loss is checked in ostp-core: it cannot
+/// be waited for here.)
+#[tokio::test(flavor = "multi_thread")]
+async fn a_udp_flow_works_and_a_datagram_lost_on_the_path_is_not_resent() {
+    let (protocol, public) = section(false);
+    let server = start_server_bound(Some(protocol), Some("127.0.0.1")).await;
+    let blackout = Arc::new(AtomicBool::new(false));
+    let relay = start_lossy_relay(server, blackout.clone()).await;
+    let tunnel = Tunnel::start(relay, Some(public)).await;
+    let (udp_target, seen) = start_udp_echo().await;
+    let tcp_target = start_echo().await;
+
+    // The flows work.
+    let flow = UdpFlow::open(&tunnel).await;
+    flow.send(udp_target, b"warm-up").await;
+    assert_eq!(flow.recv(Duration::from_secs(5)).await.as_deref(), Some(&b"warm-up"[..]), "UDP echo; log:\n{}", tunnel.log_text());
+    for i in 0..20u8 {
+        flow.send(udp_target, &[i; 100]).await;
+        assert_eq!(flow.recv(Duration::from_secs(5)).await.as_deref(), Some(&[i; 100][..]));
+    }
+    let mut tcp = tunnel.connect(tcp_target).await.unwrap();
+
+    // A blackout: nothing gets through in either direction.
+    blackout.store(true, Ordering::Relaxed);
+    flow.send(udp_target, b"lost-in-the-blackout").await;
+    tcp.write_all(b"stream-data-in-the-blackout").await.unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    blackout.store(false, Ordering::Relaxed);
+
+    // The stream data is resent and arrives (echoed back).
+    let mut back = vec![0u8; "stream-data-in-the-blackout".len()];
+    timeout(Duration::from_secs(20), tcp.read_exact(&mut back))
+        .await
+        .unwrap_or_else(|_| panic!("the stream data was not resent; log:\n{}", tunnel.log_text()))
+        .unwrap();
+    assert_eq!(&back, b"stream-data-in-the-blackout");
+
+    // The datagram is not: give every retransmission a chance, then look.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert!(
+        !seen.lock().unwrap().iter().any(|p| p == b"lost-in-the-blackout"),
+        "a lost datagram was delivered after the path came back, so it was resent"
+    );
+    assert!(flow.recv(Duration::from_millis(200)).await.is_none(), "and no echo of it either");
+
+    // The flow goes on.
+    flow.send(udp_target, b"after").await;
+    assert_eq!(flow.recv(Duration::from_secs(5)).await.as_deref(), Some(&b"after"[..]));
+}
+
+/// A 0.4.x profile against the transitional server: the old behaviour, through
+/// the same proxy. Its streams use 16-bit ids, a program's end of stream is a
+/// `Close`, and UDP is a stream message.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_v5_profile_through_the_proxy_behaves_as_before() {
+    let (protocol, _) = section(true);
+    let server = start_server_bound(Some(protocol), Some("127.0.0.1")).await;
+    let tunnel = Tunnel::start(server, None).await;
+    let echo = start_echo().await;
+    let (udp_target, _) = start_udp_echo().await;
+
+    // Many streams in a row, a larger transfer, and UDP.
+    for i in 0..300u32 {
+        let mut app = tunnel.connect(echo).await.unwrap_or_else(|c| panic!("stream {i} refused ({c}); log:\n{}", tunnel.log_text()));
+        let msg = i.to_be_bytes();
+        app.write_all(&msg).await.unwrap();
+        let mut back = [0u8; 4];
+        timeout(Duration::from_secs(10), app.read_exact(&mut back)).await.unwrap().unwrap();
+        assert_eq!(back, msg);
+    }
+    let mut app = tunnel.connect(echo).await.unwrap();
+    let data: Vec<u8> = (0..500_000).map(|i| (i % 253) as u8).collect();
+    let (mut rd, mut wr) = app.split();
+    let send = async { wr.write_all(&data).await.unwrap() };
+    let recv = async {
+        let mut got = vec![0u8; data.len()];
+        rd.read_exact(&mut got).await.unwrap();
+        got
+    };
+    let (_, got) = timeout(Duration::from_secs(30), async { tokio::join!(send, recv) }).await.expect("the transfer");
+    assert_eq!(got, data);
+
+    let flow = UdpFlow::open(&tunnel).await;
+    flow.send(udp_target, b"v5 udp").await;
+    assert_eq!(flow.recv(Duration::from_secs(5)).await.as_deref(), Some(&b"v5 udp"[..]));
+    let log = tunnel.log_text();
+    assert!(!log.contains("refused") && !log.contains("reset"), "{log}");
 }

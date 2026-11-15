@@ -19,7 +19,7 @@ use tokio::sync::{mpsc, watch};
 use tokio::time::timeout;
 
 const KEY: &str = "roaming-e2e-key";
-const STREAM: u16 = 7;
+const STREAM: u32 = 7;
 
 fn free_port() -> u16 {
     // UDP and TCP on the same port: the server binds both.
@@ -214,7 +214,7 @@ async fn start_relay(upstream: SocketAddr) -> Relay {
 struct Client {
     cmd: mpsc::Sender<BridgeCommand>,
     proxy_ev: mpsc::Sender<ProxyEvent>,
-    to_app: mpsc::UnboundedReceiver<(u16, ProxyToClientMsg)>,
+    to_app: mpsc::UnboundedReceiver<(u32, ProxyToClientMsg)>,
     logs: Arc<Mutex<Vec<String>>>,
     _shutdown: watch::Sender<bool>,
 }
@@ -348,8 +348,11 @@ fn client_handshakes(client: &Client) -> usize {
 fn describe(msg: &ProxyToClientMsg) -> String {
     match msg {
         ProxyToClientMsg::ConnectOk => "ConnectOk".into(),
+        ProxyToClientMsg::ConnectOkV6 => "ConnectOkV6".into(),
         ProxyToClientMsg::Data(d) => format!("Data({} bytes)", d.len()),
         ProxyToClientMsg::UdpData(t, d) => format!("UdpData({t}, {} bytes)", d.len()),
+        ProxyToClientMsg::Fin => "Fin".into(),
+        ProxyToClientMsg::Reset => "Reset".into(),
         ProxyToClientMsg::Close => "Close".into(),
         ProxyToClientMsg::Error(e) => format!("Error({e})"),
         ProxyToClientMsg::Window(n) => format!("Window({n})"),
