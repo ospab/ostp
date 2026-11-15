@@ -5,6 +5,7 @@ pub mod fmt;
 pub mod framing;
 pub mod http_upgrade;
 pub mod keys;
+pub mod logpriv;
 pub mod net;
 pub mod protocol;
 pub mod relay;
