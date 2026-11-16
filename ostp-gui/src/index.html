@@ -732,6 +732,19 @@
       </div>
     </div>
 
+    <!-- A server's user: its settings, or the form for a new one (servers.js) -->
+    <div id="user-modal" class="modal-overlay hidden">
+      <div class="modal-content wide" role="dialog" aria-modal="true" aria-labelledby="user-modal-title">
+        <h3 class="modal-title" id="user-modal-title"></h3>
+        <div id="user-modal-body"></div>
+        <p class="field-hint is-error" id="user-modal-error"></p>
+        <div class="modal-actions">
+          <button id="btn-user-modal-cancel" class="btn secondary" data-dismiss>Cancel</button>
+          <button id="btn-user-modal-save" class="btn primary">Save</button>
+        </div>
+      </div>
+    </div>
+
   <script type="module" src="main.js"></script>
 </body>
 </html>

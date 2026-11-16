@@ -924,6 +924,16 @@ textarea.field-input { resize: vertical; min-height: 38px; line-height: 1.4; pad
 .card-note { font-size: 0.72rem; color: var(--c-txt-2); line-height: 1.5; margin: -4px 2px 12px; }
 .server-card .profile-server { font-size: 0.68rem; }
 .user-card { border: 1px solid var(--c-card-border); background: var(--c-card); border-radius: var(--r-md); padding: 11px 12px 11px 14px; margin-bottom: 8px; }
+.user-card.openable { cursor: pointer; }
+.user-card.openable:hover, .user-card.openable:focus-visible { border-color: rgba(var(--c-fg-rgb),0.22); outline: none; }
+.user-chevron { color: var(--c-txt-3); flex-shrink: 0; }
+.copy-row { display: flex; align-items: center; gap: 8px; padding: 9px 14px; border-top: 1px solid rgba(var(--c-fg-rgb),0.04); }
+.copy-row:first-child { border-top: none; }
+.copy-row .k { font-size: 0.7rem; color: var(--c-txt-2); }
+.copy-row .v { font-size: 0.7rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.copy-row > div { flex: 1; min-width: 0; }
+.user-modal-section { font-size: 0.66rem; letter-spacing: 0.12em; text-transform: uppercase; color: var(--c-txt-3); margin: 16px 2px 8px; }
+.user-modal-danger { width: 100%; margin-top: 14px; }
 .user-head { display: flex; align-items: center; gap: 8px; }
 .user-name { flex: 1; font-weight: 600; font-size: 0.86rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .online-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--c-txt-3); flex-shrink: 0; }

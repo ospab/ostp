@@ -10,10 +10,15 @@ Older history is on the [Releases](https://github.com/ospab/ostp/releases) page 
 
 ### Added
 - `ostp manage user-set USER [--name N] [--limit-bytes N] [--devices N]` changes a user's name and limits in one write; an option left out keeps its value, 0 removes a limit. `ostp manage user-add` takes `--key`, `--limit-bytes` and `--devices`, so a user is created with everything at once. The apps may run `user-set`.
+- Apps, server management, Users: a tap (Android) or click (desktop) on a user opens its settings: name, traffic limit in GB, device limit, the access key, subscription and links to copy, traffic, online state, the devices that fetched the subscription, Add to this app, Share and Revoke. Add opens the same form empty: the name (marked *) is required; the access key may be pasted or left empty for a random one; limits are optional. The field above the list searches users by name. A change is saved with one `ostp manage` call; against a server too old for `user-set` or the new `user-add` options the app says to update OSTP on the server.
 
 ### Changed
 - `ostp manage` answers a person at a terminal in text, like the other commands (a table of users, `✓ pops: at most 1 device(s) on the subscription`, `[error] ...`), and prints JSON as before when there is no terminal, which is how the apps run it over SSH; `--json` asks for JSON at a terminal too. The command is listed in `ostp --help`.
 - `ostp manage` names the users when none matches what was given (`no user matches user1. Users: #1, pops`).
+
+### Fixed
+- Desktop app, server DNS: the empty upstream list showed a broken character instead of a dash (`servers.js` had one Windows-1252 byte; the file is UTF-8 again).
+- Desktop app: reading a user's devices or the DNS settings no longer counts as a change, so it does not block a change on the same server.
 
 ## [0.5.0-alpha.2] - 2026-11-17
 

@@ -332,105 +332,30 @@ class _ServerScreenState extends State<ServerScreen> {
   // ── Users ─────────────────────────────────────────────────────────────
   Widget _users(Map<String, dynamic> r) {
     final users = (r['users'] as List? ?? const []).cast<Map<String, dynamic>>();
-    final newName = TextEditingController();
-    Future<void> add() async {
-      final name = newName.text.trim();
-      if (name.isEmpty) return;
-      try {
-        final r = await _manage(['user-add', name]);
-        _toast('User $name added');
-        // The new user may be for someone else: "Not now" leaves the app as is.
-        final user = r['user'];
-        if (user is Map<String, dynamic> && mounted) {
-          final n = await ServersApi.addUserToApp(context, widget.prefs, _server['name'] as String, user, cancelLabel: 'Not now');
-          if (n != null && n > 0) _toast('Added $n profile(s)');
-        }
-        _refresh();
-      } catch (e) {
-        _toast(e.toString(), error: true);
-      }
-    }
-
-    return ListView(padding: const EdgeInsets.all(16), children: [
-      Row(children: [
-        Expanded(
-          child: TextField(
-            controller: newName,
-            decoration: const InputDecoration(hintText: "New user's name, e.g. phone", isDense: true),
-            onSubmitted: (_) => add(),
-          ),
-        ),
-        const SizedBox(width: 10),
-        FilledButton(onPressed: add, child: const Text('Add')),
-      ]),
-      const SizedBox(height: 14),
-      for (final u in users) _userCard(u),
-      _Note('Traffic is kept across restarts and updates'
-          '${r['stats_at'] != null ? ', as of ${TimeOfDay.fromDateTime(DateTime.fromMillisecondsSinceEpoch(((r['stats_at'] as num) * 1000).toInt())).format(context)}' : ''}.'),
-    ]);
+    final statsAt = r['stats_at'] as num?;
+    return _UsersTab(
+      users: users,
+      note: 'Traffic is kept across restarts and updates'
+          '${statsAt != null ? ', as of ${TimeOfDay.fromDateTime(DateTime.fromMillisecondsSinceEpoch((statsAt * 1000).toInt())).format(context)}' : ''}.',
+      onOpen: _openUser,
+    );
   }
 
-  Widget _userCard(Map<String, dynamic> u) {
-    final name = (u['name'] as String?)?.isNotEmpty == true ? u['name'] as String : 'user ${u['number']}';
-    final traffic = u['bytes_down'] != null ? '↓ ${fmtBytes(u['bytes_down'] as num)} · ↑ ${fmtBytes(u['bytes_up'] as num?)}' : 'no traffic yet';
-    final who = '${u['number']}';
-    return Card(
-      margin: const EdgeInsets.only(bottom: 10),
-      child: Padding(
-        padding: const EdgeInsets.fromLTRB(14, 6, 4, 10),
-        child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-          Row(children: [
-            Icon(Icons.circle, size: 9, color: u['online'] == true ? _green : Colors.white24),
-            const SizedBox(width: 8),
-            Expanded(child: Text(name, style: const TextStyle(fontWeight: FontWeight.w600), overflow: TextOverflow.ellipsis)),
-            IconButton(
-              tooltip: 'Add to this app',
-              icon: const Icon(Icons.download, size: 20),
-              onPressed: () async {
-                final n = await ServersApi.addUserToApp(context, widget.prefs, _server['name'] as String, u);
-                if (n != null) _toast(n > 0 ? 'Added $n profile(s)' : 'Already in the app');
-              },
-            ),
-            IconButton(tooltip: 'Share', icon: const Icon(Icons.qr_code, size: 20), onPressed: () => _share(name, u)),
-            PopupMenuButton<String>(
-              onSelected: (a) async {
-                if (a == 'rename') {
-                  final v = await _prompt('Rename user', null, {'name': ('Name', false, (u['name'] as String?) ?? '')});
-                  if (v == null || v['name']!.trim().isEmpty) return;
-                  try {
-                    await _manage(['user-rename', who, v['name']!.trim()]);
-                    _refresh();
-                  } catch (e) {
-                    _toast(e.toString(), error: true);
-                  }
-                } else if (a == 'revoke') {
-                  if (!await _confirm('Revoke $name?', 'Their key stops working at once. Profiles made from it stop connecting.', ok: 'Revoke')) {
-                    return;
-                  }
-                  try {
-                    await _manage(['user-remove', u['key'] as String]);
-                    _refresh();
-                  } catch (e) {
-                    _toast(e.toString(), error: true);
-                  }
-                }
-              },
-              itemBuilder: (_) => const [
-                PopupMenuItem(value: 'rename', child: Text('Rename')),
-                PopupMenuItem(value: 'revoke', child: Text('Revoke', style: TextStyle(color: Colors.redAccent))),
-              ],
-            ),
-          ]),
-          Padding(
-            padding: const EdgeInsets.only(left: 17),
-            child: Text(
-              '$traffic${u['limit_bytes'] != null ? ' · limit ${fmtBytes(u['limit_bytes'] as num)}' : ''}',
-              style: const TextStyle(color: Colors.white54, fontSize: 12),
-            ),
-          ),
-        ]),
+  /// The user's settings, or an empty form for a new user (`u` null).
+  Future<void> _openUser(Map<String, dynamic>? u) async {
+    final changed = await Navigator.push<bool>(
+      context,
+      MaterialPageRoute(
+        builder: (_) => _UserEditor(
+          user: u,
+          manage: _manage,
+          share: _share,
+          addToApp: (user, {String cancelLabel = 'Cancel'}) =>
+              ServersApi.addUserToApp(context, widget.prefs, _server['name'] as String, user, cancelLabel: cancelLabel),
+        ),
       ),
     );
+    if (changed == true) _refresh();
   }
 
   void _share(String name, Map<String, dynamic> u) {
@@ -847,6 +772,395 @@ class _LogViewState extends State<_LogView> {
           ),
         ),
     ]);
+  }
+}
+
+String _userName(Map<String, dynamic> u) =>
+    (u['name'] as String?)?.isNotEmpty == true ? u['name'] as String : 'user ${u['number']}';
+
+const _gib = 1024 * 1024 * 1024;
+
+extension on String {
+  String ifEmpty(String other) => isEmpty ? other : this;
+}
+
+/// The Users tab: search by name, Add, and a card per user that opens its settings.
+class _UsersTab extends StatefulWidget {
+  final List<Map<String, dynamic>> users;
+  final String note;
+  final Future<void> Function(Map<String, dynamic>? user) onOpen;
+  const _UsersTab({required this.users, required this.note, required this.onOpen});
+
+  @override
+  State<_UsersTab> createState() => _UsersTabState();
+}
+
+class _UsersTabState extends State<_UsersTab> {
+  final _search = TextEditingController();
+
+  @override
+  void dispose() {
+    _search.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final q = _search.text.trim().toLowerCase();
+    final shown = q.isEmpty ? widget.users : widget.users.where((u) => _userName(u).toLowerCase().contains(q)).toList();
+    return ListView(padding: const EdgeInsets.all(16), children: [
+      Row(children: [
+        Expanded(
+          child: TextField(
+            controller: _search,
+            onChanged: (_) => setState(() {}),
+            decoration: InputDecoration(
+              hintText: 'Search by name',
+              isDense: true,
+              prefixIcon: const Icon(Icons.search, size: 20),
+              suffixIcon: q.isEmpty
+                  ? null
+                  : IconButton(
+                      icon: const Icon(Icons.close, size: 18),
+                      onPressed: () => setState(_search.clear),
+                    ),
+            ),
+          ),
+        ),
+        const SizedBox(width: 10),
+        FilledButton(onPressed: () => widget.onOpen(null), child: const Text('Add')),
+      ]),
+      const SizedBox(height: 14),
+      for (final u in shown) _card(u),
+      if (shown.isEmpty)
+        Padding(
+          padding: const EdgeInsets.symmetric(vertical: 24),
+          child: Text(q.isEmpty ? 'No users.' : 'No user named like "${_search.text.trim()}".',
+              textAlign: TextAlign.center, style: const TextStyle(color: Colors.white54)),
+        ),
+      _Note(widget.note),
+    ]);
+  }
+
+  Widget _card(Map<String, dynamic> u) {
+    final traffic = u['bytes_down'] != null ? '↓ ${fmtBytes(u['bytes_down'] as num)} · ↑ ${fmtBytes(u['bytes_up'] as num?)}' : 'no traffic yet';
+    final limits = [
+      if (u['limit_bytes'] != null) 'limit ${fmtBytes(u['limit_bytes'] as num)}',
+      if (u['max_devices'] != null) '${u['max_devices']} device(s)',
+    ];
+    return Card(
+      margin: const EdgeInsets.only(bottom: 10),
+      child: InkWell(
+        borderRadius: BorderRadius.circular(12),
+        onTap: () => widget.onOpen(u),
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(14, 12, 10, 12),
+          child: Row(children: [
+            Icon(Icons.circle, size: 9, color: u['online'] == true ? _green : Colors.white24),
+            const SizedBox(width: 10),
+            Expanded(
+              child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                Text(_userName(u), style: const TextStyle(fontWeight: FontWeight.w600), overflow: TextOverflow.ellipsis),
+                const SizedBox(height: 3),
+                Text([traffic, ...limits].join(' · '), style: const TextStyle(color: Colors.white54, fontSize: 12)),
+              ]),
+            ),
+            const Icon(Icons.chevron_right, color: Colors.white38),
+          ]),
+        ),
+      ),
+    );
+  }
+}
+
+/// One user's settings; with `user` null, the form for a new user.
+class _UserEditor extends StatefulWidget {
+  final Map<String, dynamic>? user;
+  final Future<Map<String, dynamic>> Function(List<String> args) manage;
+  final void Function(String name, Map<String, dynamic> user) share;
+  final Future<int?> Function(Map<String, dynamic> user, {String cancelLabel}) addToApp;
+  const _UserEditor({required this.user, required this.manage, required this.share, required this.addToApp});
+
+  @override
+  State<_UserEditor> createState() => _UserEditorState();
+}
+
+class _UserEditorState extends State<_UserEditor> {
+  late final Map<String, dynamic>? _u = widget.user;
+  late final _name = TextEditingController(text: (_u?['name'] as String?) ?? '');
+  final _key = TextEditingController();
+  late final _limit = TextEditingController(text: _gbText(_u?['limit_bytes'] as num?));
+  late final _devices = TextEditingController(text: _u?['max_devices']?.toString() ?? '');
+  bool _busy = false;
+  String? _error;
+  List<Map<String, dynamic>>? _seen; // devices that fetched the subscription
+
+  bool get _isNew => _u == null;
+
+  static String _gbText(num? bytes) {
+    if (bytes == null) return '';
+    final gb = bytes / _gib;
+    return gb == gb.roundToDouble() ? gb.toInt().toString() : gb.toStringAsFixed(2);
+  }
+
+  @override
+  void initState() {
+    super.initState();
+    if (!_isNew) _loadDevices();
+  }
+
+  @override
+  void dispose() {
+    for (final c in [_name, _key, _limit, _devices]) {
+      c.dispose();
+    }
+    super.dispose();
+  }
+
+  Future<void> _loadDevices() async {
+    try {
+      final r = await widget.manage(['user-devices', _u!['key'] as String]);
+      if (mounted) setState(() => _seen = (r['devices'] as List? ?? const []).cast<Map<String, dynamic>>());
+    } catch (_) {
+      if (mounted) setState(() => _seen = const []);
+    }
+  }
+
+  /// Bytes from the GB field: null for empty, -1 for something that is not a size.
+  int? _limitBytes() {
+    final t = _limit.text.trim().replaceAll(',', '.');
+    if (t.isEmpty) return null;
+    final gb = double.tryParse(t);
+    if (gb == null || gb <= 0 || gb > 1024 * 1024) return -1;
+    return (gb * _gib).round();
+  }
+
+  /// The device limit: null for empty, -1 for something that is not 1 to 1000.
+  int? _deviceLimit() {
+    final t = _devices.text.trim();
+    if (t.isEmpty) return null;
+    final n = int.tryParse(t);
+    return n == null || n < 1 || n > 1000 ? -1 : n;
+  }
+
+  Future<void> _save() async {
+    final name = _name.text.trim();
+    final limit = _limitBytes();
+    final devices = _deviceLimit();
+    final key = _key.text.trim();
+    String? problem;
+    if (name.isEmpty) {
+      problem = 'Enter a name.';
+    } else if (limit == -1) {
+      problem = 'The traffic limit is a number of GB, or empty for none.';
+    } else if (devices == -1) {
+      problem = 'Devices is a whole number from 1 to 1000, or empty for no limit.';
+    } else if (_isNew && key.isNotEmpty && (key.length < 8 || key.length > 128 || RegExp(r'[\s/?#%\\]').hasMatch(key))) {
+      problem = 'An access key is 8 to 128 characters with no spaces, slashes, %, ? or #. Leave it empty for a random one.';
+    }
+    if (problem != null) {
+      setState(() => _error = problem);
+      return;
+    }
+    final List<String> args;
+    if (_isNew) {
+      args = [
+        'user-add', name,
+        if (key.isNotEmpty) ...['--key', key],
+        if (limit != null) ...['--limit-bytes', '$limit'],
+        if (devices != null) ...['--devices', '$devices'],
+      ];
+    } else {
+      final oldLimit = (_u!['limit_bytes'] as num?)?.toInt();
+      final oldDevices = (_u['max_devices'] as num?)?.toInt();
+      // A limit shown in GB is rounded: an untouched field keeps the exact old value.
+      final limitChanged = _limit.text.trim() != _gbText(oldLimit) && limit != oldLimit;
+      args = [
+        'user-set', _u['key'] as String,
+        if (name != ((_u['name'] as String?) ?? '')) ...['--name', name],
+        if (limitChanged) ...['--limit-bytes', '${limit ?? 0}'],
+        if (devices != oldDevices) ...['--devices', '${devices ?? 0}'],
+      ];
+      if (args.length == 2) {
+        Navigator.pop(context, false);
+        return;
+      }
+    }
+    setState(() {
+      _busy = true;
+      _error = null;
+    });
+    try {
+      final r = await widget.manage(args);
+      if (!mounted) return;
+      if (_isNew) {
+        // The new user may be for someone else: "Not now" leaves the app as is.
+        final user = r['user'];
+        if (user is Map<String, dynamic>) await widget.addToApp(user, cancelLabel: 'Not now');
+      }
+      if (mounted) Navigator.pop(context, true);
+    } catch (e) {
+      if (mounted) setState(() => _error = e.toString());
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  Future<void> _revoke() async {
+    final name = _userName(_u!);
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text('Revoke $name?'),
+        content: const Text('Their key stops working at once. Profiles made from it stop connecting.'),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancel')),
+          FilledButton(
+            style: FilledButton.styleFrom(backgroundColor: Colors.red.shade700, foregroundColor: Colors.white),
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('Revoke'),
+          ),
+        ],
+      ),
+    );
+    if (ok != true || !mounted) return;
+    setState(() => _busy = true);
+    try {
+      await widget.manage(['user-remove', _u['key'] as String]);
+      if (mounted) Navigator.pop(context, true);
+    } catch (e) {
+      if (mounted) setState(() => _error = e.toString());
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  void _copy(String what, String text) {
+    Clipboard.setData(ClipboardData(text: text));
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('$what copied')));
+  }
+
+  Widget _copyRow(String label, String value) => ListTile(
+        dense: true,
+        contentPadding: const EdgeInsets.symmetric(horizontal: 14),
+        title: Text(label, style: const TextStyle(color: Colors.white54, fontSize: 12)),
+        subtitle: Text(value, maxLines: 2, overflow: TextOverflow.ellipsis, style: const TextStyle(fontFamily: 'monospace', fontSize: 11)),
+        trailing: IconButton(icon: const Icon(Icons.copy, size: 18), tooltip: 'Copy', onPressed: () => _copy(label, value)),
+      );
+
+  @override
+  Widget build(BuildContext context) {
+    final u = _u;
+    final links = (u?['links'] as List? ?? const []).cast<Map<String, dynamic>>();
+    return Scaffold(
+      appBar: AppBar(
+        title: Text(_isNew ? 'New user' : _userName(u!)),
+        actions: [
+          if (!_isNew)
+            IconButton(tooltip: 'Share', icon: const Icon(Icons.qr_code), onPressed: () => widget.share(_userName(u!), u)),
+          if (!_isNew)
+            IconButton(
+              tooltip: 'Add to this app',
+              icon: const Icon(Icons.download),
+              onPressed: () async {
+                final n = await widget.addToApp(u!);
+                if (n != null && context.mounted) {
+                  ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(n > 0 ? 'Added $n profile(s)' : 'Already in the app')));
+                }
+              },
+            ),
+        ],
+      ),
+      body: AbsorbPointer(
+        absorbing: _busy,
+        child: ListView(padding: const EdgeInsets.all(16), children: [
+          TextField(
+            controller: _name,
+            autofocus: _isNew,
+            maxLength: 100,
+            decoration: const InputDecoration(labelText: 'Name *', hintText: 'e.g. phone', counterText: ''),
+          ),
+          if (_isNew) ...[
+            const SizedBox(height: 12),
+            TextField(
+              controller: _key,
+              maxLength: 128,
+              style: const TextStyle(fontFamily: 'monospace', fontSize: 13),
+              decoration: const InputDecoration(
+                labelText: 'Access key',
+                helperText: 'Empty: a random key is made. Paste one to keep an existing key.',
+                counterText: '',
+              ),
+            ),
+          ],
+          const SizedBox(height: 12),
+          TextField(
+            controller: _limit,
+            keyboardType: const TextInputType.numberWithOptions(decimal: true),
+            decoration: const InputDecoration(labelText: 'Traffic limit, GB', helperText: 'Empty: unlimited.'),
+          ),
+          const SizedBox(height: 12),
+          TextField(
+            controller: _devices,
+            keyboardType: TextInputType.number,
+            decoration: const InputDecoration(
+              labelText: 'Devices',
+              helperText: 'Empty: unlimited. A device is counted when its app fetches the subscription with its device ID on.',
+              helperMaxLines: 3,
+            ),
+          ),
+          if (_error != null)
+            Padding(
+              padding: const EdgeInsets.only(top: 14),
+              child: Text(_error!, style: const TextStyle(color: Colors.redAccent, fontSize: 13)),
+            ),
+          const SizedBox(height: 18),
+          FilledButton(
+            onPressed: _busy ? null : _save,
+            child: _busy
+                ? const SizedBox(width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2))
+                : Text(_isNew ? 'Add user' : 'Save'),
+          ),
+          if (!_isNew) ...[
+            const SizedBox(height: 22),
+            const _Section('Access'),
+            Card(
+              child: Column(children: [
+                _copyRow('Access key', u!['key'] as String),
+                if (u['subscription'] is String) _copyRow('Subscription', u['subscription'] as String),
+                for (final l in links) _copyRow('Link (${l['label']})', l['uri'] as String),
+              ]),
+            ),
+            const _Section('Usage'),
+            _Card([
+              _Row('Online', pill: u['online'] == true ? ('online', _green) : ('offline', Colors.white38)),
+              _Row('Downloaded', value: fmtBytes(u['bytes_down'] as num?)),
+              _Row('Uploaded', value: fmtBytes(u['bytes_up'] as num?)),
+            ]),
+            const _Section('Devices that fetched the subscription'),
+            if (_seen == null)
+              const Padding(padding: EdgeInsets.all(12), child: Center(child: CircularProgressIndicator(strokeWidth: 2)))
+            else if (_seen!.isEmpty)
+              const _Note('None yet.')
+            else
+              _Card([
+                for (final d in _seen!)
+                  _Row(
+                      [d['model'], d['os']].whereType<String>().where((s) => s.isNotEmpty).join(', ').ifEmpty('device'),
+                      value: d['last_seen'] is num
+                          ? 'last ${DateTime.fromMillisecondsSinceEpoch(((d['last_seen'] as num) * 1000).toInt()).toString().substring(0, 16)}'
+                          : null),
+              ]),
+            const SizedBox(height: 18),
+            OutlinedButton(
+              style: OutlinedButton.styleFrom(foregroundColor: Colors.redAccent, side: const BorderSide(color: Colors.redAccent)),
+              onPressed: _busy ? null : _revoke,
+              child: const Text('Revoke user'),
+            ),
+          ],
+        ]),
+      ),
+    );
   }
 }
 

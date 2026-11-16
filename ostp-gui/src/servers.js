@@ -156,7 +156,7 @@ let serversCache = [];
 // at a time, because the progress lines of two jobs would mix.
 let changing = false;
 const isChange = (cmd, args) => cmd === 'server_install' || cmd === 'server_action'
-  || (cmd === 'server_manage' && !['status', 'users', 'logs'].includes(args.args?.[0]));
+  || (cmd === 'server_manage' && !['status', 'users', 'user-devices', 'dns', 'logs'].includes(args.args?.[0]));
 
 async function call(cmd, args) {
   if (!isChange(cmd, args)) return callOnce(cmd, args);
@@ -536,68 +536,208 @@ async function renderUsers(body, id, seq) {
   const server = serversCache.find(s => s.id === id);
   body.innerHTML = `
     <div class="inline-add">
-      <input class="field-input" id="new-user-name" aria-label="Name of the new user" placeholder="Name of the new user, e.g. phone" />
+      <input class="field-input" id="user-search" type="search" aria-label="Search users by name" placeholder="Search by name" />
       <button class="btn primary" id="btn-user-add">Add user</button>
     </div>
     <div id="users-list"></div>
+    <p class="empty-note hidden" id="users-none"></p>
     <p class="card-note">Traffic is kept across restarts and updates${r.stats_at ? `, as of ${new Date(r.stats_at * 1000).toLocaleTimeString()}` : ''}.</p>`;
   const list = $('users-list');
-  users.forEach(u => {
+  const cards = users.map(u => {
     const card = document.createElement('div');
-    card.className = 'user-card';
+    card.className = 'user-card openable';
+    card.tabIndex = 0;
+    card.setAttribute('role', 'button');
     const traffic = u.bytes_down != null ? `down ${fmtBytes(u.bytes_down)} · up ${fmtBytes(u.bytes_up)}` : 'no traffic yet';
+    const limits = [
+      u.limit_bytes ? `limit ${fmtBytes(u.limit_bytes)}` : '',
+      u.max_devices ? `${u.max_devices} ${u.max_devices === 1 ? 'device' : 'devices'}` : '',
+    ].filter(Boolean).map(s => ` · ${s}`).join('');
     card.innerHTML = `
       <div class="user-head">
         <span class="online-dot ${u.online ? 'on' : ''}" role="img" aria-label="${u.online ? 'Online' : 'Offline'}" title="${u.online ? 'Online' : 'Offline'}"></span>
-        <span class="user-name">${esc(u.name || 'user ' + u.number)}</span>
-        <button class="profile-action-btn" data-a="import" title="Add to this app"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg></button>
-        <button class="profile-action-btn" data-a="share" title="Share link or QR code"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/><line x1="8.59" y1="13.51" x2="15.42" y2="17.49"/><line x1="15.41" y1="6.51" x2="8.59" y2="10.49"/></svg></button>
-        <button class="profile-action-btn" data-a="rename" title="Rename"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg></button>
-        <button class="profile-action-btn" data-a="remove" title="Revoke access"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/></svg></button>
+        <span class="user-name">${esc(userName(u))}</span>
+        <svg class="user-chevron" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="9 18 15 12 9 6"/></svg>
       </div>
-      <div class="user-meta">${traffic}${u.limit_bytes ? ` · limit ${fmtBytes(u.limit_bytes)}` : ''}</div>`;
-    const who = String(u.number);
-    card.querySelector('[data-a="import"]').onclick = async () => {
+      <div class="user-meta">${traffic}${limits}</div>`;
+    const open = () => openUser(server, id, u);
+    card.onclick = open;
+    card.onkeydown = e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); open(); } };
+    list.appendChild(card);
+    return [u, card];
+  });
+  const search = $('user-search');
+  const none = $('users-none');
+  const filter = () => {
+    const q = search.value.trim().toLowerCase();
+    let shown = 0;
+    for (const [u, card] of cards) {
+      const on = !q || userName(u).toLowerCase().includes(q);
+      card.classList.toggle('hidden', !on);
+      if (on) shown++;
+    }
+    none.textContent = q ? `No user named like "${search.value.trim()}".` : 'No users.';
+    none.classList.toggle('hidden', shown > 0);
+  };
+  search.oninput = filter;
+  filter();
+  $('btn-user-add').onclick = () => openUser(server, id, null);
+}
+
+const userName = u => u.name || 'user ' + u.number;
+const GIB = 1024 ** 3;
+const gbText = b => b == null ? '' : (Number.isInteger(b / GIB) ? String(b / GIB) : (b / GIB).toFixed(2));
+
+// A user's settings, or the form for a new user (`u` null). Saves with one
+// `ostp manage` call: user-add with everything, or user-set with what changed.
+function openUser(server, id, u) {
+  const isNew = !u;
+  const modal = $('user-modal');
+  const err = $('user-modal-error');
+  const save = $('btn-user-modal-save');
+  $('user-modal-title').textContent = isNew ? 'New user' : userName(u);
+  save.textContent = isNew ? 'Add user' : 'Save';
+  save.disabled = false;
+  err.textContent = '';
+  const copyRow = (label, value) => `
+    <div class="copy-row"><div><div class="k">${esc(label)}</div><div class="v mono" title="${esc(value)}">${esc(value)}</div></div>
+      <button class="profile-action-btn" data-copy="${esc(value)}" title="Copy ${esc(label.toLowerCase())}" aria-label="Copy ${esc(label.toLowerCase())}"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></button></div>`;
+  $('user-modal-body').innerHTML = `
+    <div class="field-group">
+      <label class="field-label" for="um-name">Name *</label>
+      <input class="field-input" id="um-name" maxlength="100" placeholder="e.g. phone" value="${esc(u?.name || '')}" />
+    </div>
+    ${isNew ? `
+    <div class="field-group">
+      <label class="field-label" for="um-key">Access key</label>
+      <input class="field-input mono" id="um-key" maxlength="128" spellcheck="false" autocomplete="off" />
+      <p class="field-hint">Empty: a random key is made. Paste one to keep an existing key.</p>
+    </div>` : ''}
+    <div class="field-group">
+      <label class="field-label" for="um-limit">Traffic limit, GB</label>
+      <input class="field-input" id="um-limit" type="number" min="0.01" step="any" value="${gbText(u?.limit_bytes)}" />
+      <p class="field-hint">Empty: unlimited.</p>
+    </div>
+    <div class="field-group">
+      <label class="field-label" for="um-devices">Devices</label>
+      <input class="field-input" id="um-devices" type="number" min="1" max="1000" step="1" value="${u?.max_devices ?? ''}" />
+      <p class="field-hint">Empty: unlimited. A device is counted when its app fetches the subscription with its device ID on.</p>
+    </div>
+    ${isNew ? '' : `
+    <div class="user-modal-section">Access</div>
+    <div class="kv-card">
+      ${copyRow('Access key', u.key)}
+      ${u.subscription ? copyRow('Subscription', u.subscription) : ''}
+      ${(u.links || []).map(l => copyRow(`Link (${l.label})`, l.uri)).join('')}
+    </div>
+    <div class="btn-row">
+      <button class="btn secondary" id="um-import">Add to this app</button>
+      <button class="btn secondary" id="um-share">Share</button>
+    </div>
+    <div class="user-modal-section">Usage</div>
+    <div class="kv-card">
+      ${kv('Online', u.online ? '<span class="pill ok">online</span>' : 'offline')}
+      ${kv('Downloaded', fmtBytes(u.bytes_down))}
+      ${kv('Uploaded', fmtBytes(u.bytes_up))}
+    </div>
+    <div class="user-modal-section">Devices that fetched the subscription</div>
+    <div id="um-devices-list"><p class="loading-note">Loading</p></div>
+    <button class="btn danger user-modal-danger" id="um-revoke">Revoke user</button>`}`;
+
+  const close = changed => {
+    modal.classList.add('hidden');
+    save.onclick = null;
+    $('btn-user-modal-cancel').onclick = null;
+    if (changed) renderTab();
+  };
+  superseding('user', () => close(false));
+  $('btn-user-modal-cancel').onclick = () => close(false);
+  modal.querySelectorAll('[data-copy]').forEach(b => {
+    b.onclick = async () => {
+      try { await navigator.clipboard.writeText(b.dataset.copy); app.showToast('Copied', 'ok'); } catch (e) { report(e); }
+    };
+  });
+
+  if (!isNew) {
+    $('um-import').onclick = async () => {
       const n = await addUserToApp(server, u);
       if (n != null) app.showToast(n ? `Added ${n} ${n === 1 ? 'profile' : 'profiles'}` : 'Already in the app', 'ok');
     };
-    card.querySelector('[data-a="share"]').onclick = () => {
+    $('um-share').onclick = () => {
       const best = u.subscription || u.links?.[0]?.uri;
-      if (best) app.showShare(`Share: ${u.name || 'user ' + u.number}`, best);
+      if (best) app.showShare(`Share: ${userName(u)}`, best);
     };
-    card.querySelector('[data-a="rename"]').onclick = async () => {
-      const v = await promptBox('Rename user', '', [{ name: 'name', label: 'Name', value: u.name }]);
-      if (!v || !v.name.trim()) return;
-      if (v.name.trim().length > 64) { app.showToast('The name is longer than 64 characters', 'error'); return; }
-      try { await call('server_manage', { id, args: ['user-rename', who, v.name.trim()] }); renderTab(); }
-      catch (e) { report(e); }
-    };
-    card.querySelector('[data-a="remove"]').onclick = async () => {
-      if (!await confirmBox(`Revoke ${u.name || 'user ' + u.number}?`, 'Their key stops working at once. Profiles made from it stop connecting.', 'Revoke access')) return;
-      try { await call('server_manage', { id, args: ['user-remove', u.key] }); renderTab(); }
-      catch (e) { report(e); }
-    };
-    list.appendChild(card);
-  });
-  $('btn-user-add').onclick = async () => {
-    const name = $('new-user-name').value.trim();
-    if (!name) { $('new-user-name').focus(); return; }
-    if (name.length > 64) { app.showToast('The name is longer than 64 characters', 'error'); return; }
-    $('btn-user-add').disabled = true;
-    try {
-      const r = await call('server_manage', { id, args: ['user-add', name] });
-      app.showToast(`User "${name}" added`, 'ok');
-      // The new user may be for someone else: "Not now" leaves the app as is.
-      if (r?.user) {
-        const n = await addUserToApp(server, r.user, { cancelLabel: 'Not now' });
-        if (n) app.showToast(`Added ${n} ${n === 1 ? 'profile' : 'profiles'}`, 'ok');
+    $('um-revoke').onclick = async () => {
+      modal.classList.add('hidden');
+      if (!await confirmBox(`Revoke ${userName(u)}?`, 'Their key stops working at once. Profiles made from it stop connecting.', 'Revoke access')) {
+        modal.classList.remove('hidden');
+        return;
       }
-      renderTab();
+      try { await call('server_manage', { id, args: ['user-remove', u.key] }); close(true); }
+      catch (e) { report(e); modal.classList.remove('hidden'); }
+    };
+    call('server_manage', { id, args: ['user-devices', u.key] }).then(d => {
+      const box = $('um-devices-list');
+      if (!box) return;
+      const list = d?.devices || [];
+      box.innerHTML = list.length
+        ? `<div class="kv-card">${list.map(x => kv([x.model, x.os].filter(Boolean).join(', ') || 'device',
+            x.last_seen ? `last ${esc(new Date(x.last_seen * 1000).toLocaleString())}` : '—')).join('')}</div>`
+        : '<p class="card-note">None yet.</p>';
+    }).catch(() => { const box = $('um-devices-list'); if (box) box.innerHTML = '<p class="card-note">Could not read the list.</p>'; });
+  }
+
+  save.onclick = async () => {
+    const name = $('um-name').value.trim();
+    const limitText = $('um-limit').value.trim().replace(',', '.');
+    const devText = $('um-devices').value.trim();
+    const key = isNew ? $('um-key').value.trim() : '';
+    const gb = limitText === '' ? null : Number(limitText);
+    const devices = devText === '' ? null : Number(devText);
+    let problem = '';
+    if (!name) problem = 'Enter a name.';
+    else if (gb !== null && !(gb > 0 && gb <= 1024 * 1024)) problem = 'The traffic limit is a number of GB, or empty for none.';
+    else if (devices !== null && !(Number.isInteger(devices) && devices >= 1 && devices <= 1000)) problem = 'Devices is a whole number from 1 to 1000, or empty for no limit.';
+    else if (key && (key.length < 8 || key.length > 128 || /[\s/?#%\\]/.test(key))) problem = 'An access key is 8 to 128 characters with no spaces, slashes, %, ? or #. Leave it empty for a random one.';
+    if (problem) { err.textContent = problem; return; }
+    const limit = gb === null ? null : Math.round(gb * GIB);
+
+    let args;
+    if (isNew) {
+      args = ['user-add', name];
+      if (key) args.push('--key', key);
+      if (limit !== null) args.push('--limit-bytes', String(limit));
+      if (devices !== null) args.push('--devices', String(devices));
+    } else {
+      args = ['user-set', u.key];
+      if (name !== (u.name || '')) args.push('--name', name);
+      // A limit shown in GB is rounded: an untouched field keeps the exact old value.
+      if (limitText !== gbText(u.limit_bytes) && limit !== (u.limit_bytes ?? null)) args.push('--limit-bytes', String(limit ?? 0));
+      if (devices !== (u.max_devices ?? null)) args.push('--devices', String(devices ?? 0));
+      if (args.length === 2) { close(false); return; }
+    }
+    save.disabled = true;
+    err.textContent = '';
+    try {
+      const r = await call('server_manage', { id, args });
+      close(true);
+      if (isNew) {
+        app.showToast(`User "${name}" added`, 'ok');
+        // The new user may be for someone else: "Not now" leaves the app as is.
+        if (r?.user) {
+          const n = await addUserToApp(server, r.user, { cancelLabel: 'Not now' });
+          if (n) app.showToast(`Added ${n} ${n === 1 ? 'profile' : 'profiles'}`, 'ok');
+        }
+      } else {
+        app.showToast('Saved', 'ok');
+      }
     } catch (e) {
-      report(e);
-      $('btn-user-add').disabled = false;
+      if (!e?.cancelled) err.textContent = String(e?.message || e);
+      save.disabled = false;
     }
   };
+  modal.classList.remove('hidden');
+  $('um-name').focus();
 }
 
 async function renderConnection(body, id, seq) {
@@ -685,7 +825,7 @@ async function renderDns(body, id, seq) {
 
     <div class="section-divider"><span>Set on the server</span></div>
     <div class="kv-card">
-      ${kv('Upstream resolvers', esc(upstreams.join(', ') || '�'), 'mono')}
+      ${kv('Upstream resolvers', esc(upstreams.join(', ') || '—'), 'mono')}
       ${lists.map(l => kv(l.name, `<span class="pill ${l.enabled ? 'ok' : 'warn'}">${l.enabled ? 'on' : 'off'}</span>`)).join('') || kv('Block lists', 'none')}
       ${kv('Rewrites', String(dns.rewrites ?? 0))}
       ${kv('Own rules', String(dns.user_rules ?? 0))}

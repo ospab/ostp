@@ -425,8 +425,12 @@ fn first_line(out: &Output) -> String {
 /// The JSON `ostp manage` printed, or its error.
 fn parse_manage(out: &Output) -> Result<Value> {
     let line = out.last_json_line().ok_or_else(|| {
-        if out.stdout.contains("unrecognized subcommand 'manage'") || out.stderr.contains("unrecognized subcommand 'manage'") {
+        let said = |s: &str| out.stdout.contains(s) || out.stderr.contains(s);
+        if said("unrecognized subcommand 'manage'") {
             anyhow!("the OSTP on the server is too old for the app; update it")
+        } else if said("unrecognized subcommand") || said("unexpected argument") {
+            // A newer command or option (user-set, user-add --devices) on an older server.
+            anyhow!("the OSTP on the server is too old for this change; update it (Status, Update OSTP) and try again")
         } else {
             anyhow!("{}", first_line(out))
         }
