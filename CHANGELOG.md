@@ -8,6 +8,8 @@ Older history is on the [Releases](https://github.com/ospab/ostp/releases) page 
 
 ## [Unreleased]
 
+## [0.5.0-alpha.2] - 2026-11-17
+
 ### Added
 - Protocol v6, session layer, stage 2 follow-up: a real TCP RST on a TUN flow. When the stream to the server is reset or aborted, the program's TUN connection now gets a RST instead of the FIN a normal close sends, so a truncated download fails instead of looking complete. The `netstack-smoltcp` crate cannot abort a flow, so the tree carries a copy of it (`third_party/netstack-smoltcp`, version 0.2.4, MIT OR Apache-2.0, used through `[patch.crates-io]` in the root workspace and in the desktop app's) with a `TcpStream::abort`; its README lists the one change. The TUN bridge aborts the flow only when the local SOCKS connection ends with a connection reset; a normal end, and an error on the program's side alone, behave as before. Tests: in the crate, abort emits a RST and no FIN, a drop or `shutdown` emits a FIN and no RST (IPv4 and IPv6, raw packets through the stack); in the client, the bridge aborts on a reset and only on a reset. A whole run through a real TUN device is not covered. See `docs/en/v6-session-design.md`.
 
