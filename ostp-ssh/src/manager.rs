@@ -165,7 +165,7 @@ impl Action {
 }
 
 /// `ostp manage` subcommands the apps may run.
-pub const MANAGE_COMMANDS: &[&str] = &["status", "users", "user-add", "user-remove", "user-rename", "user-limit", "user-devices", "dns", "logs", "restart"];
+pub const MANAGE_COMMANDS: &[&str] = &["status", "users", "user-add", "user-set", "user-remove", "user-rename", "user-limit", "user-devices", "dns", "logs", "restart"];
 
 /// A password or key typed in the app, as JSON:
 /// `{"kind": "password"|"key", "secret": "...", "passphrase": "..."}`.

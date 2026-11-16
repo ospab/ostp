@@ -8,6 +8,13 @@ Older history is on the [Releases](https://github.com/ospab/ostp/releases) page 
 
 ## [Unreleased]
 
+### Added
+- `ostp manage user-set USER [--name N] [--limit-bytes N] [--devices N]` changes a user's name and limits in one write; an option left out keeps its value, 0 removes a limit. `ostp manage user-add` takes `--key`, `--limit-bytes` and `--devices`, so a user is created with everything at once. The apps may run `user-set`.
+
+### Changed
+- `ostp manage` answers a person at a terminal in text, like the other commands (a table of users, `✓ pops: at most 1 device(s) on the subscription`, `[error] ...`), and prints JSON as before when there is no terminal, which is how the apps run it over SSH; `--json` asks for JSON at a terminal too. The command is listed in `ostp --help`.
+- `ostp manage` names the users when none matches what was given (`no user matches user1. Users: #1, pops`).
+
 ## [0.5.0-alpha.2] - 2026-11-17
 
 ### Added

@@ -35,8 +35,32 @@ pub enum ManageAction {
     Status,
     /// Users with their links and traffic
     Users,
-    /// Add a user with a new access key
-    UserAdd { name: String },
+    /// Add a user: a new access key unless --key gives one, and its limits
+    UserAdd {
+        name: String,
+        /// Use this access key instead of a new random one (8 to 128 characters)
+        #[arg(long)]
+        key: Option<String>,
+        /// Traffic limit in bytes (0 or absent: none)
+        #[arg(long)]
+        limit_bytes: Option<u64>,
+        /// How many devices may use the subscription (0 or absent: no limit)
+        #[arg(long)]
+        devices: Option<u32>,
+    },
+    /// Change a user in one write: number, name or access key, then what changes.
+    /// An option left out keeps its value; 0 removes a limit.
+    UserSet {
+        user: String,
+        #[arg(long)]
+        name: Option<String>,
+        /// Traffic limit in bytes (0 removes it)
+        #[arg(long)]
+        limit_bytes: Option<u64>,
+        /// Device limit of the subscription (0 removes it)
+        #[arg(long)]
+        devices: Option<u32>,
+    },
     /// Remove a user: number (as in `ostp links`), name or access key
     UserRemove { user: String },
     /// Rename a user: number, name or access key, then the new name
@@ -60,12 +84,38 @@ pub enum ManageAction {
     Restart,
 }
 
-pub fn run(action: ManageAction, config_path: &Path) -> ! {
+/// JSON for the apps (they run these over SSH, with no terminal) and for
+/// scripts; text for a person at a terminal, unless `--json` asks for JSON.
+pub fn wants_json(flag: bool) -> bool {
+    flag || !std::io::IsTerminal::is_terminal(&std::io::stdout())
+}
+
+pub fn run(action: ManageAction, config_path: &Path, json_out: bool) -> ! {
+    use crate::manage_text::Shown;
+    let shown = match &action {
+        ManageAction::Install { .. } => Shown::Install,
+        ManageAction::Status => Shown::Status,
+        ManageAction::Users => Shown::Users,
+        ManageAction::UserAdd { .. } => Shown::UserAdd,
+        ManageAction::UserSet { .. } => Shown::UserSet,
+        ManageAction::UserRemove { .. } => Shown::UserRemove,
+        ManageAction::UserRename { .. } => Shown::UserRename,
+        ManageAction::UserLimit { .. } => Shown::UserLimit,
+        ManageAction::UserDevices { .. } => Shown::UserDevices,
+        ManageAction::Dns => Shown::Dns,
+        ManageAction::Logs { .. } => Shown::Logs,
+        ManageAction::Restart => Shown::Restart,
+    };
     let result = match action {
         ManageAction::Install { port, host, user } => install(config_path, port, host.as_deref(), &user),
         ManageAction::Status => status(config_path),
         ManageAction::Users => users(config_path),
-        ManageAction::UserAdd { name } => user_add(config_path, &name),
+        ManageAction::UserAdd { name, key, limit_bytes, devices } => {
+            user_add(config_path, &name, key.as_deref(), Limits { bytes: limit_bytes, devices })
+        }
+        ManageAction::UserSet { user, name, limit_bytes, devices } => {
+            user_set(config_path, &user, name.as_deref(), Limits { bytes: limit_bytes, devices })
+        }
         ManageAction::UserRemove { user } => user_remove(config_path, &user),
         ManageAction::UserRename { user, name } => user_rename(config_path, &user, &name),
         ManageAction::UserLimit { user, devices } => user_limit(config_path, &user, devices),
@@ -74,13 +124,24 @@ pub fn run(action: ManageAction, config_path: &Path) -> ! {
         ManageAction::Logs { lines } => logs(lines),
         ManageAction::Restart => restart().map(|active| json!({ "active": active })),
     };
-    match result {
-        Ok(v) => {
+    match (result, json_out) {
+        (Ok(v), true) => {
             println!("{v}");
             std::process::exit(0)
         }
-        Err(e) => {
+        (Ok(v), false) => {
+            for line in crate::manage_text::render(shown, &v) {
+                println!("{line}");
+            }
+            std::process::exit(0)
+        }
+        (Err(e), true) => {
             println!("{}", json!({ "error": format!("{e:#}") }));
+            std::process::exit(1)
+        }
+        (Err(e), false) => {
+            use colored::Colorize;
+            eprintln!("{} {e:#}", "[error]".red().bold());
             std::process::exit(1)
         }
     }
@@ -115,7 +176,17 @@ fn find_user(v: &Value, who: &str) -> Result<usize> {
             who == (i + 1).to_string() || who == key || (!name.is_empty() && who.eq_ignore_ascii_case(&name))
         })
         .map(|(i, _)| i)
-        .ok_or_else(|| anyhow!("no user matches {who}"))
+        .ok_or_else(|| {
+            let names: Vec<String> = keys
+                .iter()
+                .enumerate()
+                .map(|(i, u)| match key_and_name(u).1 {
+                    n if n.is_empty() => format!("#{}", i + 1),
+                    n => n,
+                })
+                .collect();
+            anyhow!("no user matches {who}. Users: {} (a number, a name or an access key)", names.join(", "))
+        })
 }
 
 fn register_service(config_path: &Path) -> Result<()> {
@@ -326,20 +397,93 @@ fn users(config_path: &Path) -> Result<Value> {
     Ok(json!({ "users": list, "stats_at": stats.map(|s| s.written_at) }))
 }
 
-fn user_add(config_path: &Path, name: &str) -> Result<Value> {
+/// Limits given to `user-add`/`user-set`: absent keeps (or, on add, means
+/// none), 0 removes.
+#[derive(Default, Clone, Copy)]
+struct Limits {
+    bytes: Option<u64>,
+    devices: Option<u32>,
+}
+
+/// 1 PiB, as the panel allows.
+const MAX_LIMIT_BYTES: u64 = 1 << 50;
+
+fn check_name(name: &str) -> Result<&str> {
     let name = name.trim();
     if name.is_empty() {
         bail!("the name must not be empty");
     }
+    if name.chars().count() > 100 || name.chars().any(char::is_control) {
+        bail!("the name is too long (100 characters at most) or has control characters");
+    }
+    Ok(name)
+}
+
+/// 8 to 128 characters, nothing that breaks a URL path or a share link (as the panel).
+fn check_key(key: &str) -> Result<()> {
+    let n = key.chars().count();
+    if !(8..=128).contains(&n) || key.chars().any(|c| c.is_whitespace() || c.is_control() || "/?#%\\".contains(c)) {
+        bail!("an access key must be 8 to 128 characters with no spaces, slashes, %, ? or #");
+    }
+    Ok(())
+}
+
+/// Writes the limits into one `access_keys` entry, made an object.
+fn apply_limits(entry: &mut Value, limits: Limits) -> Result<()> {
+    if limits.bytes.is_some_and(|b| b > MAX_LIMIT_BYTES) {
+        bail!("a traffic limit is 1 PiB at most (0 removes it)");
+    }
+    if limits.devices.is_some_and(|d| d > 1000) {
+        bail!("a device limit is 1000 at most (0 removes it)");
+    }
+    if !entry.is_object() {
+        let (key, _) = key_and_name(entry);
+        *entry = json!({ "access_key": key });
+    }
+    let obj = entry.as_object_mut().expect("made an object above");
+    match limits.bytes {
+        Some(0) => {
+            obj.remove("limit_bytes");
+        }
+        Some(b) => {
+            obj.insert("limit_bytes".into(), b.into());
+        }
+        None => {}
+    }
+    match limits.devices {
+        Some(0) => {
+            obj.remove("max_devices");
+        }
+        Some(d) => {
+            obj.insert("max_devices".into(), d.into());
+        }
+        None => {}
+    }
+    Ok(())
+}
+
+fn user_add(config_path: &Path, name: &str, key: Option<&str>, limits: Limits) -> Result<Value> {
+    let name = check_name(name)?;
     let (mut v, _) = load(config_path)?;
     if find_user(&v, name).is_ok() {
         bail!("a user named {name} already exists");
     }
-    let key = crate::generate_secure_key("hex");
+    let key = match key.map(str::trim).filter(|k| !k.is_empty()) {
+        Some(k) => {
+            check_key(k)?;
+            if find_user(&v, k).is_ok() {
+                bail!("this access key is already in use");
+            }
+            k.to_string()
+        }
+        None => crate::generate_secure_key("hex"),
+    };
+    let mut entry = json!({ "access_key": key, "name": name });
+    apply_limits(&mut entry, limits)?;
     v["access_keys"]
         .as_array_mut()
         .ok_or_else(|| anyhow!("the config has no access_keys"))?
-        .push(json!({ "access_key": key, "name": name }));
+        .push(entry);
     save(config_path, &v)?;
     let all = users(config_path)?;
     let user = all["users"].as_array().and_then(|u| u.iter().find(|u| u["key"] == key.as_str()).cloned());
@@ -376,6 +520,27 @@ fn user_rename(config_path: &Path, who: &str, name: &str) -> Result<Value> {
     *entry = renamed;
     save(config_path, &v)?;
     Ok(json!({ "renamed": { "key": key, "name": name } }))
+}
+
+fn user_set(config_path: &Path, who: &str, name: Option<&str>, limits: Limits) -> Result<Value> {
+    let (mut v, _) = load(config_path)?;
+    let i = find_user(&v, who)?;
+    let name = name.map(check_name).transpose()?;
+    if let Some(n) = name {
+        if find_user(&v, n).is_ok_and(|other| other != i) {
+            bail!("a user named {n} already exists");
+        }
+    }
+    let entry = &mut v["access_keys"][i];
+    apply_limits(entry, limits)?;
+    if let Some(n) = name {
+        entry["name"] = n.into();
+    }
+    let (key, _) = key_and_name(entry);
+    save(config_path, &v)?;
+    let all = users(config_path)?;
+    let user = all["users"].as_array().and_then(|u| u.iter().find(|u| u["key"] == key.as_str()).cloned());
+    Ok(json!({ "user": user }))
 }
 
 fn user_limit(config_path: &Path, who: &str, devices: u32) -> Result<Value> {
@@ -559,10 +724,10 @@ mod tests {
         let dir = temp_config(&server());
         let cfg = dir.path().join("config.json");
 
-        let added = user_add(&cfg, "laptop").unwrap();
+        let added = user_add(&cfg, "laptop", None, Limits::default()).unwrap();
         assert_eq!(added["user"]["name"], "laptop");
         assert_eq!(added["user"]["number"], 3);
-        assert!(user_add(&cfg, "Laptop").is_err(), "names are unique, case-insensitively");
+        assert!(user_add(&cfg, "Laptop", None, Limits::default()).is_err(), "names are unique, case-insensitively");
 
         // A bare key becomes a named entry.
         user_rename(&cfg, "1", "desktop").unwrap();
@@ -579,6 +744,38 @@ mod tests {
 
         // A backup of the previous version is kept.
         assert!(cfg.with_extension("json.bak").exists());
+    }
+
+    #[test]
+    fn add_with_a_key_and_limits_then_change_them_in_one_set() {
+        let dir = temp_config(&server());
+        let cfg = dir.path().join("config.json");
+
+        let added = user_add(&cfg, "tablet", Some("my-own-key-1234"), Limits { bytes: Some(5 << 30), devices: Some(2) }).unwrap();
+        assert_eq!(added["user"]["key"], "my-own-key-1234");
+        assert_eq!(added["user"]["limit_bytes"], 5u64 << 30);
+        assert_eq!(added["user"]["max_devices"], 2);
+        assert!(user_add(&cfg, "other", Some("my-own-key-1234"), Limits::default()).is_err(), "a key is used once");
+        assert!(user_add(&cfg, "bad", Some("has space"), Limits::default()).is_err());
+        assert!(user_add(&cfg, "bad", Some("a/b/c/d/e"), Limits::default()).is_err());
+
+        // Only what is given changes; 0 removes a limit.
+        let set = user_set(&cfg, "tablet", Some("tablet-2"), Limits { bytes: Some(0), devices: None }).unwrap();
+        assert_eq!(set["user"]["name"], "tablet-2");
+        assert_eq!(set["user"]["limit_bytes"], Value::Null);
+        assert_eq!(set["user"]["max_devices"], 2);
+        let (v, _) = load(&cfg).unwrap();
+        assert!(v["access_keys"][2].get("limit_bytes").is_none());
+
+        // A bare key gains limits and keeps its key.
+        let set = user_set(&cfg, "1", None, Limits { bytes: Some(1 << 30), devices: Some(1) }).unwrap();
+        assert_eq!(set["user"]["key"], "00112233445566778899aabbccddeeff");
+        assert_eq!(set["user"]["limit_bytes"], 1u64 << 30);
+
+        assert!(user_set(&cfg, "tablet-2", Some("phone"), Limits::default()).is_err(), "names stay unique");
+        assert!(user_set(&cfg, "tablet-2", None, Limits { bytes: Some(1 << 51), devices: None }).is_err());
+        assert!(user_set(&cfg, "tablet-2", None, Limits { bytes: None, devices: Some(1001) }).is_err());
+        assert!(user_set(&cfg, "nobody", None, Limits::default()).is_err());
     }
 
     #[test]

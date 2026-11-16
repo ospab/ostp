@@ -14,6 +14,7 @@ mod key_cmd;
 mod log_cmd;
 mod changelog_cmd;
 mod manage_cmd;
+mod manage_text;
 mod service_cmd;
 mod webserver;
 
@@ -137,9 +138,11 @@ enum Commands {
         #[command(subcommand)]
         action: Option<key_cmd::KeyAction>,
     },
-    /// Server state and everyday changes as JSON, for the desktop app (server only)
-    #[command(hide = true)]
+    /// Users, limits and server state (server only): text at a terminal, JSON for the apps and scripts
     Manage {
+        /// Print JSON even at a terminal (it is printed anyway without one, as the apps run it)
+        #[arg(long, global = true)]
+        json: bool,
         #[command(subcommand)]
         action: manage_cmd::ManageAction,
     },
@@ -1373,7 +1376,7 @@ async fn run_app() -> Result<()> {
             Commands::Cert { action } => return cert_cmd::run(action, &args.config).await,
             Commands::Sub { action } => return sub_cmd::run(action, &args.config),
             Commands::Panel { action } => return panel_cmd::run(action, &args.config),
-            Commands::Manage { action } => manage_cmd::run(action, &args.config),
+            Commands::Manage { json, action } => manage_cmd::run(action, &args.config, manage_cmd::wants_json(json)),
             Commands::Dns { action } => return dns_cmd::run(action, &args.config).await,
             Commands::Overnet { action } => return overnet_cmd::run(action, &args.config),
             Commands::Warp { action } => return warp_cmd::run(action, &args.config).await,
