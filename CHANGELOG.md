@@ -14,6 +14,8 @@ Older history is on the [Releases](https://github.com/ospab/ostp/releases) page 
 ### Fixed
 - `ostp init server|client` and `ostp setup` replaced an existing config with a new one holding a single fresh access key, with no question and no copy: every user of the old keys was cut off. Now `init` leaves an existing config alone and says so unless given `--force`; `setup` names the file and how many access keys it holds and asks before going on. When the config is replaced, a copy is kept first as `config.json.<unix time>.bak`, which a later run never overwrites (the single `config.json.bak` was overwritten by the next change). When the setup wizard cannot write the config and falls back to `config.json` in the current folder, it no longer overwrites a file already there. To add keys to a config, use `ostp key gen --add`.
 - Builds of 0.5.0-alpha.1 reported themselves as 0.4.8-beta.2 (the mobile app's version line, `ostp update`, the release channel the apps install servers from), because `.release-state.json` was not updated for the release. The release workflow now refuses a tag that this file does not describe.
+- `ostp check` printed the listen address as `ColoredString { ... }`.
+- Tests: a server in the transitional mode (a server key and `accept_v5`) gives no handshake reply to a v5 or v6 client whose key is not in `access_keys`, and a removed v5 key cannot open a new session.
 
 ## [0.5.0-alpha.1] - 2026-11-16
 

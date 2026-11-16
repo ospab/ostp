@@ -1539,7 +1539,7 @@ async fn run_app() -> Result<()> {
                 match &config.mode {
                     AppMode::Server(s) => {
                         println!("{} Config OK: server mode", "[ostp]".green().bold());
-                        println!("  Listen: {:?}", s.listen.primary().as_str().cyan());
+                        println!("  Listen: {}", s.listen.primary().as_str().cyan());
                         println!("  Access keys: {}", s.access_keys.len().to_string().yellow());
                         if let Some(api) = &s.api {
                             println!("  API: {} (bind: {})",
@@ -1591,7 +1591,7 @@ async fn run_app() -> Result<()> {
                     }
                     AppMode::Relay(r) => {
                         println!("{} Config OK: relay mode", "[ostp]".green().bold());
-                        println!("  Listen: {:?}", r.listen.primary().cyan());
+                        println!("  Listen: {}", r.listen.primary().cyan());
                         println!("  Upstream TCP: {}", r.upstream_tcp.cyan());
                         println!("  Upstream UDP: {}", r.upstream_udp.cyan());
                         if !r.upstream_api_url.is_empty() {

@@ -1549,6 +1549,70 @@ mod roaming_tests {
         assert_eq!(dispatcher.closing_pending(), 0);
     }
 
+    /// The first datagram of a v5 client that uses `key`.
+    fn v5_first_datagram(key: &str, sid: u32) -> Bytes {
+        let secrets = ostp_core::crypto::derive_all_secrets(key.as_bytes());
+        let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        let mut payload = ts.to_be_bytes().to_vec();
+        payload.extend_from_slice(&sid.to_be_bytes());
+        payload.extend_from_slice(key.as_bytes());
+        let mut cfg = base_config(NoiseRole::Initiator);
+        cfg.session_id = sid;
+        cfg.psk = secrets.psk;
+        cfg.obfuscation_key = secrets.obfuscation_key;
+        cfg.handshake_pad_min = secrets.handshake_pad_min;
+        cfg.handshake_pad_max = secrets.handshake_pad_max;
+        cfg.handshake_payload = payload;
+        let mut client = ProtocolMachine::new(cfg).unwrap();
+        first_datagram(client.on_event(OstpEvent::Start).unwrap())
+    }
+
+    /// A transitional server (a server key and `accept_v5`) whose list holds
+    /// only another key.
+    fn transitional_with_other_key_only() -> (Dispatcher, [u8; 32]) {
+        let keys = Arc::new(RwLock::new(HashMap::from([(
+            "some-other-key-0123456789abcdef".to_string(),
+            crate::api::UserMeta { name: None, limit_bytes: None, max_devices: None },
+        )])));
+        let mut dispatcher = Dispatcher::new(base_config(NoiseRole::Responder), keys);
+        let (private, public) = ostp_core::crypto::noise::generate_server_key();
+        dispatcher.set_wire_versions(Some(private), true);
+        (dispatcher, public)
+    }
+
+    #[test]
+    fn a_v5_client_whose_key_is_not_listed_is_refused_in_the_transitional_mode() {
+        let (mut dispatcher, _) = transitional_with_other_key_only();
+        let home = addr("198.51.100.7:40000");
+        let outcome = dispatcher.on_datagram(home, v5_first_datagram(KEY, SID)).unwrap();
+        assert!(accepted_reply(outcome).is_none(), "an unlisted key must not get a handshake reply");
+        assert_eq!(dispatcher.active_sessions(), 0);
+    }
+
+    #[test]
+    fn a_v6_client_whose_key_is_not_listed_is_refused() {
+        let (mut dispatcher, public) = transitional_with_other_key_only();
+        let (_client, msg1) = v6_client(public);
+        let outcome = dispatcher.on_datagram(addr("198.51.100.8:40000"), msg1).unwrap();
+        assert!(accepted_reply(outcome).is_none(), "an unlisted key must not get a handshake reply");
+        assert_eq!(dispatcher.active_sessions(), 0);
+    }
+
+    #[test]
+    fn a_removed_v5_key_cannot_start_a_new_session() {
+        let home = addr("198.51.100.9:40000");
+        let (mut dispatcher, _client) = established(home);
+        let (private, _) = ostp_core::crypto::noise::generate_server_key();
+        dispatcher.set_wire_versions(Some(private), true);
+        remove_key(&dispatcher);
+        let (_, dropped) = dispatcher.on_tick();
+        assert_eq!(dropped, vec![SID]);
+        // The client reconnects with the same key: a new handshake, new session id.
+        let outcome = dispatcher.on_datagram(home, v5_first_datagram(KEY, SID + 1)).unwrap();
+        assert!(accepted_reply(outcome).is_none(), "a removed key must not open a session again");
+        assert_eq!(dispatcher.active_sessions(), 0);
+    }
+
     #[test]
     fn the_traffic_limit_sends_close_3() {
         let (mut dispatcher, mut client, home) = connected_v6();
