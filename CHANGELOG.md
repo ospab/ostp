@@ -8,6 +8,8 @@ Older history is on the [Releases](https://github.com/ospab/ostp/releases) page 
 
 ## [Unreleased]
 
+## [0.5.0-alpha.3] - 2026-11-17
+
 ### Added
 - `ostp manage user-set USER [--name N] [--limit-bytes N] [--devices N]` changes a user's name and limits in one write; an option left out keeps its value, 0 removes a limit. `ostp manage user-add` takes `--key`, `--limit-bytes` and `--devices`, so a user is created with everything at once. The apps may run `user-set`.
 - Apps, server management, Users: a tap (Android) or click (desktop) on a user opens its settings: name, traffic limit in GB, device limit, the access key, subscription and links to copy, traffic, online state, the devices that fetched the subscription, Add to this app, Share and Revoke. Add opens the same form empty: the name (marked *) is required; the access key may be pasted or left empty for a random one; limits are optional. The field above the list searches users by name. A change is saved with one `ostp manage` call; against a server too old for `user-set` or the new `user-add` options the app says to update OSTP on the server.
