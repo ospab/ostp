@@ -125,8 +125,8 @@ ostp [--config PATH] [COMMAND]
 | Command | What it does |
 |---|---|
 | *(none)* | Run as client or server, as the config says |
-| `setup` | Interactive setup wizard |
-| `init server\|client\|relay` | Write a template config |
+| `setup` | Interactive setup wizard; asks before replacing an existing config |
+| `init server\|client\|relay` | Write a template config; an existing one is replaced only with `--force` (a dated copy is kept) |
 | `check` | Validate the config and print a summary |
 | `start`, `stop`, `restart` | Control the `ostp` service (Linux, registered by `setup`) |
 | `status` | Whether ostp is running, since when, and the last log lines |

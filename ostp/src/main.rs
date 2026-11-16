@@ -36,10 +36,16 @@ enum Commands {
         /// Optional mode to initialize the config for (client or server)
         #[arg(short, long)]
         init: Option<String>,
+        /// Replace an existing config without asking (a dated copy is kept)
+        #[arg(long)]
+        force: bool,
     },
     /// Initialize config for client, server, or relay mode
     Init {
         mode: String,
+        /// Replace an existing config (a dated copy is kept); without it an existing config is left alone
+        #[arg(long)]
+        force: bool,
     },
     /// Hash a password for the web panel's `api.password_hash` config field
     #[command(name = "hash-password", alias = "hp")]
@@ -185,6 +191,8 @@ struct LegacyArgs {
     config: PathBuf,
     init: Option<String>,
     setup: bool,
+    /// `--force` of `setup`/`init`: replace an existing config without asking.
+    force: bool,
     links: bool,
     check: bool,
     url: Option<String>,
@@ -793,6 +801,65 @@ fn listen_addr_port(listen: &str) -> u16 {
     listen.rsplit_once(':').and_then(|(_, p)| p.parse().ok()).unwrap_or(50000)
 }
 
+/// Number of `access_keys` in a config file, when it reads as one.
+fn count_access_keys(path: &std::path::Path) -> Option<usize> {
+    let text = fs::read_to_string(path).ok()?;
+    let mut stripped = json_comments::StripComments::new(text.as_bytes());
+    let v: serde_json::Value = serde_json::from_reader(&mut stripped).ok()?;
+    v.get("access_keys")?.as_array().map(Vec::len)
+}
+
+/// Where a config is copied before `setup`/`init` replace it: the name carries
+/// the time, so a second run never overwrites the copy the first one kept.
+fn dated_copy_path(path: &std::path::Path, unix_secs: u64) -> PathBuf {
+    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "config.json".into());
+    path.with_file_name(format!("{name}.{unix_secs}.bak"))
+}
+
+/// `setup` and `init` write a whole new config. When one is already there,
+/// it holds access keys people use, so it is never replaced silently: `init`
+/// refuses without `--force`, `setup` asks, and either way a dated copy is
+/// kept first. Returns false when the user chose to keep the config.
+fn keep_copy_before_replacing(path: &std::path::Path, force: bool, interactive: bool) -> Result<bool> {
+    if !path.exists() {
+        return Ok(true);
+    }
+    let keys = match count_access_keys(path) {
+        Some(n) => format!(" with {n} access key(s)"),
+        None => String::new(),
+    };
+    if !force {
+        if !interactive {
+            anyhow::bail!(
+                "{:?} already exists{keys}; it was left as it is. To replace it with a new config, \
+                 run this again with --force (a copy of the old one is kept). \
+                 To add keys to it instead: ostp key gen --add",
+                path
+            );
+        }
+        println!();
+        wizard_warn(&format!("{:?} already exists{keys}.", path));
+        wizard_warn("Setup writes a new config in its place; the clients of the old keys stop connecting.");
+        if !wizard_yn("Replace it (a copy of the old one is kept)?", false) {
+            wizard_ok("The config was left as it is. To add keys to it: ostp key gen --add");
+            return Ok(false);
+        }
+    }
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or_default();
+    let copy = dated_copy_path(path, secs);
+    fs::copy(path, &copy).map_err(|e| anyhow!("cannot copy {:?} to {:?}: {e}; nothing was changed", path, copy))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&copy, fs::Permissions::from_mode(0o600));
+    }
+    println!("[ostp] The old config was copied to {:?}", copy);
+    Ok(true)
+}
+
 fn wizard_save_config(config_path: &std::path::Path, json_value: &serde_json::Value) -> Result<std::path::PathBuf> {
     let current_path = config_path.to_path_buf();
     
@@ -810,6 +877,10 @@ fn wizard_save_config(config_path: &std::path::Path, json_value: &serde_json::Va
         Err(e) => {
             wizard_warn(&format!("Cannot write {:?}: {}", current_path, e));
             let fallback = std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")).join("config.json");
+            if fallback.exists() {
+                // Another config already lives there; it is not ours to replace.
+                anyhow::bail!("cannot write {:?}, and {:?} already exists", current_path, fallback);
+            }
             wizard_warn(&format!("Trying {:?} instead", fallback));
             
             match write_config_file(&fallback, json_value) {
@@ -1245,6 +1316,7 @@ async fn run_app() -> Result<()> {
         config: raw_args.config.clone(),
         init: None,
         setup: false,
+        force: false,
         links: false,
         check: false,
         url: None,
@@ -1261,8 +1333,8 @@ async fn run_app() -> Result<()> {
 
     if let Some(cmd) = raw_args.command {
         match cmd {
-            Commands::Setup { init } => { args.setup = true; args.init = init; }
-            Commands::Init { mode } => { args.init = Some(mode); }
+            Commands::Setup { init, force } => { args.setup = true; args.init = init; args.force = force; }
+            Commands::Init { mode, force } => { args.init = Some(mode); args.force = force; }
             Commands::HashPassword { password } => {
                 let password = match password {
                     Some(p) => p,
@@ -1331,6 +1403,9 @@ async fn run_app() -> Result<()> {
     }
 
     if args.setup {
+        if !keep_copy_before_replacing(&args.config, args.force, true)? {
+            return Ok(());
+        }
         if let Some(path) = run_setup_wizard(&args.config)? {
             cert_cmd::issue_interactive(&path, cert_cmd::IssueArgs::default()).await?;
         }
@@ -1533,6 +1608,9 @@ async fn run_app() -> Result<()> {
     }
 
     if let Some(ref mode_str) = args.init {
+        if !keep_copy_before_replacing(&args.config, args.force, false)? {
+            return Ok(());
+        }
         let is_server = mode_str == "server";
         let key = generate_secure_key("hex");
         let content = if is_server {
@@ -2139,4 +2217,55 @@ async fn run_client_directly(client_cfg: ClientConfig) -> Result<()> {
 
     ostp_client::runner::run_client(client_conf).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod config_guard_tests {
+    use super::*;
+
+    fn temp_config(body: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("ostp-guard-{}-{}", std::process::id(), rand::random::<u64>()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+        fs::write(&path, body).unwrap();
+        path
+    }
+
+    #[test]
+    fn init_without_force_leaves_an_existing_config_alone() {
+        let path = temp_config(r#"{ "mode": "server", "access_keys": ["a", "b", "c"] }"#);
+        let err = keep_copy_before_replacing(&path, false, false).unwrap_err().to_string();
+        assert!(err.contains("3 access key(s)"), "{err}");
+        assert!(err.contains("--force"), "{err}");
+        let copies = fs::read_dir(path.parent().unwrap()).unwrap().count();
+        assert_eq!(copies, 1, "nothing is written when the config is kept");
+    }
+
+    #[test]
+    fn force_keeps_a_dated_copy_first() {
+        let body = r#"{ "mode": "server", // keys
+            "access_keys": ["a", { "access_key": "b", "name": "bob" }] }"#;
+        let path = temp_config(body);
+        assert_eq!(count_access_keys(&path), Some(2));
+        assert!(keep_copy_before_replacing(&path, true, false).unwrap());
+        let copy = fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .find(|p| p != &path)
+            .expect("a copy");
+        assert_eq!(fs::read_to_string(copy).unwrap(), body);
+    }
+
+    #[test]
+    fn a_missing_config_needs_no_copy() {
+        let path = std::env::temp_dir().join(format!("ostp-guard-none-{}", rand::random::<u64>())).join("config.json");
+        assert!(keep_copy_before_replacing(&path, false, false).unwrap());
+    }
+
+    #[test]
+    fn dated_copies_do_not_overwrite_each_other() {
+        let p = Path::new("/etc/ostp/config.json");
+        assert_ne!(dated_copy_path(p, 1), dated_copy_path(p, 2));
+        assert_eq!(dated_copy_path(p, 7), Path::new("/etc/ostp/config.json.7.bak"));
+    }
 }
