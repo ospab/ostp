@@ -385,6 +385,8 @@ pub struct ProtocolMachine {
     /// only when the peer NACKs a gap or after the session moved to another
     /// connection, where what was in flight on the old one is gone.
     reliable_carrier: bool,
+    /// Counters for the queue diagnostics (`crate::diag`).
+    diag: crate::diag::Counters,
     /// When the session last moved (`on_path_change`): on a reliable carrier,
     /// frames sent before this are resent once.
     path_changed_at: Option<Instant>,
@@ -591,6 +593,7 @@ impl ProtocolMachine {
             frame_give_up: FRAME_GIVE_UP,
             cc: CongestionController::new(mtu as u64),
             reliable_carrier: false,
+            diag: crate::diag::Counters::default(),
             path_changed_at: None,
             last_nacked_nonce: None,
             handshake_pad_min: config.handshake_pad_min.max(8),
@@ -649,6 +652,7 @@ impl ProtocolMachine {
     /// first packet on the new path carries a fresh nonce, the thing the
     /// server moves the session's address on.
     pub fn on_path_change(&mut self) {
+        self.diag.path_changes += 1;
         self.cc.reset_path();
         // The new path may carry another size: discovery starts over.
         self.restart_mtu_discovery();
@@ -808,6 +812,36 @@ impl ProtocolMachine {
 
     pub fn cwnd_packets(&self) -> usize {
         self.cc.cwnd_packets() as usize
+    }
+
+    /// The session's id (for the diagnostics).
+    pub fn session_id(&self) -> u32 {
+        self.session_id
+    }
+
+    /// The sending side's state and counters, for `crate::diag`.
+    pub fn diag_snapshot(&self) -> crate::diag::MachineDiag {
+        let mut counters = self.diag;
+        counters.recv = self.authenticated_recv_count;
+        let (srtt, min_rtt) = match self.cc.path_rtt() {
+            Some(p) => (p.smoothed, p.min),
+            None => (Duration::ZERO, Duration::ZERO),
+        };
+        crate::diag::MachineDiag {
+            reliable: self.reliable_carrier,
+            cwnd_packets: self.cc.cwnd_packets(),
+            in_flight: self.in_flight_count(),
+            bytes_in_flight: self.cc.bytes_in_flight(),
+            history: self.sent_history.len(),
+            srtt_ms: srtt.as_millis() as u64,
+            min_rtt_ms: min_rtt.as_millis() as u64,
+            rto_ms: self.base_rto().as_millis() as u64,
+            budget_10ms: self.send_budget(Duration::from_millis(10)),
+            pacing_kbps: self.cc.pacing_rate() * 8 / 1000,
+            heard_ago_ms: self.last_authenticated_recv.map_or(u64::MAX, |t| t.elapsed().as_millis() as u64),
+            reorder_buffered: self.reorder_buffer.len(),
+            counters,
+        }
     }
 
     /// Data frames that may go out within `horizon`: what the congestion
@@ -1214,6 +1248,16 @@ impl ProtocolMachine {
             self.log_stall_end(ended);
         }
         if was_silent && self.in_flight_count() > 0 {
+            self.diag.outage_path_changes += 1;
+            if crate::diag::enabled() {
+                tracing::info!(
+                    target: "ostp_diag",
+                    "outage path change: heard again after silence >= {} ms with {} frames in flight; \
+                     on a reliable carrier all of them are resent now",
+                    OUTAGE_SILENCE.as_millis(),
+                    self.in_flight_count()
+                );
+            }
             self.on_path_change();
         }
         if self.highest_authenticated_recv_nonce < Some(nonce) {
@@ -1245,6 +1289,7 @@ impl ProtocolMachine {
                         self.cc.on_loss(cached_frame.len() as u64);
                     }
                     self.cc.on_retransmit(cached_frame.len() as u64);
+                    self.diag.resent_nack += 1;
                     outbound_actions.push(ProtocolAction::SendDatagram(cached_frame));
                 } else {
                     tracing::debug!("NACK received: nonce={} not found in sent_history (evicted)", req_nonce);
@@ -1554,6 +1599,7 @@ impl ProtocolMachine {
                         self.cc.on_loss(cached.len() as u64);
                     }
                     self.cc.on_retransmit(cached.len() as u64);
+                    self.diag.resent_nack += 1;
                     let len = cached.len();
                     wire.push(ProtocolAction::SendDatagram(cached));
                     self.note_resent_frame(len, retries, first_sent, Instant::now());
@@ -1713,6 +1759,15 @@ impl ProtocolMachine {
                 .retain(|f| !(f.is_retransmittable && f.kind == FrameKind::Data && by_stream.contains_key(&f.stream_id)));
             for (stream_id, nonces) in by_stream {
                 tracing::debug!("Gave up on a frame of stream {}: resetting it", stream_id);
+                self.diag.given_up += nonces.len() as u64;
+                if crate::diag::enabled() {
+                    tracing::info!(
+                        target: "ostp_diag",
+                        "gave up on stream {stream_id}: {} frames dropped (retry limit {grace}, give-up age {} s)",
+                        nonces.len(),
+                        give_up.as_secs()
+                    );
+                }
                 self.kill_stream(stream_id);
                 for frame in self.build_abandon(stream_id, Some(ResetReason::Lost), &nonces)? {
                     actions.push(ProtocolAction::SendDatagram(frame));
@@ -1835,6 +1890,7 @@ impl ProtocolMachine {
         frame.retries = frame.retries.saturating_add(1);
         self.cc.on_retransmit(frame.bytes.len() as u64);
         actions.push(ProtocolAction::SendDatagram(frame.bytes.clone()));
+        self.diag.resent_probe += 1;
         if log {
             tracing::info!(
                 "Stall #{}: no ACK progress for {} ms with {} frames in flight; resent the oldest frame now",
@@ -2070,6 +2126,7 @@ impl ProtocolMachine {
         self.gap_nacked = true;
         self.gap_nack_count = self.gap_nack_count.saturating_add(1);
         self.nacked_nonce = Some(self.expected_recv_nonce);
+        self.diag.nacks_sent += 1;
         let nack_payload = self.expected_recv_nonce.to_be_bytes();
         self.build_control_datagram(0, FrameKind::Nack, Bytes::copy_from_slice(&nack_payload)).ok()
     }
@@ -2118,6 +2175,7 @@ impl ProtocolMachine {
         self.cc.on_discard(given_up);
         self.sent_history.retain(|f| !given_up_frame(f));
         let evicted = before - self.sent_history.len();
+        self.diag.given_up += evicted as u64;
         if evicted > 0 {
             tracing::debug!("Evicted {} zombie frames from sent_history (remaining={})", evicted, self.sent_history.len());
         }
@@ -2146,16 +2204,21 @@ impl ProtocolMachine {
             }
 
             let wait = retransmit_wait(base_rto, srtt, frame.retries, self.reliable_carrier);
+            let by_path = self.reliable_carrier && self.path_changed_at.is_some_and(|t| frame.last_sent < t);
             let due = if self.reliable_carrier {
                 // What was in flight on a connection the session left, and a
                 // slow safety net for a frame the sending side dropped from a
                 // full queue with nothing after it (no gap, so no NACK).
-                self.path_changed_at.is_some_and(|t| frame.last_sent < t)
-                    || now.duration_since(frame.last_sent) >= wait
+                by_path || now.duration_since(frame.last_sent) >= wait
             } else {
                 now.duration_since(frame.last_sent) >= wait
             };
             if due {
+                if by_path {
+                    self.diag.resent_path += 1;
+                } else {
+                    self.diag.resent_timer += 1;
+                }
                 // Only burn the retry counter and reset the RTO timer when the
                 // frame is ACTUALLY put on the wire. Doing it unconditionally
                 // meant that whenever the per-tick budget ran out — which is
@@ -2304,6 +2367,7 @@ impl ProtocolMachine {
             // The first data on an idle session starts the stall clock.
             self.stall.on_data_sent(Instant::now(), self.cc.bytes_in_flight() == 0);
             self.cc.on_send(bytes.len() as u64);
+            self.diag.data_sent += 1;
         }
         self.sent_history.push_back(SentFrame {
             nonce,
@@ -2325,6 +2389,7 @@ impl ProtocolMachine {
                 if let Some(old) = self.sent_history.pop_front() {
                     if old.is_retransmittable {
                         self.cc.on_discard(old.bytes.len() as u64);
+                        self.diag.given_up += 1;
                     }
                 }
             }
@@ -2361,6 +2426,7 @@ impl ProtocolMachine {
         for frame in self.sent_history.iter().filter(|f| f.is_retransmittable) {
             if nonce_in_ranges(frame.nonce, ranges) {
                 acked_bytes += frame.bytes.len() as u64;
+                self.diag.acked += 1;
                 let len = frame.bytes.len();
                 acked_sizes = Some(acked_sizes.map_or((len, len), |(lo, hi)| (lo.min(len), hi.max(len))));
                 probe_acked |= probe_nonce == Some(frame.nonce);

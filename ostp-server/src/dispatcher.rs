@@ -373,6 +373,11 @@ impl Dispatcher {
             .collect()
     }
 
+    /// Every session's sending side, for the queue diagnostics.
+    pub fn diag_sessions(&self) -> Vec<(u32, SocketAddr, ostp_core::diag::MachineDiag)> {
+        self.peer_machines.iter().map(|(&sid, ps)| (sid, ps.last_addr, ps.machine.diag_snapshot())).collect()
+    }
+
     /// The send budget of the session a datagram from `addr` belongs to,
     /// right after it was processed (an ACK may have opened the window).
     pub fn budget_for_addr(&self, addr: SocketAddr) -> Option<(u32, i64)> {
@@ -474,6 +479,14 @@ impl Dispatcher {
                     self.roaming.mark_known(peer.ip());
                     // What the server learned about the old path does not
                     // describe the new one, as on the client's side of a move.
+                    if crate::diag::enabled() {
+                        tracing::info!(
+                            target: "ostp_diag",
+                            "session {session_id} moved to another connection with {} frames in flight; \
+                             on a reliable carrier all of them are resent now",
+                            peer_state.machine.in_flight_count()
+                        );
+                    }
                     peer_state.machine.on_path_change();
                 }
                 if peer_state.last_addr == peer {

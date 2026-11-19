@@ -62,6 +62,11 @@ impl SendGate {
     pub fn spend(&self, packets: i64) {
         self.budget.fetch_sub(packets, Ordering::Relaxed);
     }
+
+    /// The budget now (for the diagnostics).
+    pub fn budget(&self) -> i64 {
+        self.budget.load(Ordering::Relaxed)
+    }
 }
 
 /// One stream's flow-control window toward the client: what the server may

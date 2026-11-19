@@ -37,6 +37,7 @@ pub mod target_policy;
 mod admission;
 mod send_gate;
 pub(crate) mod carrier_queue;
+pub(crate) mod diag;
 mod subscription;
 pub mod devices;
 
@@ -1070,6 +1071,11 @@ fn final_stats(stats: &Arc<RwLock<HashMap<String, Arc<dispatcher::UserStats>>>>,
 /// Frames dropped because a TCP/TLS client's send queue was full.
 static TCP_QUEUE_DROPS: portable_atomic::AtomicU64 = portable_atomic::AtomicU64::new(0);
 
+/// Frames dropped from full TCP/TLS send queues so far (all clients).
+pub(crate) fn tcp_queue_drops() -> u64 {
+    TCP_QUEUE_DROPS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Hands a frame to a TCP/TLS client's writer. The queue is bounded, and the
 /// main loop must not wait on one slow client, so a full queue drops the
 /// frame; the client then NACKs the gap. That used to happen silently, which
@@ -1294,6 +1300,11 @@ async fn handle_tick(
                 None => { map.insert(sid, Arc::new(send_gate::SendGate::new(available))); }
             }
         }
+    }
+
+    if diag::enabled() {
+        let gates = session_backpressure.read().unwrap_or_else(|e| e.into_inner());
+        diag::sessions_tick(dispatcher.diag_sessions(), |sid| gates.get(&sid).map(|g| g.budget()));
     }
 
     let (frames, dropped_sessions) = dispatcher.on_tick();

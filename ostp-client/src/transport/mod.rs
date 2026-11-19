@@ -20,6 +20,33 @@ const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(8);
 /// freeze the recovery that is meant to replace this connection.
 const WRITE_STALL: Duration = Duration::from_secs(10);
 
+/// Queue diagnostics of one UoT connection (`ostp_core::diag`, off unless
+/// `OSTP_DIAG` is set): what the writer and the reader moved, how long the
+/// writer sat in `write` and the bridge waited to hand a frame to it.
+#[derive(Default)]
+pub struct UotDiag {
+    pub fd: Option<i32>,
+    pub frames_out: portable_atomic::AtomicU64,
+    pub bytes_out: portable_atomic::AtomicU64,
+    pub write_ns: portable_atomic::AtomicU64,
+    pub write_max_ns: portable_atomic::AtomicU64,
+    pub send_wait_ns: portable_atomic::AtomicU64,
+    pub send_wait_max_ns: portable_atomic::AtomicU64,
+    pub frames_in: portable_atomic::AtomicU64,
+    pub bytes_in: portable_atomic::AtomicU64,
+    /// Frames `Transport::recv` took from the reader.
+    pub frames_taken: portable_atomic::AtomicU64,
+}
+
+impl UotDiag {
+    fn note(total: &portable_atomic::AtomicU64, max: &portable_atomic::AtomicU64, took: Duration) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let ns = took.as_nanos() as u64;
+        total.fetch_add(ns, Relaxed);
+        max.fetch_max(ns, Relaxed);
+    }
+}
+
 /// UoT/TCP connection parameters shared by the live bridge and the prober.
 #[derive(Clone)]
 pub struct UotOptions {
@@ -66,6 +93,11 @@ pub async fn connect_uot(
     if let Some(ttl) = opts.ttl {
         let _ = stream.set_ttl(ttl);
     }
+    #[cfg(unix)]
+    let fd = Some(std::os::fd::AsRawFd::as_raw_fd(&stream));
+    #[cfg(not(unix))]
+    let fd = None;
+    let diag = Arc::new(UotDiag { fd, ..Default::default() });
 
     match &opts.tls {
         Some(tls_opts) => {
@@ -75,7 +107,7 @@ pub async fn connect_uot(
                 None => Bytes::new(),
             };
             let (r, w) = tokio::io::split(tls);
-            Ok(spawn_uot_io(r, w, prefix).await)
+            Ok(spawn_uot_io(r, w, prefix, diag).await)
         }
         None => {
             let prefix = match &opts.ws_path {
@@ -83,7 +115,7 @@ pub async fn connect_uot(
                 None => Bytes::new(),
             };
             let (r, w) = stream.into_split();
-            Ok(spawn_uot_io(r, w, prefix).await)
+            Ok(spawn_uot_io(r, w, prefix, diag).await)
         }
     }
 }
@@ -94,6 +126,7 @@ async fn spawn_uot_io<R, W>(
     mut read_half: R,
     mut write_half: W,
     prefix: Bytes,
+    diag: Arc<UotDiag>,
 ) -> (Transport, mpsc::UnboundedReceiver<String>)
 where
     R: AsyncRead + Unpin + Send + 'static,
@@ -105,14 +138,36 @@ where
 
     // Writer: length-prefix each frame; each frame goes out as one write,
     // i.e. one TLS record.
+    let writer_diag = diag.clone();
     tokio::spawn(async move {
+        let mut why = "the transport was dropped";
         while let Some(data) = rx_out.recv().await {
             let len_buf = (data.len() as u16).to_be_bytes();
             let mut frame = Vec::with_capacity(2 + data.len());
             frame.extend_from_slice(&len_buf);
             frame.extend_from_slice(&data);
-            if !matches!(tokio::time::timeout(WRITE_STALL, write_half.write_all(&frame)).await, Ok(Ok(_))) { break; }
-            if !matches!(tokio::time::timeout(WRITE_STALL, write_half.flush()).await, Ok(Ok(_))) { break; }
+            let started = std::time::Instant::now();
+            match tokio::time::timeout(WRITE_STALL, write_half.write_all(&frame)).await {
+                Ok(Ok(_)) => {}
+                Ok(Err(_)) => { why = "write failed"; break; }
+                Err(_) => { why = "write made no progress for WRITE_STALL (10 s)"; break; }
+            }
+            match tokio::time::timeout(WRITE_STALL, write_half.flush()).await {
+                Ok(Ok(_)) => {}
+                Ok(Err(_)) => { why = "flush failed"; break; }
+                Err(_) => { why = "flush made no progress for WRITE_STALL (10 s)"; break; }
+            }
+            writer_diag.frames_out.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            writer_diag.bytes_out.fetch_add(frame.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            UotDiag::note(&writer_diag.write_ns, &writer_diag.write_max_ns, started.elapsed());
+        }
+        if ostp_core::diag::enabled() {
+            let sock = writer_diag.fd.and_then(ostp_core::diag::sock_stats).map(|s| s.line()).unwrap_or_default();
+            tracing::info!(
+                target: "ostp_diag",
+                "UoT writer stopped: {why}; {} frames were waiting for it | {sock}",
+                rx_out.len()
+            );
         }
         // The transport was dropped (or the stream failed): close our side.
         // Dropping a plain TCP write half already sends FIN, but a write half
@@ -136,6 +191,7 @@ where
     // the leftover bytes on `foreign_tx` — which by construction never
     // includes a successfully-parsed (and therefore genuine) ostp frame.
     let tx_in_clone = tx_in.clone();
+    let reader_diag = diag.clone();
     tokio::spawn(async move {
         let mut acc: Vec<u8> = prefix.to_vec();
         let mut chunk = [0u8; 4096];
@@ -145,6 +201,8 @@ where
                 if acc.len() >= 2 + len {
                     let data = acc[2..2 + len].to_vec();
                     acc.drain(0..2 + len);
+                    reader_diag.frames_in.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    reader_diag.bytes_in.fetch_add(2 + len as u64, std::sync::atomic::Ordering::Relaxed);
                     if tx_in_clone.send(Bytes::from(data)).await.is_err() { break; }
                     continue;
                 }
@@ -185,10 +243,13 @@ where
                 }
             }
         }
+        if ostp_core::diag::enabled() {
+            tracing::info!(target: "ostp_diag", "UoT reader stopped (EOF, read error or the transport was dropped)");
+        }
     });
 
     (
-        Transport::Uot { tx: tx_out, rx: Arc::new(Mutex::new(rx_in)) },
+        Transport::Uot { tx: tx_out, rx: Arc::new(Mutex::new(rx_in)), diag },
         foreign_rx,
     )
 }
@@ -199,6 +260,7 @@ pub enum Transport {
     Uot {
         tx: tokio::sync::mpsc::Sender<Bytes>,
         rx: Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<Bytes>>>,
+        diag: Arc<UotDiag>,
     }
 }
 
@@ -206,11 +268,51 @@ impl Transport {
     pub async fn send(&self, frame: &Bytes) -> std::io::Result<usize> {
         match self {
             Self::Udp(sock) => sock.send(frame).await,
-            Self::Uot { tx, .. } => {
-                tx.send(frame.clone()).await.map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "uot closed"))?;
+            Self::Uot { tx, diag, .. } => {
+                let started = std::time::Instant::now();
+                let sent = tx.send(frame.clone()).await;
+                UotDiag::note(&diag.send_wait_ns, &diag.send_wait_max_ns, started.elapsed());
+                sent.map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "uot closed"))?;
                 Ok(frame.len())
             }
         }
+    }
+
+    /// One line for the queue diagnostics: the writer's queue, what moved
+    /// since `before` (frames out, bytes out, write ns, send-wait ns, frames
+    /// in, bytes in), and the socket's queues. `None` on UDP.
+    pub fn diag_line(&self, before: &mut [u64; 6]) -> Option<String> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let Self::Uot { tx, rx, diag } = self else { return None };
+        let now = [
+            diag.frames_out.load(Relaxed),
+            diag.bytes_out.load(Relaxed),
+            diag.write_ns.load(Relaxed),
+            diag.send_wait_ns.load(Relaxed),
+            diag.frames_in.load(Relaxed),
+            diag.bytes_in.load(Relaxed),
+        ];
+        let d: Vec<u64> = now.iter().zip(before.iter()).map(|(n, b)| n.wrapping_sub(*b)).collect();
+        *before = now;
+        let _ = rx;
+        // Frames the reader handed over and nobody took yet.
+        let inbound_queued = now[4].saturating_sub(diag.frames_taken.load(Relaxed));
+        let sock = diag.fd.and_then(ostp_core::diag::sock_stats).map(|s| s.line()).unwrap_or_else(|| "no socket stats".into());
+        Some(format!(
+            "writer_queue={} closed={} in_queue={} | out {} fr {} kB write {} ms (max {} ms) send_wait {} ms (max {} ms) | \
+             in {} fr {} kB | {sock}",
+            tx.max_capacity() - tx.capacity(),
+            tx.is_closed() as u8,
+            inbound_queued,
+            d[0],
+            d[1] / 1000,
+            d[2] / 1_000_000,
+            diag.write_max_ns.swap(0, Relaxed) / 1_000_000,
+            d[3] / 1_000_000,
+            diag.send_wait_max_ns.swap(0, Relaxed) / 1_000_000,
+            d[4],
+            d[5] / 1000,
+        ))
     }
 
     pub async fn send_to(&self, frame: &Bytes, target: std::net::SocketAddr) -> std::io::Result<usize> {
@@ -223,10 +325,11 @@ impl Transport {
     pub async fn recv(&self, buf: &mut [u8]) -> std::io::Result<usize> {
         match self {
             Self::Udp(sock) => sock.recv(buf).await,
-            Self::Uot { rx, .. } => {
+            Self::Uot { rx, diag, .. } => {
                 let mut rx = rx.lock().await;
                 match rx.recv().await {
                     Some(bytes) => {
+                        diag.frames_taken.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         let len = bytes.len().min(buf.len());
                         buf[..len].copy_from_slice(&bytes[..len]);
                         Ok(len)

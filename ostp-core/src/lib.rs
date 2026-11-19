@@ -1,6 +1,7 @@
 pub mod access_keys;
 pub mod congestion;
 pub mod crypto;
+pub mod diag;
 pub mod fmt;
 pub mod framing;
 pub mod http_upgrade;

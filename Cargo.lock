@@ -2294,6 +2294,7 @@ dependencies = [
  "hkdf 0.12.4",
  "hmac 0.12.1",
  "idna",
+ "libc",
  "percent-encoding",
  "rand 0.8.5",
  "serde",

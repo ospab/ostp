@@ -214,6 +214,10 @@ struct SessionState {
     ids: ostp_core::streams::StreamIds,
     /// v5: where the search for a free 16-bit stream id goes on.
     next_v5_id: u16,
+    /// Queue diagnostics (`ostp_core::diag`): the last line's time and counters.
+    diag_at: Instant,
+    diag_counters: ostp_core::diag::Counters,
+    diag_io: [u64; 6],
 }
 
 impl SessionState {
@@ -225,7 +229,29 @@ impl SessionState {
             last_recv: Instant::now(),
             ids: ostp_core::streams::StreamIds::new(ostp_core::streams::Side::Client),
             next_v5_id: 1,
+            diag_at: Instant::now(),
+            diag_counters: Default::default(),
+            diag_io: [0; 6],
         }
+    }
+
+    /// Once a second with `OSTP_DIAG` set: this session's sending side and
+    /// its connection's queues. No address: the session's index and id only.
+    fn diag_tick(&mut self, index: usize) {
+        if !ostp_core::diag::enabled() || self.diag_at.elapsed() < Duration::from_secs(1) {
+            return;
+        }
+        self.diag_at = Instant::now();
+        let d = self.machine.diag_snapshot();
+        let io = self.socket.diag_line(&mut self.diag_io).unwrap_or_else(|| "udp".to_string());
+        tracing::info!(
+            target: "ostp_diag",
+            "client session {index} (0x{:08x}) last_recv={}ms {} || {io}",
+            self.machine.session_id(),
+            self.last_recv.elapsed().as_millis(),
+            d.line(&self.diag_counters)
+        );
+        self.diag_counters = d.counters;
     }
 }
 
@@ -541,6 +567,9 @@ impl Bridge {
                     self.check_link(&tx, &proxy_tx).await;
                     if self.link != Link::Idle {
                         self.emit_metrics(&tx).await;
+                    }
+                    for (i, s) in self.sessions.iter_mut().enumerate() {
+                        s.diag_tick(i);
                     }
                 }
                 _ = keepalive_tick.tick() => {
@@ -1021,6 +1050,9 @@ impl Bridge {
                     }
                     self.link = Link::Up;
                     self.metrics.connection_state.store(2, Ordering::Relaxed);
+                    if ostp_core::diag::enabled() {
+                        tracing::info!(target: "ostp_diag", "client: the move was answered after {} ms", started.elapsed().as_millis());
+                    }
                     let msg = match outage {
                         Some((since, _)) => format!(
                             "Connection restored after {} s, no connection was dropped",
@@ -1038,6 +1070,15 @@ impl Bridge {
                     .max(Duration::from_millis((self.last_rtt_ms * 4.0) as u64))
                     .min(MIGRATION_TIMEOUT_MAX);
                 if started.elapsed() >= deadline {
+                    if ostp_core::diag::enabled() {
+                        tracing::info!(
+                            target: "ostp_diag",
+                            "client: the move got no answer within {} ms (standby={}, outage={})",
+                            deadline.as_millis(),
+                            self.standby.is_some(),
+                            outage.is_some()
+                        );
+                    }
                     // The server stays silent to unknown sessions on purpose, so
                     // "session expired" and "path blocked" look the same here.
                     // A full handshake tells them apart: it gets through only
@@ -1095,6 +1136,9 @@ impl Bridge {
     ) {
         // The hop count to the server may differ on the new network.
         self.ttl_desync_measured = None;
+        if ostp_core::diag::enabled() {
+            tracing::info!(target: "ostp_diag", "client: recover_now: {reason}");
+        }
         match self.link {
             Link::Idle => {}
             Link::Down { since, attempt, .. } => {
@@ -1119,6 +1163,9 @@ impl Bridge {
         tx: &mpsc::Sender<UiEvent>,
         proxy_tx: &mpsc::UnboundedSender<(u32, ProxyToClientMsg)>,
     ) {
+        if ostp_core::diag::enabled() {
+            tracing::info!(target: "ostp_diag", "client: begin_reconnect: {reason} (keep_session={keep_session})");
+        }
         if !keep_session {
             self.drop_sessions(tx, proxy_tx);
         }
@@ -1166,6 +1213,15 @@ impl Bridge {
         let Link::Down { since, attempt, handshake_next, .. } = self.link else { return true };
         refresh_routes(tx).await;
 
+        if ostp_core::diag::enabled() {
+            tracing::info!(
+                target: "ostp_diag",
+                "client: reconnect attempt {} after {} s down (handshake_next={handshake_next}, sessions kept {})",
+                attempt + 1,
+                since.elapsed().as_secs(),
+                self.sessions.len()
+            );
+        }
         if !self.sessions.is_empty() && since.elapsed() >= KEEP_SESSION_THROUGH_OUTAGE {
             tx.send(UiEvent::Log(format!(
                 "No connection for {} s: giving up the old session",
@@ -1295,6 +1351,14 @@ impl Bridge {
         proxy_rx: Option<&mut mpsc::Receiver<ProxyEvent>>,
     ) {
         self.standby = None;
+        if ostp_core::diag::enabled() {
+            tracing::info!(
+                target: "ostp_diag",
+                "client: install_sessions: {} new session(s) replace {} old one(s)",
+                established.sessions.len(),
+                self.sessions.len()
+            );
+        }
         self.sessions = established.sessions;
         self.udp_rx = Some(established.udp_rx);
         self.last_rtt_ms = established.rtt_ms;
@@ -2009,9 +2073,16 @@ impl Bridge {
     /// Starts a move; false if no new connection could be opened.
     async fn try_migrate(&mut self, reason: &str, tx: &mpsc::Sender<UiEvent>) -> bool {
         tx.send(UiEvent::Log(format!("{reason}: moving the session to a new path"))).await.ok();
+        if ostp_core::diag::enabled() {
+            let in_flight: Vec<usize> = self.sessions.iter().map(|s| s.machine.in_flight_count()).collect();
+            tracing::info!(target: "ostp_diag", "client: {reason}: moving the session to a new connection (in flight {in_flight:?})");
+        }
         match self.start_migration(tx).await {
             Ok(()) => true,
             Err(e) => {
+                if ostp_core::diag::enabled() {
+                    tracing::info!(target: "ostp_diag", "client: the move failed before it started");
+                }
                 tx.send(UiEvent::Log(format!("Could not move the session: {e}"))).await.ok();
                 false
             }

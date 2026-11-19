@@ -119,12 +119,19 @@ pub async fn serve_listener(listener: TcpListener, ctx: Arc<SniffCtx>) {
             continue;
         };
 
+        #[cfg(unix)]
+        let fd = Some(std::os::fd::AsRawFd::as_raw_fd(&stream));
+        #[cfg(not(unix))]
+        let fd = None;
+        crate::diag::accepted(peer, fd);
+
         let ctx = ctx.clone();
         tokio::spawn(async move {
             let deadline = Instant::now() + CLASSIFY_TIMEOUT;
             if let Err(e) = handle_conn(stream, peer, ctx, permit, deadline).await {
                 crate::logs::connection_closed(peer, &e);
             }
+            crate::diag::closed(peer);
         });
     }
 }

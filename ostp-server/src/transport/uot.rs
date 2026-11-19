@@ -75,13 +75,22 @@ where
     let writer_authed = authenticated.clone();
     let drain = crate::carrier_queue::register(peer_addr);
     let mut meter = crate::carrier_queue::Meter::new(drain.clone());
+    // Queue diagnostics (off unless OSTP_DIAG is set).
+    let diag_stats = Arc::new(crate::diag::ConnStats::default());
+    let diag_queue = me.clone();
+    let diag_log = crate::diag::start_conn_log(peer_addr, diag_stats.clone(), drain.clone(), move || {
+        diag_queue.upgrade().map(|tx| tx.max_capacity() - tx.capacity())
+    });
+    let writer_diag = diag_stats.clone();
     let writer = async move {
         let mut unauth = unauth;
         while let Some(packet) = rx.recv().await {
             let mut out = BytesMut::with_capacity(2 + packet.len());
             out.put_u16(packet.len() as u16);
             out.put_slice(&packet);
+            let write_started = std::time::Instant::now();
             if write_half.write_all(&out).await.is_err() { break; }
+            writer_diag.wrote(out.len(), write_started.elapsed());
             // How fast this connection really drains (see carrier_queue).
             meter.written(out.len(), rx.len(), std::time::Instant::now());
             if !writer_authed.swap(true, Ordering::Relaxed) {
@@ -127,6 +136,7 @@ where
                 }
             };
             let Some(data) = data else { break };
+            diag_stats.read(data.len() + 2);
             if udp_tx.send((Bytes::from(data), peer_addr)).await.is_err() { break; }
         }
     };
@@ -136,10 +146,14 @@ where
     // old code `join!`ed both, so a half-open connection (client's read side
     // gone but no outbound data pending) left the writer parked on rx.recv()
     // forever, leaking the task and its stale tcp_map entry.
-    tokio::select! {
-        _ = writer => {},
-        _ = reader => {},
+    let ended_by = tokio::select! {
+        _ = writer => "writer (write failed or channel closed)",
+        _ = reader => "reader (EOF, error or idle timeout)",
+    };
+    if let Some(h) = diag_log {
+        h.abort();
     }
+    crate::diag::conn_ended(peer_addr, ended_by);
 
     // A newer connection from the same address (a local web server reuses
     // ports) has its own entry by now; it is not ours to remove.
