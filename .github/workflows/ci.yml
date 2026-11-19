@@ -3,7 +3,8 @@
 # static checks. Releases stay in release.yml (tags only).
 #
 # Results: `gh run list --workflow ci.yml`, `gh run view <id> --log-failed`.
-# The binary: `gh run download <id> --name ostp-linux-amd64`.
+# Binaries: `gh run download <id> --name ostp-linux-amd64` (or ostp-windows-amd64).
+# The apps themselves (APK, desktop installers) are built by release.yml.
 name: CI
 
 on:
@@ -75,6 +76,46 @@ jobs:
         with:
           name: ostp-linux-amd64
           path: target/x86_64-unknown-linux-musl/release/ostp
+          retention-days: 14
+
+  # Windows has its own code paths (TUN through wintun and netsh, socket
+  # errors such as 10054) that the Linux run never touches.
+  windows:
+    name: Tests and binary (Windows x64)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Cargo cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ci-win-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ci-win-
+      - name: Dummy dist for rust-embed
+        shell: bash
+        run: mkdir -p ostp-control/dist && touch ostp-control/dist/index.html
+      - name: cargo test
+        run: cargo test -p ostp-core -p ostp-client -p ostp-server -p ostp -p ostp-tun
+      - name: Build
+        run: cargo build --release --bin ostp
+      - name: wintun.dll
+        shell: pwsh
+        run: |
+          $ProgressPreference = 'SilentlyContinue'
+          Invoke-WebRequest -Uri "https://www.wintun.net/builds/wintun-0.14.1.zip" -OutFile wt.zip
+          Expand-Archive wt.zip -DestinationPath wt_tmp -Force
+          Get-ChildItem wt_tmp -Filter wintun.dll -Recurse | Where-Object { $_.FullName -match 'bin[\\/]amd64[\\/]' } | Copy-Item -Destination target/release/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ostp-windows-amd64
+          path: |
+            target/release/ostp.exe
+            target/release/wintun.dll
           retention-days: 14
 
   apps:

@@ -9,7 +9,7 @@ Older history is on the [Releases](https://github.com/ospab/ostp/releases) page 
 ## [Unreleased]
 
 ### Added
-- Development: a CI workflow (`.github/workflows/ci.yml`) on every push and pull request, so nothing large needs to be built locally. It runs the tests of the core, client, server, CLI and SSH crates on Linux (the end-to-end v6 and roaming tests included), builds a Linux x86_64 binary (musl) kept as a run artifact for 14 days (`gh run download <id> --name ostp-linux-amd64`), and checks the apps (`node --check` on the desktop JavaScript, `flutter analyze` with errors and warnings fatal). Releases are unchanged (tags, `release.yml`).
+- Development: a CI workflow (`.github/workflows/ci.yml`) on every push and pull request, so nothing large needs to be built locally. It runs the tests of the core, client, server, CLI and SSH crates on Linux and on Windows (the end-to-end v6 and roaming tests included; the TUN crate on Windows too), builds a Linux x86_64 binary (musl) and a Windows x64 one with `wintun.dll`, kept as run artifacts for 14 days (`gh run download <id> --name ostp-linux-amd64`, `ostp-windows-amd64`), and checks the apps (`node --check` on the desktop JavaScript, `flutter analyze` with errors and warnings fatal). Releases are unchanged (tags, `release.yml`).
 
 ## [0.5.0-alpha.4] - 2026-11-19
 
