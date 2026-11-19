@@ -7,12 +7,13 @@
 # The apps themselves (APK, desktop installers) are built by release.yml.
 name: CI
 
-# Pushes to alpha that change code; text-only changes (docs, changelogs,
-# READMEs) do not start a run. Any branch can be checked by hand from the
-# Actions tab ("Run workflow").
+# Pushes to beta and master that change code; text-only changes (docs,
+# changelogs, READMEs) do not start a run. alpha and any other branch are
+# checked by hand from the Actions tab ("Run workflow") or with
+# `gh workflow run ci.yml --ref alpha`.
 on:
   push:
-    branches: [alpha]
+    branches: [beta, master]
     paths-ignore:
       - "docs/**"
       - "**/*.md"
