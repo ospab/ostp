@@ -434,6 +434,11 @@ pub struct ProtocolMachine {
     /// How long a probe may go unacknowledged before it counts as lost; the
     /// RTO-based default when `None` (a field so tests can shorten it).
     probe_timeout: Option<Duration>,
+    /// Data in flight with no ACK progress (`crate::stall`).
+    stall: crate::stall::StallDetector,
+    /// How long a reliable carrier may be silent with data waiting before it
+    /// counts as a stall (`stall::RELIABLE_STALL`; a field so tests can shorten it).
+    reliable_stall_after: Duration,
 }
 
 /// A path MTU probe that was sent and neither acknowledged nor given up on.
@@ -605,6 +610,8 @@ impl ProtocolMachine {
             pmtu,
             probe: None,
             probe_timeout: None,
+            stall: crate::stall::StallDetector::new(now),
+            reliable_stall_after: crate::stall::RELIABLE_STALL,
         })
     }
 
@@ -645,6 +652,8 @@ impl ProtocolMachine {
         self.cc.reset_path();
         // The new path may carry another size: discovery starts over.
         self.restart_mtu_discovery();
+        // What stalled was the old path: the clock starts anew.
+        self.stall.on_idle(Instant::now());
         self.path_changed_at = Some(Instant::now());
         let due = Instant::now()
             .checked_sub(Duration::from_secs(3600))
@@ -1198,6 +1207,12 @@ impl ProtocolMachine {
         let now = Instant::now();
         let was_silent = self.last_authenticated_recv.is_some_and(|t| now.duration_since(t) >= OUTAGE_SILENCE);
         self.last_authenticated_recv = Some(now);
+        if self.reliable_carrier {
+            // There the peer being heard is the progress: nothing is lost on
+            // the way, so no ACK is awaited as such.
+            let ended = self.stall.on_progress(now);
+            self.log_stall_end(ended);
+        }
         if was_silent && self.in_flight_count() > 0 {
             self.on_path_change();
         }
@@ -1779,6 +1794,70 @@ impl ProtocolMachine {
         self.apply_mtu_change(change);
     }
 
+    /// On the tick: data in flight and no ACK progress for longer than
+    /// `max(4 x SRTT, 1 s)` is a stall (`crate::stall`). The oldest
+    /// unacknowledged frame is resent at once instead of waiting for its
+    /// backoff timer (a tail-loss probe), and again every such period until
+    /// an ACK moves. The session is never torn down or moved here: that is
+    /// the client's call and the user's.
+    ///
+    /// On a reliable carrier nothing is lost on the way and nothing is
+    /// resent: a stall there is the peer not being heard for 5 s while data
+    /// waits, and is counted and logged only.
+    fn stall_tick(&mut self, now: Instant, actions: &mut Vec<ProtocolAction>) {
+        let in_flight = self.cc.bytes_in_flight() > 0;
+        let after = if self.reliable_carrier {
+            self.reliable_stall_after
+        } else {
+            crate::stall::threshold(self.cc.smoothed_rtt())
+        };
+        let Some(stall) = self.stall.poll(now, in_flight, after) else { return };
+        let log = stall.first && crate::stall::loggable(stall.episode);
+        if self.reliable_carrier {
+            if log {
+                tracing::info!(
+                    "Stall #{}: nothing heard from the peer for {} ms with {} frames waiting; \
+                     a reliable carrier resends nothing",
+                    stall.episode,
+                    stall.stalled_for.as_millis(),
+                    self.in_flight_count()
+                );
+            }
+            return;
+        }
+        // The oldest frame that can be resent (a datagram or a path MTU
+        // probe is never resent: with only those in flight there is no stall).
+        let Some(frame) = self.sent_history.iter_mut().find(|f| f.is_retransmittable && !f.no_resend) else {
+            self.stall.retract(&stall, now);
+            return;
+        };
+        frame.last_sent = now;
+        frame.retries = frame.retries.saturating_add(1);
+        self.cc.on_retransmit(frame.bytes.len() as u64);
+        actions.push(ProtocolAction::SendDatagram(frame.bytes.clone()));
+        if log {
+            tracing::info!(
+                "Stall #{}: no ACK progress for {} ms with {} frames in flight; resent the oldest frame now",
+                stall.episode,
+                stall.stalled_for.as_millis(),
+                self.in_flight_count()
+            );
+        }
+    }
+
+    /// An ACK moved after a stall: said once, for the stalls that were logged.
+    fn log_stall_end(&self, ended: Option<crate::stall::StallEnd>) {
+        if let Some(end) = ended.filter(|e| crate::stall::loggable(e.episode)) {
+            tracing::info!(
+                "Stall #{} over after {} ms ({} {})",
+                end.episode,
+                end.lasted.as_millis(),
+                end.probes,
+                if self.reliable_carrier { "check(s), nothing resent" } else { "tail probe(s)" }
+            );
+        }
+    }
+
     fn wrap_datagram_handshake(&self, noise_payload: &[u8]) -> Result<Bytes, ProtocolError> {
         // Anti-DPI: add random padding after the Noise payload to prevent
         // size fingerprinting. The padding range is derived from the access key
@@ -1933,8 +2012,9 @@ impl ProtocolMachine {
     /// configuration, so the receiver uses its own estimate of it.
     fn sender_gives_up_after(&self) -> Duration {
         let base = self.base_rto();
+        let srtt = self.cc.smoothed_rtt();
         let schedule: Duration =
-            (0..=self.retry_limit()).map(|retries| retransmit_wait(base, retries, self.reliable_carrier)).sum();
+            (0..=self.retry_limit()).map(|retries| retransmit_wait(base, srtt, retries, self.reliable_carrier)).sum();
         schedule.max(self.frame_give_up)
     }
 
@@ -2047,6 +2127,7 @@ impl ProtocolMachine {
         // Backoff starts from retry #0 (immediately effective):
         //   effective_rto = base_rto * 2^retries, capped at 2^6 = 64×
         let mut retransmit_budget: usize = self.cc.retransmit_budget();
+        let srtt = self.cc.smoothed_rtt();
         // The largest frame resent for the third time or more, for path MTU
         // black hole detection after the loop.
         let mut resent_again: Option<(usize, u8, Instant)> = None;
@@ -2064,7 +2145,7 @@ impl ProtocolMachine {
                 break;
             }
 
-            let wait = retransmit_wait(base_rto, frame.retries, self.reliable_carrier);
+            let wait = retransmit_wait(base_rto, srtt, frame.retries, self.reliable_carrier);
             let due = if self.reliable_carrier {
                 // What was in flight on a connection the session left, and a
                 // slow safety net for a frame the sending side dropped from a
@@ -2103,6 +2184,9 @@ impl ProtocolMachine {
         if let Some((len, retries, first_sent)) = resent_again {
             self.note_resent_frame(len, retries, first_sent, now);
         }
+
+        // ── Stall: data in flight and no ACK progress ────────────────
+        self.stall_tick(now, &mut actions);
 
         // Our Close was acknowledged, or retransmitted until given up: the
         // session is over even if the peer never sends its own Close (it
@@ -2217,6 +2301,8 @@ impl ProtocolMachine {
 
     fn push_sent_frame(&mut self, nonce: u64, bytes: Bytes, meta: FrameMeta) {
         if meta.retransmittable {
+            // The first data on an idle session starts the stall clock.
+            self.stall.on_data_sent(Instant::now(), self.cc.bytes_in_flight() == 0);
             self.cc.on_send(bytes.len() as u64);
         }
         self.sent_history.push_back(SentFrame {
@@ -2309,6 +2395,9 @@ impl ProtocolMachine {
         // least one unambiguous ACK; otherwise update the window without
         // polluting the RTT estimator.
         if acked_bytes > 0 {
+            // ACK progress ends a stall.
+            let ended = self.stall.on_progress(now);
+            self.log_stall_end(ended);
             match min_rtt {
                 Some(rtt) => self.cc.on_ack(acked_bytes, rtt),
                 None => self.cc.on_ack_no_rtt(acked_bytes),
@@ -2322,11 +2411,16 @@ impl ProtocolMachine {
 /// Exponential backoff, but bounded in absolute terms. The base RTO is itself
 /// adaptive and can reach RTO_MAX (16 s) on a congested path; multiplied by
 /// the 64x backoff cap that is a frame unretransmitted for ~17 minutes, long
-/// past the point where the session is dead to the user. On a reliable
-/// carrier the timer is only a slow safety net (see `reliable_carrier`).
-fn retransmit_wait(base_rto: Duration, retries: u8, reliable_carrier: bool) -> Duration {
+/// past the point where the session is dead to the user. The backoff stops at
+/// `max(4 x SRTT, 1 s)` (`stall::threshold`), never below the base RTO
+/// itself and never above MAX_EFFECTIVE_RTO: a v5 session delivers nothing
+/// behind a lost frame, and waits of 6 and 8 s in a row were tens of seconds
+/// of nothing. On a reliable carrier the timer is only a slow safety net (see
+/// `reliable_carrier`).
+fn retransmit_wait(base_rto: Duration, srtt: Duration, retries: u8, reliable_carrier: bool) -> Duration {
     let backoff = 1u32 << u32::from(retries).min(6);
-    let wait = base_rto.saturating_mul(backoff).min(MAX_EFFECTIVE_RTO);
+    let cap = crate::stall::threshold(srtt).max(base_rto).min(MAX_EFFECTIVE_RTO);
+    let wait = base_rto.saturating_mul(backoff).min(cap);
     if reliable_carrier {
         wait.max(RELIABLE_CARRIER_RTO)
     } else {
@@ -3044,11 +3138,34 @@ mod tests {
     #[test]
     fn the_wait_matches_the_retransmit_schedule() {
         let base = Duration::from_millis(100);
-        let total: Duration = (0..=10).map(|r| retransmit_wait(base, r, false)).sum();
-        // 0.1 + 0.2 + 0.4 + 0.8 + 1.6 + 3.2 + 6.4 x 5 = 38.3 s
-        assert_eq!(total, Duration::from_millis(38_300));
-        assert_eq!(retransmit_wait(Duration::from_secs(1), 9, false), MAX_EFFECTIVE_RTO);
-        assert_eq!(retransmit_wait(base, 0, true), RELIABLE_CARRIER_RTO);
+        let fast = Duration::from_millis(20);
+        let total: Duration = (0..=10).map(|r| retransmit_wait(base, fast, r, false)).sum();
+        // The backoff stops at max(4 x SRTT, 1 s) = 1 s:
+        // 0.1 + 0.2 + 0.4 + 0.8 + 1 x 7 = 8.5 s (it was 38.3 s, with 6.4 s waits).
+        assert_eq!(total, Duration::from_millis(8_500));
+        assert_eq!(retransmit_wait(base, fast, 0, true), RELIABLE_CARRIER_RTO);
+    }
+
+    /// The cap on the backoff follows the path: four SRTTs, a second at the
+    /// least, never below the first wait and never above MAX_EFFECTIVE_RTO.
+    #[test]
+    fn the_backoff_stops_at_four_srtts_and_a_second() {
+        let ms = Duration::from_millis;
+        // A slow path: base 3 s (SRTT 1 s and variance), cap 4 s.
+        assert_eq!(retransmit_wait(ms(3000), ms(1000), 0, false), ms(3000));
+        assert_eq!(retransmit_wait(ms(3000), ms(1000), 1, false), ms(4000));
+        assert_eq!(retransmit_wait(ms(3000), ms(1000), 6, false), ms(4000));
+        // A fast one never waits more than a second between two sends.
+        assert_eq!(retransmit_wait(ms(100), ms(30), 9, false), ms(1000));
+        // The first wait is the RTO even where the RTO is above the cap.
+        assert_eq!(retransmit_wait(ms(1500), ms(100), 0, false), ms(1500));
+        assert_eq!(retransmit_wait(ms(1500), ms(100), 5, false), ms(1500));
+        // An awful path is held to the old ceiling.
+        assert_eq!(retransmit_wait(ms(6000), ms(5000), 3, false), MAX_EFFECTIVE_RTO);
+        // And the schedule never gets shorter than the RTO the path asks for:
+        // monotone in the retries.
+        let waits: Vec<Duration> = (0..12).map(|r| retransmit_wait(ms(100), ms(20), r, false)).collect();
+        assert!(waits.windows(2).all(|w| w[0] <= w[1]), "{waits:?}");
     }
 
     /// Every datagram `action` would put on the wire, in order.
@@ -4103,6 +4220,10 @@ mod tests {
         assert_eq!(frame.len(), 1452);
         let o = feed(&mut server, &frame);
         assert_eq!(o.app.len(), 1);
+        // The server's answer (an ACK, if it is due already) comes back.
+        for d in &o.wire {
+            feed(&mut client, d);
+        }
         // Nothing is left in flight or open once the probes were answered.
         let _ = pump(&mut client, &mut server, 1500, Duration::from_millis(100));
         assert_eq!(client.in_flight_count(), 0);
@@ -4265,6 +4386,147 @@ mod tests {
         assert_eq!(client.max_payload_handle().load(std::sync::atomic::Ordering::Relaxed), 1200 - DATAGRAM_OVERHEAD_V6);
         let _ = pump(&mut client, &mut server, 1300, Duration::from_millis(2600));
         assert_eq!(client.send_mtu(), 1280, "the new path is learned afresh");
+    }
+
+    // ── Stalls ───────────────────────────────────────────────────────────────
+
+    /// What `to` sends back for `frames`, with its pending ACK flushed.
+    fn answers(to: &mut ProtocolMachine, frames: &[Bytes]) -> Vec<Bytes> {
+        let mut out = Vec::new();
+        for f in frames {
+            out.extend(datagrams(to.on_event(OstpEvent::Inbound(f.clone())).unwrap()));
+        }
+        std::thread::sleep(Duration::from_millis(10));
+        out.extend(datagrams(to.on_event(OstpEvent::Tick).unwrap()));
+        out
+    }
+
+    /// Both frames are lost. The ordinary timer is out of the way (30 s), so
+    /// what resends the oldest one after a second without ACK progress is
+    /// the stall detector, once, and it is the oldest only.
+    fn a_stall_resends_the_oldest_frame(mut client: ProtocolMachine, mut server: ProtocolMachine, stream: u32) {
+        client.rto = Duration::from_secs(30);
+        let first = send(&mut client, stream, b"first");
+        let _second = send(&mut client, stream, b"second");
+        assert!(!client.stall.stalled());
+
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(datagrams(client.on_event(OstpEvent::Tick).unwrap()).is_empty(), "nothing is resent before the threshold");
+        std::thread::sleep(Duration::from_millis(600));
+        let resent = datagrams(client.on_event(OstpEvent::Tick).unwrap());
+        assert_eq!(resent, vec![first.clone()], "the oldest unacknowledged frame, once");
+        assert!(client.stall.stalled());
+        assert_eq!(client.stall.episodes(), 1);
+        assert!(datagrams(client.on_event(OstpEvent::Tick).unwrap()).is_empty(), "not again in the same period");
+
+        // The probe gets through, its ACK comes back and ends the stall.
+        let acks = answers(&mut server, &resent);
+        assert!(!acks.is_empty());
+        for a in &acks {
+            let _ = client.on_event(OstpEvent::Inbound(a.clone()));
+        }
+        assert!(!client.stall.stalled(), "an ACK that moved ended it");
+        assert_eq!(client.stall.episodes(), 1);
+        assert_eq!(client.in_flight_count(), 1, "the second frame is still out");
+    }
+
+    #[test]
+    fn a_v6_stall_resends_the_oldest_frame_before_its_timer() {
+        let (client, server) = do_handshake_v6();
+        a_stall_resends_the_oldest_frame(client, server, 3);
+    }
+
+    #[test]
+    fn a_v5_stall_resends_the_oldest_frame_before_its_timer() {
+        let (client, server) = do_handshake();
+        a_stall_resends_the_oldest_frame(client, server, 3);
+    }
+
+    /// Frames that are acknowledged, and an idle session, are not stalls.
+    #[test]
+    fn acknowledged_data_and_an_idle_session_are_never_a_stall() {
+        let (mut client, mut server) = do_handshake_v6();
+        let f = send(&mut client, 3, b"hello");
+        let acks = answers(&mut server, &[f]);
+        for a in &acks {
+            let _ = client.on_event(OstpEvent::Inbound(a.clone()));
+        }
+        assert_eq!(client.in_flight_count(), 0);
+        std::thread::sleep(Duration::from_millis(1200));
+        assert!(datagrams(client.on_event(OstpEvent::Tick).unwrap()).is_empty());
+        assert_eq!(client.stall.episodes(), 0);
+
+        // And the idle time does not count against the next data: the clock
+        // starts when it goes out.
+        let _lost = send(&mut client, 3, b"next");
+        assert!(datagrams(client.on_event(OstpEvent::Tick).unwrap()).is_empty());
+        assert_eq!(client.stall.episodes(), 0);
+    }
+
+    /// The threshold follows the path: with an SRTT of 600 ms it is 2.4 s,
+    /// not a second.
+    #[test]
+    fn the_stall_threshold_follows_four_srtts() {
+        let (mut client, _server) = do_handshake_v6();
+        client.rto = Duration::from_secs(30);
+        client.cc.on_send(1200);
+        client.cc.on_ack(1200, Duration::from_millis(600));
+        let _lost = send(&mut client, 3, b"x");
+        std::thread::sleep(Duration::from_millis(1300));
+        assert!(datagrams(client.on_event(OstpEvent::Tick).unwrap()).is_empty(), "1.3 s is under four SRTTs of 600 ms");
+        assert_eq!(client.stall.episodes(), 0);
+    }
+
+    /// A stall with nothing to resend (only a path MTU probe, which is never
+    /// resent, is in flight) is none, and is not counted.
+    #[test]
+    fn a_probe_alone_in_flight_is_not_a_stall() {
+        let (mut client, _server) = auto_pair();
+        let probe = tick(&mut client).wire;
+        assert_eq!(probe.len(), 1);
+        // The probe timeout would judge it lost first: make it longer than the wait.
+        client.probe_timeout = Some(Duration::from_secs(30));
+        client.rto = Duration::from_secs(30);
+        std::thread::sleep(Duration::from_millis(1100));
+        let o = tick(&mut client);
+        assert!(o.wire.is_empty(), "nothing to resend");
+        assert_eq!(client.stall.episodes(), 0);
+        assert!(!client.stall.stalled());
+    }
+
+    /// On a reliable carrier nothing is resent on the timer, so a stall is
+    /// counted (the peer not heard from while data waits) and nothing else
+    /// happens; hearing the peer again ends it.
+    #[test]
+    fn a_reliable_carrier_counts_a_stall_and_resends_nothing() {
+        let (mut client, mut server) = do_handshake_v6();
+        client.set_reliable_carrier(true);
+        client.reliable_stall_after = Duration::from_millis(300);
+        let _queued = send(&mut client, 3, b"waiting");
+        std::thread::sleep(Duration::from_millis(350));
+        let out = tick(&mut client);
+        assert!(out.wire.is_empty(), "a reliable carrier resends nothing for a stall");
+        assert_eq!(client.stall.episodes(), 1);
+        assert!(client.stall.stalled());
+        assert_eq!(client.in_flight_count(), 1, "the frame stays queued");
+
+        // The peer is heard: any authenticated datagram does it.
+        let from_server = send(&mut server, 2, b"hello");
+        let _ = feed(&mut client, &from_server);
+        assert!(!client.stall.stalled());
+    }
+
+    /// A path change forgets the stall of the old path.
+    #[test]
+    fn a_path_change_ends_the_stall_clock() {
+        let (mut client, _server) = do_handshake_v6();
+        client.rto = Duration::from_secs(30);
+        let _lost = send(&mut client, 3, b"x");
+        std::thread::sleep(Duration::from_millis(1100));
+        client.on_path_change();
+        // (The frame is resent by the path change itself: due at once.)
+        let _ = tick(&mut client);
+        assert_eq!(client.stall.episodes(), 0, "the stall of the old path was not counted");
     }
 
     #[test]

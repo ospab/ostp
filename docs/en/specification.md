@@ -222,7 +222,7 @@ OSTP provides reliability over an inherently unreliable datagram substrate using
 * **Reorder buffer:** out-of-order frames are held in a `BTreeMap` keyed by nonce, capped at 8,192 buffered frames (`max_reorder_buffer`). A frame arriving more than 16,384 nonces (`max_reorder`) ahead of the expected sequence is rejected with an immediate `Nack` rather than buffered.
 * **Acknowledgment:** **Cumulative + SACK.** The `Ack` payload always starts with the cumulative range `(0, expected_recv_nonce - 1)`, followed by up to 7 additional selective-ACK ranges describing non-contiguous blocks already sitting in the reorder buffer (8 ranges total).
 * **Rate-limited NACK:** on detecting a gap, the receiver emits a `Nack` for the lowest missing nonce, but at most once every `max(10ms, current_RTO / 2)` — this fires *before* the sender's own retransmit timer, prompting a fast retransmit, while still bounding the storm under bursty loss.
-* **Retransmission:** unacknowledged data frames are retransmitted after an adaptive RTO (RFC 6298 `SRTT + 4×RTTVAR`, clamped to `[50ms, 16s]`, default base 100ms) with exponential backoff up to 64× the base RTO.
+* **Retransmission:** unacknowledged data frames are retransmitted after an adaptive RTO (RFC 6298 `SRTT + 4×RTTVAR`, clamped to `[50ms, 16s]`, default base 100ms) with exponential backoff up to 64× the base RTO, but never longer than `max(4×SRTT, 1s)` between two sends of one frame (and never shorter than the RTO itself or longer than 8s): the wait used to grow to 8s, and a v5 session delivers nothing behind a lost frame. Besides the timer there is a stall detector (§9.9).
 * **Zombie frame eviction:** a frame that has been retried more than `max_retries + 2` times (default `max_retries` = 8, so 10 total attempts) is dropped from the sender's history — it can no longer be retransmitted, which is what makes gap recovery (§9.4) necessary on the receive side.
 * **In-flight accounting:** only retransmittable `Data` frames count toward backpressure; control frames (`Ack`/`Nack`) are excluded so acknowledgment traffic can never itself throttle the session.
 * **Graceful close:** the `Closing` state keeps processing inbound frames (including trailing ACKs and retransmits) instead of tearing down on the first post-`Close` packet, so in-flight data isn't lost during teardown.
@@ -282,6 +282,16 @@ The datagram size (a UDP payload, the whole OSTP datagram) is set in the client 
 * **Where it does not run:** on a reliable carrier (UoT, TLS) the size does not matter and the configured one is used (1350 on the server, on the client 1350 under `auto`); on a v5 session, because a lost probe would be a hole in the nonce space that a v5 peer cannot close (it would hold up every frame behind it until the NACK for it is answered with a frame that can no longer be re-cut), so the 0.4.x size is kept (1140 under `auto`, a fixed number as given).
 * **Chunking follows:** the sender cuts stream data to the size found so far (`ProtocolMachine::max_payload`; the server's readers read it through a shared handle on every read).
 * **TUN and local reads:** with `auto` the TUN device keeps its MTU of 1140 (it is set once, and 1140 plus the overhead fits the 1200-byte start), so inner packets stay within it; downloads through the server, and the local proxy's reads, use the full size found.
+
+### 9.9 Stall Detection
+
+A frame lost on a datagram path waits for its retransmit timer, so the cumulative wait for one frame used to reach tens of seconds, during which a v5 session delivers nothing behind it. Each side therefore watches its own sending: **data in flight and no ACK progress for longer than `max(4×SRTT, 1s)` is a stall.**
+
+* **Tail-loss probe:** on a stall the oldest unacknowledged frame is resent at once, without waiting for its backoff timer, and again every such period until an ACK moves. A frame that cannot be resent (a v6 datagram, a path MTU probe) is not probed; with only those in flight there is no stall. The probe does not shrink the congestion window.
+* **Backoff cap:** the wait between two sends of one frame stops growing at the same `max(4×SRTT, 1s)` (§9.1).
+* **Reliable carrier (UoT, TLS):** nothing is lost on the way and nothing is resent on a timer, so a stall there is counted and logged only: nothing heard from the peer for more than 5s while data waits.
+* **Log:** `info`, no address and no destination: the number of the stall, how long it lasted, how many frames were in flight and what was done (`Stall #3: no ACK progress for 1004 ms with 2 frames in flight; resent the oldest frame now`, `Stall #3 over after 1230 ms (1 tail probe(s))`). Only the first stall and then every power of two (1, 2, 4, 8, ...) is written, so a flapping path cannot fill the log.
+* **Nothing else:** the detector acts only inside the session. It never reconnects, moves the session or changes the carrier: that is the client's call after its own silence limits (§9.6, §9.7), and the user's choice.
 
 ---
 

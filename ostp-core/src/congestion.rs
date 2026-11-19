@@ -257,6 +257,11 @@ impl CongestionController {
                 - bytes as f64;
     }
 
+    /// Bytes sent and not yet acknowledged (or given up on).
+    pub fn bytes_in_flight(&self) -> u64 {
+        self.bytes_in_flight
+    }
+
     /// Returns the current congestion window in bytes.
     pub fn cwnd(&self) -> u64 {
         self.cwnd
