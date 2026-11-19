@@ -48,7 +48,7 @@ where
         .udp_buffer_size(1024)
         .enable_tcp(true)
         .enable_udp(true)
-        .mtu(config.ostp.mtu)
+        .mtu(config.ostp.mtu.tun_mtu())
         .build()?;
 
     let mut runner_task = tokio::spawn(async move {
@@ -552,7 +552,7 @@ pub async fn run_native_tunnel(
         bypass_ips,
         dns_server: config.dns_server.clone(),
         kill_switch: config.kill_switch,
-        mtu: config.ostp.mtu as u16,
+        mtu: config.ostp.mtu.tun_mtu() as u16,
         wintun_path: None,
     };
 

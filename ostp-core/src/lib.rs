@@ -7,6 +7,7 @@ pub mod http_upgrade;
 pub mod keys;
 pub mod logpriv;
 pub mod net;
+pub mod pmtu;
 pub mod protocol;
 pub mod relay;
 pub mod server_key;

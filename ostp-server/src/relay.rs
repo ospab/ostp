@@ -154,11 +154,17 @@ pub async fn handle_message(
                 let mut map = session_backpressure.write().unwrap_or_else(|e| e.into_inner());
                 map.entry(session_id).or_insert_with(|| Arc::new(SendGate::new(32))).clone()
             };
-            let frame_payload = dispatcher
-                .max_payload(session_id)
-                .unwrap_or(1300)
-                .saturating_sub(ostp_core::relay::DATA_OVERHEAD)
-                .max(1);
+            // How much stream data one datagram of this session carries: read
+            // anew for each read, because it grows while the session finds
+            // the path's MTU (a handle shared with the machine).
+            let payload_handle = dispatcher.max_payload_handle(session_id);
+            let frame_payload_now = move || {
+                payload_handle
+                    .as_ref()
+                    .map_or(1300, |h| h.load(std::sync::atomic::Ordering::Relaxed))
+                    .saturating_sub(ostp_core::relay::DATA_OVERHEAD)
+                    .max(1)
+            };
             // The client grants this stream's download as its program reads it.
             let window = dispatcher
                 .flow_control(session_id)
@@ -186,6 +192,7 @@ pub async fn handle_message(
                                 // The budget is updated on every ACK and tick and
                                 // wakes this task at once.
                                 let budget = gate.acquire().await;
+                                let frame_payload = frame_payload_now();
                                 let mut want = (budget as usize).saturating_mul(frame_payload).clamp(1, READ_BUF);
                                 if let Some(window) = &reader_window {
                                     let credit = tokio::select! {

@@ -205,8 +205,12 @@ pub async fn run_server(params: ServerParams) -> Result<()> {
     // streams end at this server, so OSTP's ARQ is their only delivery
     // guarantee, and a frame evicted before it was acknowledged is lost for
     // good and silently corrupts its stream.
+    // `mtu_auto`: a v6 session on a datagram carrier finds the datagram size
+    // this server sends to it (`ostp_core::pmtu`); a v5 session, and any
+    // session on TCP or TLS, uses the 1350 given here, as before.
     let protocol_config = ProtocolConfig {
         max_padding: 256,
+        mtu_auto: true,
         ..ProtocolConfig::with_defaults(NoiseRole::Responder, 1350)
     };
 

@@ -63,6 +63,19 @@ Only `ostp import https://…/sub/…` and the apps' subscription fetch use it, 
 - `debug`: everything, with the destinations. Only when you ask for it (*Log privacy* in the apps, or `"debug": true`, which still means this when `log.privacy` is absent); it does not turn itself off.
 - The address of your own server is still written: it is yours.
 
+## Packet size (`mtu`)
+
+`mtu` is `"auto"` or a number of bytes, and a config without it means `"auto"`:
+
+```json
+"mtu": "auto"
+```
+
+- `"auto"` (default): on a v6 profile over UDP, each side finds by itself how large a datagram the path carries, starting at 1200 bytes and probing 1280, 1350, 1400 and 1452 (see [specification.md](specification.md), *Path MTU discovery*). It also steps down by itself if the path starts to lose large datagrams. Nothing to type in, and nothing to lower when a connection drops over a path with a small MTU. A v5 profile (no `pk`) and a TCP or TLS carrier do not discover anything: they use the size 0.4.x used, 1140 for the client.
+- A number (576 to 1500; `1280`): that size, as before, for every profile and carrier.
+- The apps: the MTU field is empty for Auto, or holds a number (desktop: Settings, MTU; Android: Settings, MTU (Packet Size)).
+- With `auto` the TUN device keeps an MTU of 1140: it is set once, when the tunnel starts.
+
 ## Exclusions
 
 The `exclude` block lists what bypasses the tunnel and goes out directly:

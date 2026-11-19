@@ -268,6 +268,20 @@ The client moves the session to a new connection of the same carrier:
 
 * **Client-side:** `Ping`/`Pong` `RelayMessage`s (§8) are exchanged every `keepalive_interval_sec` (default 5s) for RTT measurement. Only a datagram that passed AEAD counts as a sign of life: a duplicate or garbage with a plausible header does not reset the silence timer. After 10s of silence the client moves the session to a new path (§9.6); after 25s it begins a background reconnect attempt; after 180s of total silence it treats the session as permanently lost and stops the tunnel — unless the kill switch is enabled, in which case it retries indefinitely rather than falling open.
 * **Server-side:** sessions with no valid inbound datagram for 600 seconds are evicted from the dispatcher's session table.
+* **Round trips shown to the user:** the apps' "RTT" is the path's own round trip, the congestion controller's smoothed RTT of ACKs of frames that were never retransmitted (the best live session with `mux`); on a reliable carrier it includes the TCP connection's own queue, which is the delay a frame really has there. The in-tunnel `Ping`/`Pong` waits behind every queued data frame, so it is shown separately as the queue delay (in-tunnel RTT minus path RTT, never negative), and only when it is above 200 ms.
+
+### 9.8 Path MTU Discovery (v6)
+
+The datagram size (a UDP payload, the whole OSTP datagram) is set in the client config by `mtu`: `"auto"` (the default; a missing field means it too) or a number of bytes. A number is the size, as in 0.4.x. `auto` is packetization-layer discovery in the spirit of RFC 8899, per session and per direction (each side probes what it sends):
+
+* **Base and ladder:** a session starts at 1200 bytes and tries 1280, 1350, 1400 and 1452, one rung at a time.
+* **Probe:** a `KeepAlive` frame (§7) padded to the size under test, counted in flight, acknowledged like any frame and never retransmitted. A peer treats it as a keepalive: nothing is delivered, an ACK follows.
+* **Confirmed / ceiling:** an ACKed probe confirms its size and the next rung is tried at once. A rung whose probe is lost 3 times in a row (no ACK within 3 RTOs, 1 to 4 s, or a NACK for its nonce) is the ceiling; the size stays at the rung below. A lost probe is not a congestion loss: it leaves the window alone. The hole it leaves in the nonce space is closed with an `Abandon` (see [`v6-session-design.md`](v6-session-design.md)), so a lost probe stalls no stream.
+* **Black hole:** when a frame has been resent 3 times and is still lost, nothing as large was acknowledged since it was first sent, but a clearly smaller frame was, the path no longer carries that size: the size drops to the largest rung below the lost frame, and the log says so. Frames already built at the larger size keep being resent at it (a frame cannot be re-cut) until they are given up.
+* **Again:** a ceiling is forgotten after 10 minutes and the rung is probed again; a path change (`on_path_change`) starts over from 1200.
+* **Where it does not run:** on a reliable carrier (UoT, TLS) the size does not matter and the configured one is used (1350 on the server, on the client 1350 under `auto`); on a v5 session, because a lost probe would be a hole in the nonce space that a v5 peer cannot close (it would hold up every frame behind it until the NACK for it is answered with a frame that can no longer be re-cut), so the 0.4.x size is kept (1140 under `auto`, a fixed number as given).
+* **Chunking follows:** the sender cuts stream data to the size found so far (`ProtocolMachine::max_payload`; the server's readers read it through a shared handle on every read).
+* **TUN and local reads:** with `auto` the TUN device keeps its MTU of 1140 (it is set once, and 1140 plus the overhead fits the 1200-byte start), so inner packets stay within it; downloads through the server, and the local proxy's reads, use the full size found.
 
 ---
 

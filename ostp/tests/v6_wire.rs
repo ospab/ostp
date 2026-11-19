@@ -209,14 +209,14 @@ impl Client {
         self.logs.lock().unwrap().join("\n")
     }
 
-    async fn echo_through(&mut self, target: SocketAddr, data: &'static [u8]) {
+    async fn echo_through(&mut self, target: SocketAddr, data: &[u8]) {
         self.proxy_ev.send(ProxyEvent::NewStream { stream_id: STREAM, target: target.to_string() }).await.unwrap();
         match timeout(Duration::from_secs(5), self.to_app.recv()).await {
             // A v6 stream says so in its ConnectOk.
             Ok(Some((STREAM, ProxyToClientMsg::ConnectOk | ProxyToClientMsg::ConnectOkV6))) => {}
             _ => panic!("no ConnectOk; log:\n{}", self.log_text()),
         }
-        self.proxy_ev.send(ProxyEvent::Data { stream_id: STREAM, payload: Bytes::from_static(data) }).await.unwrap();
+        self.proxy_ev.send(ProxyEvent::Data { stream_id: STREAM, payload: Bytes::copy_from_slice(data) }).await.unwrap();
         let mut got = Vec::new();
         while got.len() < data.len() {
             match timeout(Duration::from_secs(5), self.to_app.recv()).await {
@@ -279,6 +279,92 @@ async fn the_apps_rtt_is_the_path_round_trip_and_the_queue_delay_stays_small_whe
     assert!(rtt >= 1, "no path RTT published");
     assert!(rtt < 500, "a loopback path has no {rtt} ms RTT");
     assert!(queue <= 200, "an idle path has no {queue} ms queue");
+}
+
+/// A UDP forwarder between one client and the server that drops datagrams
+/// above `limit` bytes, as a path with a small MTU does, and keeps what it
+/// saw: the sizes it dropped and the largest it passed.
+struct SmallMtuPath {
+    addr: SocketAddr,
+    dropped: Arc<Mutex<Vec<usize>>>,
+    largest_passed: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+async fn small_mtu_path(server: SocketAddr, limit: usize) -> SmallMtuPath {
+    let front = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    let addr = front.local_addr().unwrap();
+    let back = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    back.connect(server).await.unwrap();
+    let dropped = Arc::new(Mutex::new(Vec::new()));
+    let largest_passed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let client: Arc<Mutex<Option<SocketAddr>>> = Arc::new(Mutex::new(None));
+    let judge = {
+        let (dropped, largest) = (dropped.clone(), largest_passed.clone());
+        move |n: usize| {
+            if n > limit {
+                dropped.lock().unwrap().push(n);
+                false
+            } else {
+                largest.fetch_max(n, Ordering::Relaxed);
+                true
+            }
+        }
+    };
+    {
+        let (front, back, client, judge) = (front.clone(), back.clone(), client.clone(), judge.clone());
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 65535];
+            loop {
+                // A datagram sent to a closed port makes the next receive fail
+                // on Windows (WSAECONNRESET); the socket is fine.
+                let Ok((n, from)) = front.recv_from(&mut buf).await else { continue };
+                *client.lock().unwrap() = Some(from);
+                if judge(n) {
+                    let _ = back.send(&buf[..n]).await;
+                }
+            }
+        });
+    }
+    tokio::spawn(async move {
+        let mut buf = vec![0u8; 65535];
+        loop {
+            let Ok(n) = back.recv(&mut buf).await else { continue };
+            let to = *client.lock().unwrap();
+            if let (Some(to), true) = (to, judge(n)) {
+                let _ = front.send_to(&buf[..n], to).await;
+            }
+        }
+    });
+    SmallMtuPath { addr, dropped, largest_passed }
+}
+
+/// `mtu` left out is auto. Over a path that carries at most 1300 bytes per
+/// datagram, a v6 client and server find 1280 by themselves: the probes of
+/// 1350 are the only datagrams lost, a 300 KB echo (server chunking follows
+/// the size) arrives whole, and the largest datagram that went through is
+/// exactly the discovered size.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_datagram_size_is_found_by_the_session_over_a_path_that_carries_1300_bytes() {
+    let (protocol, public) = section(false);
+    let server = start_server(Some(protocol)).await;
+    let echo = start_echo().await;
+    let path = small_mtu_path(server, 1300).await;
+    let mut client = Client::from_link(&link_to(path.addr, Some(public)), "udp").await;
+    assert!(client.wait_log("Connection established", Duration::from_secs(10)).await, "log:\n{}", client.log_text());
+
+    // Three lost probes of the rung per side end the climb (a probe is given
+    // up after at least a second, and the next waits half a second).
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while path.dropped.lock().unwrap().len() < 6 && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let dropped = path.dropped.lock().unwrap().clone();
+    assert_eq!(dropped, vec![1350; 6], "only the probes of the rung above the path are lost");
+
+    let data: Vec<u8> = (0..300_000u32).map(|i| (i % 251) as u8).collect();
+    client.echo_through(echo, &data).await;
+    assert_eq!(path.dropped.lock().unwrap().len(), 6, "no data frame was lost to the size");
+    assert_eq!(path.largest_passed.load(Ordering::Relaxed), 1280, "data filled datagrams of the discovered size, no more");
 }
 
 #[tokio::test(flavor = "multi_thread")]

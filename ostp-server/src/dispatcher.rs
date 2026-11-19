@@ -797,6 +797,13 @@ impl Dispatcher {
         self.peer_machines.get(&session_id).map(|ps| ps.machine.max_payload())
     }
 
+    /// The same, shared: it follows the datagram size the session discovers
+    /// (`ProtocolMachine::max_payload_handle`), for readers that chunk stream
+    /// data without holding the dispatcher.
+    pub fn max_payload_handle(&self, session_id: u32) -> Option<Arc<std::sync::atomic::AtomicUsize>> {
+        self.peer_machines.get(&session_id).map(|ps| ps.machine.max_payload_handle())
+    }
+
     /// v6: the client opens a stream. Refused (the reason is for the client)
     /// when the id is not an odd one, was used before, or 1024 are open.
     pub fn open_stream(&mut self, session_id: u32, stream_id: u32) -> Result<(), ostp_core::streams::StreamError> {

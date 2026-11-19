@@ -73,7 +73,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
   void _loadSettings() {
     _localBindCtrl = TextEditingController(text: widget.prefs.getString('local_bind') ?? '127.0.0.1:1088');
     _dnsCtrl = TextEditingController(text: widget.prefs.getString('dns_server') ?? '1.1.1.1');
-    _mtuCtrl = TextEditingController(text: widget.prefs.getString('mtu') ?? '1140');
+    // Empty is Auto: the session finds the packet size. A number fixes it.
+    _mtuCtrl = TextEditingController(text: widget.prefs.getString('mtu') ?? '');
     // Exclusions, app options, logs, server management and updates live on
     // MoreSettingsScreen; this screen only saves what it shows, so it never
     // writes back stale copies of those.
@@ -262,7 +263,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
   void _saveSettings() {
     widget.prefs.setString('local_bind', _localBindCtrl.text.trim());
     widget.prefs.setString('dns_server', _dnsCtrl.text.trim());
-    widget.prefs.setString('mtu', _mtuCtrl.text.trim());
+    final mtu = _mtuCtrl.text.trim();
+    widget.prefs.setString('mtu', mtu.toLowerCase() == 'auto' ? '' : mtu);
     // The profile list is saved by each change to it. Writing it here as well
     // would overwrite a subscription refresh that finished while this screen was open.
   }
@@ -910,7 +912,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
               children: [
                 _buildTextField('Local Proxy Bind', _localBindCtrl, hint: '127.0.0.1:1088'),
                 _buildTextField('Custom DNS Server', _dnsCtrl, hint: '1.1.1.1 (e.g. 8.8.8.8)'),
-                _buildTextField('MTU (Packet Size)', _mtuCtrl, hint: '1140 (decrease if connection drops)'),
+                _buildTextField('MTU (Packet Size)', _mtuCtrl, hint: 'Auto (leave empty). A number fixes the size; lower it if the connection drops'),
               ],
             ),
           ),

@@ -2,6 +2,8 @@ use bytes::Bytes;
 use rand::Rng;
 use thiserror::Error;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::sync::atomic::AtomicUsize;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// Upper bound on a single frame's retransmit timer, after exponential backoff
@@ -58,7 +60,16 @@ pub struct ProtocolConfig {
     /// Different access keys produce different handshake packet sizes.
     pub handshake_pad_min: usize,
     pub handshake_pad_max: usize,
+    /// The size of a datagram (UDP payload) this side sends, unless
+    /// `mtu_auto` finds it out; also the unit the congestion window counts
+    /// packets in.
     pub mtu: usize,
+    /// Find the datagram size by probing the path (`crate::pmtu`) instead of
+    /// taking `mtu`. Only a v6 session on a datagram carrier does it: a probe
+    /// that is lost leaves a hole in the nonce space that only a v6 peer
+    /// can close (`Abandon`), and on a reliable carrier the size does not
+    /// matter. Elsewhere `mtu` is the size, as it always was.
+    pub mtu_auto: bool,
     /// `Some`: the handshake is v6 (the server's static key, a masked
     /// handshake datagram). `None`: v5. The caller derives `psk`,
     /// `obfuscation_key` and the padding range for the same version.
@@ -104,6 +115,7 @@ impl ProtocolConfig {
             handshake_pad_min: 32,
             handshake_pad_max: 128,
             mtu,
+            mtu_auto: false,
             v6: None,
         }
     }
@@ -406,6 +418,30 @@ pub struct ProtocolMachine {
     dead_streams: BTreeSet<u32>,
     /// The last `Abandon` sent in answer to a NACK, to rate-limit those.
     last_abandon_answer: Instant,
+    /// The datagram size this side sends now: the configured `mtu`, or what
+    /// path MTU discovery has found.
+    send_mtu: usize,
+    /// `send_mtu` less the datagram overhead, shared so the tasks that chunk
+    /// stream data (the server's readers) follow it as it changes.
+    max_payload_shared: Arc<AtomicUsize>,
+    /// The session asked for discovery (`mtu_auto`, v6): it runs while the
+    /// carrier is a datagram one.
+    mtu_auto: bool,
+    /// Path MTU discovery, while it runs.
+    pmtu: Option<crate::pmtu::PathMtu>,
+    /// The probe that is out.
+    probe: Option<Probe>,
+    /// How long a probe may go unacknowledged before it counts as lost; the
+    /// RTO-based default when `None` (a field so tests can shorten it).
+    probe_timeout: Option<Duration>,
+}
+
+/// A path MTU probe that was sent and neither acknowledged nor given up on.
+#[derive(Debug, Clone, Copy)]
+struct Probe {
+    nonce: u64,
+    size: usize,
+    sent_at: Instant,
 }
 
 // ── Gap recovery (see `ProtocolMachine::recover_stalled_gap`) ────────────────
@@ -451,6 +487,18 @@ struct SentFrame {
     no_resend: bool,
 }
 
+/// A path MTU probe is a `KeepAlive` that is counted in flight, acknowledged
+/// and never resent (the one kind that is: a v6 datagram is `Datagram`).
+fn is_probe_frame(f: &SentFrame) -> bool {
+    f.no_resend && f.kind == FrameKind::KeepAlive
+}
+
+/// How long a probe may go unanswered, at the least and at the most. Three
+/// RTOs in between, with a floor that the first estimate of a path (a guess)
+/// cannot undercut.
+const PROBE_TIMEOUT_MIN: Duration = Duration::from_secs(1);
+const PROBE_TIMEOUT_MAX: Duration = Duration::from_secs(4);
+
 /// What a frame being built is.
 #[derive(Clone, Copy)]
 struct FrameMeta {
@@ -491,6 +539,10 @@ impl ProtocolMachine {
         let overhead = if v6 { DATAGRAM_OVERHEAD_V6 } else { DATAGRAM_OVERHEAD };
         let mtu = config.mtu.max(overhead + 64);
         let now = Instant::now();
+        // Discovery needs a peer that can close the hole a lost probe leaves.
+        let mtu_auto = config.mtu_auto && v6;
+        let pmtu = mtu_auto.then(|| crate::pmtu::PathMtu::new(crate::pmtu::BASE, crate::pmtu::MAX, now));
+        let send_mtu = if mtu_auto { crate::pmtu::BASE } else { mtu };
 
         Ok(Self {
             role: config.role,
@@ -504,7 +556,7 @@ impl ProtocolMachine {
             sent_history: VecDeque::with_capacity(config.max_sent_history.max(1)),
             session_id: config.session_id,
             handshake_payload: config.handshake_payload,
-            padder: AdaptivePadder::new(mtu, config.max_padding, config.padding_strategy).with_overhead(overhead),
+            padder: AdaptivePadder::new(send_mtu, config.max_padding, config.padding_strategy).with_overhead(overhead),
             obfuscation_key: config.obfuscation_key,
             max_reorder: config.max_reorder.max(1),
             // A sender never has more than MAX_CWND_PACKETS frames in flight,
@@ -547,6 +599,12 @@ impl ProtocolMachine {
             stream_buffered: 0,
             dead_streams: BTreeSet::new(),
             last_abandon_answer: now.checked_sub(Duration::from_secs(1)).unwrap_or(now),
+            send_mtu,
+            max_payload_shared: Arc::new(AtomicUsize::new(send_mtu.saturating_sub(overhead).max(64))),
+            mtu_auto,
+            pmtu,
+            probe: None,
+            probe_timeout: None,
         })
     }
 
@@ -585,6 +643,8 @@ impl ProtocolMachine {
     /// server moves the session's address on.
     pub fn on_path_change(&mut self) {
         self.cc.reset_path();
+        // The new path may carry another size: discovery starts over.
+        self.restart_mtu_discovery();
         self.path_changed_at = Some(Instant::now());
         let due = Instant::now()
             .checked_sub(Duration::from_secs(3600))
@@ -602,8 +662,110 @@ impl ProtocolMachine {
     /// rather than UDP; see the `reliable_carrier` field. Safe to change at
     /// any time, the peer is not affected.
     pub fn set_reliable_carrier(&mut self, reliable: bool) {
+        let changed = self.reliable_carrier != reliable;
         self.reliable_carrier = reliable;
         self.cc.set_delay_signal(!reliable);
+        // The size of a datagram does not matter on a byte stream: discovery
+        // stops and the configured size is used. (Not restarted when nothing
+        // changed: a repeated call must not send a running discovery back to
+        // the start.)
+        if changed {
+            self.restart_mtu_discovery();
+        }
+    }
+
+    /// The datagram size this side sends now (UDP payload): the configured
+    /// `mtu`, or what discovery has found so far.
+    pub fn send_mtu(&self) -> usize {
+        self.send_mtu
+    }
+
+    /// Whether path MTU discovery is running on this session.
+    pub fn mtu_discovery_active(&self) -> bool {
+        self.pmtu.is_some()
+    }
+
+    /// `max_payload()`, shared: it follows the discovered size, for tasks that
+    /// chunk stream data and do not hold the machine.
+    pub fn max_payload_handle(&self) -> Arc<AtomicUsize> {
+        self.max_payload_shared.clone()
+    }
+
+    /// Takes `size` as the datagram size from now on.
+    fn set_send_mtu(&mut self, size: usize) {
+        self.send_mtu = size;
+        self.padder.mtu_hint = size;
+        self.max_payload_shared.store(self.max_payload(), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Discovery starts from the base size, or stops: it runs on a v6 session
+    /// whose carrier is a datagram one. An outstanding probe is forgotten.
+    fn restart_mtu_discovery(&mut self) {
+        if !self.mtu_auto {
+            return;
+        }
+        self.forget_probe();
+        if self.reliable_carrier {
+            self.pmtu = None;
+            self.set_send_mtu(self._mtu);
+        } else {
+            self.pmtu = Some(crate::pmtu::PathMtu::new(crate::pmtu::BASE, crate::pmtu::MAX, Instant::now()));
+            self.set_send_mtu(crate::pmtu::BASE);
+        }
+    }
+
+    /// Drops the probe that is out, if any, from the history. It was never
+    /// resendable, so nothing else keeps track of it.
+    fn forget_probe(&mut self) {
+        if let Some(p) = self.probe.take() {
+            self.remove_sent_frame(p.nonce);
+        }
+    }
+
+    /// Takes a frame out of the history as given up, releasing its window.
+    fn remove_sent_frame(&mut self, nonce: u64) -> bool {
+        let i = self.sent_history.partition_point(|f| f.nonce < nonce);
+        if self.sent_history.get(i).is_some_and(|f| f.nonce == nonce) {
+            if let Some(f) = self.sent_history.remove(i) {
+                if f.is_retransmittable {
+                    self.cc.on_discard(f.bytes.len() as u64);
+                }
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Writes what path MTU discovery did to the log. No address, no
+    /// destination: sizes only. A server logs the climb at debug (it does it
+    /// for every session); a client says so at info.
+    fn log_mtu_change(&self, change: crate::pmtu::Change) {
+        use crate::pmtu::Change;
+        let client = matches!(self.role, NoiseRole::Initiator);
+        match change {
+            Change::Raised { to } if client => tracing::info!("Path MTU: {to} bytes confirmed by a probe"),
+            Change::Raised { to } => tracing::debug!("Path MTU: {to} bytes confirmed by a probe"),
+            Change::Ceiling { size } => {
+                tracing::info!("Path MTU: probes of {size} bytes are lost; sending {} bytes at most", self.send_mtu)
+            }
+            Change::BlackHole { lost, from, to } => tracing::info!(
+                "Path MTU: frames of {lost} bytes keep getting lost while smaller ones get through; \
+                 datagram size lowered from {from} to {to} bytes"
+            ),
+            Change::Reprobing { size } => tracing::debug!("Path MTU: trying {size} bytes again"),
+        }
+    }
+
+    /// A change from `pmtu` takes effect: a new size is applied, and logged.
+    fn apply_mtu_change(&mut self, change: Option<crate::pmtu::Change>) {
+        use crate::pmtu::Change;
+        let Some(change) = change else { return };
+        match change {
+            Change::Raised { to } => self.set_send_mtu(to),
+            Change::BlackHole { to, .. } => self.set_send_mtu(to),
+            Change::Ceiling { .. } | Change::Reprobing { .. } => {}
+        }
+        self.log_mtu_change(change);
     }
 
     /// The RTT of the network path as ACKs measured it (`None` before the first
@@ -659,7 +821,7 @@ impl ProtocolMachine {
     /// configured MTU; split anything larger (see `relay::data_chunks`).
     pub fn max_payload(&self) -> usize {
         let overhead = if self.v6 { DATAGRAM_OVERHEAD_V6 } else { DATAGRAM_OVERHEAD };
-        self._mtu.saturating_sub(overhead).max(64)
+        self.send_mtu.saturating_sub(overhead).max(64)
     }
 
     /// Whether the pacing bucket currently allows releasing another packet.
@@ -1062,7 +1224,7 @@ impl ProtocolMachine {
                 let req_nonce = u64::from_be_bytes(packet.payload[..8].try_into().map_err(|_| ProtocolError::Framing("nack payload too short".into()))?);
                 let new_gap = self.last_nacked_nonce != Some(req_nonce);
                 self.last_nacked_nonce = Some(req_nonce);
-                if let Some(cached_frame) = self.lookup_sent_frame(req_nonce) {
+                if let Some((cached_frame, _, _)) = self.lookup_sent_frame(req_nonce) {
                     tracing::debug!("NACK received: retransmitting nonce={}", req_nonce);
                     if new_gap {
                         self.cc.on_loss(cached_frame.len() as u64);
@@ -1371,17 +1533,24 @@ impl ProtocolMachine {
         let is_datagram = self.sent_history.get(i).filter(|f| f.nonce == req_nonce).map(|f| f.no_resend);
         match is_datagram {
             Some(false) => {
-                if let Some(cached) = self.lookup_sent_frame(req_nonce) {
+                if let Some((cached, retries, first_sent)) = self.lookup_sent_frame(req_nonce) {
                     tracing::debug!("NACK received: retransmitting nonce={}", req_nonce);
                     if new_gap {
                         self.cc.on_loss(cached.len() as u64);
                     }
                     self.cc.on_retransmit(cached.len() as u64);
+                    let len = cached.len();
                     wire.push(ProtocolAction::SendDatagram(cached));
+                    self.note_resent_frame(len, retries, first_sent, Instant::now());
                 }
             }
             Some(true) => {
-                if let Some(lost) = self.sent_history.remove(i) {
+                let probe = self.probe.filter(|p| p.nonce == req_nonce);
+                if let Some(p) = probe {
+                    // A NACK for the probe: it did not arrive. Its loss is the
+                    // size's, not congestion's.
+                    self.probe_lost(p, Instant::now());
+                } else if let Some(lost) = self.sent_history.remove(i) {
                     let len = lost.bytes.len() as u64;
                     self.cc.on_discard(len);
                     if new_gap {
@@ -1541,13 +1710,15 @@ impl ProtocolMachine {
         let lost_after = base_rto.saturating_mul(DATAGRAM_LOSS_RTOS).min(MAX_EFFECTIVE_RTO);
         let mut lost = Vec::new();
         let mut lost_bytes = 0u64;
-        for f in self.sent_history.iter().filter(|f| f.no_resend && now.duration_since(f.first_sent) >= lost_after) {
+        // (A path MTU probe is not one: `mtu_tick` judges it, and its loss says
+        // nothing about congestion.)
+        for f in self.sent_history.iter().filter(|f| f.no_resend && !is_probe_frame(f) && now.duration_since(f.first_sent) >= lost_after) {
             lost.push(f.nonce);
             lost_bytes += f.bytes.len() as u64;
         }
         if !lost.is_empty() {
             // The same age test as above, against the same `now`.
-            self.sent_history.retain(|f| !(f.no_resend && now.duration_since(f.first_sent) >= lost_after));
+            self.sent_history.retain(|f| !(f.no_resend && !is_probe_frame(f) && now.duration_since(f.first_sent) >= lost_after));
             self.cc.on_discard(lost_bytes);
             self.cc.on_loss(lost_bytes);
             for frame in self.build_abandon(0, None, &lost)? {
@@ -1555,6 +1726,57 @@ impl ProtocolMachine {
             }
         }
         Ok(())
+    }
+
+    /// v6, on the tick: path MTU discovery. A probe that went unanswered for
+    /// too long is lost (and the hole it leaves is closed with an `Abandon`);
+    /// when none is out and the next rung is due, one goes out. A probe is a
+    /// `KeepAlive` frame, which every peer accepts and acknowledges, padded to
+    /// the size under test; it is never resent, so what a lost one costs is
+    /// the probe alone, not a stalled stream.
+    fn mtu_tick(&mut self, now: Instant, base_rto: Duration, actions: &mut Vec<ProtocolAction>) -> Result<(), ProtocolError> {
+        if self.pmtu.is_none() {
+            return Ok(());
+        }
+        if let Some(p) = self.probe {
+            let timeout = self.probe_timeout.unwrap_or_else(|| base_rto.saturating_mul(3).clamp(PROBE_TIMEOUT_MIN, PROBE_TIMEOUT_MAX));
+            if now.duration_since(p.sent_at) >= timeout {
+                self.probe_lost(p, now);
+                for frame in self.build_abandon(0, None, &[p.nonce])? {
+                    actions.push(ProtocolAction::SendDatagram(frame));
+                }
+            }
+        }
+        if self.state != OstpState::Established || self.probe.is_some() {
+            return Ok(());
+        }
+        let Some(pm) = self.pmtu.as_mut() else { return Ok(()) };
+        let (size, change) = pm.next_probe(now);
+        self.apply_mtu_change(change);
+        if let Some(size) = size {
+            let meta = FrameMeta { kind: FrameKind::KeepAlive, stream_id: 0, seq: 0, retransmittable: true, no_resend: true };
+            let frame = self.build_frame_padded(meta, Bytes::new(), Some(size.saturating_sub(DATAGRAM_OVERHEAD_V6)))?;
+            // The nonce just spent is the last one.
+            self.probe = Some(Probe { nonce: self.send_nonce - 1, size: frame.len(), sent_at: now });
+            actions.push(ProtocolAction::SendDatagram(frame));
+        }
+        Ok(())
+    }
+
+    /// The probe was not answered: it leaves the history and the window
+    /// (without counting as a congestion loss) and discovery is told.
+    fn probe_lost(&mut self, p: Probe, now: Instant) {
+        self.probe = None;
+        self.remove_sent_frame(p.nonce);
+        let change = self.pmtu.as_mut().and_then(|pm| pm.probe_lost(p.size, now));
+        self.apply_mtu_change(change);
+    }
+
+    /// A resent frame is still lost: black hole detection weighs it
+    /// (`pmtu::PathMtu::black_hole`).
+    fn note_resent_frame(&mut self, len: usize, retries: u8, first_sent: Instant, now: Instant) {
+        let change = self.pmtu.as_mut().and_then(|pm| pm.black_hole(len, retries, first_sent, now));
+        self.apply_mtu_change(change);
     }
 
     fn wrap_datagram_handshake(&self, noise_payload: &[u8]) -> Result<Bytes, ProtocolError> {
@@ -1623,8 +1845,21 @@ impl ProtocolMachine {
     }
 
     fn build_frame(&mut self, meta: FrameMeta, payload: Bytes) -> Result<Bytes, ProtocolError> {
+        self.build_frame_padded(meta, payload, None)
+    }
+
+    /// `build_frame` with the padding length given (a path MTU probe is
+    /// padded to the size under test) instead of chosen by the padder.
+    fn build_frame_padded(&mut self, meta: FrameMeta, payload: Bytes, pad: Option<usize>) -> Result<Bytes, ProtocolError> {
         let FrameMeta { kind, stream_id, seq, retransmittable: is_retransmittable, no_resend } = meta;
-        let padding = self.padder.build_padding(payload.len());
+        let padding = match pad {
+            Some(len) => {
+                let mut buf = vec![0_u8; len];
+                rand::thread_rng().fill(&mut buf[..]);
+                buf
+            }
+            None => self.padder.build_padding(payload.len()),
+        };
         let plaintext = if self.v6 {
             // A frame never exceeds the path MTU.
             if payload.len() > self.max_payload() {
@@ -1782,6 +2017,7 @@ impl ProtocolMachine {
         // ── v6: given-up streams and lost datagrams ──────────────────
         if self.v6 {
             self.v6_tick_losses(now, base_rto, &mut actions)?;
+            self.mtu_tick(now, base_rto, &mut actions)?;
         }
 
         // ── Zombie frame eviction ────────────────────────────────────
@@ -1811,6 +2047,9 @@ impl ProtocolMachine {
         // Backoff starts from retry #0 (immediately effective):
         //   effective_rto = base_rto * 2^retries, capped at 2^6 = 64×
         let mut retransmit_budget: usize = self.cc.retransmit_budget();
+        // The largest frame resent for the third time or more, for path MTU
+        // black hole detection after the loop.
+        let mut resent_again: Option<(usize, u8, Instant)> = None;
         for frame in self.sent_history.iter_mut() {
             // A v6 datagram is never resent (`no_resend` is false for every
             // v5 frame).
@@ -1851,7 +2090,18 @@ impl ProtocolMachine {
                 self.cc.on_retransmit(frame.bytes.len() as u64);
                 actions.push(ProtocolAction::SendDatagram(frame.bytes.clone()));
                 retransmit_budget -= 1;
+                // (A frame built before an earlier drop is bigger than the
+                // size now and says nothing new.)
+                if frame.retries >= crate::pmtu::BLACK_HOLE_RETRIES
+                    && frame.bytes.len() <= self.send_mtu
+                    && resent_again.map_or(true, |(len, _, _)| frame.bytes.len() > len)
+                {
+                    resent_again = Some((frame.bytes.len(), frame.retries, frame.first_sent));
+                }
             }
+        }
+        if let Some((len, retries, first_sent)) = resent_again {
+            self.note_resent_frame(len, retries, first_sent, now);
         }
 
         // Our Close was acknowledged, or retransmitted until given up: the
@@ -1953,14 +2203,16 @@ impl ProtocolMachine {
         Bytes::from(out)
     }
 
-    fn lookup_sent_frame(&mut self, nonce: u64) -> Option<Bytes> {
+    /// The frame for a NACK, marked as resent, and how many times it has been
+    /// sent again now.
+    fn lookup_sent_frame(&mut self, nonce: u64) -> Option<(Bytes, u8, Instant)> {
         // The history is in nonce order, and a NACK for a nonce that is not in
         // it must not cost a scan of the whole history.
         let i = self.sent_history.partition_point(|f| f.nonce < nonce);
         let frame = self.sent_history.get_mut(i).filter(|f| f.nonce == nonce)?;
         frame.last_sent = Instant::now();
         frame.retries = frame.retries.saturating_add(1);
-        Some(frame.bytes.clone())
+        Some((frame.bytes.clone(), frame.retries, frame.first_sent))
     }
 
     fn push_sent_frame(&mut self, nonce: u64, bytes: Bytes, meta: FrameMeta) {
@@ -2010,6 +2262,11 @@ impl ProtocolMachine {
         let now = Instant::now();
         let mut acked_bytes = 0u64;
         let mut min_rtt: Option<Duration> = None;
+        // Sizes of what this ACK acknowledged (path MTU black hole evidence),
+        // and whether the probe that is out was among it.
+        let mut acked_sizes: Option<(usize, usize)> = None;
+        let probe_nonce = self.probe.map(|p| p.nonce);
+        let mut probe_acked = false;
 
         // Only frames that carry data count: our own ACKs and NACKs sit in the
         // history too, but they were never charged as in flight, and their
@@ -2018,6 +2275,9 @@ impl ProtocolMachine {
         for frame in self.sent_history.iter().filter(|f| f.is_retransmittable) {
             if nonce_in_ranges(frame.nonce, ranges) {
                 acked_bytes += frame.bytes.len() as u64;
+                let len = frame.bytes.len();
+                acked_sizes = Some(acked_sizes.map_or((len, len), |(lo, hi)| (lo.min(len), hi.max(len))));
+                probe_acked |= probe_nonce == Some(frame.nonce);
                 // Karn's algorithm: never take an RTT sample from a frame that
                 // was retransmitted. `last_sent` is bumped on every retransmit,
                 // so an ACK for the ORIGINAL transmission would be measured
@@ -2032,6 +2292,18 @@ impl ProtocolMachine {
         }
 
         self.sent_history.retain(|frame| !nonce_in_ranges(frame.nonce, ranges));
+
+        if let Some(pm) = self.pmtu.as_mut() {
+            if let Some((smallest, largest)) = acked_sizes {
+                pm.note_acked(smallest, largest, now);
+            }
+            if probe_acked {
+                if let Some(p) = self.probe.take() {
+                    let change = pm.probe_acked(p.size, now);
+                    self.apply_mtu_change(change);
+                }
+            }
+        }
 
         // Notify congestion controller. Feed an RTT sample only when we had at
         // least one unambiguous ACK; otherwise update the window without
@@ -2159,6 +2431,7 @@ mod tests {
             handshake_pad_min: 8,
             handshake_pad_max: 32,
             mtu: 1400,
+            mtu_auto: false,
             v6: None,
         }
     }
@@ -3759,5 +4032,286 @@ mod tests {
         let o = feed(&mut server, &f);
         assert_eq!(texts(&o), vec![(65_535, "x".to_string())]);
         assert_eq!(client.max_payload(), 1400 - DATAGRAM_OVERHEAD);
+    }
+
+    // ── Path MTU discovery (v6, datagram carrier) ────────────────────────────
+
+    /// A v6 pair that discovers the path MTU, with a short probe timeout so a
+    /// test does not wait seconds for a lost probe.
+    fn auto_pair() -> (ProtocolMachine, ProtocolMachine) {
+        let (private, public) = crate::crypto::noise::generate_server_key();
+        let (mut ccfg, mut scfg) = v6_configs(private, public);
+        ccfg.mtu_auto = true;
+        scfg.mtu_auto = true;
+        let mut client = ProtocolMachine::new(ccfg).unwrap();
+        let mut server = ProtocolMachine::new(scfg).unwrap();
+        let ProtocolAction::SendDatagram(msg1) = client.on_event(OstpEvent::Start).unwrap() else { panic!() };
+        let (_, reply) = server_reply(server.on_event(OstpEvent::Inbound(msg1)).unwrap());
+        client.on_event(OstpEvent::Inbound(reply)).unwrap();
+        client.probe_timeout = Some(Duration::from_millis(60));
+        server.probe_timeout = Some(Duration::from_millis(60));
+        (client, server)
+    }
+
+    /// Both machines run over a path that carries at most `path` bytes per
+    /// datagram, for `run`. Returns the sizes of the datagrams it dropped.
+    fn pump(client: &mut ProtocolMachine, server: &mut ProtocolMachine, path: usize, run: Duration) -> Vec<usize> {
+        let end = Instant::now() + run;
+        let mut dropped = Vec::new();
+        let (mut to_server, mut to_client): (Vec<Bytes>, Vec<Bytes>) = (Vec::new(), Vec::new());
+        while Instant::now() < end {
+            to_server.extend(tick(client).wire);
+            to_client.extend(tick(server).wire);
+            for d in std::mem::take(&mut to_server) {
+                if d.len() > path {
+                    dropped.push(d.len());
+                } else {
+                    to_client.extend(feed(server, &d).wire);
+                }
+            }
+            for d in std::mem::take(&mut to_client) {
+                if d.len() > path {
+                    dropped.push(d.len());
+                } else {
+                    to_server.extend(feed(client, &d).wire);
+                }
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        dropped
+    }
+
+    #[test]
+    fn a_session_starts_at_the_base_size_and_a_clear_path_takes_it_to_the_top() {
+        let (mut client, mut server) = auto_pair();
+        assert!(client.mtu_discovery_active() && server.mtu_discovery_active());
+        assert_eq!(client.send_mtu(), 1200);
+        assert_eq!(client.max_payload(), 1200 - DATAGRAM_OVERHEAD_V6);
+
+        let dropped = pump(&mut client, &mut server, 1500, Duration::from_millis(600));
+        assert!(dropped.is_empty());
+        // Each side found the size of what IT sends.
+        assert_eq!(client.send_mtu(), 1452);
+        assert_eq!(server.send_mtu(), 1452);
+        assert_eq!(client.max_payload(), 1452 - DATAGRAM_OVERHEAD_V6);
+        // The shared handle (the server's readers chunk by it) follows.
+        assert_eq!(client.max_payload_handle().load(std::sync::atomic::Ordering::Relaxed), client.max_payload());
+
+        // A full-size payload now makes a datagram of exactly the size, no larger.
+        let max = client.max_payload();
+        let frame = send(&mut client, 3, &vec![7u8; max]);
+        assert_eq!(frame.len(), 1452);
+        let o = feed(&mut server, &frame);
+        assert_eq!(o.app.len(), 1);
+        // Nothing is left in flight or open once the probes were answered.
+        let _ = pump(&mut client, &mut server, 1500, Duration::from_millis(100));
+        assert_eq!(client.in_flight_count(), 0);
+    }
+
+    /// The first tick sends a probe: a padded `KeepAlive` of the first rung.
+    /// An old peer accepts that kind with any padding, delivers nothing for
+    /// it and acknowledges it.
+    #[test]
+    fn a_probe_is_a_padded_keepalive_that_delivers_nothing_and_is_acknowledged() {
+        let (mut client, mut server) = auto_pair();
+        let probe = tick(&mut client).wire;
+        assert_eq!(probe.len(), 1, "one probe at a time");
+        assert_eq!(probe[0].len(), 1280);
+        assert!(client.probe.is_some());
+        assert!(tick(&mut client).wire.is_empty(), "the next rung waits for the answer");
+
+        let o = feed(&mut server, &probe[0]);
+        assert!(o.app.is_empty() && o.dgrams.is_empty() && o.resets.is_empty());
+        std::thread::sleep(Duration::from_millis(10));
+        let acks = tick(&mut server).wire;
+        let mut answered = false;
+        for ack in acks.iter().chain(o.wire.iter()) {
+            feed(&mut client, ack);
+            answered |= client.send_mtu() == 1280;
+        }
+        assert!(answered, "the ACK confirmed the probe");
+        assert!(client.probe.is_none());
+    }
+
+    /// Probes beyond the path are lost; the size stays at the rung below, no
+    /// frame but those probes is lost, and the holes they leave are closed.
+    #[test]
+    fn a_path_of_1300_settles_on_1280_and_only_probes_are_lost() {
+        let (mut client, mut server) = auto_pair();
+        let dropped = pump(&mut client, &mut server, 1300, Duration::from_millis(2600));
+        assert_eq!(client.send_mtu(), 1280);
+        assert_eq!(server.send_mtu(), 1280);
+        assert_eq!(client.pmtu.as_ref().unwrap().ceiling(), Some(1350));
+        // Three lost probes of the rung per side, nothing else.
+        assert_eq!(dropped, vec![1350; 6], "dropped: {dropped:?}");
+
+        // The lost probes are no longer anywhere: not in the history, and the
+        // receiver's holes for them are closed (no NACK left to send).
+        let _ = pump(&mut client, &mut server, 1300, Duration::from_millis(200));
+        assert_eq!(client.in_flight_count(), 0);
+        assert!(client.probe.is_none() && server.probe.is_none());
+        assert!(server.reorder_buffer.is_empty() && client.reorder_buffer.is_empty(), "a hole was left open");
+        // The congestion window did not take the lost probes for congestion.
+        assert!(client.cwnd_packets() >= 10, "cwnd {}", client.cwnd_packets());
+
+        // Data at the size goes through.
+        let max = client.max_payload();
+        let frame = send(&mut client, 3, &vec![1u8; max]);
+        assert_eq!(frame.len(), 1280);
+        assert_eq!(texts(&feed(&mut server, &frame)).len(), 1);
+    }
+
+    /// A probe that is lost once is tried again: random loss is not a ceiling.
+    #[test]
+    fn one_lost_probe_does_not_end_the_climb() {
+        let (mut client, mut server) = auto_pair();
+        // The first probe is lost, whatever the path.
+        let probe = tick(&mut client).wire.remove(0);
+        assert_eq!(probe.len(), 1280);
+        std::thread::sleep(Duration::from_millis(80));
+        let after = tick(&mut client).wire;
+        // Judged lost: an Abandon for its nonce goes out, no probe yet (the pause).
+        assert!(client.probe.is_none());
+        assert!(after.iter().all(|d| d.len() < 200), "{:?}", after.iter().map(Bytes::len).collect::<Vec<_>>());
+        assert_eq!(client.send_mtu(), 1200);
+        // Over a clear path the climb then goes on to the top.
+        for d in after {
+            let _ = feed(&mut server, &d);
+        }
+        let _ = pump(&mut client, &mut server, 1500, Duration::from_millis(1500));
+        assert_eq!(client.send_mtu(), 1452);
+    }
+
+    /// A path that shrinks under a session that already found 1452: full-size
+    /// frames are lost again and again while small ones get through. The size
+    /// drops below the lost one, the loss is logged, and the lost size is not
+    /// tried again for ten minutes.
+    #[test]
+    fn a_path_that_shrinks_is_a_black_hole_and_the_size_drops_to_what_passes() {
+        let (mut client, mut server) = auto_pair();
+        assert!(pump(&mut client, &mut server, 1500, Duration::from_millis(500)).is_empty());
+        assert_eq!(client.send_mtu(), 1452);
+
+        // The path now carries 1420. A full-size frame goes out, and a small
+        // one after it.
+        let max = client.max_payload();
+        let big = send(&mut client, 5, &vec![9u8; max]);
+        assert_eq!(big.len(), 1452);
+        let small = send(&mut client, 7, b"small");
+        let (mut to_server, mut to_client): (Vec<Bytes>, Vec<Bytes>) = (vec![big, small], Vec::new());
+        let end = Instant::now() + Duration::from_millis(2500);
+        let mut dropped_big = 0;
+        let mut delivered_small = false;
+        while Instant::now() < end {
+            to_server.extend(tick(&mut client).wire);
+            to_client.extend(tick(&mut server).wire);
+            for d in std::mem::take(&mut to_server) {
+                if d.len() > 1420 {
+                    dropped_big += 1;
+                } else {
+                    let o = feed(&mut server, &d);
+                    delivered_small |= texts(&o).iter().any(|(s, t)| *s == 7 && t == "small");
+                    to_client.extend(o.wire);
+                }
+            }
+            for d in std::mem::take(&mut to_client) {
+                to_server.extend(feed(&mut client, &d).wire);
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(delivered_small);
+        assert!(dropped_big >= 4, "the full-size frame was sent {dropped_big} times");
+        assert_eq!(client.send_mtu(), 1400, "dropped below the lost size");
+        assert_eq!(client.pmtu.as_ref().unwrap().ceiling(), Some(1452));
+        assert_eq!(client.max_payload(), 1400 - DATAGRAM_OVERHEAD_V6);
+
+        // The size now passes, in another stream than the one with the stuck frame.
+        let max = client.max_payload();
+        let frame = send(&mut client, 9, &vec![2u8; max]);
+        assert_eq!(frame.len(), 1400);
+        assert_eq!(feed(&mut server, &frame).app.len(), 1);
+        // And no probe of the lost size goes out soon (the stuck frame itself
+        // is still resent at its old size, which is all that is lost here).
+        let _ = pump(&mut client, &mut server, 1420, Duration::from_millis(500));
+        assert!(client.probe.is_none(), "a probe of the lost size went out");
+        assert_eq!(client.send_mtu(), 1400);
+    }
+
+    /// Frames that are lost again and again while nothing at all gets through
+    /// are a dead path, not a size.
+    #[test]
+    fn frames_lost_on_a_dead_path_do_not_lower_the_size() {
+        let (mut client, mut server) = auto_pair();
+        assert!(pump(&mut client, &mut server, 1500, Duration::from_millis(500)).is_empty());
+        assert_eq!(client.send_mtu(), 1452);
+        let max = client.max_payload();
+        let _big = send(&mut client, 5, &vec![9u8; max]);
+        // Nothing is delivered either way, for longer than three resends take.
+        let end = Instant::now() + Duration::from_millis(1500);
+        while Instant::now() < end {
+            let _ = tick(&mut client);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(client.send_mtu(), 1452);
+    }
+
+    #[test]
+    fn a_new_path_starts_discovery_over() {
+        let (mut client, mut server) = auto_pair();
+        let _ = pump(&mut client, &mut server, 1500, Duration::from_millis(500));
+        assert_eq!(client.send_mtu(), 1452);
+        client.on_path_change();
+        assert_eq!(client.send_mtu(), 1200);
+        assert_eq!(client.max_payload_handle().load(std::sync::atomic::Ordering::Relaxed), 1200 - DATAGRAM_OVERHEAD_V6);
+        let _ = pump(&mut client, &mut server, 1300, Duration::from_millis(2600));
+        assert_eq!(client.send_mtu(), 1280, "the new path is learned afresh");
+    }
+
+    #[test]
+    fn discovery_runs_only_on_a_v6_session_on_a_datagram_carrier_that_asked_for_it() {
+        // v6, but a fixed size was asked for.
+        let (mut c, _) = do_handshake_v6();
+        assert!(!c.mtu_discovery_active());
+        assert_eq!(c.send_mtu(), 1400);
+        assert!(tick(&mut c).wire.is_empty());
+
+        // v5: `mtu_auto` is set and means nothing: a lost probe could not be
+        // closed over by a v5 peer, which would hold every frame behind it.
+        let mut ccfg = make_config(NoiseRole::Initiator);
+        ccfg.mtu_auto = true;
+        let mut scfg = make_config(NoiseRole::Responder);
+        scfg.mtu_auto = true;
+        let mut client = ProtocolMachine::new(ccfg).unwrap();
+        let mut server = ProtocolMachine::new(scfg).unwrap();
+        let ProtocolAction::SendDatagram(msg1) = client.on_event(OstpEvent::Start).unwrap() else { panic!() };
+        server.on_event(OstpEvent::Start).unwrap();
+        let ProtocolAction::HandshakePayload(_, Some(msg2)) = server.on_event(OstpEvent::Inbound(msg1)).unwrap() else { panic!() };
+        client.on_event(OstpEvent::Inbound(msg2)).unwrap();
+        assert!(!client.is_v6());
+        assert!(!client.mtu_discovery_active());
+        assert_eq!(client.send_mtu(), 1400);
+        std::thread::sleep(Duration::from_millis(20));
+        assert!(datagrams(client.on_event(OstpEvent::Tick).unwrap()).is_empty(), "a v5 session sends no probe");
+
+        // A reliable carrier: the size does not matter, the configured one is
+        // used and nothing is probed; back on a datagram carrier it starts over.
+        let (mut c, mut s) = auto_pair();
+        let _ = pump(&mut c, &mut s, 1500, Duration::from_millis(400));
+        assert_eq!(c.send_mtu(), 1452);
+        c.set_reliable_carrier(true);
+        assert!(!c.mtu_discovery_active());
+        assert_eq!(c.send_mtu(), 1400);
+        assert!(tick(&mut c).wire.iter().all(|d| d.len() < 400), "a probe on a reliable carrier");
+        // Said twice, it changes nothing.
+        c.set_reliable_carrier(true);
+        assert_eq!(c.send_mtu(), 1400);
+        c.set_reliable_carrier(false);
+        assert!(c.mtu_discovery_active());
+        assert_eq!(c.send_mtu(), 1200);
+        // Said twice, a running discovery is not sent back to the start.
+        let _ = pump(&mut c, &mut s, 1500, Duration::from_millis(400));
+        assert_eq!(c.send_mtu(), 1452);
+        c.set_reliable_carrier(false);
+        assert_eq!(c.send_mtu(), 1452);
     }
 }

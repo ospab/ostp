@@ -142,7 +142,7 @@ pub async fn attempt_handshake(
         session_id,
         handshake_payload,
         TrafficProfile::JsonRpc,
-        PROBE_MTU,
+        crate::config::MtuSetting::Fixed(PROBE_MTU),
     )) {
         Ok(m) => m,
         Err(e) => return AttemptOutcome { success: false, rtt_ms: None, error: Some(format!("protocol init error: {e}")), foreign_bytes: None },

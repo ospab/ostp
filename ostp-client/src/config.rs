@@ -94,15 +94,93 @@ pub struct OstpConfig {
     pub server_pk: Option<String>,
     pub handshake_timeout_ms: u64,
     pub io_timeout_ms: u64,
-    #[serde(default = "default_mtu")]
-    pub mtu: usize,
+    /// The datagram size: found by the session (`"auto"`, and what a missing
+    /// field means) or a fixed number of bytes.
+    #[serde(default)]
+    pub mtu: MtuSetting,
     #[serde(default = "default_keepalive")]
     pub keepalive_interval_sec: u64,
 }
 
 fn default_keepalive() -> u64 { 5 }
 
-fn default_mtu() -> usize { 1140 }
+/// The `mtu` setting: `"auto"` (the default: a v6 session on a datagram
+/// carrier finds the largest datagram the path carries, see
+/// `ostp_core::pmtu`), or a number of bytes, which is the datagram size as it
+/// always was. A config written before `auto` existed has a number or none and
+/// loads as it did (a number) or as auto (none).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MtuSetting {
+    #[default]
+    Auto,
+    Fixed(usize),
+}
+
+impl MtuSetting {
+    /// The MTU of the TUN device and the size local reads are cut to. Those
+    /// are set once, so with `auto` they take the size every session carries
+    /// (1140 plus the frame overhead fits the 1200-byte starting datagram).
+    pub const AUTO_TUN_MTU: usize = 1140;
+    /// What the congestion window counts a packet as, with `auto` on a v6
+    /// session: the datagram size the session finds is at most 1452.
+    pub const AUTO_PACKET_UNIT: usize = 1350;
+
+    pub fn tun_mtu(self) -> usize {
+        match self {
+            MtuSetting::Auto => Self::AUTO_TUN_MTU,
+            MtuSetting::Fixed(n) => n,
+        }
+    }
+
+    pub fn is_auto(self) -> bool {
+        self == MtuSetting::Auto
+    }
+}
+
+impl std::fmt::Display for MtuSetting {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MtuSetting::Auto => f.write_str("auto"),
+            MtuSetting::Fixed(n) => write!(f, "{n}"),
+        }
+    }
+}
+
+impl Serialize for MtuSetting {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        match self {
+            MtuSetting::Auto => s.serialize_str("auto"),
+            MtuSetting::Fixed(n) => s.serialize_u64(*n as u64),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for MtuSetting {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct V;
+        impl serde::de::Visitor<'_> for V {
+            type Value = MtuSetting;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("\"auto\" or a number of bytes")
+            }
+            fn visit_u64<E: serde::de::Error>(self, n: u64) -> Result<MtuSetting, E> {
+                usize::try_from(n).map(MtuSetting::Fixed).map_err(E::custom)
+            }
+            fn visit_i64<E: serde::de::Error>(self, n: i64) -> Result<MtuSetting, E> {
+                u64::try_from(n).map_err(|_| E::custom("the mtu cannot be negative")).and_then(|n| self.visit_u64(n))
+            }
+            fn visit_str<E: serde::de::Error>(self, s: &str) -> Result<MtuSetting, E> {
+                let s = s.trim();
+                // An empty field, as an app's text box gives it, is auto.
+                if s.is_empty() || s.eq_ignore_ascii_case("auto") {
+                    return Ok(MtuSetting::Auto);
+                }
+                s.parse::<usize>().map(MtuSetting::Fixed).map_err(|_| E::custom("the mtu is \"auto\" or a number of bytes"))
+            }
+        }
+        d.deserialize_any(V)
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LocalProxyConfig {
@@ -184,7 +262,7 @@ impl Default for OstpConfig {
             server_pk: None,
             handshake_timeout_ms: 5000,
             io_timeout_ms: 2500,
-            mtu: default_mtu(),
+            mtu: MtuSetting::default(),
             keepalive_interval_sec: default_keepalive(),
         }
     }
@@ -270,7 +348,7 @@ impl ClientFileConfig {
             server_addr: self.server.clone(),
             access_key: self.access_key.clone(),
             server_pk: self.server_pk.clone().filter(|k| !k.trim().is_empty()),
-            mtu: self.mtu.unwrap_or_else(default_mtu),
+            mtu: self.mtu.unwrap_or_default(),
             ..OstpConfig::default()
         };
         let local_proxy = LocalProxyConfig {
@@ -727,7 +805,9 @@ pub struct ClientFileConfig {
     /// The client never switches between the two by itself.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub server_pk: Option<String>,
-    pub mtu: Option<usize>,
+    /// `"auto"` (also when absent) or a number of bytes: see [`MtuSetting`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mtu: Option<MtuSetting>,
     pub socks5_bind: Option<String>,
     pub tun: Option<TunConfig>,
     pub debug: Option<bool>,
@@ -960,7 +1040,7 @@ mod tests {
         let rt = client_file(r#"{"mode":"client","server":"example.org:443","access_key":"k"}"#).to_runtime();
         assert_eq!(rt.mode, "proxy");
         assert_eq!(rt.ostp.server_addr, "example.org:443");
-        assert_eq!(rt.ostp.mtu, 1140);
+        assert_eq!(rt.ostp.mtu, MtuSetting::Auto, "no mtu in the file is auto");
         assert_eq!(rt.ostp.io_timeout_ms, 2500);
         assert_eq!(rt.ostp.handshake_timeout_ms, 5000);
         assert_eq!(rt.local_proxy.connect_timeout_ms, 15000);
@@ -985,7 +1065,7 @@ mod tests {
         )
         .to_runtime();
         assert_eq!(rt.mode, "tun");
-        assert_eq!(rt.ostp.mtu, 1280);
+        assert_eq!(rt.ostp.mtu, MtuSetting::Fixed(1280));
         assert_eq!(rt.local_proxy.bind_addr, "127.0.0.1:9");
         assert_eq!(rt.tun_stack, "gvisor");
         assert_eq!(rt.dns_server.as_deref(), Some("1.1.1.1"));
@@ -997,6 +1077,41 @@ mod tests {
         assert_eq!(rt.transport.mode, "uot");
         assert!(rt.transport.tls);
         assert_eq!(rt.transport.tls_sni, None, "an empty SNI means unset");
+    }
+
+    /// `mtu` is "auto" or a number: a number is a fixed size as it always was,
+    /// an old config without the field is auto, and nonsense is refused.
+    #[test]
+    fn the_mtu_is_auto_or_a_fixed_number() {
+        let mtu = |frag: &str| {
+            serde_json::from_str::<ClientFileConfig>(&format!(r#"{{"server":"s:1","access_key":"k"{frag}}}"#)).map(|c| c.to_runtime().ostp.mtu)
+        };
+        assert_eq!(mtu("").unwrap(), MtuSetting::Auto);
+        assert_eq!(mtu(r#","mtu":"auto""#).unwrap(), MtuSetting::Auto);
+        assert_eq!(mtu(r#","mtu":"AUTO""#).unwrap(), MtuSetting::Auto);
+        assert_eq!(mtu(r#","mtu":"""#).unwrap(), MtuSetting::Auto, "an empty text box");
+        assert_eq!(mtu(r#","mtu":1350"#).unwrap(), MtuSetting::Fixed(1350));
+        assert_eq!(mtu(r#","mtu":"1280""#).unwrap(), MtuSetting::Fixed(1280));
+        assert!(mtu(r#","mtu":"big""#).is_err());
+        assert!(mtu(r#","mtu":-5"#).is_err());
+        assert!(mtu(r#","mtu":1.5"#).is_err());
+
+        // What is written reads back the same, and `auto` is what a runtime
+        // config of an app holds.
+        for s in [MtuSetting::Auto, MtuSetting::Fixed(1200)] {
+            let json = serde_json::to_string(&s).unwrap();
+            assert_eq!(serde_json::from_str::<MtuSetting>(&json).unwrap(), s, "{json}");
+        }
+        assert_eq!(serde_json::to_string(&MtuSetting::Auto).unwrap(), r#""auto""#);
+        assert_eq!(serde_json::to_string(&MtuSetting::Fixed(1200)).unwrap(), "1200");
+        let ostp: OstpConfig = serde_json::from_str(
+            r#"{"server_addr":"s:1","local_bind_addr":"0.0.0.0:0","access_key":"k","handshake_timeout_ms":1,"io_timeout_ms":1}"#,
+        )
+        .unwrap();
+        assert_eq!(ostp.mtu, MtuSetting::Auto, "a runtime config without mtu");
+        // The TUN and the local reads keep the size they always had under auto.
+        assert_eq!(MtuSetting::Auto.tun_mtu(), 1140);
+        assert_eq!(MtuSetting::Fixed(1280).tun_mtu(), 1280);
     }
 
     /// The new `carrier` section reads like the old `transport` one.

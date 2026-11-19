@@ -253,7 +253,13 @@ pub async fn run_local_socks5_proxy(
     let mut current_exclusions = exclusions_rx.borrow().clone();
     let mut matcher = ExclusionMatcher::new(&current_exclusions, physical_if_index, physical_if_name.clone());
     let (connect_tx, mut connect_rx) = mpsc::channel(128);
-    let max_chunk = ostp.mtu.saturating_sub(150).max(512);
+    // A fixed MTU cuts each read to that size, as it always did. With `auto`
+    // the bridge cuts to the datagram size the session has found, which grows
+    // while the session runs: the reads go to it whole.
+    let max_chunk = match ostp.mtu {
+        crate::config::MtuSetting::Fixed(mtu) => mtu.saturating_sub(150).max(512),
+        crate::config::MtuSetting::Auto => usize::MAX,
+    };
 
     let mut next_stream_id: u32 = 1;
     let mut active_streams: HashMap<u32, StreamSlot> = HashMap::new();
@@ -948,7 +954,7 @@ async fn handle_proxy_client(
                         }
                         let mut offset = 0;
                         while offset < n {
-                            let end = (offset + max_chunk).min(n);
+                            let end = offset.saturating_add(max_chunk).min(n);
                             let _ = event_tx.send(ProxyEvent::Data {
                                 stream_id,
                                 payload: bytes::Bytes::copy_from_slice(&tcp_buf[offset..end]),

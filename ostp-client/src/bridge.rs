@@ -125,7 +125,7 @@ mod handshake_resend_tests {
 
     fn machine(pk: Option<[u8; 32]>) -> (ProtocolMachine, Bytes) {
         let cfg = crate::wire::initiator_config(
-            b"key", pk, 9, ostp_core::build_handshake_payload(b"key", 9), TrafficProfile::JsonRpc, 1200,
+            b"key", pk, 9, ostp_core::build_handshake_payload(b"key", 9), TrafficProfile::JsonRpc, crate::config::MtuSetting::Fixed(1200),
         );
         let mut m = ProtocolMachine::new(cfg).unwrap();
         let ProtocolAction::SendDatagram(first) = m.on_event(OstpEvent::Start).unwrap() else { panic!() };
@@ -253,7 +253,7 @@ fn build_probe_handshake(
     server_pk: Option<[u8; 32]>,
     access_key: &[u8],
     profile: TrafficProfile,
-    mtu: usize,
+    mtu: crate::config::MtuSetting,
 ) -> Vec<u8> {
     let session_id: u32 = rand::random();
     let handshake_payload = ostp_core::build_handshake_payload(access_key, session_id);
@@ -368,7 +368,8 @@ pub struct Bridge {
     /// Hop-distance measurement for TTL-desync, cached so the sweep does not run
     /// on every (re)connect; cleared when the network changes.
     ttl_desync_measured: Option<u8>,
-    pub mtu: usize,
+    /// `auto` or a fixed datagram size (`crate::config::MtuSetting`).
+    pub mtu: crate::config::MtuSetting,
     pub kill_switch: bool,
     pub reload_tx: Option<watch::Sender<crate::config::ExclusionConfig>>,
 

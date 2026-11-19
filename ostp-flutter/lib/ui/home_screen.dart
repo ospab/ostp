@@ -211,7 +211,9 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin, 
     final exDomains = widget.prefs.getString('ex_domains') ?? '';
     final exIps = widget.prefs.getString('ex_ips') ?? '';
     final logPrivacy = logPrivacyOf(widget.prefs);
-    final mtu = (int.tryParse(widget.prefs.getString('mtu') ?? '') ?? 1140).clamp(576, 1500);
+    // "auto" (an empty field): the session finds the packet size. A number fixes it.
+    final fixedMtu = int.tryParse((widget.prefs.getString('mtu') ?? '').trim());
+    final Object mtu = fixedMtu == null ? 'auto' : fixedMtu.clamp(576, 1500);
     final dnsServer = widget.prefs.getString('dns_server');
     // The VPN builder throws on anything but an IP literal, which would fail the start.
     final effectiveDnsServer = effectiveDns(
