@@ -7,6 +7,7 @@ pub mod hwid;
 pub mod migrate;
 pub mod path_probe;
 pub mod prober;
+pub mod rtt;
 pub mod signal;
 pub mod subscription;
 pub mod updates;

@@ -143,6 +143,11 @@ const errorBanner    = $('error-banner');
 const connInfo       = $('connection-info');
 const serverBadge    = $('server-badge-text');
 const liveRtt        = $('live-rtt');
+// The queue delay is shown next to the RTT above this many ms.
+const QUEUE_SHOWN_ABOVE_MS = 200;
+function fmtQueue(ms) {
+  return ms < 1000 ? Math.round(ms) + ' ms' : (ms / 1000).toFixed(1) + ' s';
+}
 const liveDown       = $('live-down-speed');
 const liveUp         = $('live-up-speed');
 const metricDown     = $('metric-down');
@@ -359,6 +364,7 @@ function setState(next) {
     metricUp.textContent   = liveUp.textContent   = '0 B';
     liveRtt.textContent    = '--';
     liveRtt.className      = 'live-stat-value';
+    liveRtt.title          = '';
     prevBytesRecv = prevBytesSent = 0;
     clearInterval(pollTimer);  pollTimer  = null;
     clearInterval(uptimeTimer); uptimeTimer = null;
@@ -450,9 +456,15 @@ async function pollOnce() {
       liveDown.textContent = fmtBytes(dRecv) + '/s';
       liveUp.textContent   = fmtBytes(dSent) + '/s';
 
-      // RTT coloring
+      // RTT is the network path's own round trip. Queue is how much longer a
+      // message takes than that (the data queued ahead of it); it is shown
+      // only when it matters.
       if (rtt > 0) {
-        liveRtt.textContent = rtt + ' ms';
+        const queue = metrics.queue_ms || 0;
+        liveRtt.textContent = rtt + ' ms' + (queue > QUEUE_SHOWN_ABOVE_MS ? ' · queue ' + fmtQueue(queue) : '');
+        liveRtt.title = queue > QUEUE_SHOWN_ABOVE_MS
+          ? 'Path round trip. Messages also wait ' + fmtQueue(queue) + ' in the queue of data ahead of them.'
+          : 'Path round trip';
         liveRtt.className = 'live-stat-value ' + (rtt < 100 ? 'rtt-good' : rtt < 250 ? 'rtt-warn' : 'rtt-bad');
       }
     }

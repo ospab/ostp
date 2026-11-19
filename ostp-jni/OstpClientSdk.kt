@@ -109,7 +109,10 @@ class OstpClientSdk private constructor(private val context: Context) {
     data class Metrics(
         val bytesSent: Long = 0L,
         val bytesRecv: Long = 0L,
+        /** The network path's round trip. */
         val rttMs: Double = 0.0,
+        /** How much longer the in-tunnel ping takes than the path: the queue in front of the data. */
+        val queueMs: Double = 0.0,
     ) {
         val totalBytes: Long get() = bytesSent + bytesRecv
         val sentMb: Double get() = bytesSent / 1_000_000.0
@@ -326,6 +329,8 @@ class OstpClientSdk private constructor(private val context: Context) {
     private fun metricsOf(obj: JSONObject) = Metrics(
         bytesSent = obj.optLong("bytes_sent", 0L),
         bytesRecv = obj.optLong("bytes_recv", 0L),
+        rttMs = obj.optDouble("rtt_ms", 0.0),
+        queueMs = obj.optDouble("queue_ms", 0.0),
     )
 
     private fun emitLog(msg: String) {

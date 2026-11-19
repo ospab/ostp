@@ -202,6 +202,7 @@ pub extern "system" fn Java_net_ostp_client_OstpClientSdk_nativeStartClient(
         bytes_recv: portable_atomic::AtomicU64::new(0),
         connection_state: portable_atomic::AtomicU8::new(0),
         rtt_ms: portable_atomic::AtomicU32::new(0),
+        queue_ms: portable_atomic::AtomicU32::new(0),
     });
 
     let bridge = match Bridge::new(&config, Arc::clone(&metrics)) {
@@ -359,20 +360,23 @@ pub extern "system" fn Java_net_ostp_client_OstpClientSdk_nativeGetMetrics(
         let sent = m.bytes_sent.load(Ordering::Relaxed);
         let recv = m.bytes_recv.load(Ordering::Relaxed);
         let conn_state = m.connection_state.load(Ordering::Relaxed);
+        // The path's round trip, and how much longer the in-tunnel ping takes
+        // (the queue in front of the data).
         let rtt = m.rtt_ms.load(Ordering::Relaxed);
+        let queue = m.queue_ms.load(Ordering::Relaxed);
         // Why the tunnel stopped by itself (the server closed the session):
         // set before `connection_state` turns to 0. Empty otherwise.
         let stop_reason = serde_json::Value::String(ostp_client::app::stop_notice().unwrap_or_default());
         let json = format!(
-            r#"{{"bytes_sent": {}, "bytes_recv": {}, "connection_state": {}, "rtt_ms": {}, "stop_reason": {}}}"#,
-            sent, recv, conn_state, rtt, stop_reason
+            r#"{{"bytes_sent": {}, "bytes_recv": {}, "connection_state": {}, "rtt_ms": {}, "queue_ms": {}, "stop_reason": {}}}"#,
+            sent, recv, conn_state, rtt, queue, stop_reason
         );
         match env.new_string(json.replace('\0', "")) {
             Ok(s) => s.into_raw(),
             Err(_) => std::ptr::null_mut(),
         }
     } else {
-        match env.new_string(r#"{"bytes_sent": 0, "bytes_recv": 0, "connection_state": 0, "rtt_ms": 0}"#) {
+        match env.new_string(r#"{"bytes_sent": 0, "bytes_recv": 0, "connection_state": 0, "rtt_ms": 0, "queue_ms": 0}"#) {
             Ok(s) => s.into_raw(),
             Err(_) => std::ptr::null_mut(),
         }

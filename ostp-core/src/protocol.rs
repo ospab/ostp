@@ -606,6 +606,16 @@ impl ProtocolMachine {
         self.cc.set_delay_signal(!reliable);
     }
 
+    /// The RTT of the network path as ACKs measured it (`None` before the first
+    /// sample and just after the session moved). It does not wait behind the
+    /// application's queued data, unlike the in-tunnel ping.
+    ///
+    /// On a reliable carrier (UoT, TLS) the number includes the TCP
+    /// connection's own queueing: that is the delay a frame really has there.
+    pub fn path_rtt(&self) -> Option<crate::congestion::PathRtt> {
+        self.cc.path_rtt()
+    }
+
     pub fn in_flight_count(&self) -> usize {
         // COUNT ONLY retransmittable Data frames — control frames (Ack/Nack) must not
         // contribute to this counter or they will trigger false backpressure.

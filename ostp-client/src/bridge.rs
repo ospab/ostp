@@ -89,7 +89,13 @@ pub struct BridgeMetrics {
     pub bytes_sent: AtomicU64,
     pub bytes_recv: AtomicU64,
     pub connection_state: AtomicU8,
+    /// The path's round trip in ms (`ProtocolMachine::path_rtt`, the best live
+    /// session): what the apps show as "RTT".
     pub rtt_ms: portable_atomic::AtomicU32,
+    /// How much longer the in-tunnel ping takes than the path (ms, never
+    /// negative): the queue in front of the application's data. The apps show
+    /// it when it is above `crate::rtt::QUEUE_SHOWN_ABOVE_MS`.
+    pub queue_ms: portable_atomic::AtomicU32,
 }
 
 async fn send_datagram(socket: &crate::transport::Transport, frame: &Bytes, _webrtc_masquerade: bool) -> std::io::Result<usize> {
@@ -369,7 +375,12 @@ pub struct Bridge {
     metrics: Arc<BridgeMetrics>,
     sample_sent: u64,
     sample_recv: u64,
+    /// The in-tunnel ping's round trip (it waits behind queued data). Drives
+    /// the stall and move timeouts, which must allow for that wait.
     last_rtt_ms: f64,
+    /// The path's own round trip, from the congestion controller; what the
+    /// apps show. Starts as the handshake's.
+    path_rtt_ms: f64,
     last_sample_at: Instant,
 
     last_inbound_error_log: Option<Instant>,
@@ -432,6 +443,7 @@ impl Bridge {
             sample_sent: 0,
             sample_recv: 0,
             last_rtt_ms: 0.0,
+            path_rtt_ms: 0.0,
             last_sample_at: Instant::now(),
 
             last_inbound_error_log: None,
@@ -692,7 +704,7 @@ impl Bridge {
             let rtt = now.saturating_sub(ts);
             if rtt <= MAX_PLAUSIBLE_RTT_MS {
                 self.last_rtt_ms = rtt as f64;
-                self.metrics.rtt_ms.store(rtt as u32, Ordering::Relaxed);
+                self.refresh_rtt();
             }
             return;
         }
@@ -860,7 +872,7 @@ impl Bridge {
                 } else {
                     crate::app::set_stop_notice(None);
                     tx.send(UiEvent::Log("Connecting to remote server...".to_string())).await.ok();
-                    tx.send(UiEvent::Metrics { status: ConnectionStatus::Handshaking, rtt_ms: 0.0, throughput_bps: 0 }).await.ok();
+                    tx.send(UiEvent::Metrics { status: ConnectionStatus::Handshaking, rtt_ms: 0.0, queue_ms: 0.0, throughput_bps: 0 }).await.ok();
                     self.metrics.connection_state.store(1, Ordering::Relaxed);
                     self.last_sample_at = Instant::now();
                     let now = Instant::now();
@@ -945,6 +957,26 @@ impl Bridge {
         self.link = Link::Idle;
         self.established_once = false;
         self.metrics.connection_state.store(0, Ordering::Relaxed);
+    }
+
+    /// Takes the path RTT from the live sessions (the best one, see
+    /// `crate::rtt`) and publishes it with the queue delay. A move leaves the
+    /// sessions without a sample for a while: the last figure stays until a
+    /// new one comes.
+    fn refresh_rtt(&mut self) {
+        let live = self.stall_after();
+        let best = crate::rtt::best_path_rtt(
+            self.sessions.iter().filter(|s| s.last_recv.elapsed() <= live).map(|s| s.machine.path_rtt()),
+        );
+        if let Some(d) = best {
+            self.path_rtt_ms = crate::rtt::to_ms(d);
+        }
+        let queue = crate::rtt::queue_delay_ms(self.last_rtt_ms, self.path_rtt_ms);
+        // A measured round trip under half a millisecond still reads as 1: the
+        // apps take 0 for "not known".
+        let path = if self.path_rtt_ms > 0.0 { (self.path_rtt_ms.round() as u32).max(1) } else { 0 };
+        self.metrics.rtt_ms.store(path, Ordering::Relaxed);
+        self.metrics.queue_ms.store(queue.round() as u32, Ordering::Relaxed);
     }
 
     /// Longest silence a healthy path may show. Pings go out on every keepalive
@@ -1265,6 +1297,8 @@ impl Bridge {
         self.sessions = established.sessions;
         self.udp_rx = Some(established.udp_rx);
         self.last_rtt_ms = established.rtt_ms;
+        self.path_rtt_ms = established.rtt_ms;
+        self.refresh_rtt();
         self.link = Link::Up;
         self.last_sample_at = Instant::now();
         self.clear_routes();
@@ -1297,7 +1331,8 @@ impl Bridge {
 
         tx.send(UiEvent::Metrics {
             status: ConnectionStatus::Established,
-            rtt_ms: self.last_rtt_ms,
+            rtt_ms: self.path_rtt_ms,
+            queue_ms: crate::rtt::queue_delay_ms(self.last_rtt_ms, self.path_rtt_ms),
             throughput_bps: 0,
         }).await.ok();
         self.metrics.connection_state.store(2, Ordering::Relaxed);
@@ -1584,9 +1619,11 @@ impl Bridge {
             ConnectionStatus::Handshaking
         };
 
+        self.refresh_rtt();
         tx.send(UiEvent::Metrics {
             status,
-            rtt_ms: self.last_rtt_ms,
+            rtt_ms: self.path_rtt_ms,
+            queue_ms: crate::rtt::queue_delay_ms(self.last_rtt_ms, self.path_rtt_ms),
             throughput_bps: throughput,
         }).await.ok();
     }

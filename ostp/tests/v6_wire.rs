@@ -165,6 +165,7 @@ impl Client {
             bytes_recv: AtomicU64::new(0),
             connection_state: AtomicU8::new(0),
             rtt_ms: AtomicU32::new(0),
+            queue_ms: AtomicU32::new(0),
         });
         let bridge = Bridge::new(&cfg, metrics.clone()).unwrap();
         let (ui_tx, mut ui_rx) = mpsc::channel(4096);
@@ -257,6 +258,29 @@ async fn a_v6_profile_connects_to_a_v6_only_server_over_udp() {
     v6_profile_works("udp").await;
 }
 
+/// The RTT the apps read is the path's, taken from ACKs: it is there once the
+/// session has carried data, on an idle loopback path the queue delay is nil,
+/// and the in-tunnel ping that feeds the queue delay has been answered.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_apps_rtt_is_the_path_round_trip_and_the_queue_delay_stays_small_when_idle() {
+    let (protocol, public) = section(false);
+    let server = start_server(Some(protocol)).await;
+    let echo = start_echo().await;
+    let mut client = Client::from_link(&link_to(server, Some(public)), "udp").await;
+    assert!(client.wait_log("Connection established", Duration::from_secs(10)).await, "log:\n{}", client.log_text());
+    client.echo_through(echo, b"hello").await;
+    // The metrics tick runs once a second.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+    while client.metrics.rtt_ms.load(Ordering::Relaxed) == 0 && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let rtt = client.metrics.rtt_ms.load(Ordering::Relaxed);
+    let queue = client.metrics.queue_ms.load(Ordering::Relaxed);
+    assert!(rtt >= 1, "no path RTT published");
+    assert!(rtt < 500, "a loopback path has no {rtt} ms RTT");
+    assert!(queue <= 200, "an idle path has no {queue} ms queue");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_v6_profile_connects_to_a_v6_only_server_over_uot() {
     v6_profile_works("uot").await;
@@ -341,6 +365,7 @@ impl Tunnel {
             bytes_recv: AtomicU64::new(0),
             connection_state: AtomicU8::new(0),
             rtt_ms: AtomicU32::new(0),
+            queue_ms: AtomicU32::new(0),
         });
         let bridge = Bridge::new(&cfg, metrics).unwrap();
         let (ui_tx, mut ui_rx) = mpsc::channel(65536);

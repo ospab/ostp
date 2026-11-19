@@ -17,6 +17,23 @@
 
 use std::time::{Duration, Instant};
 
+/// The round-trip time of the network path, as the ACKs measure it. Unlike the
+/// in-tunnel ping (`RelayMessage::Ping`), which waits behind every queued data
+/// frame, an ACK is a small control frame of the protocol layer: it measures
+/// the path, not the application queue.
+///
+/// On a reliable carrier (UoT, TLS) the ACK rides a TCP connection, so
+/// `smoothed` includes that connection's own queueing and retransmission
+/// delay. That is the delay a frame really has on such a carrier, and the
+/// number says so honestly; it is not the bare propagation time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PathRtt {
+    /// SRTT (RFC 6298): what the apps show.
+    pub smoothed: Duration,
+    /// The windowed minimum: the path with no queue of its own.
+    pub min: Duration,
+}
+
 /// Congestion control state for a single OSTP session.
 pub struct CongestionController {
     /// Current congestion window in bytes (how much can be in-flight)
@@ -258,6 +275,15 @@ impl CongestionController {
     /// Returns the smoothed RTT estimate (SRTT).
     pub fn smoothed_rtt(&self) -> Duration {
         self.srtt
+    }
+
+    /// What the path's own RTT looks like now, or `None` before the first
+    /// sample (and again after `reset_path`). Samples come from ACKs of frames
+    /// that were never retransmitted (Karn), so a frame stuck in a queue of
+    /// ours is not one of them while it waits, but an ACK that itself queued
+    /// behind the peer's data is: see `PathRtt`.
+    pub fn path_rtt(&self) -> Option<PathRtt> {
+        self.rtt_initialized.then_some(PathRtt { smoothed: self.srtt, min: self.min_rtt })
     }
 
     /// Returns the adaptive RTO computed per RFC 6298:
@@ -931,6 +957,36 @@ mod tests {
         cc.on_ack_no_rtt(1200);
         assert!(cc.cwnd() > cwnd_before, "cwnd should still grow on a no-RTT ack");
         assert_eq!(cc.smoothed_rtt(), srtt_before, "SRTT must not move on a no-RTT ack");
+    }
+
+    /// The path RTT is unknown until an ACK measured it (the 30 ms start value
+    /// is a guess, not a measurement), follows the samples, and is forgotten
+    /// with the path.
+    #[test]
+    fn the_path_rtt_is_known_only_from_samples() {
+        let mut cc = CongestionController::new(1200);
+        assert_eq!(cc.path_rtt(), None);
+
+        cc.on_send(1200);
+        cc.on_ack(1200, Duration::from_millis(80));
+        let p = cc.path_rtt().expect("sampled");
+        assert_eq!(p.smoothed, Duration::from_millis(80));
+        assert_eq!(p.min, Duration::from_millis(80));
+
+        // A slower sample moves SRTT by 1/8 and leaves the minimum.
+        cc.on_send(1200);
+        cc.on_ack(1200, Duration::from_millis(160));
+        let p = cc.path_rtt().unwrap();
+        assert_eq!(p.smoothed, Duration::from_millis(90));
+        assert_eq!(p.min, Duration::from_millis(80));
+
+        // An ACK without a usable sample (Karn) changes nothing.
+        cc.on_send(1200);
+        cc.on_ack_no_rtt(1200);
+        assert_eq!(cc.path_rtt(), Some(p));
+
+        cc.reset_path();
+        assert_eq!(cc.path_rtt(), None);
     }
 
     #[test]

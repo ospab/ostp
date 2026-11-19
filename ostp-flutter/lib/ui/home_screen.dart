@@ -113,6 +113,11 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin, 
   String _pingText = '-- ms';
   Color _pingColor = Colors.white54;
 
+  /// The queue delay is shown next to the RTT above this many ms.
+  static const _queueShownAboveMs = 200;
+
+  static String _formatQueue(int ms) => ms < 1000 ? '$ms ms' : '${(ms / 1000).toStringAsFixed(1)} s';
+
   // App version, shown at the bottom of the home screen. Read from the build
   // (pubspec) via package_info rather than hardcoded, so it never drifts.
   String _version = '';
@@ -497,7 +502,10 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin, 
       final bytesRecv = (parsed['bytes_recv'] as num?)?.toInt() ?? 0;
       // 0 = not connected, 1 = handshake or reconnect in progress, 2 = connected.
       final connState = (parsed['connection_state'] as num?)?.toInt() ?? 0;
+      // The network path's own round trip.
       final rttMs = (parsed['rtt_ms'] as num?)?.toInt() ?? 0;
+      // How much longer a message takes than that: the queue of data ahead of it.
+      final queueMs = (parsed['queue_ms'] as num?)?.toInt() ?? 0;
       // Set when the server closed the session on purpose; empty otherwise.
       final stopReason = parsed['stop_reason'];
 
@@ -537,7 +545,7 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin, 
         _downSpeed = '${formatBytes(dRecv)}/s';
         _upSpeed = '${formatBytes(dSent)}/s';
         if (rttMs > 0) {
-          _pingText = '$rttMs ms';
+          _pingText = queueMs > _queueShownAboveMs ? '$rttMs ms · queue ${_formatQueue(queueMs)}' : '$rttMs ms';
           if (rttMs < 100) {
             _pingColor = const Color(0xFF22D3A5);
           } else if (rttMs < 250) {

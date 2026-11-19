@@ -23,7 +23,10 @@ impl ConnectionStatus {
 pub enum UiEvent {
     Metrics {
         status: ConnectionStatus,
+        /// The path's round trip (see `crate::rtt`).
         rtt_ms: f64,
+        /// How much longer the in-tunnel ping takes than the path.
+        queue_ms: f64,
         throughput_bps: u64,
     },
     Traffic {
@@ -117,6 +120,7 @@ pub struct AppState {
     pub status: ConnectionStatus,
     pub active_profile: TrafficProfile,
     pub rtt_ms: f64,
+    pub queue_ms: f64,
     pub throughput_bps: u64,
     pub incoming_history: Vec<u64>,
     pub outgoing_history: Vec<u64>,
@@ -136,6 +140,7 @@ impl AppState {
             status: ConnectionStatus::Stopped,
             active_profile: TrafficProfile::JsonRpc,
             rtt_ms: 0.0,
+            queue_ms: 0.0,
             throughput_bps: 0,
             incoming_history: vec![0; 64],
             outgoing_history: vec![0; 64],
@@ -149,10 +154,12 @@ impl AppState {
             UiEvent::Metrics {
                 status,
                 rtt_ms,
+                queue_ms,
                 throughput_bps,
             } => {
                 self.status = status;
                 self.rtt_ms = rtt_ms;
+                self.queue_ms = queue_ms;
                 self.throughput_bps = throughput_bps;
             }
             UiEvent::Traffic {

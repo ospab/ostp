@@ -169,6 +169,7 @@ pub async fn run_client(config: crate::config::ClientConfig) -> Result<()> {
         bytes_recv: portable_atomic::AtomicU64::new(0),
         connection_state: portable_atomic::AtomicU8::new(0),
         rtt_ms: portable_atomic::AtomicU32::new(0),
+        queue_ms: portable_atomic::AtomicU32::new(0),
     });
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -355,14 +356,14 @@ async fn run_client_once(
                         println!("[ostp] {text}");
                     }
                 }
-                crate::app::UiEvent::Metrics { status, rtt_ms, .. } => {
+                crate::app::UiEvent::Metrics { status, rtt_ms, queue_ms, .. } => {
                     if matches!(status, crate::app::ConnectionStatus::Established) {
                         was_up_logger.store(true, std::sync::atomic::Ordering::Relaxed);
                     }
                     let status_str = status.as_str().to_string();
                     if last_status != Some(status_str.clone()) {
                         last_status = Some(status_str.clone());
-                        println!("[ostp] Status: {} (rtt={:.1}ms)", status_str, rtt_ms);
+                        println!("[ostp] Status: {} ({})", status_str, crate::rtt::status_text(rtt_ms, queue_ms));
                     }
                 }
                 crate::app::UiEvent::Traffic { .. } => {}

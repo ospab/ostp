@@ -231,6 +231,7 @@ impl Client {
             bytes_recv: AtomicU64::new(0),
             connection_state: AtomicU8::new(0),
             rtt_ms: AtomicU32::new(0),
+            queue_ms: AtomicU32::new(0),
         });
         let bridge = Bridge::new(&cfg, metrics).unwrap();
 
