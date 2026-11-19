@@ -1,0 +1,97 @@
+# Checks every push on GitHub's machines, so nothing large is built locally:
+# the tests, a Linux binary to try on a server or in wirelab, and the apps'
+# static checks. Releases stay in release.yml (tags only).
+#
+# Results: `gh run list --workflow ci.yml`, `gh run view <id> --log-failed`.
+# The binary: `gh run download <id> --name ostp-linux-amd64`.
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: Tests (Linux)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Cargo cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ci-test-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ci-test-
+            cargo-check-
+      - name: Dummy dist for rust-embed
+        run: mkdir -p ostp-control/dist && touch ostp-control/dist/index.html
+      # Unit and end-to-end tests (v6 wire, roaming) of the core, client, server and CLI.
+      - name: cargo test
+        run: cargo test -p ostp-core -p ostp-client -p ostp-server -p ostp -p ostp-ssh
+
+  linux-binary:
+    name: Linux binary (x86_64, musl)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - name: musl-tools
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: Cargo cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ci-musl-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ci-musl-
+      - name: Build
+        run: cargo build --release --target x86_64-unknown-linux-musl --bin ostp
+      - name: Version
+        run: target/x86_64-unknown-linux-musl/release/ostp --version
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ostp-linux-amd64
+          path: target/x86_64-unknown-linux-musl/release/ostp
+          retention-days: 14
+
+  apps:
+    name: Apps (static checks)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Desktop JavaScript syntax
+        run: for f in ostp-gui/src/*.js; do node --check "$f"; done
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.41.6'
+          channel: stable
+          cache: true
+      # Errors and warnings fail the job; the existing infos do not.
+      - name: flutter analyze
+        working-directory: ostp-flutter
+        run: |
+          flutter pub get
+          flutter analyze --no-fatal-infos
