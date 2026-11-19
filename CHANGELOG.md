@@ -8,6 +8,12 @@ Older history is on the [Releases](https://github.com/ospab/ostp/releases) page 
 
 ## [Unreleased]
 
+### Fixed
+- TLS and TCP carriers: the server let the queue toward one client grow to about 15,000 frames (20 MB), and the kernel socket buffer added megabytes more. On a byte stream OSTP sees no loss and its delay signal is off, so nothing held that back: on a link of a few Mbit/s the queue was tens of seconds long, and everything behind it waited that long. The apps' RTT (a ping inside the tunnel) read up to 50 s, and videos froze about a minute in. Now the server measures how fast each TCP/TLS connection drains while frames wait, and lets the queue hold about 100 ms of that rate (at least 64 frames; about 1 MB before the first measurement). On Linux the socket keeps at most 128 KiB unsent in the kernel (`TCP_NOTSENT_LOWAT`). UDP clients are not affected. Tests: the rate counts only time when frames waited, the queue limit follows the rate, a newer connection from the same address keeps its own measurement. Not yet measured on a real slow link.
+
+### Changed
+- `ostp -V`, the setup wizard, the log header, the server status the apps show and the desktop tray say the release with its channel (`0.5.0-alpha.3`, `0.5.0-beta.1`) instead of the bare `0.5.0` shared by every alpha and beta.
+
 ## [0.5.0-alpha.3] - 2026-11-17
 
 ### Added

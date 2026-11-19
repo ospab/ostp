@@ -16,7 +16,8 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 json_comments = "0.2"
 rand.workspace = true
-socket2 = "0.6.3"
+# "all": TCP_NOTSENT_LOWAT on Linux (carrier_queue).
+socket2 = { version = "0.6.3", features = ["all"] }
 axum = "0.8"
 tower-http = { version = "0.6", features = ["cors"] }
 portable-atomic.workspace = true

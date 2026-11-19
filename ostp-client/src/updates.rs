@@ -35,6 +35,13 @@ pub fn build_tag() -> String {
     }
 }
 
+/// This build's version as people read it, with its channel: "0.5.0-alpha.3",
+/// "0.5.0-beta.1", "0.5.0". `CARGO_PKG_VERSION` is "0.5.0" for all of them.
+pub fn version() -> &'static str {
+    static V: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| build_tag().trim_start_matches('v').to_string());
+    &V
+}
+
 /// A parsed tag: numbers, then the pre-release channel (none = stable).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Version {

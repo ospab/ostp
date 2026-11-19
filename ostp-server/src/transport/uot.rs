@@ -73,6 +73,8 @@ where
     // Writer: length-prefix (u16 BE) each outbound datagram. OSTP datagrams are
     // always well under 64 KiB (MTU-bounded), so the u16 prefix never truncates.
     let writer_authed = authenticated.clone();
+    let drain = crate::carrier_queue::register(peer_addr);
+    let mut meter = crate::carrier_queue::Meter::new(drain.clone());
     let writer = async move {
         let mut unauth = unauth;
         while let Some(packet) = rx.recv().await {
@@ -80,6 +82,8 @@ where
             out.put_u16(packet.len() as u16);
             out.put_slice(&packet);
             if write_half.write_all(&out).await.is_err() { break; }
+            // How fast this connection really drains (see carrier_queue).
+            meter.written(out.len(), rx.len(), std::time::Instant::now());
             if !writer_authed.swap(true, Ordering::Relaxed) {
                 drop(unauth.take());
             }
@@ -145,6 +149,7 @@ where
             map.remove(&peer_addr);
         }
     }
+    crate::carrier_queue::unregister(peer_addr, &drain);
     crate::logs::uot_disconnected(peer_addr);
     Ok(())
 }

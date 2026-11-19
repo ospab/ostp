@@ -330,7 +330,8 @@ fn status(config_path: &Path) -> Result<Value> {
     let api = &v["api"];
     let str_of = |k: &str| api[k].as_str().unwrap_or_default().to_string();
     Ok(json!({
-        "version": env!("CARGO_PKG_VERSION"),
+        // With the channel ("0.5.0-alpha.3"): the apps show it.
+        "version": ostp_client::updates::version(),
         "service": {
             "registered": Path::new(UNIT).exists(),
             "active": service_active(),

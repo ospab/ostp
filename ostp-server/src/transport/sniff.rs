@@ -102,6 +102,11 @@ pub async fn serve_listener(listener: TcpListener, ctx: Arc<SniffCtx>) {
         // Nagle batches the download direction against the client's delayed
         // ACKs, stalling streams; every TCP tunnel sets nodelay.
         let _ = stream.set_nodelay(true);
+        // Little unsent data in the kernel: the send queue stays where the
+        // server can see and limit it (carrier_queue), not in a socket buffer
+        // that grows to megabytes, seconds on a slow link.
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        let _ = socket2::SockRef::from(&stream).set_tcp_notsent_lowat(crate::carrier_queue::NOTSENT_LOWAT);
 
         // Loopback peers are a local web server fronting OSTP; they are limited
         // per forwarded client address once the request head is read.

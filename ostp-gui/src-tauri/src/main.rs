@@ -10,7 +10,7 @@ fn main() {
     let log_level = detect_log_level_from_config();
     // Opening the GUI is not a connection: the log is trimmed on each connect
     // (start_tunnel), so it holds the previous connection and the current one.
-    let _log_guard = ostp_client::logging::init_tracing(&log_level, "ostp-gui", env!("CARGO_PKG_VERSION"), false);
+    let _log_guard = ostp_client::logging::init_tracing(&log_level, "ostp-gui", ostp_client::updates::version(), false);
 
     tracing::info!("ostp-gui starting (log_level={})", log_level);
 

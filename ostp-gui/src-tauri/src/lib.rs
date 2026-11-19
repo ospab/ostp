@@ -1481,7 +1481,7 @@ pub fn run() {
             let connect_i = MenuItem::with_id(app, "connect", "Connect", true, None::<&str>)?;
             let disconnect_i = MenuItem::with_id(app, "disconnect", "Disconnect", true, None::<&str>)?;
             let server_i = MenuItem::with_id(app, "server", format!("Server: {}", masked_ip), false, None::<&str>)?;
-            let version_i = MenuItem::with_id(app, "version", format!("OSTP v{}", env!("CARGO_PKG_VERSION")), false, None::<&str>)?;
+            let version_i = MenuItem::with_id(app, "version", format!("OSTP v{}", ostp_client::updates::version()), false, None::<&str>)?;
             let show_i = MenuItem::with_id(app, "show", "Show window", true, None::<&str>)?;
             let exit_i = MenuItem::with_id(app, "exit", "Quit", true, None::<&str>)?;
             

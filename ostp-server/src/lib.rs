@@ -36,6 +36,7 @@ pub mod password;
 pub mod target_policy;
 mod admission;
 mod send_gate;
+pub(crate) mod carrier_queue;
 mod subscription;
 pub mod devices;
 
@@ -1078,12 +1079,21 @@ const TCP_QUEUE_RESERVE: usize = 1024;
 /// drains at its own pace, and frames that overflowed its queue used to be
 /// dropped and then waited out the long reliable-carrier RTO, which held a
 /// TLS download to a few Mbit/s. UDP clients are not limited here.
+///
+/// The queue is also kept to about `carrier_queue::TARGET_DELAY` of what the
+/// connection drains: filling all of it made tens of seconds of queue on a
+/// slow link (see `carrier_queue`).
 async fn tcp_headroom(
     tcp_map: &Arc<tokio::sync::RwLock<HashMap<std::net::SocketAddr, mpsc::Sender<Bytes>>>>,
     addr: std::net::SocketAddr,
 ) -> i64 {
     match tcp_map.read().await.get(&addr) {
-        Some(tx) => tx.capacity().saturating_sub(TCP_QUEUE_RESERVE) as i64,
+        Some(tx) => {
+            let free = tx.capacity().saturating_sub(TCP_QUEUE_RESERVE);
+            let queued = tx.max_capacity().saturating_sub(tx.capacity());
+            let room = carrier_queue::target_frames(addr).saturating_sub(queued);
+            free.min(room) as i64
+        }
         None => i64::MAX,
     }
 }

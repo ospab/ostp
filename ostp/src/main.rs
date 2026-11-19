@@ -19,7 +19,7 @@ mod service_cmd;
 mod webserver;
 
 #[derive(Parser, Debug)]
-#[command(author, version, about = "OSTP: encrypted tunnel for filtered networks", long_about = None)]
+#[command(author, version = ostp_client::updates::version(), about = "OSTP: encrypted tunnel for filtered networks", long_about = None)]
 struct Args {
     /// Path to the JSON configuration file
     #[cfg_attr(unix, arg(short, long, default_value = "/etc/ostp/config.json", global = true))]
@@ -617,7 +617,7 @@ async fn main() -> Result<()> {
     ostp_client::logging::setup_panic_hook();
     // One-shot commands (`ostp key gen`, `ostp check`) must not truncate a running daemon's log.
     let is_daemon = ostp_client::logging::invocation_is_daemon(std::env::args());
-    let _log_guard = ostp_client::logging::init_tracing("info", "ostp-cli", env!("CARGO_PKG_VERSION"), is_daemon);
+    let _log_guard = ostp_client::logging::init_tracing("info", "ostp-cli", ostp_client::updates::version(), is_daemon);
 
     let res = run_app().await;
     if let Err(e) = res {
@@ -906,10 +906,8 @@ fn run_setup_wizard(config_path: &std::path::Path) -> Result<Option<PathBuf>> {
     use std::io::Write;
 
     println!();
-    wizard_summary(&[
-        concat!("OSTP ", env!("CARGO_PKG_VERSION"), " setup"),
-        "Press Enter to accept the value in [brackets].",
-    ]);
+    let title = format!("OSTP {} setup", ostp_client::updates::version());
+    wizard_summary(&[title.as_str(), "Press Enter to accept the value in [brackets]."]);
 
     // -- Mode selection ------------------------------------------------
     println!();
