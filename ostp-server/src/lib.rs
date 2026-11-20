@@ -1284,8 +1284,18 @@ async fn handle_tick(
     // sessions that no longer exist are pruned below alongside dropped_sessions.
     {
         let mut snapshot = dispatcher.snapshot_backpressure();
-        for (_, addr, available) in snapshot.iter_mut() {
-            *available = (*available).min(tcp_headroom(tcp_map, *addr).await);
+        let mut rooms = Vec::with_capacity(snapshot.len());
+        for (sid, addr, available) in snapshot.iter_mut() {
+            let room = tcp_headroom(tcp_map, *addr).await;
+            *available = (*available).min(room);
+            rooms.push((*sid, room));
+        }
+        // Retransmissions on a TCP/TLS carrier fit the same queue as new data:
+        // after a move to a new connection the whole window is due at once,
+        // and past the queue it was dropped (see ProtocolMachine::carrier_room).
+        for (sid, room) in rooms {
+            let room = (room != i64::MAX).then(|| room.max(0) as usize);
+            dispatcher.set_carrier_room(sid, room);
         }
         let mut map = session_backpressure.write().unwrap_or_else(|e| e.into_inner());
         for (sid, _, available) in snapshot {

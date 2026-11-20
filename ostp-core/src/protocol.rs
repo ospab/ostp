@@ -385,6 +385,14 @@ pub struct ProtocolMachine {
     /// only when the peer NACKs a gap or after the session moved to another
     /// connection, where what was in flight on the old one is gone.
     reliable_carrier: bool,
+    /// Frames the reliable carrier's send queue can take this tick, as the
+    /// sending side measured it (`set_carrier_room`); `None`: no limit known.
+    /// Retransmissions are held to it like new data is: after a move to a new
+    /// connection everything in flight is due at once, and pushing it past
+    /// the queue only made the queue drop frames, which on a byte stream are
+    /// not resent for seconds (RFC 9002 §7, RFC 5681 §3.1: retransmissions
+    /// are subject to the same sending limit as new data).
+    carrier_room: Option<usize>,
     /// When the session last moved (`on_path_change`): on a reliable carrier,
     /// frames sent before this are resent once.
     path_changed_at: Option<Instant>,
@@ -591,6 +599,7 @@ impl ProtocolMachine {
             frame_give_up: FRAME_GIVE_UP,
             cc: CongestionController::new(mtu as u64),
             reliable_carrier: false,
+            carrier_room: None,
             path_changed_at: None,
             last_nacked_nonce: None,
             handshake_pad_min: config.handshake_pad_min.max(8),
@@ -665,6 +674,13 @@ impl ProtocolMachine {
         self.last_nack_sent = due;
         self.last_ack_sent = due;
         self.ack_pending = true;
+    }
+
+    /// How many frames the reliable carrier's send queue takes now (see the
+    /// `carrier_room` field). Set before each tick by a sender that can see
+    /// its queue; ignored on UDP.
+    pub fn set_carrier_room(&mut self, room: Option<usize>) {
+        self.carrier_room = room;
     }
 
     /// Whether datagrams ride a reliable byte stream (UDP-over-TCP or TLS)
@@ -2127,6 +2143,11 @@ impl ProtocolMachine {
         // Backoff starts from retry #0 (immediately effective):
         //   effective_rto = base_rto * 2^retries, capped at 2^6 = 64×
         let mut retransmit_budget: usize = self.cc.retransmit_budget();
+        if self.reliable_carrier {
+            if let Some(room) = self.carrier_room {
+                retransmit_budget = retransmit_budget.min(room);
+            }
+        }
         let srtt = self.cc.smoothed_rtt();
         // The largest frame resent for the third time or more, for path MTU
         // black hole detection after the loop.
@@ -3265,6 +3286,45 @@ mod tests {
         std::thread::sleep(Duration::from_millis(250));
         let udp = datagrams(client.on_event(OstpEvent::Tick).unwrap());
         assert!(udp.contains(&sent[0]), "UDP still retransmits on RTO");
+    }
+
+    /// After a move to a new connection every frame in flight is due at once;
+    /// on a byte stream the resends must fit the queue the sender reports,
+    /// as new data does, and the rest follow on later ticks in send order.
+    #[test]
+    fn resends_after_a_path_change_fit_the_carrier_room() {
+        let (mut client, _server) = do_handshake();
+        client.set_reliable_carrier(true);
+        let mut sent = Vec::new();
+        for i in 0..20u8 {
+            sent.extend(datagrams(client.on_event(OstpEvent::Outbound(1, Bytes::from(vec![i; 200]))).unwrap()));
+        }
+        assert_eq!(sent.len(), 20);
+
+        client.on_path_change();
+        client.set_carrier_room(Some(5));
+        let first = datagrams(client.on_event(OstpEvent::Tick).unwrap());
+        let resent: Vec<_> = first.iter().filter(|d| sent.contains(d)).collect();
+        assert_eq!(resent.len(), 5, "no more resends than the queue takes");
+        assert_eq!(resent[0], &sent[0], "oldest first");
+
+        // A full queue: nothing is pushed into it.
+        client.set_carrier_room(Some(0));
+        let none = datagrams(client.on_event(OstpEvent::Tick).unwrap());
+        assert!(none.iter().all(|d| !sent.contains(d)), "a full queue takes no resends");
+
+        // Room again: the rest follow, the ones already resent are not repeated.
+        client.set_carrier_room(Some(100));
+        let rest = datagrams(client.on_event(OstpEvent::Tick).unwrap());
+        let rest: Vec<_> = rest.iter().filter(|d| sent.contains(d)).collect();
+        assert_eq!(rest.len(), 15);
+        assert!(!rest.contains(&&sent[0]));
+
+        // On UDP the room says nothing.
+        let (mut udp, _s) = do_handshake();
+        udp.set_carrier_room(Some(0));
+        let out = datagrams(udp.on_event(OstpEvent::Outbound(1, Bytes::from_static(b"x"))).unwrap());
+        assert_eq!(out.len(), 1);
     }
 
     #[test]

@@ -373,6 +373,14 @@ impl Dispatcher {
             .collect()
     }
 
+    /// Frames the session's TCP/TLS send queue takes before the next tick
+    /// (`None` on UDP); its retransmissions are held to it.
+    pub fn set_carrier_room(&mut self, sid: u32, room: Option<usize>) {
+        if let Some(ps) = self.peer_machines.get_mut(&sid) {
+            ps.machine.set_carrier_room(room);
+        }
+    }
+
     /// The send budget of the session a datagram from `addr` belongs to,
     /// right after it was processed (an ACK may have opened the window).
     pub fn budget_for_addr(&self, addr: SocketAddr) -> Option<(u32, i64)> {

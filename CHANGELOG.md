@@ -8,6 +8,9 @@ Older history is on the [Releases](https://github.com/ospab/ostp/releases) page 
 
 ## [Unreleased]
 
+### Fixed
+- TLS and TCP carriers: after a client moved to a new TCP connection, the server marked everything in flight as due and resent up to 512 frames every 10 ms tick (a quarter of the congestion window, which on a byte stream grows to 8192 frames), straight into the new connection's send queue, past its limit. The queue then dropped frames (a server's journal showed more than 16,000), and on a byte stream a dropped frame is resent only after seconds; streams starved and the session ended with "the control stream was lost". Resends on a reliable carrier are now held to the room the connection's queue has before each tick, as new data is (RFC 9002 §7, RFC 5681 §3.1: retransmissions are subject to the same sending limit), and the rest follow on later ticks, oldest first. Test: after a path change with 20 frames in flight and room for 5, five are resent, none into a full queue, the other fifteen when there is room again, none twice; UDP is unaffected. Not yet run on a real slow link.
+
 ### Added
 - Development: a CI workflow (`.github/workflows/ci.yml`), so nothing large needs to be built locally. It runs on pushes to `beta` and `master` that change code (changes only to `docs/`, Markdown files and licences start nothing), and by hand for `alpha` or any other branch (the Actions tab, or `gh workflow run ci.yml --ref alpha`). It runs the tests of the core, client, server, CLI and SSH crates on Linux and on Windows (the end-to-end v6 and roaming tests included; the TUN crate on Windows too), builds a Linux x86_64 binary (musl) and a Windows x64 one with `wintun.dll`, kept as run artifacts for 14 days (`gh run download <id> --name ostp-linux-amd64`, `ostp-windows-amd64`), and checks the apps (`node --check` on the desktop JavaScript, `flutter analyze` with errors and warnings fatal). Releases are unchanged (tags, `release.yml`).
 
