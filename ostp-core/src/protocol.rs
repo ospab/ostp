@@ -3313,12 +3313,19 @@ mod tests {
         let none = datagrams(client.on_event(OstpEvent::Tick).unwrap());
         assert!(none.iter().all(|d| !sent.contains(d)), "a full queue takes no resends");
 
-        // Room again: the rest follow, the ones already resent are not repeated.
+        // Room again: the rest follow over the next ticks (each also within the
+        // window's own per-tick budget), and none is resent twice.
         client.set_carrier_room(Some(100));
-        let rest = datagrams(client.on_event(OstpEvent::Tick).unwrap());
-        let rest: Vec<_> = rest.iter().filter(|d| sent.contains(d)).collect();
-        assert_eq!(rest.len(), 15);
-        assert!(!rest.contains(&&sent[0]));
+        let mut rest = Vec::new();
+        for _ in 0..10 {
+            let out = datagrams(client.on_event(OstpEvent::Tick).unwrap());
+            rest.extend(out.into_iter().filter(|d| sent.contains(d)));
+        }
+        assert_eq!(rest.len(), 15, "the fifteen not yet resent, once each");
+        for (i, s) in sent.iter().enumerate() {
+            let n = rest.iter().filter(|d| *d == s).count();
+            assert_eq!(n, usize::from(i >= 5), "frame {i}");
+        }
 
         // On UDP the room says nothing.
         let (mut udp, _s) = do_handshake();
