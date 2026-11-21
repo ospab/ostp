@@ -353,7 +353,7 @@ function setState(next) {
   brandDot.className   = 'brand-dot';
   statusText.className = 'status-label';
   btnConnect.setAttribute('aria-label',
-    next === 'disconnected' ? 'Connect' : next === 'connecting' ? 'Cancel connecting' : 'Disconnect');
+    next === 'disconnected' ? 'Connect' : next === 'connecting' ? 'Connecting' : 'Disconnect');
 
   if (next === 'disconnected') {
     sessionProfile = null;
@@ -376,7 +376,7 @@ function setState(next) {
     brandDot.classList.add('connecting');
     statusText.classList.add('is-connecting');
     statusText.textContent = 'Connecting…';
-    uptimeText.textContent  = 'Press the button to cancel';
+    uptimeText.textContent  = 'Please wait';
     connInfo.classList.add('hidden');
     clearInterval(uptimeTimer); uptimeTimer = null;
     uptimeSecs = 0;
@@ -671,8 +671,16 @@ async function handleToggle() {
         showError('The connection did not start. The file ostp.log next to the app has details.');
       }
     } catch (err) {
-      setState('disconnected');
       const msg = String(err?.message || err);
+      if (msg === TIMEOUT_MSG) {
+        // The core may still be finishing the start: keep polling the real
+        // state instead of claiming "disconnected" while a tunnel comes up.
+        sessionProfile = profileSignature(activeId);
+        startPolling();
+        showError('The core is slow to answer; the status shows the real state.');
+        return;
+      }
+      setState('disconnected');
       if (msg.includes('WINTUN_MISSING')) wintunModal.classList.remove('hidden');
       else showError('Could not connect: ' + msg);
     }
@@ -890,10 +898,10 @@ function profileCard(p) {
       </div>
       <span class="profile-transport-badge">${escHtml(p.transport === 'uot' && p.tls ? 'tls' : (p.transport || 'udp'))}</span>
       <div class="profile-actions">
-        <button class="profile-action-btn btn-share-profile" title="Share profile" data-id="${p.id}">
+        <button class="profile-action-btn btn-share-profile" title="Share profile" data-id="${escHtml(p.id)}">
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/><line x1="8.59" y1="13.51" x2="15.42" y2="17.49"/><line x1="15.41" y1="6.51" x2="8.59" y2="10.49"/></svg>
         </button>
-        <button class="profile-action-btn btn-edit-profile" title="Edit profile" data-id="${p.id}">
+        <button class="profile-action-btn btn-edit-profile" title="Edit profile" data-id="${escHtml(p.id)}">
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>
         </button>
       </div>
@@ -915,7 +923,7 @@ function profileCard(p) {
       if (e.target !== card || (e.key !== 'Enter' && e.key !== ' ')) return;
       e.preventDefault();
       select();
-      document.querySelector(`.profile-card[data-id="${p.id}"]`)?.focus();
+      document.querySelector(`.profile-card[data-id="${CSS.escape(String(p.id))}"]`)?.focus();
     });
 
     card.querySelector('.btn-edit-profile').addEventListener('click', e => {

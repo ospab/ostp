@@ -507,8 +507,8 @@ async function renderStatus(body, id, seq) {
       ${kv('OSTP service', active ? '<span class="pill ok">running</span>' : '<span class="pill bad">stopped</span>')}
       ${kv('Version', esc(s.version))}
       ${kv('Running for', s.service?.started_at && active ? fmtDuration(now - s.service.started_at) : '—')}
-      ${kv('Connected sessions', s.sessions ?? '—')}
-      ${kv('Users', s.users)}
+      ${kv('Connected sessions', esc(s.sessions ?? '—'))}
+      ${kv('Users', esc(s.users))}
       ${kv('Listens on', esc(s.listen), 'mono')}
     </div>
     <div class="kv-card">
@@ -748,10 +748,10 @@ async function renderConnection(body, id, seq) {
   const certPill = !tls.enabled ? '<span class="pill warn">not set up</span>'
     : tls.cert_self_signed ? '<span class="pill warn">not issued yet</span>'
     : days == null ? '<span class="pill ok">by the web server</span>'
-    : days < 10 ? `<span class="pill bad">${days} days left</span>` : `<span class="pill ok">${days} days left</span>`;
+    : days < 10 ? `<span class="pill bad">${esc(days)} days left</span>` : `<span class="pill ok">${esc(days)} days left</span>`;
   body.innerHTML = `
     <div class="kv-card">
-      ${kv('UDP / TCP port', s.udp_port)}
+      ${kv('UDP / TCP port', esc(s.udp_port))}
       ${kv('TLS on 443', tls.enabled ? '<span class="pill ok">on</span>' : '<span class="pill warn">off</span>')}
       ${kv('Domain', esc(tls.domain || '—'))}
       ${kv('Certificate', certPill)}

@@ -42,7 +42,9 @@ impl Drop for Job {
 const MAX_SECRET_BYTES: usize = 64 * 1024;
 const MAX_NAME_CHARS: usize = 64;
 const MAX_ARG_BYTES: usize = 512;
-const MAX_ARGS: usize = 4;
+// `user-add NAME --key K --limit-bytes L --devices D` is the longest command
+// (8 args); the cap leaves a little room.
+const MAX_ARGS: usize = 10;
 
 fn short_text(what: &str, v: &str, max: usize) -> Result<(), String> {
     if v.chars().count() > max || v.contains('\0') {
@@ -189,7 +191,10 @@ pub async fn server_manage(id: String, auth: Option<AuthIn>, args: Vec<String>) 
     if !args.first().is_some_and(|a| ostp_ssh::manager::MANAGE_COMMANDS.contains(&a.as_str())) {
         return Err("unknown server command".into());
     }
-    if args.len() > MAX_ARGS + 2 || args.iter().any(|a| a.len() > MAX_ARG_BYTES || a.contains('\0')) {
+    if args.len() > MAX_ARGS {
+        return Err("a server command has too many arguments".into());
+    }
+    if args.iter().any(|a| a.len() > MAX_ARG_BYTES || a.contains('\0')) {
         return Err("a server command argument is too long".into());
     }
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
