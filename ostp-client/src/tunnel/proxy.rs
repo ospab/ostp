@@ -224,7 +224,41 @@ async fn read_exact_within(client: &mut TcpStream, buf: &mut [u8], limit: Durati
     Ok(())
 }
 
+/// Binds the local proxy's listening socket. Separate from the accept loop so a
+/// caller (the Android library) can report a busy port before it starts anything.
+pub async fn bind_local_proxy(bind_addr: &str) -> Result<TcpListener> {
+    let listener = TcpListener::bind(bind_addr)
+        .await
+        .with_context(|| format!("failed to bind local HTTP/SOCKS5 proxy at {bind_addr}"))?;
+
+    tracing::info!("local HTTP/SOCKS5 proxy listening at {}", bind_addr);
+    if let Ok(local) = listener.local_addr() {
+        if !local.ip().is_loopback() {
+            tracing::warn!(
+                "the local proxy listens on {local}, not on a loopback address: it has no authentication, \
+                 so anyone who can reach this port can use the tunnel as an open proxy"
+            );
+        }
+    }
+    Ok(listener)
+}
+
 pub async fn run_local_socks5_proxy(
+    cfg: LocalProxyConfig,
+    ostp: OstpConfig,
+    exclusions_rx: watch::Receiver<ExclusionConfig>,
+    debug: bool,
+    shutdown: watch::Receiver<bool>,
+    proxy_events_tx: mpsc::Sender<ProxyEvent>,
+    client_msgs_rx: mpsc::UnboundedReceiver<(u16, ProxyToClientMsg)>,
+) -> Result<()> {
+    let listener = bind_local_proxy(&cfg.bind_addr).await?;
+    run_local_socks5_proxy_on(listener, cfg, ostp, exclusions_rx, debug, shutdown, proxy_events_tx, client_msgs_rx).await
+}
+
+/// The accept loop of the local proxy on an already bound `listener`.
+pub async fn run_local_socks5_proxy_on(
+    listener: TcpListener,
     cfg: LocalProxyConfig,
     ostp: OstpConfig,
     mut exclusions_rx: watch::Receiver<ExclusionConfig>,
@@ -234,11 +268,6 @@ pub async fn run_local_socks5_proxy(
     mut client_msgs_rx: mpsc::UnboundedReceiver<(u32, ProxyToClientMsg)>,
 ) -> Result<()> {
     let connect_timeout = Duration::from_millis(cfg.connect_timeout_ms.max(1));
-    let listener = TcpListener::bind(&cfg.bind_addr)
-        .await
-        .with_context(|| format!("failed to bind local HTTP/SOCKS5 proxy at {}", cfg.bind_addr))?;
-
-    tracing::info!("local HTTP/SOCKS5 proxy listening at {}", cfg.bind_addr);
 
     let physical_if_index = tokio::task::spawn_blocking(get_windows_physical_if_index).await.unwrap_or(None);
     let physical_if_name = tokio::task::spawn_blocking(get_linux_physical_if_name).await.unwrap_or(None);
@@ -380,8 +409,32 @@ pub async fn run_local_socks5_proxy(
     Ok(())
 }
 
-/// Extracts `host:port` from an HTTP absolute-URI like `http://example.com/path` or `https://example.com`.
-/// Falls back to the raw target if already in `host:port` form.
+/// Index just past the first blank line (`\r\n\r\n`) of an HTTP request head.
+fn find_header_end(buf: &[u8]) -> Option<usize> {
+    buf.windows(4).position(|w| w == b"\r\n\r\n").map(|i| i + 4)
+}
+
+/// `authority` (`host`, `host:port`, `[v6]`, `[v6]:port`) with `default_port` added
+/// when it has none. A bare IPv6 literal without brackets is bracketed.
+fn with_default_port(authority: &str, default_port: u16) -> String {
+    if let Some(rest) = authority.strip_prefix('[') {
+        // "[v6]" or "[v6]:port"
+        return match rest.find(']') {
+            Some(close) if rest[close + 1..].starts_with(':') && rest.len() > close + 2 => authority.to_string(),
+            Some(close) => format!("[{}]:{}", &rest[..close], default_port),
+            None => authority.to_string(),
+        };
+    }
+    match authority.matches(':').count() {
+        0 => format!("{authority}:{default_port}"),
+        1 => authority.to_string(),
+        // Several colons without brackets: an IPv6 literal.
+        _ => format!("[{authority}]:{default_port}"),
+    }
+}
+
+/// Extracts `host:port` from an HTTP absolute-URI like `http://example.com/path` or
+/// `http://[::1]:8080/x`. Falls back to the raw target if already in `host:port` form.
 fn extract_host_port(uri: &str, default_port: u16) -> String {
     let without_scheme = if let Some(rest) = uri.strip_prefix("https://") {
         rest
@@ -390,13 +443,10 @@ fn extract_host_port(uri: &str, default_port: u16) -> String {
     } else {
         uri
     };
-    // Trim path/query fragment
-    let host_part = without_scheme.split('/').next().unwrap_or(without_scheme);
-    if host_part.contains(':') {
-        host_part.to_string()
-    } else {
-        format!("{}:{}", host_part, default_port)
-    }
+    // The authority ends at the path, query or fragment; drop any user info.
+    let authority = without_scheme.split(['/', '?', '#']).next().unwrap_or(without_scheme);
+    let authority = authority.rsplit('@').next().unwrap_or(authority);
+    with_default_port(authority, default_port)
 }
 
 struct StreamGuard {
@@ -426,6 +476,9 @@ async fn handle_udp_associate(
     connect_timeout: Duration,
 ) -> Result<()> {
     let client_udp_addr = Arc::new(std::sync::Mutex::new(None));
+    // Only datagrams from the host of the control connection are relayed: the first
+    // sender used to be taken as the client, whoever it was.
+    let control_ip = client_tcp.peer_addr().ok().map(|a| a.ip());
     let mut buf = vec![0u8; 65536];
     
     let udp_socket = Arc::new(udp_socket);
@@ -456,6 +509,10 @@ async fn handle_udp_associate(
                         continue; // transient error, don't kill the session
                     }
                 };
+                if control_ip.map_or(true, |ip| ip != addr.ip()) {
+                    tracing::debug!("udp_associate: dropped a datagram from {addr}, not the control connection's host");
+                    continue;
+                }
                 {
                     let mut guard = client_udp_addr.lock().unwrap();
                     if guard.is_none() {
@@ -651,6 +708,41 @@ fn spawn_direct_udp_reader(
     });
 }
 
+/// Reads the destination of a SOCKS5 request (the part after the 4-byte header) as
+/// `host:port`. `None` for an address type this proxy does not support.
+async fn read_socks5_target(client: &mut TcpStream, atyp: u8) -> Result<Option<String>> {
+    // 1 length byte + up to 255 domain bytes + 2 port bytes.
+    let mut addr_buf = [0_u8; 258];
+    Ok(Some(match atyp {
+        0x01 => {
+            // IPv4: 4 bytes address + 2 bytes port
+            read_exact_within(client, &mut addr_buf[0..6], LOCAL_REQUEST_TIMEOUT).await?;
+            let ip = std::net::Ipv4Addr::new(addr_buf[0], addr_buf[1], addr_buf[2], addr_buf[3]);
+            let port = u16::from_be_bytes([addr_buf[4], addr_buf[5]]);
+            format!("{}:{}", ip, port)
+        }
+        0x03 => {
+            // Domain: 1 byte length, then domain, then 2 bytes port
+            read_exact_within(client, &mut addr_buf[0..1], LOCAL_REQUEST_TIMEOUT).await?;
+            let domain_len = addr_buf[0] as usize;
+            read_exact_within(client, &mut addr_buf[0..domain_len + 2], LOCAL_REQUEST_TIMEOUT).await?;
+            let domain = String::from_utf8_lossy(&addr_buf[0..domain_len]);
+            let port = u16::from_be_bytes([addr_buf[domain_len], addr_buf[domain_len + 1]]);
+            format!("{}:{}", domain, port)
+        }
+        0x04 => {
+            // IPv6: 16 bytes + 2 bytes port
+            read_exact_within(client, &mut addr_buf[0..18], LOCAL_REQUEST_TIMEOUT).await?;
+            let mut octets = [0u8; 16];
+            octets.copy_from_slice(&addr_buf[0..16]);
+            let ip = std::net::Ipv6Addr::from(octets);
+            let port = u16::from_be_bytes([addr_buf[16], addr_buf[17]]);
+            format!("[{}]:{}", ip, port)
+        }
+        _ => return Ok(None),
+    }))
+}
+
 async fn handle_proxy_client(
     mut client: TcpStream,
     stream_id: u32,
@@ -715,36 +807,11 @@ async fn handle_proxy_client(
             return Err(anyhow!("unsupported SOCKS5 command {}", req[1]));
         }
 
-        let mut addr_buf = [0_u8; 256];
-        target = match req[3] {
-            0x01 => {
-                // IPv4: 4 bytes address + 2 bytes port
-                read_exact_within(&mut client, &mut addr_buf[0..6], LOCAL_REQUEST_TIMEOUT).await?;
-                let ip = std::net::Ipv4Addr::new(addr_buf[0], addr_buf[1], addr_buf[2], addr_buf[3]);
-                let port = u16::from_be_bytes([addr_buf[4], addr_buf[5]]);
-                format!("{}:{}", ip, port)
-            }
-            0x03 => {
-                // Domain: 1 byte length, then domain, then 2 bytes port
-                read_exact_within(&mut client, &mut addr_buf[0..1], LOCAL_REQUEST_TIMEOUT).await?;
-                let domain_len = addr_buf[0] as usize;
-                read_exact_within(&mut client, &mut addr_buf[0..domain_len + 2], LOCAL_REQUEST_TIMEOUT).await?;
-                let domain = String::from_utf8_lossy(&addr_buf[0..domain_len]);
-                let port = u16::from_be_bytes([addr_buf[domain_len], addr_buf[domain_len + 1]]);
-                format!("{}:{}", domain, port)
-            }
-            0x04 => {
-                // IPv6: 16 bytes + 2 bytes port
-                read_exact_within(&mut client, &mut addr_buf[0..18], LOCAL_REQUEST_TIMEOUT).await?;
-                let mut octets = [0u8; 16];
-                octets.copy_from_slice(&addr_buf[0..16]);
-                let ip = std::net::Ipv6Addr::from(octets);
-                let port = u16::from_be_bytes([addr_buf[16], addr_buf[17]]);
-                format!("[{}]:{}", ip, port)
-            }
-            atyp => {
+        target = match read_socks5_target(&mut client, req[3]).await? {
+            Some(t) => t,
+            None => {
                 client.write_all(&[0x05, 0x08, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await?;
-                return Err(anyhow!("unsupported SOCKS5 address type: {}", atyp));
+                return Err(anyhow!("unsupported SOCKS5 address type: {}", req[3]));
             }
         };
 
@@ -812,6 +879,7 @@ async fn handle_proxy_client(
         // ── HTTP Proxy (CONNECT and plain GET/POST) ───────────────────
         // Read the rest of the HTTP request headers byte-by-byte
         let mut header_bytes = Vec::with_capacity(512);
+        let mut leftover: Vec<u8> = Vec::new();
         header_bytes.push(first_byte[0]);
         let mut chunk = [0_u8; 512];
         loop {
@@ -822,11 +890,11 @@ async fn handle_proxy_client(
                 return Err(anyhow!("connection closed during HTTP header read"));
             }
             header_bytes.extend_from_slice(&chunk[..n]);
-            if header_bytes.len() >= 4 {
-                let tail = &header_bytes[header_bytes.len().saturating_sub(4)..];
-                if tail.ends_with(b"\r\n\r\n") {
-                    break;
-                }
+            // The request may arrive with its body (or, after CONNECT, the first bytes
+            // of the tunneled stream) in the same read: cut at the first blank line.
+            if let Some(end) = find_header_end(&header_bytes) {
+                leftover = header_bytes.split_off(end);
+                break;
             }
             if header_bytes.len() > 8192 {
                 client.write_all(b"HTTP/1.1 431 Request Header Fields Too Large\r\n\r\n").await?;
@@ -847,11 +915,7 @@ async fn handle_proxy_client(
 
         target = if method == "CONNECT" {
             // CONNECT uses host:port directly — e.g. "CONNECT example.com:443 HTTP/1.1"
-            if raw_uri.contains(':') {
-                raw_uri.to_string()
-            } else {
-                format!("{}:443", raw_uri)
-            }
+            with_default_port(raw_uri, 443)
         } else {
             // Plain HTTP: absolute URI like "GET http://example.com/path HTTP/1.1"
             let default_port = if raw_uri.starts_with("https://") { 443u16 } else { 80u16 };
@@ -859,6 +923,16 @@ async fn handle_proxy_client(
         };
 
         crate::logs::proxy_connect(stream_id, &target);
+        // What goes to the remote side before the raw copy starts: for CONNECT only the
+        // bytes that followed the request headers, for a plain request the headers
+        // (which this proxy consumed) and whatever of the body came with them.
+        let forward_prefix: Vec<u8> = if method == "CONNECT" {
+            std::mem::take(&mut leftover)
+        } else {
+            let mut v = std::mem::take(&mut header_bytes);
+            v.append(&mut leftover);
+            v
+        };
         let target_host = if let Some((host, _)) = split_host_port(&target) { host } else { target.clone() };
         let target_port = match split_host_port(&target) { Some((_, p)) => p, None => 443 };
         if matcher.should_bypass_target(&target_host, target_port, connect_timeout).await {
@@ -867,7 +941,7 @@ async fn handle_proxy_client(
                 stream_id,
                 &target,
                 method.as_str(),
-                header_bytes,
+                forward_prefix,
                 matcher.physical_if_index,
                 &matcher.physical_if_name,
                 close_tx,
@@ -882,12 +956,14 @@ async fn handle_proxy_client(
                 if method == "CONNECT" {
                     // For CONNECT, tell client the tunnel is ready
                     client.write_all(b"HTTP/1.1 200 Connection Established\r\nProxy-Agent: ostp/1.0\r\n\r\n").await?;
-                } else {
-                    // For plain HTTP (GET/POST), we MUST forward the request headers we consumed
-                    // to the server over the newly established tunnel.
+                }
+                // For plain HTTP the request we consumed must be forwarded to the
+                // server over the newly established tunnel; for CONNECT, any bytes
+                // the program sent right behind the request.
+                for piece in forward_prefix.chunks(max_chunk) {
                     event_tx.send(ProxyEvent::Data {
                         stream_id,
-                        payload: bytes::Bytes::copy_from_slice(&header_bytes),
+                        payload: bytes::Bytes::copy_from_slice(piece),
                     }).await?;
                 }
             }
@@ -1059,7 +1135,7 @@ async fn direct_connect_http(
     stream_id: u32,
     target: &str,
     method: &str,
-    header_bytes: Vec<u8>,
+    forward_prefix: Vec<u8>,
     physical_if_index: Option<u32>,
     physical_if_name: &Option<String>,
     close_tx: mpsc::Sender<u32>,
@@ -1070,11 +1146,83 @@ async fn direct_connect_http(
 
     if method == "CONNECT" {
         client.write_all(b"HTTP/1.1 200 Connection Established\r\nProxy-Agent: ostp/1.0\r\n\r\n").await?;
-    } else {
-        remote.write_all(&header_bytes).await?;
+    }
+    if !forward_prefix.is_empty() {
+        remote.write_all(&forward_prefix).await?;
     }
 
     let _ = tokio::io::copy_bidirectional(&mut client, &mut remote).await;
     let _ = close_tx.send(stream_id).await;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::AsyncWriteExt;
+
+    #[test]
+    fn host_port_from_absolute_uri() {
+        assert_eq!(extract_host_port("http://example.com/path", 80), "example.com:80");
+        assert_eq!(extract_host_port("http://example.com:8080/x?y=1", 80), "example.com:8080");
+        assert_eq!(extract_host_port("https://example.com", 443), "example.com:443");
+        assert_eq!(extract_host_port("http://example.com?q=1", 80), "example.com:80");
+        assert_eq!(extract_host_port("http://user:pw@example.com/x", 80), "example.com:80");
+    }
+
+    #[test]
+    fn host_port_with_ipv6_literals() {
+        assert_eq!(extract_host_port("http://[::1]/x", 80), "[::1]:80");
+        assert_eq!(extract_host_port("http://[::1]:8080/x", 80), "[::1]:8080");
+        assert_eq!(extract_host_port("http://[2001:db8::7]", 80), "[2001:db8::7]:80");
+        assert_eq!(with_default_port("[::1]", 443), "[::1]:443");
+        assert_eq!(with_default_port("[::1]:8443", 443), "[::1]:8443");
+        assert_eq!(with_default_port("example.com", 443), "example.com:443");
+        assert_eq!(with_default_port("example.com:8443", 443), "example.com:8443");
+    }
+
+    #[test]
+    fn header_end_is_the_first_blank_line() {
+        let req = b"POST http://h/ HTTP/1.1\r\nHost: h\r\nContent-Length: 4\r\n\r\nbody";
+        let end = find_header_end(req).unwrap();
+        assert_eq!(&req[end..], b"body");
+        assert_eq!(find_header_end(b"GET / HTTP/1.1\r\nHost: h\r\n"), None);
+        // Bytes after a CONNECT head are not lost either.
+        let connect = b"CONNECT h:443 HTTP/1.1\r\n\r\n\x16\x03\x01";
+        assert_eq!(&connect[find_header_end(connect).unwrap()..], b"\x16\x03\x01");
+    }
+
+    /// A connected pair: the first stream is what the proxy reads, the second the
+    /// "program" writing to it.
+    async fn pair() -> (TcpStream, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (server, client) = tokio::join!(listener.accept(), TcpStream::connect(addr));
+        (server.unwrap().0, client.unwrap())
+    }
+
+    #[tokio::test]
+    async fn socks5_domain_of_255_bytes_does_not_overflow() {
+        let (mut server, mut client) = pair().await;
+        let domain = "a".repeat(255);
+        let mut msg = vec![255u8];
+        msg.extend_from_slice(domain.as_bytes());
+        msg.extend_from_slice(&443u16.to_be_bytes());
+        client.write_all(&msg).await.unwrap();
+        let target = read_socks5_target(&mut server, 0x03).await.unwrap();
+        assert_eq!(target, Some(format!("{domain}:443")));
+    }
+
+    #[tokio::test]
+    async fn socks5_address_types() {
+        let (mut server, mut client) = pair().await;
+        client.write_all(&[1, 2, 3, 4, 0x01, 0xbb]).await.unwrap();
+        assert_eq!(read_socks5_target(&mut server, 0x01).await.unwrap(), Some("1.2.3.4:443".to_string()));
+        let mut v6 = vec![0u8; 15];
+        v6.push(1);
+        v6.extend_from_slice(&80u16.to_be_bytes());
+        client.write_all(&v6).await.unwrap();
+        assert_eq!(read_socks5_target(&mut server, 0x04).await.unwrap(), Some("[::1]:80".to_string()));
+        assert_eq!(read_socks5_target(&mut server, 0x09).await.unwrap(), None);
+    }
 }

@@ -26,6 +26,11 @@ const REASM_TIMEOUT: Duration = Duration::from_secs(3);
 const MAX_GROUPS: usize = 4096;
 /// A reassembled IPv4 datagram cannot exceed this (total-length is 16-bit).
 const MAX_DATAGRAM: usize = 65_535;
+/// Most fragments one group may hold. Real traffic needs a few dozen at most; a
+/// stream of 8-byte pieces would otherwise grow one group to thousands.
+const MAX_PARTS_PER_GROUP: usize = 512;
+/// Most payload bytes one group may buffer (overlapping pieces count twice).
+const MAX_GROUP_BYTES: usize = 2 * MAX_DATAGRAM;
 
 type Key = (u32, u32, u16, u8); // src, dst, identification, protocol
 
@@ -36,6 +41,8 @@ struct Group {
     header: Option<Vec<u8>>,
     /// Total payload length, known once the last fragment (MF=0) is seen.
     total_len: Option<usize>,
+    /// Sum of the buffered payload lengths.
+    bytes: usize,
     first_seen: Instant,
 }
 
@@ -87,16 +94,23 @@ impl Reassembler {
             parts: BTreeMap::new(),
             header: None,
             total_len: None,
+            bytes: 0,
             first_seen: now,
         });
 
-        // Ignore a payload that would push the datagram past the legal maximum.
-        if v4.frag_offset + v4.payload.len() > MAX_DATAGRAM {
+        // Ignore a payload that would push the datagram past the legal maximum:
+        // the header counts towards the 16-bit total length too.
+        if v4.frag_offset + v4.payload.len() + v4.header.len() > MAX_DATAGRAM {
             self.groups.remove(&key);
             return None;
         }
 
-        group.parts.insert(v4.frag_offset, v4.payload.to_vec());
+        let old = group.parts.insert(v4.frag_offset, v4.payload.to_vec());
+        group.bytes = group.bytes - old.map_or(0, |o| o.len()) + v4.payload.len();
+        if group.parts.len() > MAX_PARTS_PER_GROUP || group.bytes > MAX_GROUP_BYTES {
+            self.groups.remove(&key);
+            return None;
+        }
         if v4.frag_offset == 0 {
             group.header = Some(v4.header.to_vec());
         }
@@ -123,6 +137,11 @@ impl Reassembler {
         }
         if expected < total {
             return None; // not fully covered yet
+        }
+        // The first fragment's header may be longer than the one the size check saw.
+        if header.len() + total > MAX_DATAGRAM {
+            self.groups.remove(&key);
+            return None;
         }
 
         // Reassemble: header + payload bytes [0, total), then fix the header so
@@ -295,6 +314,28 @@ mod tests {
         assert_eq!(r.process(&first), None);
         let whole = r.process(&mid).expect("last piece completes it");
         assert_eq!(&whole[20..], &(0u8..20).collect::<Vec<_>>()[..]);
+    }
+
+    #[test]
+    fn oversized_datagram_is_dropped() {
+        let mut r = Reassembler::new();
+        // Offset 65520 + 8 payload bytes + 20 header bytes is past 65535: the
+        // reassembled total length would wrap a u16.
+        let first = ipv4(5, true, 0, &[0; 8]);
+        let huge = ipv4(5, false, 65_520, &[0; 8]);
+        assert_eq!(r.process(&first), None);
+        assert_eq!(r.process(&huge), None);
+        assert!(r.groups.is_empty(), "the group must be discarded");
+    }
+
+    #[test]
+    fn a_group_cannot_grow_without_bound() {
+        let mut r = Reassembler::new();
+        for i in 0..(MAX_PARTS_PER_GROUP + 10) {
+            // Tiny non-final fragments at consecutive offsets, never completing.
+            assert_eq!(r.process(&ipv4(6, true, (i + 1) * 8, &[0; 8])), None);
+        }
+        assert!(r.groups.values().all(|g| g.parts.len() <= MAX_PARTS_PER_GROUP));
     }
 
     #[test]

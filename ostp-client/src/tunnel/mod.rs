@@ -16,7 +16,7 @@ use tokio::sync::{mpsc, watch};
 
 use crate::config::{ExclusionConfig, LocalProxyConfig, OstpConfig};
 
-pub use proxy::run_local_socks5_proxy;
+pub use proxy::{bind_local_proxy, run_local_socks5_proxy, run_local_socks5_proxy_on};
 
 /// A local connection's id: the proxy's own, never reused while the
 /// connection lives (the bridge maps it to a stream id of a session).

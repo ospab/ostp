@@ -9,10 +9,10 @@ pub mod windows_route {
 
 /// The bypass routes in place, so a network change can move them.
 struct BypassRoutes {
-    ips: Vec<std::net::Ipv4Addr>,
+    nets: Vec<(std::net::Ipv4Addr, u8)>,
     gw: std::net::Ipv4Addr,
     if_index: u32,
-    added: Vec<(std::net::Ipv4Addr, std::net::Ipv4Addr, u32)>,
+    added: Vec<(std::net::Ipv4Addr, u8, std::net::Ipv4Addr, u32)>,
 }
 
 static ROUTES: std::sync::Mutex<Option<BypassRoutes>> = std::sync::Mutex::new(None);
@@ -25,7 +25,7 @@ pub(crate) fn refresh_bypass_routes() -> bool {
         return false;
     }
     windows_route::sys::remove_bypass_routes(&r.added);
-    r.added = windows_route::sys::add_bypass_routes(&r.ips, gw, if_index, 1);
+    r.added = windows_route::sys::add_bypass_routes(&r.nets, gw, if_index, 1);
     tracing::info!(
         "Network changed: bypass routes moved from {} (if_index={}) to {} (if_index={})",
         r.gw, r.if_index, gw, if_index
@@ -51,30 +51,27 @@ impl Drop for WindowsRouteGuard {
         }
         crate::set_physical_if(None, None);
 
-        let ipv6_if = self.ipv6_if;
-        let _ = std::thread::spawn(move || {
-            if let Some(idx) = ipv6_if {
-                for prefix in crate::IPV6_HALVES {
-                    let _ = Command::new("netsh")
-                        .creation_flags(CREATE_NO_WINDOW)
-                        .args(["interface", "ipv6", "delete", "route", &format!("prefix={prefix}"), &format!("interface={idx}")])
-                        .output();
-                }
+        // Synchronous on purpose: a detached thread could still be running when the
+        // tunnel is started again in the same process (GUI restart) and would then
+        // delete the firewall rules and routes of the new session.
+        if let Some(idx) = self.ipv6_if {
+            for prefix in crate::IPV6_HALVES {
+                let _ = Command::new("netsh")
+                    .creation_flags(CREATE_NO_WINDOW)
+                    .args(["interface", "ipv6", "delete", "route", &format!("prefix={prefix}"), &format!("interface={idx}")])
+                    .output();
             }
+        }
+        for rule in ["OSTP Tunnel In", "OSTP Tunnel Out"] {
             let _ = Command::new("netsh")
                 .creation_flags(CREATE_NO_WINDOW)
-                .args(["advfirewall", "firewall", "delete", "rule", "name=OSTP Tunnel In"])
+                .args(["advfirewall", "firewall", "delete", "rule", &format!("name={rule}")])
                 .output();
-            let _ = Command::new("netsh")
-                .creation_flags(CREATE_NO_WINDOW)
-                .args(["advfirewall", "firewall", "delete", "rule", "name=OSTP Tunnel Out"])
-                .output();
-            let _ = Command::new("netsh")
-                .creation_flags(CREATE_NO_WINDOW)
-                .args(["interface", "ipv4", "set", "dnsservers",
-                       "name=ostp_tun", "source=dhcp"])
-                .output();
-        });
+        }
+        let _ = Command::new("netsh")
+            .creation_flags(CREATE_NO_WINDOW)
+            .args(["interface", "ipv4", "set", "dnsservers", "name=ostp_tun", "source=dhcp"])
+            .output();
     }
 }
 
@@ -119,22 +116,26 @@ pub async fn create(opts: OstpTunOptions) -> Result<OstpTunInterface> {
     let (phys_gw, phys_if) = windows_route::sys::get_default_ipv4_route()
         .ok_or_else(|| anyhow!("Cannot find physical default IPv4 route"))?;
 
-    let mut bypass_v4: Vec<std::net::Ipv4Addr> = Vec::new();
+    let mut bypass_v4: Vec<(std::net::Ipv4Addr, u8)> = Vec::new();
     if let std::net::IpAddr::V4(v4) = opts.server_ip {
-        bypass_v4.push(v4);
+        bypass_v4.push((v4, 32));
     }
-    for ip in opts.bypass_ips {
+    for (ip, prefix) in &opts.bypass_nets {
         if let std::net::IpAddr::V4(v4) = ip {
-            bypass_v4.push(v4);
+            bypass_v4.push((*v4, (*prefix).min(32)));
         }
     }
 
     let bypass_routes = windows_route::sys::add_bypass_routes(&bypass_v4, phys_gw, phys_if, 1);
     tracing::info!("Added {} bypass routes via {} (if_index={})", bypass_routes.len(), phys_gw, phys_if);
     if let Ok(mut r) = ROUTES.lock() {
-        *r = Some(BypassRoutes { ips: bypass_v4, gw: phys_gw, if_index: phys_if, added: bypass_routes });
+        *r = Some(BypassRoutes { nets: bypass_v4, gw: phys_gw, if_index: phys_if, added: bypass_routes });
     }
     crate::set_physical_if(Some(phys_if), None);
+
+    // From here on every error return drops the guard, which removes the routes
+    // and rules added so far.
+    let mut guard = WindowsRouteGuard { ipv6_if: None };
 
     let mut tun_cfg = tun::Configuration::default();
     tun_cfg
@@ -198,24 +199,25 @@ pub async fn create(opts: OstpTunOptions) -> Result<OstpTunInterface> {
         set_tun_mtu(idx, opts.mtu).await;
     }
 
-    if let Some(idx) = tun_index {
-        match windows_route::sys::add_ipv4_route(
-            std::net::Ipv4Addr::new(0, 0, 0, 0),
-            std::net::Ipv4Addr::new(0, 0, 0, 0),
-            std::net::Ipv4Addr::new(10, 1, 0, 1),
-            idx,
-            5,
-        ) {
-            Ok(()) => tracing::info!("Default route via TUN (if_index={idx}, metric=5) added."),
-            Err(e) => tracing::error!("cannot add the default route via TUN (if_index={idx}): {e}; traffic is not captured"),
-        }
-    } else {
-        tracing::error!("cannot find the ostp_tun interface index after 15 s; traffic is not captured");
-    }
+    // Without a default route through the TUN traffic keeps leaving directly while
+    // the tunnel looks up: fail instead of running open.
+    let Some(idx) = tun_index else {
+        return Err(anyhow!("cannot find the ostp_tun interface index: traffic would not be captured"));
+    };
+    windows_route::sys::add_ipv4_route(
+        std::net::Ipv4Addr::new(0, 0, 0, 0),
+        std::net::Ipv4Addr::new(0, 0, 0, 0),
+        std::net::Ipv4Addr::new(10, 1, 0, 1),
+        idx,
+        5,
+    )
+    .map_err(|e| anyhow!("cannot add the default route via TUN (if_index={idx}): {e}"))?;
+    tracing::info!("Default route via TUN (if_index={idx}, metric=5) added.");
 
     // IPv6 through the tunnel too (see ostp_tun::IPV6_HALVES). The routes are
     // `store=active`: they go away with the adapter even if the guard never runs.
-    let ipv6_if = tun_index.filter(|_| crate::capture_ipv6(opts.server_ip));
+    let ipv6_if = Some(idx).filter(|_| crate::capture_ipv6(opts.server_ip));
+    guard.ipv6_if = ipv6_if;
     if let Some(idx) = ipv6_if {
         let ok = tokio::task::spawn_blocking(move || {
             let run = |args: &[&str]| {
@@ -238,6 +240,13 @@ pub async fn create(opts: OstpTunOptions) -> Result<OstpTunInterface> {
     let exe1 = current_exe.clone();
     let exe2 = current_exe.clone();
     let _ = tokio::task::spawn_blocking(move || {
+        // Delete first: every start used to add one more rule with the same name.
+        for rule in ["OSTP Tunnel In", "OSTP Tunnel Out"] {
+            let _ = Command::new("netsh")
+                .creation_flags(CREATE_NO_WINDOW)
+                .args(["advfirewall", "firewall", "delete", "rule", &format!("name={rule}")])
+                .output();
+        }
         let _ = Command::new("netsh")
             .creation_flags(CREATE_NO_WINDOW)
             .args(["advfirewall", "firewall", "add", "rule",
@@ -280,9 +289,7 @@ pub async fn create(opts: OstpTunOptions) -> Result<OstpTunInterface> {
 
     Ok(OstpTunInterface {
         device: dev,
-        guard: Box::new(WindowsRouteGuard {
-            ipv6_if,
-        }),
+        guard: Box::new(guard),
     })
 }
 

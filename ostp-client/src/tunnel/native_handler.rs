@@ -113,7 +113,7 @@ where
     let matcher_arc = std::sync::Arc::new(tokio::sync::RwLock::new(matcher));
 
     let matcher_clone = matcher_arc.clone();
-    tokio::spawn(async move {
+    let mut reload_task = tokio::spawn(async move {
         while let Ok(_) = exclusions_rx.changed().await {
             let current = exclusions_rx.borrow().clone();
             let new_matcher = crate::tunnel::exclusion::ExclusionMatcher::new(&current, None, None);
@@ -155,13 +155,24 @@ where
     let mut tcp_accept_task = tokio::spawn(async move {
         let Some(mut listener) = tcp_listener else { return; };
 
-        while let Some((mut stream, local, remote)) = listener.next().await {
+        // Connection tasks live in a JoinSet: aborting this task drops the set and
+        // with it every open connection.
+        let mut conns = tokio::task::JoinSet::new();
+        loop {
+            let (mut stream, local, remote) = tokio::select! {
+                next = listener.next() => match next {
+                    Some(c) => c,
+                    None => break,
+                },
+                // Reap finished connections so the set does not grow forever.
+                Some(_) = conns.join_next(), if !conns.is_empty() => continue,
+            };
             let proxy_addr = proxy_addr_tcp.clone();
             let matcher_arc = matcher_arc.clone();
             #[cfg(target_os = "linux")]
             let lin_name = linux_phys_name.clone();
 
-            tokio::spawn(async move {
+            conns.spawn(async move {
                 let matcher = matcher_arc.read().await.clone();
                 if debug {
                     crate::logs::tun_tcp(local, remote);
@@ -326,6 +337,24 @@ where
         _ = &mut udp_proxy_task => {}
         _ = &mut tcp_accept_task => {}
     }
+
+    // Stop every task and wait for it: a dropped JoinHandle only detaches the task,
+    // which would keep the TUN device and the userspace stack alive after the
+    // tunnel is stopped, and a restart in the same process would meet the old ones.
+    runner_task.abort();
+    tun_to_stack.abort();
+    stack_to_tun.abort();
+    udp_proxy_task.abort();
+    tcp_accept_task.abort();
+    reload_task.abort();
+    let _ = tokio::join!(
+        runner_task,
+        tun_to_stack,
+        stack_to_tun,
+        udp_proxy_task,
+        tcp_accept_task,
+        reload_task
+    );
 
     Ok(())
 }
@@ -519,15 +548,22 @@ pub async fn run_native_tunnel(
     let server_ip_str = server_ip.to_string();
 
     // ── 2. Resolve excluded domains → IP addresses for bypass routing ─────────
-    let mut bypass_ips: Vec<std::net::IpAddr> = Vec::new();
+    let mut bypass_nets: Vec<(std::net::IpAddr, u8)> = Vec::new();
 
     // Server IP always bypasses TUN
-    bypass_ips.push(server_ip);
+    bypass_nets.push((server_ip, if server_ip.is_ipv4() { 32 } else { 128 }));
 
+    // Excluded IPs and CIDRs keep their real prefix: `10.0.0.0/16` used to become a
+    // single /32 host route, so the rest of the range went into the tunnel.
     for ip_str in &config.exclusions.ips {
-        let host = ip_str.split('/').next().unwrap_or(ip_str);
-        if let Ok(ip) = host.parse() {
-            bypass_ips.push(ip);
+        match crate::tunnel::exclusion::parse_cidr(ip_str) {
+            Some(crate::tunnel::exclusion::Cidr::V4(addr, bits)) => {
+                bypass_nets.push((std::net::IpAddr::V4(std::net::Ipv4Addr::from(addr)), bits));
+            }
+            Some(crate::tunnel::exclusion::Cidr::V6(addr, bits)) => {
+                bypass_nets.push((std::net::IpAddr::V6(std::net::Ipv6Addr::from(addr)), bits));
+            }
+            None => tracing::warn!("ignoring invalid excluded address {ip_str:?}"),
         }
     }
 
@@ -536,7 +572,8 @@ pub async fn run_native_tunnel(
         match tokio::net::lookup_host((domain.as_str(), 443u16)).await {
             Ok(addrs) => {
                 for addr in addrs {
-                    bypass_ips.push(addr.ip());
+                    let ip = addr.ip();
+                    bypass_nets.push((ip, if ip.is_ipv4() { 32 } else { 128 }));
                 }
             }
             Err(e) => {
@@ -549,7 +586,7 @@ pub async fn run_native_tunnel(
     // ── 3. Create TUN device via ostp-tun crate ───────────────────────────────
     let opts = ostp_tun::OstpTunOptions {
         server_ip,
-        bypass_ips,
+        bypass_nets,
         dns_server: config.dns_server.clone(),
         kill_switch: config.kill_switch,
         mtu: config.ostp.mtu.tun_mtu() as u16,

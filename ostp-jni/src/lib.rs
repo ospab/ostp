@@ -65,6 +65,9 @@ struct SdkState {
     shutdown_tx: Option<watch::Sender<bool>>,
     metrics: Option<Arc<BridgeMetrics>>,
     cmd_tx: Option<mpsc::Sender<BridgeCommand>>,
+    /// Kept for the life of the client: dropping it closes the watch channel and
+    /// exclusions hot reload (`updateExclusions`) would never reach the tasks.
+    exclusions_tx: Option<watch::Sender<ostp_client::config::ExclusionConfig>>,
 }
 
 impl SdkState {
@@ -74,7 +77,42 @@ impl SdkState {
             shutdown_tx: None,
             metrics: None,
             cmd_tx: None,
+            exclusions_tx: None,
         }
+    }
+}
+
+/// Lock helpers that survive poisoning: a panic while a lock was held (caught at
+/// the JNI boundary) must not leave the client unable to start again.
+fn lock_r<T>(l: &RwLock<T>) -> std::sync::RwLockReadGuard<'_, T> {
+    l.read().unwrap_or_else(|e| e.into_inner())
+}
+
+fn lock_w<T>(l: &RwLock<T>) -> std::sync::RwLockWriteGuard<'_, T> {
+    l.write().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Runs `$body`; a panic is logged and `$fallback` returned instead of unwinding
+/// across the JNI boundary, which would abort the whole app.
+macro_rules! guarded {
+    ($name:expr, $fallback:expr, $body:block) => {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| $body)) {
+            Ok(v) => v,
+            Err(_) => {
+                add_log(format!("internal error (panic) in {}", $name));
+                $fallback
+            }
+        }
+    };
+}
+
+fn panic_jstring(env: &mut JNIEnv) -> jstring {
+    error_jstring(env, "internal error")
+}
+
+fn clear_pending_exception(env: &mut JNIEnv) {
+    if env.exception_check().unwrap_or(false) {
+        let _ = env.exception_clear();
     }
 }
 
@@ -95,17 +133,16 @@ fn add_log(mut text: String) {
         text.truncate(end);
         text.push_str("...");
     }
-    if let Ok(mut guard) = LOGS.write() {
-        if guard.len() >= 1000 {
-            guard.pop_front();
-        }
-        guard.push_back(text);
+    let mut guard = lock_w(&LOGS);
+    if guard.len() >= 1000 {
+        guard.pop_front();
     }
+    guard.push_back(text);
 }
 
 #[no_mangle]
 pub extern "system" fn Java_net_ostp_client_OstpClientSdk_nativeStartClient(
-    mut env: JNIEnv,
+    env: JNIEnv,
     _class: JClass,
     config_json: JString,
     fd: jni::sys::jint,
@@ -114,10 +151,11 @@ pub extern "system" fn Java_net_ostp_client_OstpClientSdk_nativeStartClient(
     _t2s_bin_path: JString,
     _local_proxy: JString,
 ) -> jboolean {
-    let mut state = match STATE.write() {
-        Ok(s) => s,
-        Err(_) => return jni::sys::JNI_FALSE,
-    };
+    guarded!("nativeStartClient", jni::sys::JNI_FALSE, { start_client_impl(env, &config_json, fd) })
+}
+
+fn start_client_impl(mut env: JNIEnv, config_json: &JString, fd: jni::sys::jint) -> jboolean {
+    let mut state = lock_w(&STATE);
 
     if state.runtime.is_some() {
         add_log("Client is already running!".to_string());
@@ -127,28 +165,21 @@ pub extern "system" fn Java_net_ostp_client_OstpClientSdk_nativeStartClient(
     init_tracing();
 
     if let Ok(jvm) = env.get_java_vm() {
-        if let Ok(mut guard) = JVM.write() {
-            *guard = Some(jvm);
-        }
+        *lock_w(&JVM) = Some(jvm);
     }
 
-    if let Ok(cls) = env.find_class("net/ostp/client/OstpClientSdk") {
-        if let Ok(global_cls) = env.new_global_ref(cls) {
-            if let Ok(mut guard) = CLASS_REF.write() {
-                *guard = Some(global_cls);
+    match env.find_class("net/ostp/client/OstpClientSdk") {
+        Ok(cls) => {
+            if let Ok(global_cls) = env.new_global_ref(cls) {
+                *lock_w(&CLASS_REF) = Some(global_cls);
             }
         }
+        Err(_) => clear_pending_exception(&mut env),
     }
 
     ostp_client::bridge::set_socket_protector(|fd| {
-        let jvm_guard = match JVM.read() {
-            Ok(g) => g,
-            Err(_) => return false,
-        };
-        let class_guard = match CLASS_REF.read() {
-            Ok(g) => g,
-            Err(_) => return false,
-        };
+        let jvm_guard = lock_r(&JVM);
+        let class_guard = lock_r(&CLASS_REF);
         if let (Some(ref jvm), Some(ref class_ref)) = (&*jvm_guard, &*class_guard) {
             if let Ok(mut env) = jvm.attach_current_thread() {
                 let class_obj = unsafe { jni::objects::JClass::from_raw(class_ref.as_obj().as_raw()) };
@@ -158,15 +189,18 @@ pub extern "system" fn Java_net_ostp_client_OstpClientSdk_nativeStartClient(
                     "(I)Z",
                     &[jni::objects::JValue::from(fd)],
                 );
-                if let Ok(jval) = val {
-                    return jval.z().unwrap_or(false);
+                match val {
+                    Ok(jval) => return jval.z().unwrap_or(false),
+                    // A Java exception left pending would make every later JNI call
+                    // on this thread fail or abort the VM.
+                    Err(_) => clear_pending_exception(&mut env),
                 }
             }
         }
         false
     });
 
-    let config_str: String = match env.get_string(&config_json) {
+    let config_str: String = match env.get_string(config_json) {
         Ok(s) => s.into(),
         Err(_) => return jni::sys::JNI_FALSE,
     };
@@ -213,14 +247,25 @@ pub extern "system" fn Java_net_ostp_client_OstpClientSdk_nativeStartClient(
         }
     };
 
+    // Bind the local proxy before anything is started: a busy port is reported to the
+    // caller instead of surfacing later as an unobserved task failure.
+    let proxy_listener = match rt.block_on(tunnel::bind_local_proxy(&config.local_proxy.bind_addr)) {
+        Ok(l) => l,
+        Err(e) => {
+            add_log(format!("Failed to start the local proxy: {e:#}"));
+            return jni::sys::JNI_FALSE;
+        }
+    };
+
     let (ui_tx, mut ui_rx) = mpsc::channel(512);
     let (cmd_tx, cmd_rx) = mpsc::channel(128);
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let proxy_shutdown_rx = shutdown_tx.subscribe();
-    
-    // Create exclusions channel
+
+    // One exclusions channel for the proxy and the TUN stack; the sender is kept in
+    // STATE so `updateExclusions` can reach both.
     let (exclusions_tx, exclusions_rx) = watch::channel(config.exclusions.clone());
-    let _exclusions_rx_tun = exclusions_tx.subscribe();
+    let tun_exclusions_rx = exclusions_tx.subscribe();
 
     let metrics_clone = Arc::clone(&metrics);
 
@@ -231,7 +276,8 @@ pub extern "system" fn Java_net_ostp_client_OstpClientSdk_nativeStartClient(
 
     let config_proxy = config.clone();
     rt.spawn(async move {
-        tunnel::run_local_proxy(
+        if let Err(e) = tunnel::run_local_socks5_proxy_on(
+            proxy_listener,
             config_proxy.local_proxy,
             config_proxy.ostp,
             exclusions_rx,
@@ -241,6 +287,9 @@ pub extern "system" fn Java_net_ostp_client_OstpClientSdk_nativeStartClient(
             client_msgs_rx,
         )
         .await
+        {
+            add_log(format!("Local proxy stopped with error: {e:#}"));
+        }
     });
 
     // Start logs receiver task
@@ -269,15 +318,14 @@ pub extern "system" fn Java_net_ostp_client_OstpClientSdk_nativeStartClient(
     {
         let shutdown_rx_clone = shutdown_tx.subscribe();
         let config_clone = config.clone();
-        let (exclusions_tx, exclusions_rx) = tokio::sync::watch::channel(config.exclusions.clone());
         rt.spawn(async move {
-            let _tx = exclusions_tx; // keep tx alive
-            if let Err(e) = tunnel::native_handler::run_native_tunnel_from_fd(config_clone, shutdown_rx_clone, exclusions_rx, fd).await {
+            if let Err(e) = tunnel::native_handler::run_native_tunnel_from_fd(config_clone, shutdown_rx_clone, tun_exclusions_rx, fd).await {
                 add_log(format!("Native TUN exited with error: {}", e));
             }
         });
     }
 
+    state.exclusions_tx = Some(exclusions_tx);
     state.runtime = Some(rt);
     state.shutdown_tx = Some(shutdown_tx);
     state.metrics = Some(metrics_clone);
@@ -297,10 +345,9 @@ pub extern "system" fn Java_net_ostp_client_OstpClientSdk_startClient(
     local_proxy: JString,
 ) -> jboolean {
     // A panic must not unwind across the JNI boundary (that aborts the whole app).
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    guarded!("startClient", jni::sys::JNI_FALSE, {
         Java_net_ostp_client_OstpClientSdk_nativeStartClient(env, class, config_json, fd, t2s_bin_path, local_proxy)
-    }))
-    .unwrap_or(jni::sys::JNI_FALSE)
+    })
 }
 
 #[no_mangle]
@@ -308,28 +355,59 @@ pub extern "system" fn Java_net_ostp_client_OstpClientSdk_nativeStopClient(
     _env: JNIEnv,
     _class: JClass,
 ) -> jboolean {
-    let (shutdown_tx, runtime) = {
-        let mut state = match STATE.write() {
-            Ok(s) => s,
+    guarded!("nativeStopClient", jni::sys::JNI_FALSE, {
+        let (shutdown_tx, runtime) = {
+            let mut state = lock_w(&STATE);
+            let s = state.shutdown_tx.take();
+            let r = state.runtime.take();
+            state.cmd_tx = None;
+            state.metrics = None;
+            state.exclusions_tx = None;
+            (s, r)
+        };
+
+        if let Some(s) = shutdown_tx {
+            let _ = s.send(true);
+        }
+
+        if let Some(rt) = runtime {
+            rt.shutdown_background();
+        }
+
+        add_log("OSTP SDK: Client successfully stopped".to_string());
+        jni::sys::JNI_TRUE
+    })
+}
+
+/// Replaces the exclusions of a running client (JSON of `ExclusionConfig`:
+/// `domains`, `ips`, `processes`); the proxy and the TUN stack pick them up at once.
+/// The Kotlin side declares it as `external fun updateExclusions(json: String): Boolean`.
+#[no_mangle]
+pub extern "system" fn Java_net_ostp_client_OstpClientSdk_updateExclusions(
+    mut env: JNIEnv,
+    _class: JClass,
+    exclusions_json: JString,
+) -> jboolean {
+    guarded!("updateExclusions", jni::sys::JNI_FALSE, {
+        let text: String = match env.get_string(&exclusions_json) {
+            Ok(s) => s.into(),
             Err(_) => return jni::sys::JNI_FALSE,
         };
-        let s = state.shutdown_tx.take();
-        let r = state.runtime.take();
-        state.cmd_tx = None;
-        state.metrics = None;
-        (s, r)
-    };
-
-    if let Some(s) = shutdown_tx {
-        let _ = s.send(true);
-    }
-
-    if let Some(rt) = runtime {
-        rt.shutdown_background();
-    }
-
-    add_log("OSTP SDK: Client successfully stopped".to_string());
-    jni::sys::JNI_TRUE
+        let parsed: ostp_client::config::ExclusionConfig = match serde_json::from_str(&text) {
+            Ok(v) => v,
+            Err(e) => {
+                add_log(format!("updateExclusions: invalid JSON: {e}"));
+                return jni::sys::JNI_FALSE;
+            }
+        };
+        match &lock_r(&STATE).exclusions_tx {
+            Some(tx) => {
+                let _ = tx.send(parsed);
+                jni::sys::JNI_TRUE
+            }
+            None => jni::sys::JNI_FALSE,
+        }
+    })
 }
 
 #[no_mangle]
@@ -337,24 +415,21 @@ pub extern "system" fn Java_net_ostp_client_OstpClientSdk_stopClient(
     env: JNIEnv,
     class: JClass,
 ) -> jboolean {
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    guarded!("stopClient", jni::sys::JNI_FALSE, {
         Java_net_ostp_client_OstpClientSdk_nativeStopClient(env, class)
-    }))
-    .unwrap_or(jni::sys::JNI_FALSE)
+    })
 }
 
 #[no_mangle]
 pub extern "system" fn Java_net_ostp_client_OstpClientSdk_nativeGetMetrics(
-    env: JNIEnv,
+    mut env: JNIEnv,
     _class: JClass,
 ) -> jstring {
-    let state = match STATE.read() {
-        Ok(s) => s,
-        Err(_) => return match env.new_string("{}") {
-            Ok(s) => s.into_raw(),
-            Err(_) => std::ptr::null_mut(),
-        },
-    };
+    guarded!("nativeGetMetrics", panic_jstring(&mut env), { get_metrics_impl(&env) })
+}
+
+fn get_metrics_impl(env: &JNIEnv) -> jstring {
+    let state = lock_r(&STATE);
 
     if let Some(m) = &state.metrics {
         let sent = m.bytes_sent.load(Ordering::Relaxed);
@@ -385,39 +460,42 @@ pub extern "system" fn Java_net_ostp_client_OstpClientSdk_nativeGetMetrics(
 
 #[no_mangle]
 pub extern "system" fn Java_net_ostp_client_OstpClientSdk_getMetrics(
-    env: JNIEnv,
+    mut env: JNIEnv,
     class: JClass,
 ) -> jstring {
-    Java_net_ostp_client_OstpClientSdk_nativeGetMetrics(env, class)
+    guarded!("getMetrics", panic_jstring(&mut env), {
+        Java_net_ostp_client_OstpClientSdk_nativeGetMetrics(unsafe { env.unsafe_clone() }, class)
+    })
 }
 
 #[no_mangle]
 pub extern "system" fn Java_net_ostp_client_OstpClientSdk_nativeGetLogs(
-    env: JNIEnv,
+    mut env: JNIEnv,
     _class: JClass,
 ) -> jstring {
-    let logs_vec: Vec<String> = match LOGS.write() {
-        Ok(mut guard) => guard.drain(..).collect(),
-        Err(_) => Vec::new(),
-    };
+    guarded!("nativeGetLogs", panic_jstring(&mut env), {
+        let logs_vec: Vec<String> = lock_w(&LOGS).drain(..).collect();
 
-    let json = match serde_json::to_string(&logs_vec) {
-        Ok(s) => s,
-        Err(_) => "[]".to_string(),
-    };
+        let json = match serde_json::to_string(&logs_vec) {
+            Ok(s) => s,
+            Err(_) => "[]".to_string(),
+        };
 
-    match env.new_string(json.replace('\0', "")) {
-        Ok(s) => s.into_raw(),
-        Err(_) => std::ptr::null_mut(),
-    }
+        match env.new_string(json.replace('\0', "")) {
+            Ok(s) => s.into_raw(),
+            Err(_) => std::ptr::null_mut(),
+        }
+    })
 }
 
 #[no_mangle]
 pub extern "system" fn Java_net_ostp_client_OstpClientSdk_getLogs(
-    env: JNIEnv,
+    mut env: JNIEnv,
     class: JClass,
 ) -> jstring {
-    Java_net_ostp_client_OstpClientSdk_nativeGetLogs(env, class)
+    guarded!("getLogs", panic_jstring(&mut env), {
+        Java_net_ostp_client_OstpClientSdk_nativeGetLogs(unsafe { env.unsafe_clone() }, class)
+    })
 }
 
 #[no_mangle]
@@ -426,10 +504,12 @@ pub extern "system" fn Java_net_ostp_client_OstpClientSdk_addLog(
     _class: JClass,
     log_msg: JString,
 ) {
-    if let Ok(s) = env.get_string(&log_msg) {
-        let text: String = s.into();
-        add_log(text);
-    }
+    guarded!("addLog", (), {
+        if let Ok(s) = env.get_string(&log_msg) {
+            let text: String = s.into();
+            add_log(text);
+        }
+    })
 }
 
 #[derive(serde::Deserialize)]
@@ -456,9 +536,15 @@ fn default_matrix_timeout_ms() -> u64 { 2500 }
 #[no_mangle]
 pub extern "system" fn Java_net_ostp_client_OstpClientSdk_runProberMatrix(
     mut env: JNIEnv,
-    _class: JClass,
+    class: JClass,
     request_json: JString,
 ) -> jstring {
+    guarded!("runProberMatrix", panic_jstring(&mut env), {
+        run_prober_matrix(unsafe { env.unsafe_clone() }, class, request_json)
+    })
+}
+
+fn run_prober_matrix(mut env: JNIEnv, _class: JClass, request_json: JString) -> jstring {
     let req_str: String = match env.get_string(&request_json) {
         Ok(s) => s.into(),
         Err(_) => return null_jstring(&mut env),
@@ -517,9 +603,15 @@ fn default_ttl_timeout_ms() -> u64 { 900 }
 #[no_mangle]
 pub extern "system" fn Java_net_ostp_client_OstpClientSdk_runProberTtlScan(
     mut env: JNIEnv,
-    _class: JClass,
+    class: JClass,
     request_json: JString,
 ) -> jstring {
+    guarded!("runProberTtlScan", panic_jstring(&mut env), {
+        run_prober_ttl_scan(unsafe { env.unsafe_clone() }, class, request_json)
+    })
+}
+
+fn run_prober_ttl_scan(mut env: JNIEnv, _class: JClass, request_json: JString) -> jstring {
     let req_str: String = match env.get_string(&request_json) {
         Ok(s) => s.into(),
         Err(_) => return null_jstring(&mut env),
@@ -569,8 +661,14 @@ pub extern "system" fn Java_net_ostp_client_OstpClientSdk_runProberTtlScan(
 #[no_mangle]
 pub extern "system" fn Java_net_ostp_client_OstpClientSdk_runProberDpiBattery(
     mut env: JNIEnv,
-    _class: JClass,
+    class: JClass,
 ) -> jstring {
+    guarded!("runProberDpiBattery", panic_jstring(&mut env), {
+        run_prober_dpi_battery(unsafe { env.unsafe_clone() }, class)
+    })
+}
+
+fn run_prober_dpi_battery(mut env: JNIEnv, _class: JClass) -> jstring {
     let report = match Runtime::new() {
         Ok(rt) => rt.block_on(ostp_client::dpi_probes::run_dpi_battery()),
         Err(e) => return error_jstring(&mut env, &format!("failed to create tokio runtime: {e}")),
@@ -596,6 +694,20 @@ fn null_jstring(env: &mut JNIEnv) -> jstring {
 /// `{"error": "device:<code>:<message>"}`.
 #[no_mangle]
 pub extern "system" fn Java_net_ostp_client_OstpClientSdk_fetchSubscription(
+    mut env: JNIEnv,
+    class: JClass,
+    url: JString,
+    send_hwid: jboolean,
+    android_id: JString,
+    os: JString,
+    model: JString,
+) -> jstring {
+    guarded!("fetchSubscription", panic_jstring(&mut env), {
+        fetch_subscription(unsafe { env.unsafe_clone() }, class, url, send_hwid, android_id, os, model)
+    })
+}
+
+fn fetch_subscription(
     mut env: JNIEnv,
     _class: JClass,
     url: JString,
@@ -627,16 +739,24 @@ pub extern "system" fn Java_net_ostp_client_OstpClientSdk_fetchSubscription(
 
 /// The release this build was cut from, e.g. "v0.4.6-beta.2".
 #[no_mangle]
-pub extern "system" fn Java_net_ostp_client_OstpClientSdk_buildTag(env: JNIEnv, _class: JClass) -> jstring {
-    match env.new_string(ostp_client::updates::build_tag()) {
-        Ok(s) => s.into_raw(),
-        Err(_) => std::ptr::null_mut(),
-    }
+pub extern "system" fn Java_net_ostp_client_OstpClientSdk_buildTag(mut env: JNIEnv, _class: JClass) -> jstring {
+    guarded!("buildTag", panic_jstring(&mut env), {
+        match env.new_string(ostp_client::updates::build_tag()) {
+            Ok(s) => s.into_raw(),
+            Err(_) => std::ptr::null_mut(),
+        }
+    })
 }
 
 /// Newer stable/beta releases on GitHub as JSON, or {"error": ...}.
 #[no_mangle]
-pub extern "system" fn Java_net_ostp_client_OstpClientSdk_checkForUpdates(mut env: JNIEnv, _class: JClass) -> jstring {
+pub extern "system" fn Java_net_ostp_client_OstpClientSdk_checkForUpdates(mut env: JNIEnv, class: JClass) -> jstring {
+    guarded!("checkForUpdates", panic_jstring(&mut env), {
+        check_for_updates(unsafe { env.unsafe_clone() }, class)
+    })
+}
+
+fn check_for_updates(mut env: JNIEnv, _class: JClass) -> jstring {
     let result = match Runtime::new() {
         Ok(rt) => rt.block_on(ostp_client::updates::check()),
         Err(e) => Err(anyhow::anyhow!("failed to create tokio runtime: {e}")),
@@ -672,16 +792,14 @@ pub extern "system" fn Java_net_ostp_client_OstpClientSdk_notifyNetworkChanged(
     _env: JNIEnv,
     _class: JClass,
 ) {
-    let state = match STATE.read() {
-        Ok(s) => s,
-        Err(_) => return,
-    };
-
-    if let Some(ref cmd_tx) = state.cmd_tx {
-        // Use try_send since we're likely on a background thread from Android's ConnectivityManager
-        let _ = cmd_tx.try_send(ostp_client::app::BridgeCommand::NetworkChanged);
-        add_log("notifyNetworkChanged: BridgeCommand::NetworkChanged sent".to_string());
-    }
+    guarded!("notifyNetworkChanged", (), {
+        let state = lock_r(&STATE);
+        if let Some(ref cmd_tx) = state.cmd_tx {
+            // Use try_send since we're likely on a background thread from Android's ConnectivityManager
+            let _ = cmd_tx.try_send(ostp_client::app::BridgeCommand::NetworkChanged);
+            add_log("notifyNetworkChanged: BridgeCommand::NetworkChanged sent".to_string());
+        }
+    })
 }
 
 
@@ -753,11 +871,17 @@ fn decode_master_key(hex: &str) -> Option<[u8; 32]> {
 #[no_mangle]
 pub extern "system" fn Java_net_ostp_client_OstpClientSdk_serversCall(
     mut env: JNIEnv,
-    _class: JClass,
+    class: JClass,
     data_dir: JString,
     master_key: JString,
     request: JString,
 ) -> jstring {
+    guarded!("serversCall", panic_jstring(&mut env), {
+        servers_call_jni(unsafe { env.unsafe_clone() }, class, data_dir, master_key, request)
+    })
+}
+
+fn servers_call_jni(mut env: JNIEnv, _class: JClass, data_dir: JString, master_key: JString, request: JString) -> jstring {
     let get = |env: &mut JNIEnv, s: &JString| -> String { env.get_string(s).map(Into::into).unwrap_or_default() };
     let (dir, key, req) = (get(&mut env, &data_dir), get(&mut env, &master_key), get(&mut env, &request));
     let reply = servers_call(&dir, &key, &req);

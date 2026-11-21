@@ -115,9 +115,20 @@ impl ExclusionMatcher {
         if self.processes.is_empty() {
             return false;
         }
-        let p = process_name.to_lowercase();
-        self.processes.iter().any(|ex| p.contains(ex))
+        let p = canonical_process_name(process_name);
+        self.processes.iter().any(|ex| {
+            let ex = canonical_process_name(ex);
+            // Linux reports `comm`, cut at 15 bytes: a longer exclusion matches its prefix.
+            ex == p || (p.len() >= 15 && ex.len() > p.len() && ex.starts_with(&p))
+        })
     }
+}
+
+/// Executable name for comparison: lower case, no directory, no `.exe`.
+fn canonical_process_name(name: &str) -> String {
+    let lower = name.trim().to_lowercase();
+    let base = lower.rsplit(['/', '\\']).next().unwrap_or(&lower);
+    base.strip_suffix(".exe").unwrap_or(base).to_string()
 }
 
 // Shared with the server so a rule means the same on both sides.
@@ -152,6 +163,33 @@ mod tests {
         assert!(m.match_domain("a.b.EXAMPLE.com."));
         assert!(!m.match_domain("badexample.com"));
         assert!(m.match_domain("x.test.org"));
+    }
+
+    fn process_matcher(procs: &[&str]) -> ExclusionMatcher {
+        let cfg = ExclusionConfig {
+            processes: procs.iter().map(|d| d.to_string()).collect(),
+            ..Default::default()
+        };
+        ExclusionMatcher::new(&cfg, None, None)
+    }
+
+    #[test]
+    fn process_names_match_exactly() {
+        let m = process_matcher(&["ssh", "Chrome.exe"]);
+        assert!(m.match_process("ssh"));
+        assert!(m.match_process("SSH.EXE"));
+        assert!(m.match_process("chrome"));
+        assert!(m.match_process("C:\\Program Files\\Chrome.exe"));
+        assert!(!m.match_process("sshd"));
+        assert!(!m.match_process("ssh-agent"));
+        assert!(!m.match_process("chromedriver.exe"));
+    }
+
+    #[test]
+    fn truncated_linux_comm_matches_long_exclusion() {
+        let m = process_matcher(&["NetworkManager-dispatcher"]);
+        assert!(m.match_process("networkmanager-"));
+        assert!(!m.match_process("network"));
     }
 
     #[tokio::test]

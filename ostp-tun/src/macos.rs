@@ -67,7 +67,7 @@ pub async fn create(opts: OstpTunOptions) -> Result<OstpTunInterface> {
         let _ = Command::new("route").args(["add", "-host", &server_ip_str, gw]).output();
         tracing::info!("Added bypass route for server {} via {}", server_ip_str, gw);
 
-        for ip in &opts.bypass_ips {
+        for (ip, _prefix) in &opts.bypass_nets {
             let route = format!("{}", ip);
             let _ = Command::new("route").args(["add", "-host", &route, gw]).output();
             bypass_routes.push(route);
