@@ -403,7 +403,17 @@ pub struct Bridge {
     /// Whether this run has been connected before, to word the logs and to
     /// clear stale proxy events only on a reconnect.
     established_once: bool,
+    /// Proxy events taken off the channel while the sending window was full,
+    /// in their order (see `HELD_PROXY_MAX`).
+    held_proxy: std::collections::VecDeque<ProxyEvent>,
 }
+
+/// Proxy events the loop takes off the channel while the window is full, to
+/// reach the `Consumed` (window updates) queued behind upload data: those
+/// let the server send more and must not wait for upload to drain, or a full
+/// upload window stalls the download too. Everything else stays in order
+/// here. Bounded, so the local programs still feel the backpressure.
+const HELD_PROXY_MAX: usize = 64;
 
 impl Bridge {
     pub fn new(config: &ClientConfig, metrics: Arc<BridgeMetrics>) -> Result<Self> {
@@ -458,6 +468,7 @@ impl Bridge {
             pending_resets: Vec::new(),
             proxy_guard: None,
             established_once: false,
+            held_proxy: std::collections::VecDeque::new(),
         })
     }
 
@@ -501,6 +512,18 @@ impl Bridge {
                 Link::Down { next_try, .. } => Some(next_try),
                 _ => None,
             };
+            // Two independent gates for upload. cwnd bounds how much may be in
+            // flight (the controller caps it at MAX_CWND_PACKETS); pacing
+            // bounds how FAST it is released. Without the second, a full
+            // window goes out back-to-back and lands in the bottleneck's
+            // buffer as standing queue rather than throughput. The
+            // `pace_wait` branch wakes the loop when pacing allows the next
+            // packet.
+            let window_open = self.sessions.is_empty()
+                || self.sessions.iter().any(|ses| {
+                    ses.machine.in_flight_count() < ses.machine.cwnd_packets() && ses.machine.can_pace_packet()
+                });
+            let live = self.link != Link::Idle;
             tokio::select! {
                 biased;
                 _ = tokio::time::sleep(pace_wait.unwrap_or_default()), if pace_wait.is_some() => {}
@@ -509,6 +532,30 @@ impl Bridge {
                     // otherwise return an error at once, on every pass.
                     if changed.is_err() || *shutdown.borrow() {
                         break;
+                    }
+                }
+                // The timers come before inbound data: during a saturated
+                // download the inbound channel is never empty, and a branch
+                // after it would starve (no retransmits, keepalives, link
+                // checks or metrics). Each fires at most once per period.
+                _ = retransmit_tick.tick() => {
+                    self.handle_retransmit(&tx, &proxy_tx).await;
+                }
+                _ = keepalive_tick.tick() => {
+                    self.send_keepalives().await;
+                }
+                _ = metrics_tick.tick() => {
+                    let wall_gap = last_wall_check.elapsed().unwrap_or_default();
+                    last_wall_check = SystemTime::now();
+                    if wall_gap > Duration::from_secs(15) && self.link != Link::Idle {
+                        let _ = tx.send(UiEvent::Log(format!(
+                            "Resumed after ~{}s suspend", wall_gap.as_secs()
+                        ))).await;
+                        self.recover_now("Resumed after suspend", &tx, &proxy_tx).await;
+                    }
+                    self.check_link(&tx, &proxy_tx).await;
+                    if self.link != Link::Idle {
+                        self.emit_metrics(&tx).await;
                     }
                 }
                 udp_msg = async {
@@ -529,38 +576,19 @@ impl Bridge {
                         break;
                     }
                 }
-                _ = metrics_tick.tick() => {
-                    let wall_gap = last_wall_check.elapsed().unwrap_or_default();
-                    last_wall_check = SystemTime::now();
-                    if wall_gap > Duration::from_secs(15) && self.link != Link::Idle {
-                        let _ = tx.send(UiEvent::Log(format!(
-                            "Resumed after ~{}s suspend", wall_gap.as_secs()
-                        ))).await;
-                        self.recover_now("Resumed after suspend", &tx, &proxy_tx).await;
+                // Held events go first, in order, once the window opens.
+                _ = std::future::ready(()), if live && window_open && !self.held_proxy.is_empty() => {
+                    let ev = self.held_proxy.pop_front();
+                    self.handle_proxy_event(ev, &tx, &proxy_tx).await;
+                }
+                proxy_ev = proxy_rx.recv(), if live && (window_open || self.held_proxy.len() < HELD_PROXY_MAX) => {
+                    match proxy_ev {
+                        // A window update concerns the other direction and is
+                        // not ordered with upload data: it goes now.
+                        Some(ev @ ProxyEvent::Consumed { .. }) => self.handle_proxy_event(Some(ev), &tx, &proxy_tx).await,
+                        Some(ev) if !window_open || !self.held_proxy.is_empty() => self.held_proxy.push_back(ev),
+                        other => self.handle_proxy_event(other, &tx, &proxy_tx).await,
                     }
-                    self.check_link(&tx, &proxy_tx).await;
-                    if self.link != Link::Idle {
-                        self.emit_metrics(&tx).await;
-                    }
-                }
-                _ = keepalive_tick.tick() => {
-                    self.send_keepalives().await;
-                }
-                _ = retransmit_tick.tick() => {
-                    self.handle_retransmit(&tx, &proxy_tx).await;
-                }
-                proxy_ev = proxy_rx.recv(), if self.link != Link::Idle && (self.sessions.is_empty() || self.sessions.iter().any(|ses| {
-                    // Two independent gates. cwnd bounds how much may be in
-                    // flight (the controller caps it at MAX_CWND_PACKETS);
-                    // pacing bounds how FAST it is released. Without the
-                    // second, a full window goes out back-to-back and lands in
-                    // the bottleneck's buffer as standing queue rather than
-                    // throughput. The `pace_wait` branch wakes the loop when
-                    // pacing allows the next packet.
-                    ses.machine.in_flight_count() < ses.machine.cwnd_packets()
-                        && ses.machine.can_pace_packet()
-                })) => {
-                    self.handle_proxy_event(proxy_ev, &tx, &proxy_tx).await;
                 }
             }
         }
@@ -1308,11 +1336,15 @@ impl Bridge {
             // Streams of the lost session are gone, and so are the requests
             // queued for it while the attempt blocked the loop.
             self.reset_proxy_streams(tx, proxy_tx, "reconnect");
+            let mut stale_events: Vec<ProxyEvent> = self.held_proxy.drain(..).collect();
             if let Some(proxy_rx) = proxy_rx {
                 while let Ok(stale) = proxy_rx.try_recv() {
-                    if let ProxyEvent::NewStream { stream_id, .. } = stale {
-                        let _ = proxy_tx.send((stream_id, ProxyToClientMsg::Error("connection reset".into())));
-                    }
+                    stale_events.push(stale);
+                }
+            }
+            for stale in stale_events {
+                if let ProxyEvent::NewStream { stream_id, .. } = stale {
+                    let _ = proxy_tx.send((stream_id, ProxyToClientMsg::Error("connection reset".into())));
                 }
             }
         }

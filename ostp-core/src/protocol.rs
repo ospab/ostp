@@ -278,18 +278,22 @@ fn encode_close_payload(reason: CloseReason, text: &str) -> Bytes {
     Bytes::from(out)
 }
 
-/// An empty payload is reason 0; an unknown reason, a text over the limit or
-/// one that is not UTF-8 makes the frame invalid.
-fn decode_close_payload(payload: &[u8]) -> Result<(CloseReason, String), ProtocolError> {
+/// An empty payload is reason 0. The `Close` is authenticated, so the peer
+/// did end the session whatever the payload says: a reason this version does
+/// not know (a newer peer's) reads as `Normal`, a text over the limit is cut
+/// and one that is not UTF-8 is read lossily. Refusing the frame instead
+/// would leave its nonce unrecorded and stall the session behind it.
+fn decode_close_payload(payload: &[u8]) -> (CloseReason, String) {
     let Some((&byte, text)) = payload.split_first() else {
-        return Ok((CloseReason::Normal, String::new()));
+        return (CloseReason::Normal, String::new());
     };
-    let reason = CloseReason::from_wire(byte).ok_or_else(|| ProtocolError::Framing("unknown close reason".to_string()))?;
-    if text.len() > CLOSE_TEXT_MAX {
-        return Err(ProtocolError::Framing("close text too long".to_string()));
+    let reason = CloseReason::from_wire(byte).unwrap_or(CloseReason::Normal);
+    let text = String::from_utf8_lossy(&text[..text.len().min(CLOSE_TEXT_MAX)]);
+    let mut end = text.len().min(CLOSE_TEXT_MAX);
+    while !text.is_char_boundary(end) {
+        end -= 1;
     }
-    let text = std::str::from_utf8(text).map_err(|_| ProtocolError::Framing("close text is not UTF-8".to_string()))?;
-    Ok((reason, text.to_string()))
+    (reason, text[..end].to_string())
 }
 
 /// Streams a receiver tracks at once (those with frames waiting or an order
@@ -670,6 +674,15 @@ impl ProtocolMachine {
         for frame in self.sent_history.iter_mut().filter(|f| f.is_retransmittable) {
             frame.last_sent = due;
             frame.retries = 1;
+        }
+        // Datagrams (never resent) in flight on the old path are gone with
+        // it; the next tick abandons them. (On a datagram carrier they are
+        // judged by age anyway; on a reliable one only a lost connection
+        // loses them, and this is that.)
+        if self.reliable_carrier {
+            for frame in self.sent_history.iter_mut().filter(|f| f.no_resend && !is_probe_frame(f)) {
+                frame.first_sent = due;
+            }
         }
         self.last_nack_sent = due;
         self.last_ack_sent = due;
@@ -1229,7 +1242,13 @@ impl ProtocolMachine {
             let ended = self.stall.on_progress(now);
             self.log_stall_end(ended);
         }
-        if was_silent && self.in_flight_count() > 0 {
+        // Only on a datagram carrier. On a reliable one silence is a queue or
+        // a slow connection, not loss: everything in flight is still on its
+        // way, and resending the window into the same byte stream (up to
+        // MAX_CWND_PACKETS frames) only lengthens the queue that caused the
+        // silence. A real move to another connection calls `on_path_change`
+        // itself.
+        if was_silent && !self.reliable_carrier && self.in_flight_count() > 0 {
             self.on_path_change();
         }
         if self.highest_authenticated_recv_nonce < Some(nonce) {
@@ -1364,9 +1383,20 @@ impl ProtocolMachine {
     // and, for a `Data` frame, its stream is reset.
 
     fn handle_v6_frame(&mut self, nonce: u64, plaintext: Vec<u8>) -> Result<ProtocolAction, ProtocolError> {
-        let packet = FramedPacketV2::decode_zero_copy(Bytes::from(plaintext))?;
-        let kind = packet.header.kind;
-        let stream_id = packet.header.stream_id;
+        // The frame passed authentication, so it is the peer's. One this
+        // version cannot read (a newer peer's kind, a malformed field) is
+        // still recorded and acknowledged, then ignored: refusing it would
+        // leave a hole at its nonce that the peer resends into for minutes
+        // and the session stalls behind.
+        let packet = match FramedPacketV2::decode_zero_copy(Bytes::from(plaintext)) {
+            Ok(packet) => Some(packet),
+            Err(e) => {
+                tracing::debug!("Skipping an authenticated frame this version cannot read (nonce={nonce}): {e}");
+                None
+            }
+        };
+        let kind = packet.as_ref().map(|p| p.header.kind);
+        let stream_id = packet.as_ref().map_or(0, |p| p.header.stream_id);
 
         // Received before (a retransmit whose first copy arrived, a replay):
         // nothing to deliver, and the peer is told what we have.
@@ -1378,13 +1408,15 @@ impl ProtocolMachine {
         let mut app: Vec<ProtocolAction> = Vec::new();
 
         // What concerns our own sending acts at once, outside any order.
-        match kind {
-            FrameKind::Nack if packet.payload.len() >= 8 => self.on_nack_v6(&packet.payload, &mut wire),
-            FrameKind::Ack => {
-                let ranges = parse_ack_ranges(&packet.payload)?;
-                self.drop_acked_frames(&ranges);
+        if let Some(packet) = &packet {
+            match packet.header.kind {
+                FrameKind::Nack if packet.payload.len() >= 8 => self.on_nack_v6(&packet.payload, &mut wire),
+                FrameKind::Ack => match parse_ack_ranges(&packet.payload) {
+                    Ok(ranges) => self.drop_acked_frames(&ranges),
+                    Err(e) => tracing::debug!("Ignoring an ACK this version cannot read: {e}"),
+                },
+                _ => {}
             }
-            _ => {}
         }
 
         let before = self.expected_recv_nonce;
@@ -1394,14 +1426,14 @@ impl ProtocolMachine {
         let mut record = !full;
         if full {
             tracing::debug!("Reorder buffer full, dropping frame nonce={}", nonce);
-        } else {
-            match kind {
+        } else if let Some(packet) = &packet {
+            match packet.header.kind {
                 FrameKind::Data => {
                     record = self.admit_stream_data(stream_id, packet.header.stream_seq, packet.payload.clone(), &mut app);
                 }
                 FrameKind::Datagram => app.push(ProtocolAction::DeliverDatagram(stream_id, packet.payload.clone())),
                 FrameKind::Close => {
-                    let (reason, text) = decode_close_payload(&packet.payload)?;
+                    let (reason, text) = decode_close_payload(&packet.payload);
                     tracing::debug!("Received Close frame (reason {}), terminating session", reason.to_wire());
                     // Told once, and only by the side that did not close first.
                     if self.state == OstpState::Established {
@@ -1409,13 +1441,21 @@ impl ProtocolMachine {
                     }
                     self.state = OstpState::Closed;
                 }
-                FrameKind::Abandon => self.on_abandon_v6(&packet.payload, &mut app)?,
+                FrameKind::Abandon => {
+                    if let Err(e) = self.on_abandon_v6(&packet.payload, &mut app) {
+                        tracing::debug!("Ignoring an Abandon this version cannot read: {e}");
+                    }
+                }
                 _ => {}
             }
         }
 
         let held = record && self.record_nonce(nonce)?;
-        if matches!(kind, FrameKind::Data | FrameKind::Close | FrameKind::KeepAlive | FrameKind::Datagram | FrameKind::Abandon) {
+        // An unreadable frame is acknowledged too, or the peer resends it.
+        if matches!(
+            kind,
+            None | Some(FrameKind::Data | FrameKind::Close | FrameKind::KeepAlive | FrameKind::Datagram | FrameKind::Abandon)
+        ) {
             self.ack_pending = true;
         }
 
@@ -1434,7 +1474,7 @@ impl ProtocolMachine {
         }
         // A Close is acknowledged at once: the receiver is Closed and will not
         // get another chance (it ignores the Close the peer resends).
-        let ack = if kind == FrameKind::Close { self.force_build_ack()? } else { self.build_ack_if_due()? };
+        let ack = if kind == Some(FrameKind::Close) { self.force_build_ack()? } else { self.build_ack_if_due()? };
         if let Some(ack_frame) = ack {
             wire.push(ProtocolAction::SendDatagram(ack_frame));
         }
@@ -1658,9 +1698,11 @@ impl ProtocolMachine {
             return Err(ProtocolError::Framing("abandon payload too short".to_string()));
         }
         let stream_id = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
+        // Any reason means the stream is reset; one this version does not
+        // know (a newer peer's) reads as `Lost`.
         let reason = match payload[4] {
             0 => None,
-            byte => Some(ResetReason::from_wire(byte).ok_or_else(|| ProtocolError::Framing("unknown reset reason".to_string()))?),
+            byte => Some(ResetReason::from_wire(byte).unwrap_or(ResetReason::Lost)),
         };
         let count = payload[5] as usize;
         if payload.len() < 6 + count * 16 {
@@ -1737,8 +1779,16 @@ impl ProtocolMachine {
             }
         }
 
-        // A datagram that nothing acknowledged by now is lost.
-        let lost_after = base_rto.saturating_mul(DATAGRAM_LOSS_RTOS).min(MAX_EFFECTIVE_RTO);
+        // A datagram that nothing acknowledged by now is lost. On a reliable
+        // carrier nothing is lost on the way, only queued: an unacknowledged
+        // datagram is given up only after `frame_give_up` (its connection is
+        // gone), and that says nothing about congestion.
+        let reliable = self.reliable_carrier;
+        let lost_after = if reliable {
+            give_up
+        } else {
+            base_rto.saturating_mul(DATAGRAM_LOSS_RTOS).min(MAX_EFFECTIVE_RTO)
+        };
         let mut lost = Vec::new();
         let mut lost_bytes = 0u64;
         // (A path MTU probe is not one: `mtu_tick` judges it, and its loss says
@@ -1751,7 +1801,9 @@ impl ProtocolMachine {
             // The same age test as above, against the same `now`.
             self.sent_history.retain(|f| !(f.no_resend && !is_probe_frame(f) && now.duration_since(f.first_sent) >= lost_after));
             self.cc.on_discard(lost_bytes);
-            self.cc.on_loss(lost_bytes);
+            if !reliable {
+                self.cc.on_loss(lost_bytes);
+            }
             for frame in self.build_abandon(0, None, &lost)? {
                 actions.push(ProtocolAction::SendDatagram(frame));
             }
@@ -1807,7 +1859,40 @@ impl ProtocolMachine {
     /// (`pmtu::PathMtu::black_hole`).
     fn note_resent_frame(&mut self, len: usize, retries: u8, first_sent: Instant, now: Instant) {
         let change = self.pmtu.as_mut().and_then(|pm| pm.black_hole(len, retries, first_sent, now));
+        let before = self.send_mtu;
         self.apply_mtu_change(change);
+        if self.send_mtu < before {
+            self.give_up_oversized_frames(now);
+        }
+    }
+
+    /// The path no longer carries frames larger than `send_mtu`, and a frame
+    /// is resent as built (its bytes, nonce and stream position are fixed),
+    /// so those in flight would be resent at their old size until
+    /// `frame_give_up` (minutes) with their streams stuck behind them. They
+    /// are given up on now instead: the next tick resets their streams
+    /// (`Abandon` with `Lost`), and the apps see a reset rather than a hang.
+    /// Other streams are not touched.
+    fn give_up_oversized_frames(&mut self, now: Instant) {
+        if !self.v6 {
+            return;
+        }
+        let limit = self.send_mtu;
+        let past = self.retry_limit().saturating_add(1);
+        let long_ago = now.checked_sub(self.frame_give_up).unwrap_or(now);
+        let mut n = 0usize;
+        for f in self
+            .sent_history
+            .iter_mut()
+            .filter(|f| f.kind == FrameKind::Data && f.is_retransmittable && !f.no_resend && f.bytes.len() > limit)
+        {
+            f.retries = f.retries.max(past);
+            f.first_sent = f.first_sent.min(long_ago);
+            n += 1;
+        }
+        if n > 0 {
+            tracing::debug!("{n} frames in flight exceed the new path MTU {limit}: their streams are reset");
+        }
     }
 
     /// On the tick: data in flight and no ACK progress for longer than
@@ -2152,6 +2237,12 @@ impl ProtocolMachine {
         // The largest frame resent for the third time or more, for path MTU
         // black hole detection after the loop.
         let mut resent_again: Option<(usize, u8, Instant)> = None;
+        // Bytes resent because their timer ran out on a datagram carrier (not
+        // because the path changed): a loss that no NACK reported, which the
+        // congestion controller must hear about (RFC 5681 §3.1, RFC 9002
+        // §7.8). Before, only NACKs did, so a path losing everything kept its
+        // full window and resent into it every RTO.
+        let mut timer_lost = 0u64;
         for frame in self.sent_history.iter_mut() {
             // A v6 datagram is never resent (`no_resend` is false for every
             // v5 frame).
@@ -2177,6 +2268,9 @@ impl ProtocolMachine {
                 now.duration_since(frame.last_sent) >= wait
             };
             if due {
+                if !self.reliable_carrier && !self.path_changed_at.is_some_and(|t| frame.last_sent < t) {
+                    timer_lost += frame.bytes.len() as u64;
+                }
                 // Only burn the retry counter and reset the RTO timer when the
                 // frame is ACTUALLY put on the wire. Doing it unconditionally
                 // meant that whenever the per-tick budget ran out — which is
@@ -2204,6 +2298,11 @@ impl ProtocolMachine {
         }
         if let Some((len, retries, first_sent)) = resent_again {
             self.note_resent_frame(len, retries, first_sent, now);
+        }
+        // One loss event per tick; `on_loss` itself reduces at most once per
+        // RTT, so a burst of expiring timers is one congestion response.
+        if timer_lost > 0 {
+            self.cc.on_loss(timer_lost);
         }
 
         // ── Stall: data in flight and no ACK progress ────────────────
@@ -3798,7 +3897,7 @@ mod tests {
     }
 
     #[test]
-    fn the_close_text_is_cut_on_a_character_boundary_and_a_longer_one_is_refused() {
+    fn the_close_text_is_cut_on_a_character_boundary_and_a_bad_one_still_closes() {
         let (mut client, mut server) = do_handshake_v6();
         // 40 two-byte characters: 80 bytes, cut to 64 (32 characters).
         let long: String = "é".repeat(40);
@@ -3810,18 +3909,61 @@ mod tests {
         let text = format!("{}é", "a".repeat(63));
         assert_eq!(&encode_close_payload(CloseReason::Normal, &text)[1..], "a".repeat(63).as_bytes());
 
-        // A frame from a peer that does not cut is refused: the session stays up.
+        // The Close is authenticated: a payload this side would not have
+        // written still ends the session (and is acknowledged), it is read as
+        // well as it can be. A text that is too long is cut.
         let (mut client, mut server) = do_handshake_v6();
         let mut payload = vec![CloseReason::KeyRevoked.to_wire()];
         payload.extend(vec![b'x'; CLOSE_TEXT_MAX + 1]);
         let bad = server.build_tracked_datagram(0, FrameKind::Close, Bytes::from(payload)).unwrap();
-        assert!(client.on_event(OstpEvent::Inbound(bad)).is_err());
-        assert_eq!(client.state(), OstpState::Established);
-        let unknown = server.build_tracked_datagram(0, FrameKind::Close, Bytes::from_static(&[9])).unwrap();
-        assert!(client.on_event(OstpEvent::Inbound(unknown)).is_err());
+        let o = feed(&mut client, &bad);
+        assert_eq!(o.closed, vec![(CloseReason::KeyRevoked, "x".repeat(CLOSE_TEXT_MAX))]);
+        assert!(!o.wire.is_empty(), "acknowledged");
+        assert_eq!(client.state(), OstpState::Closed);
+        // A reason from a newer peer reads as Normal.
+        let (mut client, mut server) = do_handshake_v6();
+        let unknown = server.build_tracked_datagram(0, FrameKind::Close, Bytes::from_static(&[9, b'h', b'i'])).unwrap();
+        assert_eq!(feed(&mut client, &unknown).closed, vec![(CloseReason::Normal, "hi".to_string())]);
+        // Text that is not UTF-8 is read lossily.
+        let (mut client, mut server) = do_handshake_v6();
         let not_utf8 = server.build_tracked_datagram(0, FrameKind::Close, Bytes::from_static(&[2, 0xff, 0xfe])).unwrap();
-        assert!(client.on_event(OstpEvent::Inbound(not_utf8)).is_err());
+        assert_eq!(feed(&mut client, &not_utf8).closed[0].0, CloseReason::KeyRevoked);
+        assert_eq!(client.state(), OstpState::Closed);
+    }
+
+    /// Seals `plaintext` as the next datagram of `m`, as `build_frame_padded`
+    /// does, without tracking it: a frame a newer version might send.
+    fn seal_raw_v6(m: &mut ProtocolMachine, plaintext: &[u8]) -> Bytes {
+        let nonce = m.send_nonce;
+        m.send_nonce += 1;
+        let sid = m.session_id.to_be_bytes();
+        let ct = m.send_cipher.as_ref().unwrap().encrypt(nonce, plaintext, &sid).unwrap();
+        let mut out = Vec::new();
+        out.extend_from_slice(&sid);
+        out.extend_from_slice(&nonce.to_be_bytes());
+        out.extend_from_slice(&ct);
+        crate::crypto::obfuscate_packet_inplace(&mut out, &m.obfuscation_key, false);
+        Bytes::from(out)
+    }
+
+    #[test]
+    fn an_authenticated_frame_of_an_unknown_kind_is_acknowledged_and_skipped() {
+        let (mut client, mut server) = do_handshake_v6();
+        // A KeepAlive with its kind byte (offset 1) set to one no version has.
+        let mut plain = FramedPacketV2::new(FrameKind::KeepAlive, 0, 0, Bytes::new(), Bytes::new())
+            .unwrap()
+            .encode()
+            .to_vec();
+        plain[1] = 200;
+        let unknown = seal_raw_v6(&mut server, &plain);
+        let expected = client.expected_recv_nonce + 1;
+        feed(&mut client, &unknown);
         assert_eq!(client.state(), OstpState::Established);
+        assert_eq!(client.expected_recv_nonce, expected, "its nonce is recorded, no hole stays behind it");
+        // The stream data behind it is delivered.
+        let data = datagrams(server.on_event(OstpEvent::Outbound(1, Bytes::from_static(b"after"))).unwrap()).remove(0);
+        let o = feed(&mut client, &data);
+        assert_eq!(o.app, vec![(1, Bytes::from_static(b"after"))]);
     }
 
     #[test]
@@ -4412,14 +4554,22 @@ mod tests {
         assert_eq!(client.send_mtu(), 1400, "dropped below the lost size");
         assert_eq!(client.pmtu.as_ref().unwrap().ceiling(), Some(1452));
         assert_eq!(client.max_payload(), 1400 - DATAGRAM_OVERHEAD_V6);
+        // The stuck frame cannot be resent smaller: its stream was reset at
+        // once (not after FRAME_GIVE_UP), and nothing of the old size is
+        // left to go out again.
+        let _ = tick(&mut client);
+        assert!(
+            !client.sent_history.iter().any(|f| f.kind == FrameKind::Data && f.bytes.len() > 1400),
+            "a frame larger than the path carries is still in flight"
+        );
+        assert!(client.dead_streams.contains(&5), "its stream is reset");
 
         // The size now passes, in another stream than the one with the stuck frame.
         let max = client.max_payload();
         let frame = send(&mut client, 9, &vec![2u8; max]);
         assert_eq!(frame.len(), 1400);
         assert_eq!(feed(&mut server, &frame).app.len(), 1);
-        // And no probe of the lost size goes out soon (the stuck frame itself
-        // is still resent at its old size, which is all that is lost here).
+        // And no probe of the lost size goes out soon.
         let _ = pump(&mut client, &mut server, 1420, Duration::from_millis(500));
         assert!(client.probe.is_none(), "a probe of the lost size went out");
         assert_eq!(client.send_mtu(), 1400);
@@ -4581,6 +4731,41 @@ mod tests {
         let from_server = send(&mut server, 2, b"hello");
         let _ = feed(&mut client, &from_server);
         assert!(!client.stall.stalled());
+    }
+
+    /// On a reliable carrier silence is a queue, not loss: hearing the peer
+    /// after OUTAGE_SILENCE does not resend the window into the same byte
+    /// stream, and an unacknowledged datagram is neither abandoned at the
+    /// datagram-carrier age nor taken as congestion.
+    #[test]
+    fn a_reliable_carrier_neither_resends_after_silence_nor_loses_datagrams() {
+        let (mut client, mut server) = do_handshake_v6();
+        client.set_reliable_carrier(true);
+        let data = send(&mut client, 3, b"queued");
+        let dgram = datagrams(client.on_event(OstpEvent::OutboundDatagram(5, Bytes::from_static(b"dns"))).unwrap());
+        assert_eq!(dgram.len(), 1);
+        let long_ago = Instant::now() - Duration::from_secs(20);
+        client.last_authenticated_recv = Some(Instant::now() - OUTAGE_SILENCE - Duration::from_secs(1));
+        for f in client.sent_history.iter_mut() {
+            f.first_sent = long_ago;
+        }
+        let cwnd = client.cwnd_packets();
+
+        let _ = tick(&mut client);
+        assert!(client.sent_history.iter().any(|f| f.no_resend), "the datagram is still in flight");
+
+        let from_server = send(&mut server, 2, b"hello");
+        let _ = feed(&mut client, &from_server);
+        assert!(client.path_changed_at.is_none(), "silence on a byte stream is not a path change");
+        let out = tick(&mut client);
+        assert!(!out.wire.contains(&data), "the window is not resent into the same stream");
+        assert_eq!(client.cwnd_packets(), cwnd, "no congestion response");
+
+        // A real move to another connection: the datagram is gone with the
+        // old one and abandoned on the next tick.
+        client.on_path_change();
+        let _ = tick(&mut client);
+        assert!(!client.sent_history.iter().any(|f| f.no_resend && f.kind == FrameKind::Datagram));
     }
 
     /// A path change forgets the stall of the old path.

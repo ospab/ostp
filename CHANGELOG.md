@@ -8,6 +8,13 @@ Older history is on the [Releases](https://github.com/ospab/ostp/releases) page 
 
 ## [Unreleased]
 
+### Fixed
+- Protocol v6, forward compatibility. An authenticated frame that this version cannot read (a frame kind, `Close` reason or reset reason added by a newer version, or a malformed field) used to be refused before its nonce was recorded: the receiver kept a hole there, the sender resent the frame for minutes, and the session stalled behind it. Such a frame is now recorded, acknowledged and ignored. A `Close` always closes: an unknown reason reads as `Normal`, a text that is too long is cut, and one that is not UTF-8 is read lossily (before, the frame was refused and the session stayed up). An unknown reset reason reads as `Lost`. Tests: a frame of an unknown kind leaves no hole and the data behind it is delivered; each kind of bad `Close` closes the session.
+- TLS and TCP carriers: 3 seconds without hearing the peer were taken as a path change on every carrier, so on a byte stream the sender reset its congestion state and resent the whole window (up to 8192 frames) into the same connection, which was about to deliver it anyway. This now happens only on UDP; a real move to another connection still resends. On these carriers an unacknowledged UDP datagram of the tunnel is no longer called lost after 4 RTOs (it is queued, not lost) and no longer cuts the congestion window; it is given up only when its connection is left. Test included.
+- UDP with automatic MTU: when black-hole detection lowers the datagram size, frames already in flight at the larger size cannot be resent smaller (a frame's bytes and stream position are fixed), and their streams hung for 5 minutes until the frames were given up. Those streams are now reset at once (the app sees a reset, not a hang); other streams are not affected. The black-hole test checks it.
+- UDP: a retransmit timer that runs out is now a congestion signal, as in TCP and QUIC (RFC 5681 §3.1, RFC 9002 §7.8). Before, only NACKs reduced the window, so on a path losing everything the sender kept its full window and resent into it every RTO. One response per tick, at most one reduction per round trip.
+- Client: window updates for downloads (`Consumed`) waited in the same queue as upload data and went out only when the upload window had room, so a full upload stalled the download too. They now bypass the queue (they are not ordered with upload data); everything else keeps its order, and at most 64 events are held so local programs still feel the backpressure. The loop's timers (retransmits, keepalives, link checks, metrics) now come before inbound data, which during a busy download could keep them waiting.
+
 ## [0.5.0-alpha.5] - 2026-11-21
 
 ### Fixed
