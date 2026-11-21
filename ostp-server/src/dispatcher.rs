@@ -1076,10 +1076,10 @@ impl Dispatcher {
                 let (Some(keys), Some(stats)) = (&keys, &stats) else { continue };
                 let meta = keys.get(&peer_state.access_key);
                 let key_valid = meta.is_some();
-                let expired = meta.is_some_and(|m| m.is_expired(unix_now));
+                let key_expired = meta.is_some_and(|m| m.is_expired(unix_now));
                 // No entry yet: nothing counted, so nothing over the limit.
                 let over_limit = stats.get(&peer_state.access_key).is_some_and(|s| s.is_over_limit());
-                if now.duration_since(peer_state.last_seen) > timeout_dur || !key_valid || expired || over_limit {
+                if now.duration_since(peer_state.last_seen) > timeout_dur || !key_valid || key_expired || over_limit {
                     expired.push(sid);
                 }
             }
@@ -1092,7 +1092,7 @@ impl Dispatcher {
             // the client; a session closed by the client or idle for ten
             // minutes has nobody to tell.
             let (reason, close) = if let Some(ps) = peer_state_opt {
-                let (key_valid, expired) = match self.access_keys.read().unwrap_or_else(|e| e.into_inner()).get(&ps.access_key) {
+                let (key_valid, key_expired) = match self.access_keys.read().unwrap_or_else(|e| e.into_inner()).get(&ps.access_key) {
                     Some(meta) => (true, meta.is_expired(ostp_core::access_keys::unix_now())),
                     None => (false, false),
                 };
@@ -1103,7 +1103,7 @@ impl Dispatcher {
                     ("inactive >10min", None)
                 } else if !key_valid {
                     ("key deleted", Some(CloseReason::KeyRevoked))
-                } else if expired {
+                } else if key_expired {
                     ("key expired", Some(CloseReason::KeyExpired))
                 } else if user_stats.is_over_limit() {
                     ("traffic limit exceeded", Some(CloseReason::TrafficLimit))
