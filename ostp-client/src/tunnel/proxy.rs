@@ -250,7 +250,7 @@ pub async fn run_local_socks5_proxy(
     debug: bool,
     shutdown: watch::Receiver<bool>,
     proxy_events_tx: mpsc::Sender<ProxyEvent>,
-    client_msgs_rx: mpsc::UnboundedReceiver<(u16, ProxyToClientMsg)>,
+    client_msgs_rx: mpsc::UnboundedReceiver<(u32, ProxyToClientMsg)>,
 ) -> Result<()> {
     let listener = bind_local_proxy(&cfg.bind_addr).await?;
     run_local_socks5_proxy_on(listener, cfg, ostp, exclusions_rx, debug, shutdown, proxy_events_tx, client_msgs_rx).await
@@ -879,7 +879,7 @@ async fn handle_proxy_client(
         // ── HTTP Proxy (CONNECT and plain GET/POST) ───────────────────
         // Read the rest of the HTTP request headers byte-by-byte
         let mut header_bytes = Vec::with_capacity(512);
-        let mut leftover: Vec<u8> = Vec::new();
+        let mut leftover: Vec<u8>;
         header_bytes.push(first_byte[0]);
         let mut chunk = [0_u8; 512];
         loop {
