@@ -113,7 +113,7 @@ where
     let matcher_arc = std::sync::Arc::new(tokio::sync::RwLock::new(matcher));
 
     let matcher_clone = matcher_arc.clone();
-    let mut reload_task = tokio::spawn(async move {
+    let reload_task = tokio::spawn(async move {
         while let Ok(_) = exclusions_rx.changed().await {
             let current = exclusions_rx.borrow().clone();
             let new_matcher = crate::tunnel::exclusion::ExclusionMatcher::new(&current, None, None);
