@@ -27,12 +27,17 @@ class OstpVpnService : VpnService() {
         var isRunning = false
         @Keep
         var instance: OstpVpnService? = null
+        // Bumped on every start; a service instance may tear down only the tunnel it owns.
+        @Volatile
+        private var generation = 0
 
         private const val NOTIF_ID = 1001
         private const val CHANNEL_ID = "ostp_vpn_channel"
         private const val WAKE_LOCK_TAG = "ostp:vpn_wakelock"
     }
 
+    // The generation of the tunnel this instance started (0 = none).
+    private var ownedGeneration = 0
     private var vpnInterface: ParcelFileDescriptor? = null
     private var wakeLock: PowerManager.WakeLock? = null
     private var networkCallback: android.net.ConnectivityManager.NetworkCallback? = null
@@ -61,6 +66,10 @@ class OstpVpnService : VpnService() {
             if (configJson == null) {
                 stopVpn()
                 return START_NOT_STICKY
+            }
+            synchronized(OstpVpnService::class.java) {
+                ownedGeneration = ++generation
+                instance = this
             }
             startVpn(configJson)
         } else if (action == "STOP") {
@@ -293,10 +302,9 @@ class OstpVpnService : VpnService() {
             // queries over IPv6, but our smoltcp TUN stack processes them as
             // IPv4 only, causing all DNS to silently fail on LTE (IPv6-only networks).
 
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                builder.allowBypass()
-            }
-                
+            // allowBypass() is deliberately not called: it would let apps opt out of the
+            // tunnel. Per-app routing uses the allowed/disallowed application lists below.
+
             try {
                 builder.allowFamily(android.system.OsConstants.AF_INET)
                 builder.allowFamily(android.system.OsConstants.AF_INET6)
@@ -399,8 +407,14 @@ class OstpVpnService : VpnService() {
         super.onDestroy()
         // A quick stop+start can create the next instance before this one is destroyed;
         // its state is not ours to tear down.
-        if (instance === this) {
-            instance = null
+        val ownsTunnel = synchronized(OstpVpnService::class.java) {
+            // A START that reached this instance after stopVpn() but before onDestroy
+            // moved `instance` and the generation to the new tunnel: leave it alone.
+            val own = instance === this && ownedGeneration == generation
+            if (instance === this) instance = null
+            own
+        }
+        if (ownsTunnel) {
             stopVpn()
         } else {
             releaseWakeLock()
