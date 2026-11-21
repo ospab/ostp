@@ -12,10 +12,12 @@ import '../models/log_privacy.dart';
 import '../models/ostp_profile.dart';
 import '../models/share_link.dart';
 import '../models/stop_reason.dart';
+import '../models/server_info.dart';
 import '../models/subscription.dart';
 import '../services/updates.dart' as updates;
 import 'dns_notice_dialog.dart';
 import 'prober_screen.dart';
+import 'server_info_sheet.dart';
 import 'settings_screen.dart';
 
 /// Success green for the "connected" state — the button aura/border/icon and
@@ -52,6 +54,26 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin, 
   bool _stopping = false;
   // One poll at a time: a slow platform call must not pile up behind the 1 s timer.
   bool _polling = false;
+  // Server information (operator, server, key) comes from the core over the
+  // tunnel: asked for once per connection, then read every minute.
+  bool _infoAsked = false;
+  DateTime _infoReadAt = DateTime.fromMillisecondsSinceEpoch(0);
+
+  void _serverInfoTick() {
+    if (sessionSubscriptionId == null) return;
+    final now = DateTime.now();
+    if (!_infoAsked) {
+      _infoAsked = true;
+      _infoReadAt = now;
+      pullServerInfo(widget.prefs, ask: true);
+    } else if (now.difference(_infoReadAt) >= const Duration(minutes: 1)) {
+      _infoReadAt = now;
+      pullServerInfo(widget.prefs);
+    }
+  }
+
+  /// The subscription of [p], or null for a profile added by hand.
+  static String? _subOf(OstpProfile? p) => p == null || p.subId.isEmpty ? null : p.subId;
   // Bumped on every user start/stop. A poll that began before it holds a stale
   // picture of the service and drops it instead of overwriting the new state.
   int _epoch = 0;
@@ -373,6 +395,8 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin, 
       _epoch++;
       _sessionProfileName = profile.name;
       _sessionProfileSig = jsonEncode(profile.toJson());
+      sessionSubscriptionId = _subOf(profile);
+      _infoAsked = false;
       _setConnecting();
       widget.prefs.setString('latest_config_json', configStr);
 
@@ -504,6 +528,8 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin, 
       if (!mounted || epoch != _epoch) return;
 
       if (isRunning == true && _state == ConnectionStateEnum.disconnected) {
+        // A tunnel found running (the app was reopened): it was started with the selection.
+        sessionSubscriptionId ??= _subOf(_activeProfile);
         _setConnecting(resumed: true);
       } else if (isRunning == false && _state != ConnectionStateEnum.disconnected) {
         // Not a stop from this screen (that sets the state itself): the service
@@ -543,10 +569,14 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin, 
         } finally {
           _stopping = false;
         }
+        // A key past its date: its subscription shows "expired" until the server says otherwise.
+        final expiredSub = isKeyExpiredReason(stopReason) ? sessionSubscriptionId : null;
         _setDisconnected();
+        if (expiredSub != null) SubscriptionStore(widget.prefs).markKeyExpired(expiredSub);
         _snack(stoppedMessage(stopReason), duration: stoppedMessageDuration(stopReason));
         return;
       }
+      if (connState == 2) _serverInfoTick();
 
       if (connState == 2 && _state != ConnectionStateEnum.connected) {
         _setConnected();
@@ -597,6 +627,8 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin, 
       _sessionProfileName = null;
       _sessionProfileSig = null;
     });
+    sessionSubscriptionId = null;
+    _infoAsked = false;
     _pulseController.stop();
     _pulseController.value = 0.0;
     _spinController.stop();

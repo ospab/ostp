@@ -6,6 +6,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 import 'device_limit.dart';
 import 'ostp_profile.dart';
+import 'server_info.dart';
 import 'share_link.dart';
 
 /// A subscription URL (`https://<domain>/sub/<token>`) and what it last
@@ -21,6 +22,12 @@ class OstpSubscription {
   int? usedBytes;
   int? limitBytes;
   String? lastError;
+  // What the server reported over the tunnel the last time the app was
+  // connected through this subscription, and when (ms, 0 = never).
+  ServerInfo? serverInfo;
+  int infoAt;
+  // The server closed a session because the key expired.
+  bool keyExpired;
 
   OstpSubscription({
     required this.id,
@@ -31,10 +38,17 @@ class OstpSubscription {
     this.usedBytes,
     this.limitBytes,
     this.lastError,
+    this.serverInfo,
+    this.infoAt = 0,
+    this.keyExpired = false,
   });
 
   bool get isDue =>
       DateTime.now().millisecondsSinceEpoch - updatedAt >= intervalHours * 3600 * 1000;
+
+  /// The key's end as last reported, or null when not known.
+  Expiry? get expiry => expiryOf(serverInfo?.key?.expiresAt, keyExpired: keyExpired);
+  bool get isExpired => expiry?.expired ?? false;
 
   Map<String, dynamic> toJson() => {
         'id': id,
@@ -45,6 +59,9 @@ class OstpSubscription {
         'usedBytes': usedBytes,
         'limitBytes': limitBytes,
         'lastError': lastError,
+        'serverInfo': serverInfo?.toJson(),
+        'infoAt': infoAt,
+        'keyExpired': keyExpired,
       };
 
   factory OstpSubscription.fromJson(Map<String, dynamic> j) => OstpSubscription(
@@ -56,6 +73,9 @@ class OstpSubscription {
         usedBytes: j['usedBytes'] as int?,
         limitBytes: j['limitBytes'] as int?,
         lastError: j['lastError'] as String?,
+        serverInfo: ServerInfo.parse(j['serverInfo']),
+        infoAt: j['infoAt'] is int ? j['infoAt'] as int : 0,
+        keyExpired: j['keyExpired'] == true,
       );
 }
 
@@ -215,6 +235,30 @@ class SubscriptionStore {
     await _save(subs);
     return changed;
   }
+
+  /// Keeps what the server reported over the tunnel with subscription [id].
+  /// Returns whether anything shown changed.
+  Future<bool> setServerInfo(String id, ServerInfo info) => _serialized(() async {
+        final subs = load();
+        final sub = subs.where((s) => s.id == id).firstOrNull;
+        if (sub == null) return false;
+        final before = jsonEncode([sub.serverInfo?.toJson(), sub.keyExpired]);
+        sub.serverInfo = info;
+        sub.infoAt = DateTime.now().millisecondsSinceEpoch;
+        final at = info.key?.expiresAt;
+        if (at == null || at * 1000 > DateTime.now().millisecondsSinceEpoch) sub.keyExpired = false;
+        await _save(subs);
+        return before != jsonEncode([sub.serverInfo?.toJson(), sub.keyExpired]);
+      });
+
+  /// The server closed a session of subscription [id] because its key expired.
+  Future<void> markKeyExpired(String id) => _serialized(() async {
+        final subs = load();
+        final sub = subs.where((s) => s.id == id).firstOrNull;
+        if (sub == null || sub.keyExpired) return;
+        sub.keyExpired = true;
+        await _save(subs);
+      });
 
   Future<void> remove(String id) => _serialized(() => _remove(id));
 

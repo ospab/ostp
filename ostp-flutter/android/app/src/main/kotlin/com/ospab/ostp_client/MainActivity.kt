@@ -144,6 +144,23 @@ class MainActivity : FlutterActivity() {
                         result.error("ERROR", e.message, null)
                     }
                 }
+                "getServerInfo" -> {
+                    // What the connected server reported over the tunnel (operator,
+                    // server, key) as JSON; "" while nothing has arrived.
+                    try {
+                        result.success(net.ostp.client.OstpClientSdk.getServerInfo())
+                    } catch (e: Throwable) {
+                        result.error("ERROR", e.message, null)
+                    }
+                }
+                "requestServerInfo" -> {
+                    // Asks the server for a fresh copy over the tunnel; true when sent.
+                    try {
+                        result.success(net.ostp.client.OstpClientSdk.requestServerInfo())
+                    } catch (e: Throwable) {
+                        result.error("ERROR", e.message, null)
+                    }
+                }
                 "runProberMatrix" -> {
                     // Real handshakes over every address x transport combo can
                     // take several seconds total — same reasoning as

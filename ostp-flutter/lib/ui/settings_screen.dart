@@ -1,9 +1,12 @@
+import 'dart:convert';
+
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'device_id_dialog.dart';
 import 'more_settings_screen.dart';
 import 'qr_scanner_screen.dart';
+import 'server_info_sheet.dart';
 import 'package:qr_flutter/qr_flutter.dart';
 import '../models/dns_notice.dart';
 import '../models/ostp_profile.dart';
@@ -166,8 +169,146 @@ class _SettingsScreenState extends State<SettingsScreen> {
     return '${d.inDays} d ago';
   }
 
-  List<Widget> _buildSubscriptionCards() {
-    return _subs.map((s) {
+  // ── Groups ───────────────────────────────────────────────────────────────
+  // With subscriptions, each one is a group of its profiles (a refresh
+  // rewrites them) and the profiles added by hand are one more group. A group
+  // folds to its header; it starts folded unless it holds the selected
+  // profile, and remembers what the user chose. A search field appears when
+  // the list is long.
+
+  static const _groupsKey = 'profile_groups_open';
+  static const _manualGroup = 'manual';
+  static const _searchFrom = 9; // profiles and subscriptions together
+  final _searchCtrl = TextEditingController();
+  String get _query => _searchCtrl.text.trim().toLowerCase();
+
+  Map<String, bool> _openGroups() {
+    try {
+      final v = jsonDecode(widget.prefs.getString(_groupsKey) ?? '{}');
+      if (v is Map) return {for (final e in v.entries) if (e.key is String && e.value is bool) e.key as String: e.value as bool};
+    } catch (_) {}
+    return {};
+  }
+
+  void _setGroupOpen(String id, bool open) {
+    final v = _openGroups()..[id] = open;
+    // Forget groups that are gone, so the stored map does not grow.
+    final known = {_manualGroup, ..._subs.map((s) => s.id)};
+    v.removeWhere((k, _) => !known.contains(k));
+    widget.prefs.setString(_groupsKey, jsonEncode(v));
+    setState(() {});
+  }
+
+  bool _groupOpen(String id, List<OstpProfile> members) =>
+      _openGroups()[id] ?? members.any((p) => p.active);
+
+  bool _matches(OstpProfile p, String q) =>
+      p.name.toLowerCase().contains(q) || p.serverAddr.toLowerCase().contains(q);
+
+  Widget _searchField() => Padding(
+        padding: const EdgeInsets.only(bottom: 14),
+        child: TextField(
+          controller: _searchCtrl,
+          onChanged: (_) => setState(() {}),
+          inputFormatters: [LengthLimitingTextInputFormatter(100)],
+          decoration: InputDecoration(
+            hintText: 'Search by name or server',
+            isDense: true,
+            filled: true,
+            fillColor: Theme.of(context).colorScheme.surface,
+            border: OutlineInputBorder(borderRadius: BorderRadius.circular(12), borderSide: BorderSide.none),
+            prefixIcon: const Icon(Icons.search, size: 20, color: Colors.white54),
+            suffixIcon: _query.isEmpty
+                ? null
+                : IconButton(icon: const Icon(Icons.close, size: 18), onPressed: () => setState(_searchCtrl.clear)),
+          ),
+        ),
+      );
+
+  /// One foldable group: header (name, count, actions), a summary line, and
+  /// its profiles when open. [unavailable] marks every profile of the group.
+  Widget _group({
+    required String id,
+    required String title,
+    required int count,
+    required List<OstpProfile> members,
+    required bool open,
+    String summary = '',
+    Color summaryColor = Colors.white54,
+    String? error,
+    Widget? bar,
+    List<Widget> actions = const [],
+    String? unavailable,
+  }) {
+    return Card(
+      color: Theme.of(context).colorScheme.surface,
+      margin: const EdgeInsets.only(bottom: 8),
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(4, 2, 2, 6),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(children: [
+              Expanded(
+                child: InkWell(
+                  borderRadius: BorderRadius.circular(10),
+                  // A search shows every match unfolded.
+                  onTap: _query.isEmpty ? () => _setGroupOpen(id, !open) : null,
+                  child: Padding(
+                    padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 10),
+                    child: Row(children: [
+                      Icon(open ? Icons.expand_more_rounded : Icons.chevron_right_rounded, size: 20, color: Colors.white54),
+                      const SizedBox(width: 6),
+                      Flexible(
+                        child: Text(title,
+                            style: const TextStyle(fontWeight: FontWeight.bold), maxLines: 1, overflow: TextOverflow.ellipsis),
+                      ),
+                      const SizedBox(width: 8),
+                      Text('$count', style: const TextStyle(fontSize: 12, color: Colors.white38, fontFamily: 'monospace')),
+                    ]),
+                  ),
+                ),
+              ),
+              ...actions,
+            ]),
+            if (bar != null) Padding(padding: const EdgeInsets.fromLTRB(32, 0, 12, 4), child: bar),
+            if (summary.isNotEmpty)
+              Padding(
+                padding: const EdgeInsets.fromLTRB(32, 0, 12, 2),
+                child: Text(summary, style: TextStyle(fontSize: 12, color: summaryColor)),
+              ),
+            if (error != null)
+              Padding(
+                padding: const EdgeInsets.fromLTRB(32, 2, 12, 2),
+                child: Text(error, style: const TextStyle(fontSize: 12, color: Colors.redAccent)),
+              ),
+            if (open)
+              Padding(
+                padding: const EdgeInsets.only(left: 12),
+                child: Column(children: [for (final p in members) _profileTile(p, dense: true, unavailable: unavailable)]),
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _subAction(IconData icon, String tooltip, VoidCallback onPressed) => IconButton(
+        icon: Icon(icon, size: 20, color: Colors.white54),
+        tooltip: tooltip,
+        visualDensity: VisualDensity.compact,
+        onPressed: onPressed,
+      );
+
+  List<Widget> _buildGroups() {
+    final q = _query;
+    final out = <Widget>[];
+    for (final s in _subs) {
+      final all = _profiles.where((p) => p.subId == s.id).toList();
+      final nameHit = q.isEmpty || (s.name.isEmpty ? s.url : s.name).toLowerCase().contains(q);
+      final members = nameHit ? all : all.where((p) => _matches(p, q)).toList();
+      if (q.isNotEmpty && members.isEmpty && !nameHit) continue;
       final used = s.usedBytes;
       final limit = s.limitBytes;
       final usage = used == null
@@ -175,80 +316,71 @@ class _SettingsScreenState extends State<SettingsScreen> {
           : limit != null && limit > 0
               ? '${formatBytes(used)} of ${formatBytes(limit)}'
               : '${formatBytes(used)} used';
+      final exp = s.expiry;
       final busy = _refreshing.contains(s.id);
-      return Card(
-        color: Theme.of(context).colorScheme.surface,
-        margin: const EdgeInsets.only(bottom: 12),
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
-        child: Padding(
-          padding: const EdgeInsets.fromLTRB(16, 12, 8, 12),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Row(
-                children: [
-                  const Icon(Icons.rss_feed_rounded, size: 18, color: Colors.white54),
-                  const SizedBox(width: 8),
-                  Expanded(
-                    child: Text(s.name.isEmpty ? s.url : s.name,
-                        style: const TextStyle(fontWeight: FontWeight.bold), maxLines: 1, overflow: TextOverflow.ellipsis),
-                  ),
-                  busy
-                      ? const Padding(
-                          padding: EdgeInsets.all(12),
-                          child: SizedBox(width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2)),
-                        )
-                      : IconButton(
-                          icon: const Icon(Icons.refresh_rounded, size: 20, color: Colors.white54),
-                          tooltip: 'Update',
-                          onPressed: () => _refreshSubscription(s),
-                        ),
-                  IconButton(
-                    icon: const Icon(Icons.qr_code_rounded, size: 20, color: Colors.white54),
-                    tooltip: 'Share',
-                    onPressed: () => _showQrDialog(
-                      'Share Subscription',
-                      s.url,
-                      note: 'Anyone with this link connects as you and uses your traffic. Share it only with your own devices.',
-                    ),
-                  ),
-                  IconButton(
-                    icon: const Icon(Icons.delete_outline_rounded, size: 20, color: Colors.white54),
-                    tooltip: 'Remove',
-                    onPressed: () => _confirmRemoveSubscription(s),
-                  ),
-                ],
-              ),
-              if (limit != null && limit > 0 && used != null) ...[
-                const SizedBox(height: 4),
-                ClipRRect(
-                  borderRadius: BorderRadius.circular(4),
-                  child: LinearProgressIndicator(value: (used / limit).clamp(0.0, 1.0), minHeight: 4),
-                ),
-              ],
-              const SizedBox(height: 6),
-              Text(
-                [
-                  if (usage != null) usage,
-                  'updated ${_ago(s.updatedAt)}',
-                  'every ${s.intervalHours} h',
-                ].join(' · '),
-                style: const TextStyle(fontSize: 12, color: Colors.white54),
-              ),
-              if (s.lastError != null)
-                Padding(
-                  padding: const EdgeInsets.only(top: 4),
-                  child: Text(s.lastError!, style: const TextStyle(fontSize: 12, color: Colors.redAccent)),
-                ),
-              // The subscription's own profiles live here, not among the
-              // ones added by hand: a refresh rewrites them.
-              const SizedBox(height: 6),
-              ..._profiles.where((p) => p.subId == s.id).map((p) => _profileTile(p, dense: true)),
-            ],
+      out.add(_group(
+        id: s.id,
+        title: s.name.isEmpty ? s.url : s.name,
+        count: all.length,
+        members: members,
+        open: q.isNotEmpty || _groupOpen(s.id, all),
+        summary: [
+          if (usage != null) usage,
+          if (exp != null) exp.label,
+          'updated ${_ago(s.updatedAt)}',
+        ].join(' · '),
+        summaryColor: exp?.expired == true ? Colors.redAccent : exp != null && exp.daysLeft < 7 ? Colors.amberAccent : Colors.white54,
+        error: s.lastError,
+        bar: limit != null && limit > 0 && used != null
+            ? ClipRRect(
+                borderRadius: BorderRadius.circular(4),
+                child: LinearProgressIndicator(value: (used / limit).clamp(0.0, 1.0), minHeight: 3),
+              )
+            : null,
+        unavailable: exp?.expired == true ? 'Unavailable: the key of this subscription expired' : null,
+        actions: [
+          _subAction(Icons.info_outline_rounded, 'Server information', () async {
+            await showServerInfo(context, widget.prefs, s.id);
+            _reloadProfilesAndSubs();
+          }),
+          busy
+              ? const Padding(
+                  padding: EdgeInsets.all(10),
+                  child: SizedBox(width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2)),
+                )
+              : _subAction(Icons.refresh_rounded, 'Update', () => _refreshSubscription(s)),
+          _subAction(
+            Icons.qr_code_rounded,
+            'Share',
+            () => _showQrDialog(
+              'Share Subscription',
+              s.url,
+              note: 'Anyone with this link connects as you and uses your traffic. Share it only with your own devices.',
+            ),
           ),
-        ),
-      );
-    }).toList();
+          _subAction(Icons.delete_outline_rounded, 'Remove', () => _confirmRemoveSubscription(s)),
+        ],
+      ));
+    }
+    final manual = _profiles.where((p) => p.subId.isEmpty).toList();
+    final manualShown = q.isEmpty ? manual : manual.where((p) => _matches(p, q)).toList();
+    if (manualShown.isNotEmpty) {
+      out.add(_group(
+        id: _manualGroup,
+        title: 'Added by hand',
+        count: manual.length,
+        members: manualShown,
+        open: q.isNotEmpty || _groupOpen(_manualGroup, manual),
+      ));
+    }
+    if (q.isNotEmpty && out.isEmpty) {
+      out.add(Padding(
+        padding: const EdgeInsets.symmetric(vertical: 20),
+        child: Text('Nothing named like "${_searchCtrl.text.trim()}".',
+            textAlign: TextAlign.center, style: const TextStyle(color: Colors.white54)),
+      ));
+    }
+    return out;
   }
 
   @override
@@ -257,6 +389,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
     _localBindCtrl.dispose();
     _dnsCtrl.dispose();
     _mtuCtrl.dispose();
+    _searchCtrl.dispose();
     super.dispose();
   }
 
@@ -747,23 +880,29 @@ class _SettingsScreenState extends State<SettingsScreen> {
     return null;
   }
 
-  /// One selectable profile row; `dense` inside a subscription card.
-  Widget _profileTile(OstpProfile p, {bool dense = false}) {
+  /// One selectable profile row; `dense` inside a group. [unavailable]: why it
+  /// cannot connect now (its key expired), shown in place of the address.
+  Widget _profileTile(OstpProfile p, {bool dense = false, String? unavailable}) {
     return ListTile(
       dense: dense,
+      visualDensity: dense ? VisualDensity.compact : null,
       contentPadding: dense ? EdgeInsets.zero : null,
       leading: Radio<String>(
         value: p.id,
         groupValue: _activeId,
         onChanged: (_) => _selectActive(p),
       ),
-      title: Text(p.name, style: TextStyle(fontWeight: FontWeight.bold, fontSize: dense ? 14 : null), maxLines: 1, overflow: TextOverflow.ellipsis),
+      title: Text(p.name,
+          style: TextStyle(fontWeight: FontWeight.bold, fontSize: dense ? 14 : null, color: unavailable != null ? Colors.white54 : null),
+          maxLines: 1,
+          overflow: TextOverflow.ellipsis),
       subtitle: Text(
-        [
-          if (p.name != p.serverAddr) p.serverAddr,
-          p.tls ? 'TLS' : p.transportMode.toUpperCase(),
-        ].join(' · '),
-        style: const TextStyle(fontSize: 12),
+        unavailable ??
+            [
+              if (p.name != p.serverAddr) p.serverAddr,
+              p.tls ? 'TLS' : p.transportMode.toUpperCase(),
+            ].join(' · '),
+        style: TextStyle(fontSize: 12, color: unavailable != null ? Colors.redAccent : null),
         maxLines: 1,
         overflow: TextOverflow.ellipsis,
         softWrap: false,
@@ -874,27 +1013,20 @@ class _SettingsScreenState extends State<SettingsScreen> {
           ListView(
             padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 16),
             children: [
-              if (_subs.isNotEmpty) ...[
-                const Text('SUBSCRIPTIONS', style: TextStyle(color: Colors.white54, fontSize: 13, fontWeight: FontWeight.bold, letterSpacing: 1.0)),
-                const SizedBox(height: 16),
-                ..._buildSubscriptionCards(),
-                const SizedBox(height: 20),
-              ],
-              Text(_subs.isEmpty ? 'PROFILES' : 'MY PROFILES',
-                  style: const TextStyle(color: Colors.white54, fontSize: 13, fontWeight: FontWeight.bold, letterSpacing: 1.0)),
+              const Text('PROFILES', style: TextStyle(color: Colors.white54, fontSize: 13, fontWeight: FontWeight.bold, letterSpacing: 1.0)),
               const SizedBox(height: 16),
-              if (_profiles.every((p) => p.subId.isNotEmpty))
-                Center(
+              if (_profiles.length + _subs.length >= _searchFrom) _searchField(),
+              if (_subs.isNotEmpty)
+                ..._buildGroups()
+              else if (_profiles.isEmpty)
+                const Center(
                   child: Padding(
-                    padding: EdgeInsets.all(_subs.isEmpty ? 32.0 : 12.0),
-                    child: Text(
-                      _subs.isEmpty ? 'Create a new profile' : 'Profiles you add by hand appear here',
-                      style: TextStyle(color: Colors.white54, fontSize: _subs.isEmpty ? 18 : 13),
-                    ),
+                    padding: EdgeInsets.all(32.0),
+                    child: Text('Create a new profile', style: TextStyle(color: Colors.white54, fontSize: 18)),
                   ),
                 )
               else
-                ..._buildProfileCards(_profiles.where((p) => p.subId.isEmpty).toList()),
+                ..._buildProfileCards(_profiles.where((p) => _query.isEmpty || _matches(p, _query)).toList()),
 
           const SizedBox(height: 32),
           const Text('CONNECTION', style: TextStyle(color: Colors.white54, fontSize: 13, fontWeight: FontWeight.bold, letterSpacing: 1.0)),

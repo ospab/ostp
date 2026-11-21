@@ -7,6 +7,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:url_launcher/url_launcher.dart';
 
 import '../models/server_dns.dart';
+import '../models/server_info.dart';
 import '../services/servers.dart';
 import 'ssh_setup.dart';
 
@@ -586,6 +587,7 @@ class _ServerScreenState extends State<ServerScreen> {
       const _Note('"Open the panel" goes through this SSH connection and needs no open port; it works while this app stays open. '
           'The VPN address works in any browser on a device connected through this server.'),
       ..._overnet((s['overnet'] as Map?)?.cast<String, dynamic>()),
+      ..._operator(s),
       const _Section('Server log'),
       _LogView(load: () async => ((await _manage(['logs', '-n', '300']))['lines'] as List? ?? const []).cast<String>()),
       const _Section('This server'),
@@ -642,6 +644,41 @@ class _ServerScreenState extends State<ServerScreen> {
       ]),
       const SizedBox(height: 24),
     ]);
+  }
+
+  // ── Operator information ──────────────────────────────────────────────
+  // The operator's own words about the server, shown to users under the "i"
+  // of their subscription once they connect.
+  List<Widget> _operator(Map<String, dynamic> s) {
+    if (!s.containsKey('server_info')) {
+      return const [
+        _Section('Operator information'),
+        _Note('The OSTP on this server is too old to set operator information. Update it on the Status tab.'),
+      ];
+    }
+    final info = (s['server_info'] as Map?)?.cast<String, dynamic>();
+    final op = (info?['operator'] as Map?)?.cast<String, dynamic>() ?? const <String, dynamic>{};
+    String? text(String k) => (op[k] as String?)?.isNotEmpty == true ? op[k] as String : null;
+    return [
+      const _Section('Operator information'),
+      _Card([
+        _Row('Name', value: text('name') ?? '—'),
+        _Row('Location', value: text('location') ?? '—'),
+        _Row('Contact', value: text('contact') ?? '—'),
+        _Row('About', value: text('about') == null ? '—' : '${text('about')!.length} characters'),
+      ]),
+      OutlinedButton(onPressed: () => _editOperator(op), child: const Text('Edit operator information')),
+      const _Note('Shown to users in the app, under the "i" of their subscription, once they connect. '
+          'Say who runs the server, where, and how to reach you.'),
+    ];
+  }
+
+  Future<void> _editOperator(Map<String, dynamic> op) async {
+    final changed = await Navigator.push<bool>(
+      context,
+      MaterialPageRoute(builder: (_) => _OperatorEditor(operator: op, manage: _manage)),
+    );
+    if (changed == true) _refresh();
   }
 
   /// The panel's address inside the tunnel: 10.1.0.1 is the server as
@@ -778,6 +815,13 @@ class _LogViewState extends State<_LogView> {
 String _userName(Map<String, dynamic> u) =>
     (u['name'] as String?)?.isNotEmpty == true ? u['name'] as String : 'user ${u['number']}';
 
+/// A user's `expires_at`: Unix seconds (the end of that day, UTC), or null for never.
+int? _expiresAt(Map<String, dynamic> u) => (u['expires_at'] as num?)?.toInt();
+bool _isExpired(Map<String, dynamic> u) {
+  final at = _expiresAt(u);
+  return at != null && at * 1000 <= DateTime.now().millisecondsSinceEpoch;
+}
+
 const _gib = 1024 * 1024 * 1024;
 
 extension on String {
@@ -844,9 +888,12 @@ class _UsersTabState extends State<_UsersTab> {
 
   Widget _card(Map<String, dynamic> u) {
     final traffic = u['bytes_down'] != null ? '↓ ${fmtBytes(u['bytes_down'] as num)} · ↑ ${fmtBytes(u['bytes_up'] as num?)}' : 'no traffic yet';
+    final expires = _expiresAt(u);
+    final expired = _isExpired(u);
     final limits = [
       if (u['limit_bytes'] != null) 'limit ${fmtBytes(u['limit_bytes'] as num)}',
       if (u['max_devices'] != null) '${u['max_devices']} device(s)',
+      if (expires != null && !expired) 'until ${expiryDate(expires)}',
     ];
     return Card(
       margin: const EdgeInsets.only(bottom: 10),
@@ -860,9 +907,17 @@ class _UsersTabState extends State<_UsersTab> {
             const SizedBox(width: 10),
             Expanded(
               child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                Text(_userName(u), style: const TextStyle(fontWeight: FontWeight.w600), overflow: TextOverflow.ellipsis),
+                Text(_userName(u),
+                    style: TextStyle(fontWeight: FontWeight.w600, color: expired ? Colors.white54 : null), overflow: TextOverflow.ellipsis),
                 const SizedBox(height: 3),
-                Text([traffic, ...limits].join(' · '), style: const TextStyle(color: Colors.white54, fontSize: 12)),
+                Text.rich(
+                  TextSpan(children: [
+                    if (expired && expires != null)
+                      TextSpan(text: 'expired ${expiryDate(expires)} · ', style: const TextStyle(color: Colors.redAccent)),
+                    TextSpan(text: [traffic, ...limits].join(' · ')),
+                  ]),
+                  style: const TextStyle(color: Colors.white54, fontSize: 12),
+                ),
               ]),
             ),
             const Icon(Icons.chevron_right, color: Colors.white38),
@@ -891,6 +946,9 @@ class _UserEditorState extends State<_UserEditor> {
   final _key = TextEditingController();
   late final _limit = TextEditingController(text: _gbText(_u?['limit_bytes'] as num?));
   late final _devices = TextEditingController(text: _u?['max_devices']?.toString() ?? '');
+  // The last day the key works (YYYY-MM-DD, UTC), or null for never.
+  late String? _expires = _initialExpires();
+  late final String? _oldExpires = _expires;
   bool _busy = false;
   String? _error;
   List<Map<String, dynamic>>? _seen; // devices that fetched the subscription
@@ -969,6 +1027,7 @@ class _UserEditorState extends State<_UserEditor> {
         if (key.isNotEmpty) ...['--key', key],
         if (limit != null) ...['--limit-bytes', '$limit'],
         if (devices != null) ...['--devices', '$devices'],
+        if (_expires != null) ...['--expires', _expires!],
       ];
     } else {
       final oldLimit = (_u!['limit_bytes'] as num?)?.toInt();
@@ -980,6 +1039,7 @@ class _UserEditorState extends State<_UserEditor> {
         if (name != ((_u['name'] as String?) ?? '')) ...['--name', name],
         if (limitChanged) ...['--limit-bytes', '${limit ?? 0}'],
         if (devices != oldDevices) ...['--devices', '${devices ?? 0}'],
+        if (_expires != _oldExpires) ...['--expires', _expires ?? 'never'],
       ];
       if (args.length == 2) {
         Navigator.pop(context, false);
@@ -1004,6 +1064,31 @@ class _UserEditorState extends State<_UserEditor> {
     } finally {
       if (mounted) setState(() => _busy = false);
     }
+  }
+
+  String? _initialExpires() {
+    final u = _u;
+    final at = u == null ? null : _expiresAt(u);
+    return at == null ? null : expiryDate(at);
+  }
+
+  Future<void> _pickExpiry() async {
+    final now = DateTime.now().toUtc();
+    final current = _expires == null ? null : DateTime.tryParse('${_expires}T00:00:00Z');
+    final today = DateTime(now.year, now.month, now.day);
+    final initial = current == null
+        ? today.add(const Duration(days: 30))
+        : DateTime(current.year, current.month, current.day);
+    final picked = await showDatePicker(
+      context: context,
+      initialDate: initial.isBefore(today) ? today : initial,
+      firstDate: initial.isBefore(today) ? initial : today,
+      lastDate: today.add(const Duration(days: 3650)),
+      helpText: 'Last day of the key (UTC)',
+    );
+    if (picked == null || !mounted) return;
+    String two(int n) => n.toString().padLeft(2, '0');
+    setState(() => _expires = '${picked.year}-${two(picked.month)}-${two(picked.day)}');
   }
 
   Future<void> _revoke() async {
@@ -1109,6 +1194,27 @@ class _UserEditorState extends State<_UserEditor> {
               helperMaxLines: 3,
             ),
           ),
+          const SizedBox(height: 12),
+          InputDecorator(
+            decoration: const InputDecoration(
+              labelText: 'Valid until',
+              helperText: 'The key works through the end of this day (UTC), then stops.',
+              helperMaxLines: 2,
+            ),
+            child: Row(children: [
+              Expanded(
+                child: Text(
+                  _expires == null ? 'Never' : _expires!,
+                  style: TextStyle(
+                    fontFamily: _expires == null ? null : 'monospace',
+                    color: _expires != null && !_isNew && _expires == _oldExpires && _isExpired(_u!) ? Colors.redAccent : null,
+                  ),
+                ),
+              ),
+              TextButton(onPressed: _pickExpiry, child: Text(_expires == null ? 'Set a date' : 'Change')),
+              if (_expires != null) TextButton(onPressed: () => setState(() => _expires = null), child: const Text('Never')),
+            ]),
+          ),
           if (_error != null)
             Padding(
               padding: const EdgeInsets.only(top: 14),
@@ -1158,6 +1264,103 @@ class _UserEditorState extends State<_UserEditor> {
               child: const Text('Revoke user'),
             ),
           ],
+        ]),
+      ),
+    );
+  }
+}
+
+/// The operator's words about the server: `ostp manage server-info` with the
+/// fields that changed (an empty value clears one).
+class _OperatorEditor extends StatefulWidget {
+  final Map<String, dynamic> operator;
+  final Future<Map<String, dynamic>> Function(List<String> args) manage;
+  const _OperatorEditor({required this.operator, required this.manage});
+
+  @override
+  State<_OperatorEditor> createState() => _OperatorEditorState();
+}
+
+class _OperatorEditorState extends State<_OperatorEditor> {
+  // field → (label, max length, hint, multiline)
+  static const _fields = {
+    'name': ('Name', 100, 'Who runs this server, e.g. a name or a nickname.', false),
+    'location': ('Location', 100, 'Where the server is, e.g. "Helsinki, Finland".', false),
+    'contact': ('Contact', 200, 'How to reach you: an email, a Telegram name, a site.', false),
+    'about': ('About', 4000, 'Markdown: # headings, **bold**, *italic*, `code`, lists, [links](https://...). HTML is shown as text.', true),
+  };
+  late final _ctrls = {for (final k in _fields.keys) k: TextEditingController(text: (widget.operator[k] as String?) ?? '')};
+  bool _busy = false;
+  String? _error;
+
+  @override
+  void dispose() {
+    for (final c in _ctrls.values) {
+      c.dispose();
+    }
+    super.dispose();
+  }
+
+  Future<void> _save() async {
+    final args = ['server-info'];
+    for (final e in _fields.entries) {
+      final raw = _ctrls[e.key]!.text;
+      final v = e.value.$4 ? raw.replaceAll('\r\n', '\n').trim() : raw.replaceAll(RegExp(r'\s+'), ' ').trim();
+      if (v != ((widget.operator[e.key] as String?) ?? '')) args.addAll(['--${e.key}', v]);
+    }
+    if (args.length == 1) {
+      Navigator.pop(context, false);
+      return;
+    }
+    setState(() {
+      _busy = true;
+      _error = null;
+    });
+    try {
+      await widget.manage(args);
+      if (mounted) Navigator.pop(context, true);
+    } catch (e) {
+      if (mounted) setState(() => _error = e.toString());
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text('Operator information')),
+      body: AbsorbPointer(
+        absorbing: _busy,
+        child: ListView(padding: const EdgeInsets.all(16), children: [
+          for (final e in _fields.entries) ...[
+            TextField(
+              controller: _ctrls[e.key],
+              maxLength: e.value.$2,
+              minLines: e.value.$4 ? 6 : 1,
+              maxLines: e.value.$4 ? 14 : 1,
+              keyboardType: e.value.$4 ? TextInputType.multiline : TextInputType.text,
+              decoration: InputDecoration(
+                labelText: e.value.$1,
+                helperText: e.value.$3,
+                helperMaxLines: 3,
+                alignLabelWithHint: e.value.$4,
+                counterText: e.value.$4 ? null : '',
+              ),
+            ),
+            const SizedBox(height: 12),
+          ],
+          if (_error != null)
+            Padding(
+              padding: const EdgeInsets.only(bottom: 12),
+              child: Text(_error!, style: const TextStyle(color: Colors.redAccent, fontSize: 13)),
+            ),
+          FilledButton(
+            onPressed: _busy ? null : _save,
+            child: _busy
+                ? const SizedBox(width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2))
+                : const Text('Save'),
+          ),
         ]),
       ),
     );
