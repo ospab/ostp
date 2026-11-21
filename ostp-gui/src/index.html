@@ -153,11 +153,15 @@
 
       <div class="settings-body">
 
-        <!-- Subscriptions -->
+        <!-- Shown when there are many profiles and subscriptions -->
+        <div id="profile-search-row" class="profile-search hidden">
+          <input id="profile-search" class="field-input compact" type="search" maxlength="100" spellcheck="false"
+                 placeholder="Search by name or server" aria-label="Search profiles and subscriptions by name or server" />
+        </div>
+
+        <!-- Subscriptions, and the profiles added by hand as one more group -->
         <div id="sub-section" style="display:none;">
-          <div class="section-divider"><span>Subscriptions</span></div>
           <div id="sub-list" class="sub-list"></div>
-          <div class="section-divider"><span>My profiles</span></div>
         </div>
 
         <!-- Profile list -->
@@ -663,6 +667,17 @@
     <div id="toast" class="toast" role="status" aria-live="polite"></div>
 
   </div>
+
+    <!-- A subscription's server: operator, what the server reports, the key -->
+    <div id="info-modal" class="modal-overlay hidden">
+      <div class="modal-content wide">
+        <h3 class="modal-title" id="info-title"></h3>
+        <div id="info-body" class="info-body"></div>
+        <div class="modal-actions">
+          <button id="btn-info-close" class="btn secondary" data-dismiss>Close</button>
+        </div>
+      </div>
+    </div>
 
     <!-- ── SERVER MODALS ────────────────────────────────────── -->
     <div id="ssh-modal" class="modal-overlay hidden">

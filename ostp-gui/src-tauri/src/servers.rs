@@ -41,10 +41,13 @@ impl Drop for Job {
 /// pasted file or a runaway string is refused here, with a reason.
 const MAX_SECRET_BYTES: usize = 64 * 1024;
 const MAX_NAME_CHARS: usize = 64;
-const MAX_ARG_BYTES: usize = 512;
-// `user-add NAME --key K --limit-bytes L --devices D` is the longest command
-// (8 args); the cap leaves a little room.
-const MAX_ARGS: usize = 10;
+// The operator's "about" text of `server-info` is the longest argument
+// (the apps cap it at 4000 characters, up to 4 bytes each).
+const MAX_ARG_BYTES: usize = 16384;
+// `user-add NAME --key K --limit-bytes L --devices D --expires E` is the
+// longest command (10 args, `server-info` with all four fields 9); the cap
+// leaves a little room.
+const MAX_ARGS: usize = 14;
 
 fn short_text(what: &str, v: &str, max: usize) -> Result<(), String> {
     if v.chars().count() > max || v.contains('\0') {

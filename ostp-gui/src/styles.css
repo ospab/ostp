@@ -945,3 +945,53 @@ textarea.field-input { resize: vertical; min-height: 38px; line-height: 1.4; pad
 .loading-note { font-size: 0.78rem; color: var(--c-txt-2); padding: 20px 2px; }
 .loading-note::before { content: ''; display: inline-block; width: 10px; height: 10px; margin-right: 8px; vertical-align: -1px; border-radius: 50%; border: 1.5px solid var(--c-txt-2); border-top-color: transparent; animation: spin 0.8s linear infinite; }
 .btn-row .btn { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+/* Profiles grouped by subscription: a group folds to its header row. */
+.profile-search { margin: 4px 0 10px; }
+.profile-search .field-input.compact { width: 100%; }
+.sub-card.group { padding: 8px 10px 8px 6px; }
+.sub-card.group .sub-meta, .sub-card.group .sub-error, .sub-card.group .sub-bar { margin-left: 26px; }
+.group-toggle {
+  flex: 1; min-width: 0; display: flex; align-items: center; gap: 6px;
+  padding: 4px 4px; border-radius: var(--r-xs); color: var(--c-txt-1); text-align: left; cursor: pointer;
+}
+.group-toggle:hover { background: rgba(var(--c-fg-rgb),0.04); }
+.group-chevron { width: 16px; display: flex; justify-content: center; color: var(--c-txt-2); flex-shrink: 0; transition: transform var(--t-fast); }
+.sub-card.group.open .group-chevron { transform: rotate(90deg); }
+.group-count { font-size: 0.7rem; color: var(--c-txt-2); font-family: var(--font-mono); flex-shrink: 0; }
+.sub-card.group .sub-profiles { margin-left: 20px; gap: 4px; }
+.sub-card.group.expired .sub-meta { color: var(--c-red); }
+.profile-card.compact { padding: 7px 10px 7px 10px; gap: 10px; }
+.profile-card.compact .profile-server { margin-top: 1px; }
+.sub-card.group .profile-card:not(.active) { border-color: transparent; }
+.profile-card.unavailable .profile-name, .profile-card.unavailable .profile-transport-badge { opacity: 0.5; }
+.profile-card.unavailable .profile-server { color: var(--c-red); font-family: inherit; }
+
+/* A user's expiry: a date, or Never */
+.expiry-row { display: flex; align-items: center; gap: 12px; }
+.expiry-row .field-input { flex: 1; color-scheme: dark; }
+.expiry-row .field-input:disabled { opacity: 0.4; }
+.check-label { display: flex; align-items: center; gap: 6px; font-size: 0.8rem; color: var(--c-txt-1); cursor: pointer; flex-shrink: 0; }
+.check-label input { accent-color: var(--c-accent); }
+.user-expired { color: var(--c-red); }
+.user-card.expired .user-name { color: var(--c-txt-2); }
+
+/* Server information window */
+.info-body .card-note { margin-top: 0; }
+.kv-row .v.is-warn { color: var(--c-amber); }
+.kv-row .v.is-bad { color: var(--c-red); }
+.md { font-size: 0.8rem; line-height: 1.55; color: var(--c-txt-1); margin: 0 2px 12px; user-select: text; overflow-wrap: anywhere; }
+.md h4, .md h5, .md h6 { font-weight: 600; margin: 10px 0 4px; }
+.md h4 { font-size: 0.92rem; }
+.md h5 { font-size: 0.86rem; }
+.md h6 { font-size: 0.8rem; color: var(--c-txt-2); }
+.md p { margin: 0 0 8px; }
+.md ul, .md ol { margin: 0 0 8px 18px; }
+.md li { margin: 2px 0; }
+.md code { font-family: var(--font-mono); font-size: 0.74rem; background: rgba(var(--c-fg-rgb),0.06); padding: 1px 4px; border-radius: 3px; }
+.md pre {
+  font-family: var(--font-mono); font-size: 0.7rem; line-height: 1.5; white-space: pre-wrap; word-break: break-all;
+  background: #0b0b0b; border: 1px solid var(--c-card-border); border-radius: var(--r-sm); padding: 8px 10px; margin: 0 0 8px;
+}
+.md .md-link { color: var(--c-txt-1); text-decoration: underline; text-underline-offset: 2px; cursor: pointer; }
+.md .md-link:hover { color: var(--c-accent); }

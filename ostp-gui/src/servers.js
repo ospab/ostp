@@ -549,17 +549,20 @@ async function renderUsers(body, id, seq) {
     card.tabIndex = 0;
     card.setAttribute('role', 'button');
     const traffic = u.bytes_down != null ? `down ${fmtBytes(u.bytes_down)} · up ${fmtBytes(u.bytes_up)}` : 'no traffic yet';
+    const expired = userExpired(u);
     const limits = [
       u.limit_bytes ? `limit ${fmtBytes(u.limit_bytes)}` : '',
       u.max_devices ? `${u.max_devices} ${u.max_devices === 1 ? 'device' : 'devices'}` : '',
+      u.expires_at != null && !expired ? `until ${expiresDate(u.expires_at)}` : '',
     ].filter(Boolean).map(s => ` · ${s}`).join('');
+    if (expired) card.classList.add('expired');
     card.innerHTML = `
       <div class="user-head">
         <span class="online-dot ${u.online ? 'on' : ''}" role="img" aria-label="${u.online ? 'Online' : 'Offline'}" title="${u.online ? 'Online' : 'Offline'}"></span>
         <span class="user-name">${esc(userName(u))}</span>
         <svg class="user-chevron" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="9 18 15 12 9 6"/></svg>
       </div>
-      <div class="user-meta">${traffic}${limits}</div>`;
+      <div class="user-meta">${expired ? `<span class="user-expired">expired ${esc(expiresDate(u.expires_at))}</span> · ` : ''}${traffic}${limits}</div>`;
     const open = () => openUser(server, id, u);
     card.onclick = open;
     card.onkeydown = e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); open(); } };
@@ -585,6 +588,9 @@ async function renderUsers(body, id, seq) {
 }
 
 const userName = u => u.name || 'user ' + u.number;
+// `expires_at` is Unix seconds (the end of the day, UTC) or null for never.
+const expiresDate = sec => new Date(sec * 1000).toISOString().slice(0, 10);
+const userExpired = u => typeof u.expires_at === 'number' && u.expires_at * 1000 <= Date.now();
 const GIB = 1024 ** 3;
 const gbText = b => b == null ? '' : (Number.isInteger(b / GIB) ? String(b / GIB) : (b / GIB).toFixed(2));
 
@@ -623,6 +629,14 @@ function openUser(server, id, u) {
       <input class="field-input" id="um-devices" type="number" min="1" max="1000" step="1" value="${u?.max_devices ?? ''}" />
       <p class="field-hint">Empty: unlimited. A device is counted when its app fetches the subscription with its device ID on.</p>
     </div>
+    <div class="field-group">
+      <label class="field-label" for="um-expires">Valid until</label>
+      <div class="expiry-row">
+        <input class="field-input" id="um-expires" type="date" value="${u?.expires_at != null ? expiresDate(u.expires_at) : ''}" />
+        <label class="check-label"><input type="checkbox" id="um-never" ${u?.expires_at == null ? 'checked' : ''} /> Never</label>
+      </div>
+      <p class="field-hint">The key works through the end of this day (UTC), then stops. ${u && userExpired(u) ? '<span class="user-expired">This key has expired.</span>' : ''}</p>
+    </div>
     ${isNew ? '' : `
     <div class="user-modal-section">Access</div>
     <div class="kv-card">
@@ -652,6 +666,17 @@ function openUser(server, id, u) {
   };
   superseding('user', () => close(false));
   $('btn-user-modal-cancel').onclick = () => close(false);
+  // "Never" and a date exclude each other: picking a date unticks Never.
+  const expIn = $('um-expires'), never = $('um-never');
+  const syncExpiry = () => { expIn.disabled = never.checked; };
+  never.onchange = () => {
+    if (!never.checked && !expIn.value) {
+      expIn.value = new Date(Date.now() + 30 * 86400000).toISOString().slice(0, 10);
+    }
+    syncExpiry();
+  };
+  expIn.onchange = () => { if (expIn.value) never.checked = false; syncExpiry(); };
+  syncExpiry();
   modal.querySelectorAll('[data-copy]').forEach(b => {
     b.onclick = async () => {
       try { await navigator.clipboard.writeText(b.dataset.copy); app.showToast('Copied', 'ok'); } catch (e) { report(e); }
@@ -699,8 +724,12 @@ function openUser(server, id, u) {
     else if (gb !== null && !(gb > 0 && gb <= 1024 * 1024)) problem = 'The traffic limit is a number of GB, or empty for none.';
     else if (devices !== null && !(Number.isInteger(devices) && devices >= 1 && devices <= 1000)) problem = 'Devices is a whole number from 1 to 1000, or empty for no limit.';
     else if (key && (key.length < 8 || key.length > 128 || /[\s/?#%\\]/.test(key))) problem = 'An access key is 8 to 128 characters with no spaces, slashes, %, ? or #. Leave it empty for a random one.';
+    // 'never' or YYYY-MM-DD, as `--expires` takes it.
+    const expires = never.checked ? 'never' : expIn.value;
+    if (!problem && expires !== 'never' && !/^\d{4}-\d{2}-\d{2}$/.test(expires)) problem = 'Pick the last day of the key, or tick Never.';
     if (problem) { err.textContent = problem; return; }
     const limit = gb === null ? null : Math.round(gb * GIB);
+    const oldExpires = u?.expires_at != null ? expiresDate(u.expires_at) : 'never';
 
     let args;
     if (isNew) {
@@ -708,12 +737,14 @@ function openUser(server, id, u) {
       if (key) args.push('--key', key);
       if (limit !== null) args.push('--limit-bytes', String(limit));
       if (devices !== null) args.push('--devices', String(devices));
+      if (expires !== 'never') args.push('--expires', expires);
     } else {
       args = ['user-set', u.key];
       if (name !== (u.name || '')) args.push('--name', name);
       // A limit shown in GB is rounded: an untouched field keeps the exact old value.
       if (limitText !== gbText(u.limit_bytes) && limit !== (u.limit_bytes ?? null)) args.push('--limit-bytes', String(limit ?? 0));
       if (devices !== (u.max_devices ?? null)) args.push('--devices', String(devices ?? 0));
+      if (expires !== oldExpires) args.push('--expires', expires);
       if (args.length === 2) { close(false); return; }
     }
     save.disabled = true;
@@ -900,6 +931,18 @@ async function renderManage(body, id, seq) {
 
     ${overnetSection(s.overnet)}
 
+    <div class="section-divider"><span>Operator information</span></div>
+    ${'server_info' in s ? `
+    <div class="kv-card">
+      ${kv('Name', esc(s.server_info?.operator?.name || '—'))}
+      ${kv('Location', esc(s.server_info?.operator?.location || '—'))}
+      ${kv('Contact', esc(s.server_info?.operator?.contact || '—'))}
+      ${kv('About', s.server_info?.operator?.about ? `${s.server_info.operator.about.length} characters` : '—')}
+    </div>
+    <div class="btn-row"><button class="btn secondary" id="btn-operator-edit">Edit operator information</button></div>
+    <p class="card-note">Shown to users in the app, under the "i" of their subscription, once they connect. Say who runs the server, where, and how to reach you.</p>`
+    : '<p class="card-note">The OSTP on this server is too old to set operator information. Update it on the Status tab.</p>'}
+
     <div class="section-divider"><span>Server log</span></div>
     <div class="btn-row"><button class="btn secondary" id="btn-logs">Show the last 300 lines</button></div>
     <pre class="log-view" id="server-log" style="display:none;"></pre>
@@ -937,6 +980,7 @@ async function renderManage(body, id, seq) {
     };
   }
   bindOvernet(id, s.overnet);
+  if ('server_info' in s) $('btn-operator-edit').onclick = () => openOperatorEditor(id, s.server_info?.operator || {});
   $('btn-logs').onclick = async () => {
     const pre = $('server-log');
     pre.style.display = '';
@@ -970,6 +1014,65 @@ async function renderManage(body, id, seq) {
       app.showScreen('servers');
     } catch (e) { report(e); }
   };
+}
+
+// The operator's own words about the server: `ostp manage server-info` with
+// the fields that changed (an empty value clears one).
+const OPERATOR_FIELDS = [
+  { name: 'name', label: 'Name', max: 100, hint: 'Who runs this server, e.g. a name or a nickname.' },
+  { name: 'location', label: 'Location', max: 100, hint: 'Where the server is, e.g. "Helsinki, Finland".' },
+  { name: 'contact', label: 'Contact', max: 200, hint: 'How to reach you: an email, a Telegram name, a site.' },
+  { name: 'about', label: 'About', max: 4000, multiline: true,
+    hint: 'Markdown: # headings, **bold**, *italic*, `code`, lists, [links](https://...). HTML is shown as text.' },
+];
+
+function openOperatorEditor(id, op) {
+  const modal = $('user-modal');
+  const err = $('user-modal-error');
+  const save = $('btn-user-modal-save');
+  $('user-modal-title').textContent = 'Operator information';
+  save.textContent = 'Save';
+  save.disabled = false;
+  err.textContent = '';
+  $('user-modal-body').innerHTML = OPERATOR_FIELDS.map(f => `
+    <div class="field-group">
+      <label class="field-label" for="op-${f.name}">${esc(f.label)}</label>
+      ${f.multiline
+        ? `<textarea class="field-input" id="op-${f.name}" rows="8" maxlength="${f.max}" spellcheck="true"></textarea>`
+        : `<input class="field-input" id="op-${f.name}" maxlength="${f.max}" />`}
+      <p class="field-hint">${esc(f.hint)}</p>
+    </div>`).join('');
+  for (const f of OPERATOR_FIELDS) $(`op-${f.name}`).value = op[f.name] || '';
+  const close = changed => {
+    modal.classList.add('hidden');
+    save.onclick = null;
+    $('btn-user-modal-cancel').onclick = null;
+    if (changed) renderTab();
+  };
+  superseding('user', () => close(false));
+  $('btn-user-modal-cancel').onclick = () => close(false);
+  save.onclick = async () => {
+    const args = ['server-info'];
+    for (const f of OPERATOR_FIELDS) {
+      const raw = $(`op-${f.name}`).value;
+      const v = f.multiline ? raw.replace(/\r\n?/g, '\n').trim() : raw.replace(/\s+/g, ' ').trim();
+      if (v.length > f.max) { err.textContent = `${f.label} is longer than ${f.max} characters.`; return; }
+      if (v !== (op[f.name] || '')) args.push('--' + f.name, v);
+    }
+    if (args.length === 1) { close(false); return; }
+    save.disabled = true;
+    err.textContent = '';
+    try {
+      await call('server_manage', { id, args });
+      close(true);
+      app.showToast('Saved', 'ok');
+    } catch (e) {
+      if (!e?.cancelled) err.textContent = String(e?.message || e);
+      save.disabled = false;
+    }
+  };
+  modal.classList.remove('hidden');
+  $('op-name').focus();
 }
 
 // The panel inside the tunnel: 10.1.0.1 is the server as clients see it.

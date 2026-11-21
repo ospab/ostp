@@ -18,6 +18,8 @@ allow = [
   "generate_qr",
   "decode_qr",
   "fetch_subscription",
+  "get_server_info",
+  "request_server_info",
   "run_prober_matrix",
   "run_prober_ttl",
   "run_dpi_battery",

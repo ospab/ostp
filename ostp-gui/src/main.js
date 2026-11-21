@@ -2,6 +2,8 @@ import { shouldAskDnsNotice, effectiveDns, filtersDns } from './dns_notice.js';
 import { classifyFetchError, cardMessage, shouldAskToSend, SEND_DIALOG } from './device_limit.js';
 import { linkPk, protocolLabel } from './server_pk.js';
 import { initServers, renderServers, mountSshForm, confirmBox, fmtBytes } from './servers.js';
+import { renderMarkdown } from './markdown.js';
+import { normalizeServerInfo, subscriptionExpiry, expiryLabel, isKeyExpiredReason, LOG_PRIVACY_TEXT } from './server_info.js';
 
 // ── Tauri invoke shim ─────────────────────────────────────────────────
 let rawInvoke = () => Promise.resolve(null);
@@ -338,6 +340,9 @@ function persistConfig() {
 
 // The tunnel stopped on its own: say so, with the reason.
 function onTunnelError(msg) {
+  // The server closed the session because the key is past its date: the
+  // subscription it came from shows "expired" until the server says otherwise.
+  if (isKeyExpiredReason(msg)) { const sid = sessionSubId(); if (sid) markKeyExpired(sid); }
   setState('disconnected');
   // The server closed the session on purpose: its message is already a full
   // sentence with what to do about it, and the cause is not a failure.
@@ -357,6 +362,7 @@ function setState(next) {
 
   if (next === 'disconnected') {
     sessionProfile = null;
+    infoRequested = false;
     statusText.textContent = 'Disconnected';
     uptimeText.textContent  = 'Press the button to connect';
     connInfo.classList.add('hidden');
@@ -433,7 +439,7 @@ async function pollOnce() {
 
     if      (code === 0) { setState('disconnected'); return; }
     else if (code === 1) setState('connecting');
-    else if (code === 2) setState('connected');
+    else if (code === 2) { setState('connected'); serverInfoTick(); }
 
     const metrics = await invoke('get_metrics');
     if (metrics && pollTimer) {
@@ -868,22 +874,57 @@ function connectedThrough(host) {
 }
 
 // ── PROFILE RENDERING ─────────────────────────────────────────────────
-// Profiles added by hand are listed here; a subscription's profiles are
-// listed inside its card (renderSubs), since every refresh rewrites them.
+// Without subscriptions the profiles are one flat list. With them, each
+// subscription is a group of its profiles (a refresh rewrites them), and the
+// profiles added by hand are one more group. Groups fold; a search field
+// appears when the list is long.
+const GROUPS_KEY = 'ostp_groups_open_v1';
+const SEARCH_FROM = 9; // profiles and subscriptions together
+const MANUAL_GROUP = 'manual';
+let profileQuery = '';
+
+function loadOpenGroups() {
+  const v = readJson(GROUPS_KEY, {});
+  return isObj(v) ? v : {};
+}
+function setGroupOpen(id, open) {
+  const v = loadOpenGroups();
+  v[id] = open;
+  // Forget groups that are gone, so the stored map does not grow.
+  const known = new Set([MANUAL_GROUP, ...loadSubs().map(s => s.id)]);
+  for (const k of Object.keys(v)) if (!known.has(k)) delete v[k];
+  writeJson(GROUPS_KEY, v);
+}
+// Folded unless the user opened it, or it holds the selected profile.
+function groupOpen(id, members) {
+  const stored = loadOpenGroups()[id];
+  if (typeof stored === 'boolean') return stored;
+  return members.some(p => p.id === activeId);
+}
+
+const profileMatches = (p, q) => (p.name || '').toLowerCase().includes(q) || String(p.server || '').toLowerCase().includes(q);
+
 function renderProfiles() {
   // Remove all cards but keep empty-state node
   Array.from(profileList.querySelectorAll('.profile-card')).forEach(n => n.remove());
+  const subs = loadSubs();
   const manual = profiles.filter(p => !p.sub_id);
-  const hasSubs = loadSubs().length > 0;
-  profileEmpty.style.display = manual.length || hasSubs ? 'none' : '';
-  manual.forEach(p => profileList.appendChild(profileCard(p)));
+  profileEmpty.style.display = manual.length || subs.length ? 'none' : '';
+  const searchable = profiles.length + subs.length >= SEARCH_FROM;
+  $('profile-search-row').classList.toggle('hidden', !searchable);
+  if (!searchable && profileQuery) { profileQuery = ''; $('profile-search').value = ''; }
+  if (!subs.length) {
+    const q = profileQuery;
+    manual.filter(p => !q || profileMatches(p, q)).forEach(p => profileList.appendChild(profileCard(p)));
+  }
   renderSubs();
   updateReconnectNotice();
 }
 
-function profileCard(p) {
+// `unavailable`: why the profile cannot connect now (its key expired), or ''.
+function profileCard(p, { compact = false, unavailable = '' } = {}) {
     const card = document.createElement('div');
-    card.className = 'profile-card' + (p.id === activeId ? ' active' : '');
+    card.className = 'profile-card' + (p.id === activeId ? ' active' : '') + (compact ? ' compact' : '') + (unavailable ? ' unavailable' : '');
     card.dataset.id = p.id;
     card.tabIndex = 0;
     card.setAttribute('role', 'radio');
@@ -894,7 +935,7 @@ function profileCard(p) {
       </div>
       <div class="profile-info">
         <div class="profile-name">${escHtml(p.name || p.server)}</div>
-        <div class="profile-server">${escHtml(p.server)}</div>
+        <div class="profile-server">${escHtml(unavailable || p.server)}</div>
       </div>
       <span class="profile-transport-badge">${escHtml(p.transport === 'uot' && p.tls ? 'tls' : (p.transport || 'udp'))}</span>
       <div class="profile-actions">
@@ -1204,7 +1245,8 @@ const SUBS_KEY = 'ostp_subscriptions_v1';
 function loadSubs() {
   const raw = readJson(SUBS_KEY, []);
   if (!Array.isArray(raw)) return [];
-  return raw.filter(s => isObj(s) && typeof s.id === 'string' && typeof s.url === 'string').slice(0, MAX_SUBS);
+  return raw.filter(s => isObj(s) && typeof s.id === 'string' && typeof s.url === 'string').slice(0, MAX_SUBS)
+    .map(s => ({ ...s, serverInfo: normalizeServerInfo(s.serverInfo), keyExpired: s.keyExpired === true }));
 }
 function saveSubs(subs) { writeJson(SUBS_KEY, subs); }
 
@@ -1384,22 +1426,81 @@ async function refreshDueSubscriptions() {
   for (const s of loadSubs().filter(subIsDue)) await refreshSubscription(s.id, { quiet: true });
 }
 
+const ICON_CHEVRON = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="9 6 15 12 9 18"/></svg>';
+const ICON_INFO = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="11"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg>';
+
+// One foldable group: a header row and its profiles. `actions` are extra
+// buttons in the header; `unavailable` marks every profile of the group.
+function profileGroup({ id, name, count, summary, error, bar, actions = '', members, open, unavailable = '' }) {
+  const card = document.createElement('div');
+  card.className = 'sub-card group' + (open ? ' open' : '');
+  card.innerHTML = `
+    <div class="sub-head">
+      <button class="group-toggle" aria-expanded="${open}" title="${open ? 'Fold' : 'Unfold'}">
+        <span class="group-chevron">${ICON_CHEVRON}</span>
+        <span class="sub-name"></span>
+        <span class="group-count">${count}</span>
+      </button>
+      ${actions}
+    </div>
+    ${bar}
+    <div class="sub-meta"></div>
+    <div class="sub-error"></div>
+    <div class="sub-profiles"></div>`;
+  card.querySelector('.sub-name').textContent = name;
+  const meta = card.querySelector('.sub-meta');
+  meta.textContent = summary;
+  if (!summary) meta.remove();
+  const err = card.querySelector('.sub-error');
+  err.textContent = error || '';
+  if (!error) err.remove();
+  const own = card.querySelector('.sub-profiles');
+  if (open) members.forEach(p => own.appendChild(profileCard(p, { compact: true, unavailable })));
+  card.querySelector('.group-toggle').addEventListener('click', () => {
+    if (profileQuery) return; // a search shows every match unfolded
+    setGroupOpen(id, !open);
+    renderSubs();
+    document.querySelector(`.sub-card[data-group="${CSS.escape(id)}"] .group-toggle`)?.focus();
+  });
+  card.dataset.group = id;
+  return card;
+}
+
+function subSummary(s) {
+  const used = s.usedBytes, limit = s.limitBytes;
+  const usage = used == null ? '' : (limit ? `${fmtBytes(used)} of ${fmtBytes(limit)}` : `${fmtBytes(used)} used`);
+  return [usage, expiryLabel(subscriptionExpiry(s)), `updated ${timeAgo(s.updatedAt)}`].filter(Boolean).join(' · ');
+}
+
 function renderSubs() {
   const subs = loadSubs();
   $('sub-section').style.display = subs.length ? '' : 'none';
   const list = $('sub-list');
   list.innerHTML = '';
+  if (!subs.length) return;
+  const q = profileQuery;
+  let shown = 0;
   for (const s of subs) {
+    const all = profiles.filter(p => p.sub_id === s.id);
+    const nameHit = !q || (s.name || s.url).toLowerCase().includes(q);
+    const members = nameHit ? all : all.filter(p => profileMatches(p, q));
+    if (q && !members.length && !nameHit) continue;
+    shown++;
     const used = s.usedBytes, limit = s.limitBytes;
     const ratio = used != null && limit ? Math.min(1, used / limit) : null;
-    const usage = used == null ? '' : (limit ? `${fmtBytes(used)} of ${fmtBytes(limit)}` : `${fmtBytes(used)} used`);
-    const meta = [usage, `updated ${timeAgo(s.updatedAt)}`, `every ${s.intervalHours || 12} h`].filter(Boolean).join(' · ');
-    const card = document.createElement('div');
-    card.className = 'sub-card';
-    card.innerHTML = `
-      <div class="sub-head">
-        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 11a9 9 0 0 1 9 9"/><path d="M4 4a16 16 0 0 1 16 16"/><circle cx="5" cy="19" r="1"/></svg>
-        <div class="sub-name">${escHtml(s.name || s.url)}</div>
+    const expired = subscriptionExpiry(s)?.expired;
+    const card = profileGroup({
+      id: s.id,
+      name: s.name || s.url,
+      count: all.length,
+      summary: subSummary(s),
+      error: s.lastError,
+      bar: ratio != null ? `<div class="sub-bar${ratio >= 1 ? ' full' : ratio >= 0.8 ? ' warn' : ''}"><div style="width:${(ratio * 100).toFixed(1)}%"></div></div>` : '',
+      members,
+      open: !!q || groupOpen(s.id, all),
+      unavailable: expired ? 'Unavailable: the key of this subscription expired' : '',
+      actions: `
+        <button class="profile-action-btn sub-info" title="Server information">${ICON_INFO}</button>
         <button class="profile-action-btn sub-refresh${refreshing.has(s.id) ? ' spinning' : ''}" title="Update subscription now">
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
         </button>
@@ -1408,20 +1509,210 @@ function renderSubs() {
         </button>
         <button class="profile-action-btn sub-remove" title="Remove subscription">
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/></svg>
-        </button>
-      </div>
-      ${ratio != null ? `<div class="sub-bar${ratio >= 1 ? ' full' : ratio >= 0.8 ? ' warn' : ''}"><div style="width:${(ratio * 100).toFixed(1)}%"></div></div>` : ''}
-      <div class="sub-meta">${escHtml(meta)}</div>
-      ${s.lastError ? `<div class="sub-error">${escHtml(s.lastError)}</div>` : ''}
-      <div class="sub-profiles"></div>
-    `;
-    const own = card.querySelector('.sub-profiles');
-    profiles.filter(p => p.sub_id === s.id).forEach(p => own.appendChild(profileCard(p)));
+        </button>`,
+    });
+    if (expired) card.classList.add('expired');
+    card.querySelector('.sub-info').addEventListener('click', () => openServerInfo(s.id));
     card.querySelector('.sub-refresh').addEventListener('click', () => refreshSubscription(s.id));
     card.querySelector('.sub-share').addEventListener('click', () => showShare('Share subscription', s.url));
     card.querySelector('.sub-remove').addEventListener('click', () => removeSubscription(s.id));
     list.appendChild(card);
   }
+  const manual = profiles.filter(p => !p.sub_id);
+  const manualShown = q ? manual.filter(p => profileMatches(p, q)) : manual;
+  if (manualShown.length) {
+    shown++;
+    list.appendChild(profileGroup({
+      id: MANUAL_GROUP, name: 'Added by hand', count: manual.length, summary: '', error: '', bar: '',
+      members: manualShown, open: !!q || groupOpen(MANUAL_GROUP, manual),
+    }));
+  }
+  if (q && !shown) {
+    const none = document.createElement('p');
+    none.className = 'empty-note';
+    none.textContent = `Nothing named like "${$('profile-search').value.trim()}".`;
+    list.appendChild(none);
+  }
+}
+
+// ── SERVER INFORMATION ────────────────────────────────────────────────
+// The core reports it inside the tunnel, never in the subscription document
+// (anyone with the URL can fetch that). It is kept with the subscription the
+// connection was started from, so the window shows the last copy offline.
+const INFO_PULL_MS = 60000;
+let infoPulledAt = 0;
+let infoRequested = false;
+
+// The subscription of the profile the running connection was started with.
+function sessionSubId() {
+  try {
+    const p = sessionProfile ? JSON.parse(sessionProfile) : null;
+    if (p) return p.sub_id || null;
+  } catch { /* fall back to the selection */ }
+  return profiles.find(p => p.id === activeId)?.sub_id || null;
+}
+
+function storeServerInfo(subId, info) {
+  if (!subId || !info) return;
+  const subs = loadSubs();
+  const sub = subs.find(s => s.id === subId);
+  if (!sub) return;
+  const changed = JSON.stringify(sub.serverInfo) !== JSON.stringify(info);
+  const at = info.key?.expires_at;
+  const wasExpired = sub.keyExpired;
+  sub.serverInfo = info;
+  sub.infoAt = Date.now();
+  if (at == null || at * 1000 > Date.now()) sub.keyExpired = false;
+  saveSubs(subs);
+  if (changed || wasExpired !== sub.keyExpired) renderSubs();
+}
+
+// Reads what the core has; `ask` first asks the server for a fresh copy.
+async function pullServerInfo({ ask = false } = {}) {
+  const subId = sessionSubId();
+  if (!subId || appState !== 'connected') return null;
+  try {
+    if (ask) await invoke('request_server_info');
+    const info = normalizeServerInfo(await invoke('get_server_info'));
+    if (info) storeServerInfo(subId, info);
+    return info;
+  } catch {
+    return null; // a core without these commands: nothing to show
+  }
+}
+
+// From the poll while connected: ask once, then read every minute.
+function serverInfoTick() {
+  const now = Date.now();
+  if (!infoRequested) { infoRequested = true; infoPulledAt = now; pullServerInfo({ ask: true }); return; }
+  if (now - infoPulledAt >= INFO_PULL_MS) { infoPulledAt = now; pullServerInfo(); }
+}
+
+function markKeyExpired(subId) {
+  const subs = loadSubs();
+  const sub = subs.find(s => s.id === subId);
+  if (!sub) return;
+  sub.keyExpired = true;
+  saveSubs(subs);
+  renderSubs();
+}
+
+function infoSection(parent, title, note) {
+  const h = document.createElement('div');
+  h.className = 'user-modal-section';
+  h.textContent = title;
+  parent.appendChild(h);
+  if (note) {
+    const p = document.createElement('p');
+    p.className = 'card-note info-note';
+    p.textContent = note;
+    parent.appendChild(p);
+  }
+  const box = document.createElement('div');
+  box.className = 'kv-card';
+  parent.appendChild(box);
+  return box;
+}
+function infoRow(box, k, v, cls = '') {
+  if (v == null || v === '') return;
+  const row = document.createElement('div');
+  row.className = 'kv-row';
+  const a = document.createElement('span');
+  a.className = 'k';
+  a.textContent = k;
+  const b = document.createElement('span');
+  b.className = ('v ' + cls).trim();
+  b.textContent = v;
+  b.title = v;
+  row.append(a, b);
+  box.appendChild(row);
+}
+const yesNo = v => (v == null ? null : v ? 'yes' : 'no');
+
+// A link in the operator's text opens only after the user sees where it goes.
+async function openLink(url) {
+  if (!await confirmBox('Open this link?', url, 'Open link', false)) return;
+  try { openUrl(url); } catch (e) { showToast(String(e?.message || e), 'error'); }
+}
+
+function fillServerInfo(sub, status) {
+  const body = $('info-body');
+  body.replaceChildren();
+  const info = sub.serverInfo;
+  const o = info?.operator, srv = info?.server, key = info?.key;
+  if (status) {
+    const p = document.createElement('p');
+    p.className = 'modal-text';
+    p.textContent = status;
+    body.appendChild(p);
+  }
+  if (o) {
+    const box = infoSection(body, 'Operator', 'Written by the operator of this server, in their own words. The app does not check it.');
+    infoRow(box, 'Name', o.name);
+    infoRow(box, 'Location', o.location);
+    infoRow(box, 'Contact', o.contact);
+    if (!box.children.length) box.remove();
+    if (o.about) {
+      const md = document.createElement('div');
+      md.className = 'md';
+      renderMarkdown(md, o.about, openLink);
+      body.appendChild(md);
+    }
+  }
+  if (srv) {
+    const box = infoSection(body, 'Reported by the server');
+    infoRow(box, 'Version', srv.version, 'mono');
+    infoRow(box, 'Carriers', srv.carriers.length ? srv.carriers.map(c => c.toUpperCase()).join(', ') : null);
+    infoRow(box, 'Log privacy', srv.log_privacy, srv.log_privacy === 'debug' ? 'is-warn' : '');
+    infoRow(box, 'IPv6', yesNo(srv.ipv6));
+    infoRow(box, 'DNS filtering', yesNo(srv.dns_filtering));
+    if (srv.log_privacy) {
+      const p = document.createElement('p');
+      p.className = 'card-note';
+      p.textContent = LOG_PRIVACY_TEXT[srv.log_privacy];
+      body.appendChild(p);
+    }
+  }
+  const used = key ? key.used_bytes : (sub.usedBytes ?? null);
+  const limit = key ? key.limit_bytes : (sub.limitBytes ?? null);
+  const exp = subscriptionExpiry(sub);
+  if (used != null || limit != null || exp || key) {
+    const box = infoSection(body, 'Your key');
+    infoRow(box, 'Traffic', used == null ? null : limit ? `${fmtBytes(used)} of ${fmtBytes(limit)}` : `${fmtBytes(used)}, no limit`);
+    if (exp) {
+      infoRow(box, 'Valid', exp.expired ? (exp.date ? `expired on ${exp.date}` : 'expired') : expiryLabel(exp),
+        exp.expired ? 'is-bad' : exp.daysLeft < 7 ? 'is-warn' : '');
+    } else if (key) {
+      infoRow(box, 'Valid', 'no end date');
+    }
+    if (key) infoRow(box, 'Devices', key.max_devices != null ? `up to ${key.max_devices}` : 'no limit');
+  }
+  const foot = document.createElement('p');
+  foot.className = 'card-note';
+  foot.textContent = !info ? "Connect once to see the server's information."
+    : sub.infoAt ? `As of ${new Date(sub.infoAt).toLocaleString()}.` : '';
+  if (foot.textContent) body.appendChild(foot);
+}
+
+let infoSeq = 0;
+async function openServerInfo(subId) {
+  const sub = loadSubs().find(s => s.id === subId);
+  if (!sub) return;
+  const seq = ++infoSeq;
+  $('info-title').textContent = sub.name || sub.url;
+  const live = appState === 'connected' && sessionSubId() === subId;
+  fillServerInfo(sub, live ? 'Asking the server for fresh information…' : '');
+  $('info-modal').classList.remove('hidden');
+  if (!live) return;
+  // The answer comes over the tunnel; the core may need a moment.
+  let fresh = null;
+  for (let i = 0; i < 6 && !fresh; i++) {
+    fresh = await pullServerInfo({ ask: i === 0 });
+    if (seq !== infoSeq || $('info-modal').classList.contains('hidden')) return;
+    if (!fresh) await new Promise(r => setTimeout(r, 1000));
+  }
+  const now = loadSubs().find(s => s.id === subId);
+  if (now) fillServerInfo(now, fresh ? '' : 'The server did not answer; this is the last copy.');
 }
 
 // ── PROBER ────────────────────────────────────────────────────────────
@@ -1873,6 +2164,8 @@ window.addEventListener('DOMContentLoaded', async () => {
   });
   setupWelcome();
   btnBack.addEventListener('click', () => showScreen('home'));
+  $('profile-search').addEventListener('input', e => { profileQuery = e.target.value.trim().toLowerCase(); renderProfiles(); });
+  $('btn-info-close').addEventListener('click', () => $('info-modal').classList.add('hidden'));
   $('btn-go-prober').addEventListener('click', () => showScreen('prober'));
   $('btn-prober-back').addEventListener('click', () => showScreen('home'));
   $('btn-pr-matrix').addEventListener('click', runMatrix);
