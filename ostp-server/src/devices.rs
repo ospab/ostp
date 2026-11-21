@@ -65,6 +65,22 @@ pub enum Refusal {
     DeviceLimit { max: u32 },
 }
 
+impl Refusal {
+    /// The code the apps read and the text for a person, as the 403 body says them.
+    pub fn code_and_message(&self) -> (&'static str, String) {
+        match self {
+            Refusal::HwidRequired => (
+                "hwid_required",
+                "This subscription limits the number of devices. Turn on sending the device ID in the app and refresh.".to_string(),
+            ),
+            Refusal::DeviceLimit { max } => (
+                "device_limit",
+                format!("This subscription is limited to {max} device(s) and all of them are in use. Ask the server's operator to remove one."),
+            ),
+        }
+    }
+}
+
 pub struct DeviceStore {
     path: Option<PathBuf>,
     inner: Mutex<HashMap<String, Vec<Device>>>,
@@ -155,6 +171,45 @@ impl DeviceStore {
         result
     }
 
+    /// [`check`](Self::check) on a blocking thread: it can write the file
+    /// (fsync and rename), which must not stall an async worker.
+    pub async fn check_blocking(
+        self: &Arc<Self>,
+        user: &str,
+        max: Option<u32>,
+        hwid: Option<Hwid>,
+        now: u64,
+    ) -> Result<(), Refusal> {
+        let me = self.clone();
+        let user = user.to_string();
+        match tokio::task::spawn_blocking(move || me.check(&user, max, hwid.as_ref(), now)).await {
+            Ok(r) => r,
+            // Only a panic gets here; a limit is not given up because of it.
+            Err(_) => match max.filter(|m| *m > 0) {
+                Some(m) => Err(Refusal::DeviceLimit { max: m }),
+                None => Ok(()),
+            },
+        }
+    }
+
+    /// Forgets the devices of every user not in `live` (the subscription
+    /// tokens of the keys that exist), so a key removed by a config edit does
+    /// not leave its record behind. How many users were dropped. An empty `live`
+    /// prunes nothing: it is more likely a config not loaded yet than no users.
+    pub fn prune(&self, live: &std::collections::HashSet<String>) -> usize {
+        if live.is_empty() {
+            return 0;
+        }
+        let mut map = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let before = map.len();
+        map.retain(|user, _| live.contains(user));
+        let dropped = before - map.len();
+        if dropped > 0 {
+            self.save(&map);
+        }
+        dropped
+    }
+
     /// The devices of `user` as recorded in the file, read without touching it
     /// (the CLI's view; a running server's newest `last_seen` may lag by an hour).
     pub fn read_list(path: &Path, user: &str) -> Vec<Device> {
@@ -208,19 +263,23 @@ impl DeviceStore {
 /// Written to a temporary file and renamed, readable by the owner only.
 fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
-    let tmp = path.with_extension("json.tmp");
+    // A temporary name of its own, so two writers never share one file.
+    let tmp = path.with_extension(format!("json.{}.{:08x}.tmp", std::process::id(), rand::random::<u32>()));
     let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
+    opts.write(true).create_new(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
         opts.mode(0o600);
     }
     let mut f = opts.open(&tmp)?;
-    f.write_all(bytes)?;
-    f.sync_all()?;
+    let written = f.write_all(bytes).and_then(|_| f.sync_all());
     drop(f);
-    std::fs::rename(&tmp, path)
+    let result = written.and_then(|_| std::fs::rename(&tmp, path));
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
 }
 
 #[cfg(test)]
@@ -267,6 +326,19 @@ mod tests {
         assert_eq!(s.check("u", Some(1), Some(&h("b")), 102), Ok(()));
         assert_eq!(s.clear("u"), 1);
         assert!(s.list("u").is_empty());
+    }
+
+    #[test]
+    fn pruning_drops_users_whose_key_is_gone() {
+        let s = DeviceStore::in_memory();
+        s.check("u1", None, Some(&h("a")), 100).unwrap();
+        s.check("u2", None, Some(&h("b")), 100).unwrap();
+        let live: std::collections::HashSet<String> = ["u1".to_string()].into();
+        assert_eq!(s.prune(&live), 1);
+        assert_eq!(s.list("u1").len(), 1);
+        assert!(s.list("u2").is_empty());
+        assert_eq!(s.prune(&Default::default()), 0, "no live keys means nothing is known, not that all are gone");
+        assert_eq!(s.list("u1").len(), 1);
     }
 
     #[test]

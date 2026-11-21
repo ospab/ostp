@@ -58,6 +58,8 @@ pub struct SubOpts {
 }
 
 pub fn run(action: SubAction, config_path: &Path) -> Result<()> {
+    // One command, one edit of the file.
+    let _lock = (!matches!(action, SubAction::Status)).then(|| ostp_server::config_io::lock_config(config_path));
     match action {
         SubAction::Status => status(config_path),
         SubAction::Enable(o) => change(config_path, Some(true), o),

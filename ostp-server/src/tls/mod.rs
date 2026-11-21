@@ -149,10 +149,29 @@ impl HotCertResolver {
     /// Loads the files; on any error the previously loaded certificate stays in use.
     pub fn reload(&self) -> Result<()> {
         let mtimes = (mtime(&self.cert_path)?, mtime(&self.key_path)?);
-        let key = load_certified_key(&self.cert_path, &self.key_path, &self.provider)?;
-        *self.current.write().unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(key));
-        *self.loaded_mtime.lock().unwrap_or_else(|e| e.into_inner()) = Some(mtimes);
-        Ok(())
+        match load_certified_key(&self.cert_path, &self.key_path, &self.provider) {
+            Ok(key) => {
+                *self.current.write().unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(key));
+                *self.loaded_mtime.lock().unwrap_or_else(|e| e.into_inner()) = Some(mtimes);
+                Ok(())
+            }
+            // Nothing loaded yet and the pair on disk is broken (a crash between
+            // the two renames of a renewal): the previous pair is better than
+            // no certificate. Once something is loaded it simply stays in use.
+            Err(e) if !self.has_cert() => {
+                let prev = load_certified_key(&prev_path(&self.cert_path), &prev_path(&self.key_path), &self.provider);
+                match prev {
+                    Ok(key) => {
+                        tracing::warn!("{e:#}; using the previous certificate and key (.prev) until a good pair is written");
+                        *self.current.write().unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(key));
+                        // Not recorded as loaded: the next check looks at the files again.
+                        Ok(())
+                    }
+                    Err(_) => Err(e),
+                }
+            }
+            Err(e) => Err(e),
+        }
     }
 
     /// Reloads when either file's mtime differs from what was last loaded.
@@ -221,21 +240,56 @@ pub fn write_placeholder(domain: &str, cert_path: &Path, key_path: &Path) -> Res
     write_pem_pair(cert_path, &ck.cert.pem(), key_path, &ck.signing_key.serialize_pem())
 }
 
-/// Writes a certificate/key pair atomically, the key readable by root only.
-pub fn write_pem_pair(cert_path: &Path, cert_pem: &str, key_path: &Path, key_pem: &str) -> Result<()> {
-    write_atomic(key_path, key_pem.as_bytes(), true)?;
-    write_atomic(cert_path, cert_pem.as_bytes(), false)
+/// `<path>.prev`: the last pair that was known to work, kept when a new one is written.
+fn prev_path(p: &Path) -> PathBuf {
+    let mut s = p.as_os_str().to_owned();
+    s.push(".prev");
+    PathBuf::from(s)
 }
 
-pub(crate) fn write_atomic(path: &Path, data: &[u8], private: bool) -> Result<()> {
+/// Writes a certificate/key pair, the key readable by root only. Two files
+/// cannot be replaced in one step, so both are written out in full first (a
+/// failure there changes nothing), the pair that works now is kept as `.prev`,
+/// and only then are the two renames done. A crash between them leaves a pair
+/// that does not match; `HotCertResolver::reload` then falls back to `.prev`
+/// instead of the server starting with no certificate.
+pub fn write_pem_pair(cert_path: &Path, cert_pem: &str, key_path: &Path, key_pem: &str) -> Result<()> {
+    let key_tmp = stage(key_path, key_pem.as_bytes(), true)?;
+    let cert_tmp = match stage(cert_path, cert_pem.as_bytes(), false) {
+        Ok(t) => t,
+        Err(e) => {
+            let _ = std::fs::remove_file(&key_tmp);
+            return Err(e);
+        }
+    };
+    // Only a pair that loads is worth keeping: after an interrupted write the
+    // files on disk are the broken ones, and `.prev` must not be overwritten by them.
+    if load_certified_key(cert_path, key_path, &provider()).is_ok() {
+        let _ = std::fs::copy(cert_path, prev_path(cert_path));
+        let _ = std::fs::copy(key_path, prev_path(key_path));
+    }
+    let renamed = std::fs::rename(&key_tmp, key_path)
+        .with_context(|| format!("cannot replace {}", key_path.display()))
+        .and_then(|_| std::fs::rename(&cert_tmp, cert_path).with_context(|| format!("cannot replace {}", cert_path.display())));
+    if renamed.is_err() {
+        let _ = std::fs::remove_file(&key_tmp);
+        let _ = std::fs::remove_file(&cert_tmp);
+    }
+    renamed
+}
+
+/// Writes `data` to a temporary file of its own next to `path` and returns its name.
+fn stage(path: &Path, data: &[u8], private: bool) -> Result<PathBuf> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).with_context(|| format!("cannot create {}", dir.display()))?;
     }
-    let tmp = path.with_extension("tmp");
-    {
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(format!(".{:08x}.tmp", rand::random::<u32>()));
+    let tmp = PathBuf::from(tmp);
+    let written = (|| -> Result<()> {
         use std::io::Write;
         let mut opts = std::fs::OpenOptions::new();
-        opts.write(true).create(true).truncate(true);
+        opts.write(true).create_new(true);
         #[cfg(unix)]
         if private {
             use std::os::unix::fs::OpenOptionsExt;
@@ -246,8 +300,21 @@ pub(crate) fn write_atomic(path: &Path, data: &[u8], private: bool) -> Result<()
         let mut f = opts.open(&tmp).with_context(|| format!("cannot write {}", tmp.display()))?;
         f.write_all(data)?;
         f.sync_all()?;
+        Ok(())
+    })();
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
     }
-    std::fs::rename(&tmp, path).with_context(|| format!("cannot replace {}", path.display()))?;
+    Ok(tmp)
+}
+
+pub(crate) fn write_atomic(path: &Path, data: &[u8], private: bool) -> Result<()> {
+    let tmp = stage(path, data, private)?;
+    std::fs::rename(&tmp, path).with_context(|| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("cannot replace {}", path.display())
+    })?;
     Ok(())
 }
 
@@ -306,6 +373,30 @@ mod tests {
         std::fs::write(&key, "not a key").unwrap();
         assert!(r.reload().is_err());
         assert!(r.has_cert(), "a failed reload must not drop the working certificate");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn an_interrupted_renewal_falls_back_to_the_previous_pair() {
+        let dir = std::env::temp_dir().join(format!("ostp-tls-test-{}", rand::random::<u64>()));
+        let (cert, key) = (dir.join("fullchain.pem"), dir.join("privkey.pem"));
+        write_placeholder("a.example", &cert, &key).unwrap();
+        // The renewal: the second pair replaces the first, which is kept as .prev.
+        write_placeholder("b.example", &cert, &key).unwrap();
+        assert!(prev_path(&cert).exists() && prev_path(&key).exists());
+        let leftovers = std::fs::read_dir(&dir).unwrap().filter_map(|e| e.ok()).filter(|e| e.file_name().to_string_lossy().ends_with(".tmp")).count();
+        assert_eq!(leftovers, 0);
+
+        // A crash after the key was renamed and before the certificate was.
+        let other = rcgen::KeyPair::generate().unwrap();
+        std::fs::write(&key, other.serialize_pem()).unwrap();
+        let r = HotCertResolver::new(&cert, &key);
+        r.reload().unwrap();
+        assert!(r.has_cert(), "the server starts on the previous pair");
+        // A third write must not replace .prev with the broken pair on disk.
+        let before = std::fs::read(prev_path(&cert)).unwrap();
+        write_placeholder("c.example", &cert, &key).unwrap();
+        assert_eq!(std::fs::read(prev_path(&cert)).unwrap(), before);
         let _ = std::fs::remove_dir_all(dir);
     }
 

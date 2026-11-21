@@ -178,7 +178,17 @@ impl Session {
     /// (stdout and stderr) as it arrives.
     pub async fn run_root_with(&self, command: &str, on_line: impl FnMut(&str)) -> Result<Output> {
         let (wrapped, stdin) = privileged(&self.user, self.password.as_deref(), command);
-        let out = self.run_with(&wrapped, stdin.as_deref(), on_line).await?;
+        self.finish_root(self.run_with(&wrapped, stdin.as_deref(), on_line).await?)
+    }
+
+    /// [`Session::run_root_with`] with `input` on the command's stdin; for a
+    /// secret that must not be in a command line (see `privileged_with_input`).
+    pub async fn run_root_with_input(&self, command: &str, input: &str, on_line: impl FnMut(&str)) -> Result<Output> {
+        let (wrapped, stdin) = privileged_with_input(&self.user, self.password.as_deref(), command, input);
+        self.finish_root(self.run_with(&wrapped, Some(&stdin), on_line).await?)
+    }
+
+    fn finish_root(&self, out: Output) -> Result<Output> {
         if out.status != 0 && self.user != "root" && sudo_refused(&out.stderr) {
             bail!(
                 "{} cannot run commands as root: {}",
@@ -280,6 +290,31 @@ pub fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
 }
 
+/// Runs `command` as root with `input` on its stdin, without either secret
+/// (the sudo password, the input) in any command line: the exec'd command is
+/// a bare `sh`, and a script on its stdin gives each secret to its command as
+/// a here-document. With a sudo password the script first asks `sudo -n`
+/// whether one is needed at all, so a passwordless sudo does not hand the
+/// password to the command as the first line of its input.
+fn privileged_with_input(user: &str, password: Option<&str>, command: &str, input: &str) -> (String, Vec<u8>) {
+    let tag = format!("OSTP_EOF_{:032x}", rand::random::<u128>());
+    let inner = format!("sh -c {}", shell_quote(command));
+    let doc = |body: &str| format!("<<'{tag}'\n{body}{}{tag}\n", if body.is_empty() || body.ends_with('\n') { "" } else { "\n" });
+    let script = if user == "root" {
+        format!("{inner} {}", doc(input))
+    } else {
+        match password {
+            Some(p) => format!(
+                "if sudo -n true </dev/null 2>/dev/null; then\nsudo -n {inner} {}\nelse\nsudo -S -p '' {inner} {}\nfi\n",
+                doc(input),
+                doc(&format!("{p}\n{input}"))
+            ),
+            None => format!("sudo -n {inner} {}", doc(input)),
+        }
+    };
+    ("sh".to_string(), script.into_bytes())
+}
+
 /// The command line and stdin that run `command` as root for `user`.
 /// sudo reads the password from stdin (`-S`) with an empty prompt, so it
 /// never shows up in the output or on the server's process list.
@@ -321,6 +356,25 @@ mod tests {
         assert_eq!(cmd, "sudo -S -p '' sh -c 'id -u'");
         assert_eq!(stdin.unwrap(), b"pw\n");
         assert_eq!(privileged("admin", None, "id -u").0, "sudo -n sh -c 'id -u'");
+    }
+
+    #[test]
+    fn a_secret_input_reaches_the_command_and_is_in_no_command_line() {
+        use std::io::Write;
+        let (cmd, stdin) = privileged_with_input("root", None, "cat", "s3cret value\n");
+        assert_eq!(cmd, "sh");
+        let mut child = std::process::Command::new("sh")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.take().unwrap().write_all(&stdin).unwrap();
+        let out = child.wait_with_output().unwrap();
+        assert_eq!(String::from_utf8(out.stdout).unwrap(), "s3cret value\n");
+        let (cmd, stdin) = privileged_with_input("admin", Some("pw"), "cat", "x");
+        assert!(!cmd.contains("pw") && !cmd.contains('x'));
+        let script = String::from_utf8(stdin).unwrap();
+        assert!(script.contains("sudo -n true") && script.contains("sudo -S -p ''"));
     }
 
     #[test]

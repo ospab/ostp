@@ -77,13 +77,17 @@ fn select<'r, 'a>(releases: &'r [Release<'a>], installed: &str, opts: &Options) 
         }
         return Ok(found);
     }
-    // Default: what this build contains. The binary only knows X.Y.Z, not
-    // which beta it is, so that is every entry of X.Y.Z, plus changes not
-    // released yet when the build was made from the development branch.
+    // Default: what this build contains. `installed` is the build's own
+    // version with its channel ("0.5.0-alpha.5"): its entry, or when the
+    // changelog has none for that pre-release, every entry of X.Y.Z; plus
+    // changes not released yet (the development branch).
+    let core = installed.split('-').next().unwrap_or(installed);
+    let has_own = releases.iter().any(|r| r.version.is_some_and(|v| version_matches(v, installed)));
+    let wanted = if has_own { installed } else { core };
     let mut found: Vec<_> = releases
         .iter()
         .filter(|r| match r.version {
-            Some(v) => version_matches(v, installed),
+            Some(v) => version_matches(v, wanted),
             None => !r.body.is_empty(),
         })
         .collect();
@@ -135,7 +139,7 @@ pub fn run(opts: Options) -> Result<()> {
     };
     let text = if lang == "ru" { RU } else { EN };
     let releases = parse(text);
-    let installed = env!("CARGO_PKG_VERSION");
+    let installed = ostp_client::updates::version();
     for release in select(&releases, installed, &opts)? {
         print_release(release);
     }

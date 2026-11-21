@@ -160,7 +160,10 @@ pub fn gen(config_path: &Path, format: &str, count: usize, add: bool) -> Result<
 
 pub fn run(action: Option<KeyAction>, config_path: &Path) -> Result<()> {
     let action = match action {
-        Some(KeyAction::Gen { format, count, add }) => return gen(config_path, &format, count, add),
+        Some(KeyAction::Gen { format, count, add }) => {
+            let _lock = add.then(|| ostp_server::config_io::lock_config(config_path));
+            return gen(config_path, &format, count, add);
+        }
         Some(a) => a,
         None => {
             let (v, p) = load(config_path)?;
@@ -171,6 +174,8 @@ pub fn run(action: Option<KeyAction>, config_path: &Path) -> Result<()> {
             return Ok(());
         }
     };
+    // Read and write of one command under one lock.
+    let _lock = ostp_server::config_io::lock_config(config_path);
     let (v, mut p) = load(config_path)?;
     match action {
         KeyAction::Gen { .. } => unreachable!("handled above"),

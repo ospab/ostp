@@ -135,7 +135,8 @@ impl Action {
             Action::Restart => ("systemctl restart ostp && sleep 2 && systemctl is-active ostp".into(), None),
             // Detached, so the command returns before the connection drops.
             Action::Reboot => ("nohup sh -c 'sleep 2; reboot' >/dev/null 2>&1 &".into(), None),
-            Action::Uninstall => (format!("{OSTP} uninstall"), None),
+            // The app has asked the user already: its text says config and keys go too.
+            Action::Uninstall => (format!("{OSTP} uninstall --yes --purge"), None),
             Action::PanelEnable { user, password } => (
                 format!("{OSTP} panel enable --user {}", shell_quote(user)),
                 Some(format!("{password}\n")),
@@ -214,7 +215,10 @@ impl Manager {
 
     /// Connects (checking the password or key) and saves the server.
     pub async fn add(&self, name: &str, target: Target, auth: Auth, remember: bool) -> Result<ServerInfo> {
-        let session = Session::connect(&target, &auth, None).await?;
+        // A server already in the list is checked against its remembered host
+        // key before the password or key is sent to it.
+        let known = self.store.lock().await.known_host_key(&target);
+        let session = Session::connect(&target, &auth, known.as_deref()).await?;
         let info = self.store.lock().await.add(&self.vault, name, &target, &auth, session.host_key(), remember)?;
         self.sessions.lock().await.insert(info.id.clone(), Arc::new(session));
         Ok(info)
@@ -292,9 +296,10 @@ impl Manager {
             "set -e; export DEBIAN_FRONTEND=noninteractive; \
              if ! command -v curl >/dev/null; then \
                (apt-get update -q && apt-get install -yq curl) || dnf install -y curl || yum install -y curl; fi; \
-             curl -fsSL {script} -o /tmp/ostp-install.sh; \
-             bash /tmp/ostp-install.sh -y -b {release} --port {port} --host {host}; \
-             rm -f /tmp/ostp-install.sh; \
+             tmp=$(mktemp /tmp/ostp-install.XXXXXX); trap 'rm -f \"$tmp\"' EXIT; \
+             curl -fsSL {script} -o \"$tmp\"; \
+             bash \"$tmp\" -y -b {release} --port {port} --host {host}; \
+             rm -f \"$tmp\"; \
              {OSTP} manage users",
             script = shell_quote(&script),
             host = shell_quote(&host),
@@ -317,12 +322,11 @@ impl Manager {
     pub async fn action(&self, id: &str, auth: Option<Auth>, action: Action, on_line: impl FnMut(&str)) -> Result<Output> {
         let s = self.session(id, auth).await?;
         let (cmd, stdin) = action.command();
-        let cmd = match stdin {
-            // Through the shell, so the password never appears on a command line.
-            Some(input) => format!("printf '%s' {} | {cmd}", shell_quote(&input)),
-            None => cmd,
+        let out = match stdin {
+            // On the command's stdin, through the SSH channel: never in a command line.
+            Some(input) => s.run_root_with_input(&cmd, &input, on_line).await?,
+            None => s.run_root_with(&cmd, on_line).await?,
         };
-        let out = s.run_root_with(&cmd, on_line).await?;
         if matches!(action, Action::Reboot) {
             self.sessions.lock().await.remove(id);
         }

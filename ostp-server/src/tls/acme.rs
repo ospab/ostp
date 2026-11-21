@@ -287,7 +287,16 @@ pub struct IssueRequest<'a> {
 /// Issues a certificate for `domain` and writes it to `cert_path`/`key_path`.
 /// The caller holds the lock and makes sure `store` is served on port 80.
 pub async fn issue(req: IssueRequest<'_>) -> Result<CertInfo> {
-    preflight(req.domain, req.store).await?;
+    // The self-fetch cannot prove the challenge is unreachable: behind NAT
+    // without hairpinning a server cannot reach its own public address while
+    // the CA can. A failure is a warning, and the CA decides.
+    let preflight_failed = match preflight(req.domain, req.store).await {
+        Ok(()) => None,
+        Err(e) => {
+            tracing::warn!("ACME self-check failed, asking the CA anyway: {e:#}");
+            Some(format!("{e:#}"))
+        }
+    };
     let account = load_or_create_account(req.state_dir, &req.directory_url, req.email)
         .await
         .context("ACME account")?;
@@ -296,7 +305,11 @@ pub async fn issue(req: IssueRequest<'_>) -> Result<CertInfo> {
     for t in &tokens {
         req.store.remove(t);
     }
-    let (chain, key) = result?;
+    let (chain, key) = match (result, preflight_failed) {
+        (Ok(done), _) => done,
+        (Err(e), Some(note)) => return Err(anyhow!("{e:#} (the server's own check of the challenge URL had failed too: {note})")),
+        (Err(e), None) => return Err(e),
+    };
     write_pem_pair(req.cert_path, &chain, req.key_path, &key)?;
     cert_info(req.cert_path)
 }
