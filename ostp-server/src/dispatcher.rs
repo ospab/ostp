@@ -1926,6 +1926,9 @@ mod roaming_tests {
         let (_c1, msg1) = v6_client_with_sid(public, SID);
         assert!(accepted_reply(dispatcher.on_datagram(addr("203.0.113.1:4000"), msg1).unwrap()).is_some());
         assert!(dispatcher.take_replaced().is_empty());
+        // The handshake payload carries the time in seconds: in the same
+        // second the second one would be the same payload, a replay.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
         let (_c2, msg2) = v6_client_with_sid(public, SID);
         assert!(accepted_reply(dispatcher.on_datagram(addr("203.0.113.2:4000"), msg2).unwrap()).is_some());
         assert_eq!(dispatcher.take_replaced(), vec![SID]);
