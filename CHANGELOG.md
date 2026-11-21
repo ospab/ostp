@@ -8,6 +8,8 @@ Older history is on the [Releases](https://github.com/ospab/ostp/releases) page 
 
 ## [Unreleased]
 
+## [0.5.0-alpha.6] - 2026-11-22
+
 ### Fixed
 - Protocol v6, forward compatibility. An authenticated frame that this version cannot read (a frame kind, `Close` reason or reset reason added by a newer version, or a malformed field) used to be refused before its nonce was recorded: the receiver kept a hole there, the sender resent the frame for minutes, and the session stalled behind it. Such a frame is now recorded, acknowledged and ignored. A `Close` always closes: an unknown reason reads as `Normal`, a text that is too long is cut, and one that is not UTF-8 is read lossily (before, the frame was refused and the session stayed up). An unknown reset reason reads as `Lost`. Tests: a frame of an unknown kind leaves no hole and the data behind it is delivered; each kind of bad `Close` closes the session.
 - TLS and TCP carriers: 3 seconds without hearing the peer were taken as a path change on every carrier, so on a byte stream the sender reset its congestion state and resent the whole window (up to 8192 frames) into the same connection, which was about to deliver it anyway. This now happens only on UDP; a real move to another connection still resends. On these carriers an unacknowledged UDP datagram of the tunnel is no longer called lost after 4 RTOs (it is queued, not lost) and no longer cuts the congestion window; it is given up only when its connection is left. Test included.
