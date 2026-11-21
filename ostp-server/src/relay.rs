@@ -534,6 +534,14 @@ pub async fn handle_message(
                         let _ = udp_reply_tx.try_send((session_id, stream_id, target, response));
                         return Ok(());
                     }
+                    // No IPv6 here: an IPv6 address would only give the
+                    // device a connection that is reset (see `ipv6_egress`).
+                    if !router.ipv6_egress {
+                        if let Some(response) = ostp_dns::empty_answer_for_aaaa(&data) {
+                            let _ = udp_reply_tx.try_send((session_id, stream_id, target, response));
+                            return Ok(());
+                        }
+                    }
                     let should_intercept = router.dns_server.answers(&target);
 
                     if should_intercept {

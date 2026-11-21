@@ -8,6 +8,10 @@ Older history is on the [Releases](https://github.com/ospab/ostp/releases) page 
 
 ## [Unreleased]
 
+### Fixed
+- A server without IPv6 (switched off in the kernel, or no IPv6 route) and a device with IPv6: the tunnel carries the device's IPv6 too (Android routes `::/0` into it), so apps connected to the IPv6 addresses DNS gave them. The device's network stack accepts a connection at once and only then the server tries the target, so the app saw an IPv6 connection succeed, sent its request and got a reset, then waited and retried; pages and videos loaded in fits. A server's log showed it as bursts of `CONNECT failed ... failed` (`Address family not supported by protocol`). The server now checks at start whether it can reach IPv6 at all and, if not, answers DNS queries for IPv6 addresses (AAAA) that come through the tunnel with an empty answer, so apps use IPv4 from the start; the log says so at start. Apps with their own encrypted DNS are not covered. Test: an AAAA query gets an empty NOERROR answer with the same id, other queries are left alone.
+- Server log: such a failure now reads `no IPv6 on this server` instead of `failed`. In `debug` the server no longer logs a line per data packet (`Deliver app payload`, about 50,000 lines in 3 minutes of browsing), which buried everything else.
+
 ## [0.5.0-alpha.6] - 2026-11-22
 
 ### Fixed

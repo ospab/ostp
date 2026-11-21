@@ -1277,12 +1277,9 @@ async fn handle_udp_packet(
             // and a formatted line per data packet was work thrown away
             // tens of thousands of times a second.
             for (session_id, stream_id, payload) in app_payloads {
-                if router.debug {
-                    let _ = ui_event_tx.send(UiEvent::Log(format!(
-                        "Deliver app payload sid={session_id} stream={stream_id} bytes={}",
-                        payload.len()
-                    )));
-                }
+                // At trace level only: in `debug` this was a line per data
+                // packet, tens of thousands a minute, drowning everything else.
+                tracing::trace!("Deliver app payload sid={session_id} stream={stream_id} bytes={}", payload.len());
                 // One bad message must not discard the rest of the datagram's
                 // payloads (see above).
                 if let Err(e) = relay::handle_relay_message(

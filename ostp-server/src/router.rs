@@ -20,11 +20,32 @@ pub struct Router {
     /// `local_access` and the panel's port: see `target_policy`.
     pub local: Arc<RwLock<(bool, Option<u16>)>>,
     pub debug: bool,
+    /// Whether this machine can reach IPv6 destinations at all. Without it,
+    /// DNS answers for IPv6 addresses (AAAA) that clients ask through the
+    /// tunnel are empty (see `ostp_dns::empty_answer_for_aaaa`).
+    pub ipv6_egress: bool,
+}
+
+/// Whether an IPv6 socket can be made and routed to a public address. A UDP
+/// `connect` sends nothing: it only binds a route, so it fails at once with
+/// "address family not supported" when the kernel has IPv6 off and with
+/// "network unreachable" when there is no IPv6 route.
+pub fn has_ipv6_egress() -> bool {
+    std::net::UdpSocket::bind("[::]:0")
+        .and_then(|s| s.connect("[2001:4860:4860::8888]:53"))
+        .is_ok()
 }
 
 impl Router {
     pub fn new(outbound_cfg: Option<OutboundConfig>, bind_ip: Option<String>, dns_server: Arc<DnsServer>, debug: bool) -> Self {
+        let ipv6_egress = has_ipv6_egress();
+        if !ipv6_egress {
+            tracing::info!(
+                "No IPv6 on this server: DNS answers for IPv6 addresses (AAAA) asked through the tunnel are empty, so clients use IPv4"
+            );
+        }
         Self {
+            ipv6_egress,
             outbound_cfg: Arc::new(RwLock::new(outbound_cfg)),
             bind_ip,
             dns_server,

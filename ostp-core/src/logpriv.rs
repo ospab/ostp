@@ -202,6 +202,8 @@ pub fn error_kind(text: &str) -> &'static str {
         "timed out"
     } else if has(&["refused"]) {
         "connection refused"
+    } else if has(&["address family not supported"]) {
+        "no IPv6 on this server"
     } else if has(&["unreachable"]) {
         "network unreachable"
     } else if has(&["reset", "broken pipe", "aborted"]) {

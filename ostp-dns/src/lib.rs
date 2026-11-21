@@ -276,6 +276,21 @@ fn reply<'a>(q: &Packet<'a>) -> Packet<'a> {
     r
 }
 
+/// For a query of IPv6 addresses (AAAA), an empty answer (NOERROR, no
+/// records): the name exists, it just has no address this server can reach.
+/// A server without IPv6 gives this so its clients use IPv4 at once; with a
+/// real AAAA answer a device that has IPv6 connects over it through the
+/// tunnel, the connection is accepted on the device and then reset, and the
+/// app waits and retries before it falls back. `None` for any other query.
+pub fn empty_answer_for_aaaa(query: &[u8]) -> Option<Vec<u8>> {
+    let q = Packet::parse(query).ok()?;
+    let question = q.questions.first()?;
+    if qtype_code(question.qtype) != 28 {
+        return None;
+    }
+    reply(&q).build_bytes_vec_compressed().ok()
+}
+
 fn with_rcode(q: &Packet, rcode: RCODE) -> Option<Vec<u8>> {
     let mut r = reply(q);
     *r.rcode_mut() = rcode;
@@ -904,6 +919,18 @@ mod tests {
         p.set_flags(PacketFlag::RECURSION_DESIRED);
         p.questions.push(simple_dns::Question::new(Name::new(name).unwrap(), QTYPE::TYPE(qtype), simple_dns::QCLASS::CLASS(CLASS::IN), false));
         p.build_bytes_vec().unwrap()
+    }
+
+    #[test]
+    fn an_aaaa_query_gets_an_empty_answer_and_others_none() {
+        let r = empty_answer_for_aaaa(&query("example.com", TYPE::AAAA)).expect("an answer");
+        let p = Packet::parse(&r).unwrap();
+        assert_eq!(p.id(), 0x4242);
+        assert_eq!(p.rcode(), RCODE::NoError);
+        assert!(p.answers.is_empty());
+        assert_eq!(p.questions[0].qname.to_string(), "example.com");
+        assert!(empty_answer_for_aaaa(&query("example.com", TYPE::A)).is_none());
+        assert!(empty_answer_for_aaaa(&[1, 2, 3]).is_none());
     }
 
     /// A fake upstream on loopback: answers every A query with 93.184.216.34,
