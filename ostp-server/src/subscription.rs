@@ -28,9 +28,14 @@ const FAILED_LOOKUP_WINDOW: Duration = Duration::from_secs(600);
 /// unknown tokens costs one pass over the keys per interval, not per request.
 const INDEX_MIN_AGE: Duration = Duration::from_secs(5);
 
+/// Device records are pruned against the live keys at most this often.
+const PRUNE_EVERY: Duration = Duration::from_secs(600);
+
 /// Token-to-key index and the failed-lookup budget of `SubscriptionService`.
 pub struct Lookups {
     failures: FailureLimiter,
+    /// When the device records were last pruned against the key list.
+    last_prune: Mutex<Option<Instant>>,
     index: Mutex<TokenIndex>,
 }
 
@@ -46,6 +51,7 @@ impl Default for Lookups {
         Self {
             failures: FailureLimiter::new(FAILED_LOOKUP_WINDOW, MAX_FAILED_LOOKUPS),
             index: Mutex::new(TokenIndex::default()),
+            last_prune: Mutex::new(None),
         }
     }
 }
@@ -216,15 +222,27 @@ impl SubscriptionService {
         // token still gets the decoy and nothing here tells anyone a limit exists.
         let max_devices = self.keys.read().unwrap_or_else(|e| e.into_inner()).get(&key).and_then(|m| m.max_devices);
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-        if let Err(refusal) = self.devices.check(&req.token, max_devices, req.hwid.as_ref(), now) {
-            return Some(self.refuse(&refusal, req.head_only));
+        self.prune_devices_sometimes();
+        let mut device_notice = false;
+        if let Err(refusal) = self.devices.check_blocking(&req.token, max_devices, req.hwid.clone(), now).await {
+            // A person who opened the link in a browser has no device ID to send:
+            // a page that says what to do is better than raw JSON. It carries no
+            // links; the apps still get the 403 they understand.
+            if req.html && refusal == crate::devices::Refusal::HwidRequired {
+                device_notice = true;
+            } else {
+                return Some(self.refuse(&refusal, req.head_only));
+            }
         }
-        let doc = self.document(&key).await;
+        let mut doc = self.document(&key).await;
+        if device_notice {
+            doc.links.clear();
+        }
 
         let (content_type, body) = if req.json {
             ("application/json", serde_json::to_string(&doc).ok()?)
         } else if req.html {
-            ("text/html; charset=utf-8", self.page(&doc, &req.token, req.ru))
+            ("text/html; charset=utf-8", self.page(&doc, &req.token, req.ru, device_notice))
         } else {
             ("text/plain; charset=utf-8", doc.links.join("\n") + "\n")
         };
@@ -261,26 +279,10 @@ impl SubscriptionService {
 impl SubscriptionService {
     /// 403 with a JSON body the apps read: `error` is a code, `message` is for a person.
     fn refuse(&self, refusal: &crate::devices::Refusal, head_only: bool) -> Vec<u8> {
-        use crate::devices::Refusal;
-        let (code, message) = match refusal {
-            Refusal::HwidRequired => (
-                "hwid_required",
-                "This subscription limits the number of devices. Turn on sending the device ID in the app and refresh.".to_string(),
-            ),
-            Refusal::DeviceLimit { max } => (
-                "device_limit",
-                format!("This subscription is limited to {max} device(s) and all of them are in use. Ask the server's operator to remove one."),
-            ),
-        };
+        let (code, message) = refusal.code_and_message();
         let body = serde_json::json!({ "error": code, "message": message }).to_string();
         let mut out = format!(
-            "HTTP/1.1 403 Forbidden
-Content-Type: application/json
-Content-Length: {}
-Cache-Control: no-store
-Connection: close
-
-",
+            "HTTP/1.1 403 Forbidden\r\nContent-Type: application/json\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
             body.len()
         )
         .into_bytes();
@@ -300,7 +302,29 @@ Connection: close
 
     /// The page a person sees when they open the subscription in a browser:
     /// what it is, how to connect, the QR code, both languages.
-    fn page(&self, doc: &SubscriptionDoc, token: &str, ru: bool) -> String {
+    /// Drops the device records of keys that no longer exist, at most once per
+    /// `PRUNE_EVERY`: keys removed by a config edit have no other hook here.
+    fn prune_devices_sometimes(&self) {
+        {
+            let mut last = self.lookups.last_prune.lock().unwrap_or_else(|e| e.into_inner());
+            if last.is_some_and(|t| t.elapsed() < PRUNE_EVERY) {
+                return;
+            }
+            *last = Some(Instant::now());
+        }
+        let live: std::collections::HashSet<String> =
+            self.keys.read().unwrap_or_else(|e| e.into_inner()).keys().map(|k| token_for_key(k)).collect();
+        let devices = self.devices.clone();
+        // The file write goes to a blocking thread.
+        tokio::task::spawn_blocking(move || {
+            let n = devices.prune(&live);
+            if n > 0 {
+                tracing::info!("devices: dropped the record of {n} removed user(s)");
+            }
+        });
+    }
+
+    fn page(&self, doc: &SubscriptionDoc, token: &str, ru: bool, device_notice: bool) -> String {
         let url = self.url(token);
         let qr = qrcode::QrCode::new(url.as_bytes())
             .map(|c| {
@@ -338,6 +362,17 @@ Connection: close
                 )
             }
             None => String::new(),
+        };
+        let usage = if device_notice {
+            format!(
+                "<section class=\"card\"><h2><span lang=\"ru\">Нужен ID устройства</span><span lang=\"en\">A device ID is needed</span></h2>\
+                 <p class=\"muted\"><span lang=\"ru\">У этой подписки ограничено число устройств, а браузер ID устройства не отправляет. \
+                 Добавьте адрес подписки ниже в приложение OSTP, включите в нём отправку ID устройства и обновите подписку: профили придут туда.</span>\
+                 <span lang=\"en\">This subscription limits the number of devices, and a browser does not send a device ID. \
+                 Add the subscription address below to the OSTP app, turn on sending the device ID there and refresh: the profiles will arrive in the app.</span></p></section>{usage}"
+            )
+        } else {
+            usage
         };
 
         let links: String = doc
@@ -492,6 +527,21 @@ x-device-model: PC
         let free = format!("/sub/{}", token_for_key("key-b"));
         let r = text(svc.respond(&get_with_device(&free, None), client()).await.unwrap());
         assert!(r.starts_with("HTTP/1.1 200"), "{r}");
+    }
+
+    #[tokio::test]
+    async fn a_browser_on_a_limited_subscription_gets_a_page_not_json() {
+        let svc = service();
+        svc.keys.write().unwrap().get_mut("key-a").unwrap().max_devices = Some(1);
+        let path = format!("/sub/{}", token_for_key("key-a"));
+        let r = String::from_utf8(svc.respond(&get(&path, "text/html"), client()).await.unwrap()).unwrap();
+        assert!(r.starts_with("HTTP/1.1 200 OK"), "{r}");
+        assert!(r.contains("text/html"), "{r}");
+        assert!(r.contains("A device ID is needed"), "{r}");
+        assert!(!r.contains("ostp://"), "no links without a device ID: {r}");
+        // An app (no HTML in Accept) still gets the code it reads.
+        let r = String::from_utf8(svc.respond(&get(&path, "*/*"), client()).await.unwrap()).unwrap();
+        assert!(r.starts_with("HTTP/1.1 403") && r.contains("hwid_required"), "{r}");
     }
 
     #[tokio::test]

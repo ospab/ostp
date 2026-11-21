@@ -56,6 +56,35 @@ impl Session {
     }
 }
 
+/// What `scripts/gha.ps1` commits with every release. The package version is
+/// "0.5.0" for every alpha, beta and the stable release, so the channel comes
+/// from here, the same way `ostp_client::updates::version()` reads it (ostp-server
+/// cannot depend on ostp-client).
+const RELEASE_STATE: &str = include_str!("../../.release-state.json");
+
+/// This build's version as people read it, with its channel: "0.5.0-alpha.5",
+/// "0.5.0-beta.1", "0.5.0".
+pub fn build_version() -> &'static str {
+    #[derive(Deserialize)]
+    struct ReleaseState {
+        target_version: String,
+        branch: String,
+        #[serde(default)]
+        alpha_iteration: u32,
+        #[serde(default)]
+        beta_iteration: u32,
+    }
+    static V: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| match serde_json::from_str::<ReleaseState>(RELEASE_STATE) {
+        Ok(s) => match s.branch.as_str() {
+            "alpha" => format!("{}-alpha.{}", s.target_version, s.alpha_iteration),
+            "beta" => format!("{}-beta.{}", s.target_version, s.beta_iteration),
+            _ => s.target_version,
+        },
+        Err(_) => env!("CARGO_PKG_VERSION").to_string(),
+    });
+    &V
+}
+
 // ── Shared state for API handlers ────────────────────────────────────────────
 
 /// API server shared state. Held behind Arc for axum handlers.
@@ -211,20 +240,25 @@ pub struct CreateUserRequest {
 
 #[derive(Deserialize)]
 pub struct UpdateUserRequest {
-    pub name: Option<String>,
-    pub limit_bytes: Option<u64>,
+    /// Absent = unchanged; `null` or empty = no name.
+    #[serde(default, deserialize_with = "present")]
+    pub name: Option<Option<String>>,
+    /// Absent = unchanged; `null` = no limit; a number = that many bytes.
+    #[serde(default, deserialize_with = "present")]
+    pub limit_bytes: Option<Option<u64>>,
     /// Absent = unchanged; `null` = no limit; a number = that many devices.
-    #[serde(default, deserialize_with = "present_devices")]
+    #[serde(default, deserialize_with = "present")]
     pub max_devices: Option<Option<u32>>,
 }
 
 /// Tells a field that is absent from one that is `null`: a request from a panel
-/// or app that predates the field must not clear what it never sent.
-fn present_devices<'de, D>(d: D) -> Result<Option<Option<u32>>, D::Error>
+/// or app that predates a field must not clear what it never sent.
+fn present<'de, D, T>(d: D) -> Result<Option<Option<T>>, D::Error>
 where
     D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
 {
-    Option::<u32>::deserialize(d).map(Some)
+    Option::<T>::deserialize(d).map(Some)
 }
 
 #[derive(Deserialize)]
@@ -275,6 +309,17 @@ fn api_unauthorized<T: Serialize>() -> (StatusCode, Json<ApiResponse<T>>) {
 #[folder = "panel/"]
 struct Assets;
 
+/// Headers of every panel file: it must not be framed (clickjacking a panel
+/// that controls the server) and a file is only ever what its type says.
+fn panel_headers(content_type: &str) -> [(header::HeaderName, String); 4] {
+    [
+        (header::CONTENT_TYPE, content_type.to_string()),
+        (header::X_FRAME_OPTIONS, "DENY".to_string()),
+        (header::CONTENT_SECURITY_POLICY, "frame-ancestors 'none'".to_string()),
+        (header::X_CONTENT_TYPE_OPTIONS, "nosniff".to_string()),
+    ]
+}
+
 async fn static_handler(State(state): State<ApiState>, uri: Uri) -> impl IntoResponse {
     let mut path = uri.path();
     
@@ -297,11 +342,11 @@ async fn static_handler(State(state): State<ApiState>, uri: Uri) -> impl IntoRes
     match Assets::get(path) {
         Some(content) => {
             let mime = mime_guess::from_path(path).first_or_octet_stream();
-            ([(header::CONTENT_TYPE, mime.as_ref())], content.data).into_response()
+            (panel_headers(mime.as_ref()), content.data).into_response()
         }
         None => {
             if let Some(index) = Assets::get("index.html") {
-                ([(header::CONTENT_TYPE, "text/html")], index.data).into_response()
+                (panel_headers("text/html"), index.data).into_response()
             } else {
                 (StatusCode::NOT_FOUND, "404 Not Found").into_response()
             }
@@ -437,7 +482,8 @@ pub async fn start_api_server(
 
     tracing::info!("Management API listening on {}", config.bind);
 
-    if let Err(e) = axum::serve(listener, app).await {
+    // The peer address is what sign-in attempts are limited by.
+    if let Err(e) = axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>()).await {
         tracing::error!("Management API error: {}", e);
     }
 }
@@ -501,6 +547,7 @@ fn check_token(state: &ApiState, headers: &axum::http::HeaderMap) -> bool {
 
 async fn handle_login(
     State(state): State<ApiState>,
+    axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
     Json(payload): Json<LoginRequest>,
 ) -> impl IntoResponse {
     if state.username.is_empty() || state.password_hash.is_empty() {
@@ -510,7 +557,8 @@ async fn handle_login(
     // The attempt is paid for up front: with PBKDF2 running off the async
     // workers, checking the bucket and spending it only after a failure would
     // let any number of parallel requests through at once.
-    if !login_reserve() {
+    let peer = peer.ip();
+    if !login_reserve(peer) {
         return (
             StatusCode::TOO_MANY_REQUESTS,
             Json(ApiResponse { ok: false, data: None, error: Some("too many sign-in attempts, wait a minute".into()) }),
@@ -529,7 +577,7 @@ async fn handle_login(
         .unwrap_or(false);
 
     if secure_eq(&payload.username, &state.username) && password_ok {
-        login_refund();
+        login_refund(peer);
         let token = uuid::Uuid::new_v4().to_string();
         {
             let mut sessions = state.session_token.write().unwrap_or_else(|e| e.into_inner());
@@ -559,38 +607,110 @@ async fn handle_logout(State(state): State<ApiState>, headers: axum::http::Heade
     (StatusCode::OK, ApiResponse::success(()))
 }
 
-/// Failed sign-ins, server-wide: a bucket of 10 refilled at 10 a minute. Not
-/// per address: through the tunnel and the built-in HTTPS frontend every
-/// request comes from 127.0.0.1, and a forwarded-for header is the client's
-/// to forge. While it is empty every sign-in is refused, the right password
-/// too; signed-in sessions keep working and the CLI is unaffected.
+/// Failed sign-ins: a bucket of 10 per source address, refilled at 10 a minute,
+/// and a much larger one for the whole server, so one address cannot lock the
+/// administrator out and a flood from many still has a ceiling. While a bucket
+/// is empty every sign-in it covers is refused, the right password too;
+/// signed-in sessions keep working and the CLI is unaffected.
+///
+/// The address is the real peer of the connection, never a forwarded-for
+/// header (that is the client's to forge). Through the tunnel and the built-in
+/// HTTPS frontend the peer is 127.0.0.1, so those sign-ins share one per-address
+/// bucket, as they did before there were two kinds.
 const LOGIN_BURST: f64 = 10.0;
 const LOGIN_REFILL_PER_SEC: f64 = 10.0 / 60.0;
+const LOGIN_GLOBAL_BURST: f64 = 200.0;
+const LOGIN_GLOBAL_REFILL_PER_SEC: f64 = 200.0 / 60.0;
+/// Addresses remembered at once; a full table forgets the ones that have refilled.
+const LOGIN_MAX_ADDRS: usize = 10_000;
 
-static LOGIN_BUCKET: std::sync::Mutex<Option<(f64, Instant)>> = std::sync::Mutex::new(None);
-
-fn login_bucket(take: f64) -> bool {
-    let mut b = LOGIN_BUCKET.lock().unwrap_or_else(|e| e.into_inner());
-    let now = Instant::now();
-    let (tokens, last) = b.get_or_insert((LOGIN_BURST, now));
-    *tokens = (*tokens + now.duration_since(*last).as_secs_f64() * LOGIN_REFILL_PER_SEC).min(LOGIN_BURST);
-    *last = now;
-    if *tokens < take {
-        return false;
-    }
-    *tokens -= take;
-    true
+struct Bucket {
+    tokens: f64,
+    last: Instant,
 }
 
-/// Takes one attempt from the bucket; false when it is empty.
-fn login_reserve() -> bool {
-    login_bucket(1.0)
+impl Bucket {
+    fn new(burst: f64, now: Instant) -> Self {
+        Self { tokens: burst, last: now }
+    }
+
+    fn refill(&mut self, burst: f64, per_sec: f64, now: Instant) {
+        self.tokens = (self.tokens + now.saturating_duration_since(self.last).as_secs_f64() * per_sec).min(burst);
+        self.last = now;
+    }
+}
+
+struct LoginLimiter {
+    global: Bucket,
+    per_addr: HashMap<std::net::IpAddr, Bucket>,
+}
+
+/// An IPv6 client owns a whole /64, so that is the unit.
+fn login_source(ip: std::net::IpAddr) -> std::net::IpAddr {
+    match ip.to_canonical() {
+        std::net::IpAddr::V6(v6) => {
+            let mut o = v6.octets();
+            o[8..].fill(0);
+            std::net::IpAddr::V6(o.into())
+        }
+        v4 => v4,
+    }
+}
+
+impl LoginLimiter {
+    fn new(now: Instant) -> Self {
+        Self { global: Bucket::new(LOGIN_GLOBAL_BURST, now), per_addr: HashMap::new() }
+    }
+
+    /// Takes one attempt for `ip` from its bucket and from the global one.
+    fn reserve(&mut self, ip: std::net::IpAddr, now: Instant) -> bool {
+        self.global.refill(LOGIN_GLOBAL_BURST, LOGIN_GLOBAL_REFILL_PER_SEC, now);
+        if self.global.tokens < 1.0 {
+            return false;
+        }
+        if self.per_addr.len() >= LOGIN_MAX_ADDRS && !self.per_addr.contains_key(&ip) {
+            self.per_addr.retain(|_, b| {
+                b.refill(LOGIN_BURST, LOGIN_REFILL_PER_SEC, now);
+                b.tokens < LOGIN_BURST
+            });
+            if self.per_addr.len() >= LOGIN_MAX_ADDRS {
+                self.per_addr.clear();
+            }
+        }
+        let b = self.per_addr.entry(ip).or_insert_with(|| Bucket::new(LOGIN_BURST, now));
+        b.refill(LOGIN_BURST, LOGIN_REFILL_PER_SEC, now);
+        if b.tokens < 1.0 {
+            return false;
+        }
+        b.tokens -= 1.0;
+        self.global.tokens -= 1.0;
+        true
+    }
+
+    fn refund(&mut self, ip: std::net::IpAddr) {
+        if let Some(b) = self.per_addr.get_mut(&ip) {
+            b.tokens = (b.tokens + 1.0).min(LOGIN_BURST);
+        }
+        self.global.tokens = (self.global.tokens + 1.0).min(LOGIN_GLOBAL_BURST);
+    }
+}
+
+static LOGIN_LIMITER: std::sync::Mutex<Option<LoginLimiter>> = std::sync::Mutex::new(None);
+
+/// Takes one attempt for this source; false when its bucket (or the server's) is empty.
+fn login_reserve(peer: std::net::IpAddr) -> bool {
+    let now = Instant::now();
+    LOGIN_LIMITER
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_or_insert_with(|| LoginLimiter::new(now))
+        .reserve(login_source(peer), now)
 }
 
 /// A correct sign-in gives its attempt back: only failures count.
-fn login_refund() {
-    if let Some((tokens, _)) = LOGIN_BUCKET.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
-        *tokens = (*tokens + 1.0).min(LOGIN_BURST);
+fn login_refund(peer: std::net::IpAddr) {
+    if let Some(l) = LOGIN_LIMITER.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+        l.refund(login_source(peer));
     }
 }
 
@@ -648,61 +768,98 @@ fn check_limit(limit: Option<u64>) -> Result<(), &'static str> {
 
 // ── config.json ──────────────────────────────────────────────────────────────
 
-use crate::config_io::{parse_config, write_config_atomic, CONFIG_LOCK};
+#[cfg(test)]
+use crate::config_io::parse_config;
+use crate::config_io::{edit_config, lock_config, write_config_atomic};
 
-/// Reads config.json, lets `change` edit it and writes it back, all under the
-/// lock. A config that cannot be parsed is left untouched.
-fn edit_config(
-    path: &std::path::Path,
-    backup: bool,
-    change: impl FnOnce(&mut serde_json::Value) -> Result<(), String>,
-) -> Result<(), String> {
-    let _guard = CONFIG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let mut value = parse_config(path)?;
-    change(&mut value)?;
-    let text = serde_json::to_string_pretty(&value).map_err(|e| format!("failed to serialize config JSON: {e}"))?;
-    if backup {
-        let _ = std::fs::copy(path, path.with_extension("json.bak"));
-    }
-    write_config_atomic(path, &text)
+/// One change to the `access_keys` list. It is applied to the list that is on
+/// disk, not written from memory: a user the CLI added a moment ago, or an
+/// edit made in the panel's config editor, is not undone by an unrelated change.
+enum KeyChange {
+    /// New users. One that is already in the file is an error.
+    Add(Vec<(String, UserMeta)>),
+    /// New name, limit and device limit of a user that is in the file.
+    Set { key: String, meta: UserMeta },
+    Remove(String),
 }
 
-fn save_config_keys(state: &ApiState) -> Result<(), String> {
+const ERR_ALREADY_IN_FILE: &str = "user already exists in config.json";
+const ERR_NOT_IN_FILE: &str = "user is not in config.json any more (removed by another change)";
+
+/// What a failed save says to the panel: the two known causes as they are, any
+/// other (a disk error, a config that does not parse) in general terms.
+fn save_error_message(e: &str) -> &'static str {
+    match e {
+        ERR_ALREADY_IN_FILE => ERR_ALREADY_IN_FILE,
+        ERR_NOT_IN_FILE => ERR_NOT_IN_FILE,
+        _ => "failed to save configuration",
+    }
+}
+
+/// An `access_keys` entry for `key`. Fields this server does not know about
+/// stay as they are in `existing`; the short form (a bare string) is used when
+/// there is nothing to say about the user.
+fn key_entry(key: &str, meta: &UserMeta, existing: Option<&serde_json::Value>) -> serde_json::Value {
+    use serde_json::Value;
+    if existing.is_none_or(|e| e.is_string()) && meta.name.is_none() && meta.limit_bytes.is_none() && meta.max_devices.is_none() {
+        return Value::String(key.to_string());
+    }
+    let mut obj = match existing {
+        Some(Value::Object(o)) => o.clone(),
+        _ => serde_json::Map::new(),
+    };
+    obj.insert("access_key".to_string(), Value::String(key.to_string()));
+    for (field, value) in [
+        ("name", meta.name.clone().map(Value::String)),
+        ("limit_bytes", meta.limit_bytes.map(|n| Value::Number(n.into()))),
+        ("max_devices", meta.max_devices.map(|n| Value::Number(n.into()))),
+    ] {
+        match value {
+            Some(v) => {
+                obj.insert(field.to_string(), v);
+            }
+            None => {
+                obj.remove(field);
+            }
+        }
+    }
+    Value::Object(obj)
+}
+
+fn apply_key_change(config: &mut serde_json::Value, change: &KeyChange) -> Result<(), String> {
+    use ostp_core::access_keys::key_of;
+    let obj = config.as_object_mut().ok_or("config root is not an object")?;
+    let list = obj
+        .entry("access_keys")
+        .or_insert_with(|| serde_json::Value::Array(Vec::new()))
+        .as_array_mut()
+        .ok_or("access_keys is not a list")?;
+    let position = |list: &[serde_json::Value], key: &str| list.iter().position(|e| key_of(e).as_deref() == Some(key));
+    match change {
+        KeyChange::Add(users) => {
+            if users.iter().any(|(k, _)| position(list, k).is_some()) {
+                return Err(ERR_ALREADY_IN_FILE.to_string());
+            }
+            for (k, m) in users {
+                list.push(key_entry(k, m, None));
+            }
+        }
+        KeyChange::Set { key, meta } => {
+            let i = position(list, key).ok_or(ERR_NOT_IN_FILE)?;
+            list[i] = key_entry(key, meta, Some(&list[i]));
+        }
+        KeyChange::Remove(key) => list.retain(|e| key_of(e).as_deref() != Some(key.as_str())),
+    }
+    Ok(())
+}
+
+/// Applies `change` to config.json under the config lock. Without a config
+/// path (run-time only) there is nothing to save.
+fn save_key_change(state: &ApiState, change: KeyChange) -> Result<(), String> {
     let Some(ref path) = state.config_path else {
         return Ok(());
     };
-
-    edit_config(path, false, |json_val| {
-        // Read inside the lock: the newest in-memory state is what gets written,
-        // whichever request got here first.
-        let keys = state.access_keys.read().unwrap_or_else(|e| e.into_inner());
-        let mut access_keys_json = Vec::new();
-        for (k, m) in keys.iter() {
-            if m.name.is_none() && m.limit_bytes.is_none() && m.max_devices.is_none() {
-                access_keys_json.push(serde_json::Value::String(k.clone()));
-            } else {
-                let mut obj = serde_json::Map::new();
-                obj.insert("access_key".to_string(), serde_json::Value::String(k.clone()));
-                if let Some(ref name) = m.name {
-                    obj.insert("name".to_string(), serde_json::Value::String(name.clone()));
-                }
-                if let Some(limit) = m.limit_bytes {
-                    obj.insert("limit_bytes".to_string(), serde_json::Value::Number(limit.into()));
-                }
-                if let Some(n) = m.max_devices {
-                    obj.insert("max_devices".to_string(), serde_json::Value::Number(n.into()));
-                }
-                access_keys_json.push(serde_json::Value::Object(obj));
-            }
-        }
-        match json_val.as_object_mut() {
-            Some(obj) => {
-                obj.insert("access_keys".to_string(), serde_json::Value::Array(access_keys_json));
-                Ok(())
-            }
-            None => Err("config root is not an object".to_string()),
-        }
-    })
+    edit_config(path, false, |config| apply_key_change(config, &change))
 }
 
 
@@ -769,7 +926,7 @@ async fn handle_put_config(
     {
         // Same lock as every other change, so a user created at this moment is
         // not half-merged into the new file; a copy of the old file is kept.
-        let _guard = CONFIG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = lock_config(path);
         let _ = std::fs::copy(path, path.with_extension("json.bak"));
         if let Err(e) = write_config_atomic(path, &new_content) {
             return api_error(&e);
@@ -805,7 +962,7 @@ async fn handle_status(
     }
 
     let status = ServerStatus {
-        version: env!("CARGO_PKG_VERSION"),
+        version: build_version(),
         uptime_seconds: state.start_time.elapsed().as_secs(),
         active_users: active,
         total_users: keys.len(),
@@ -950,23 +1107,62 @@ async fn handle_create_user(
         if keys.len() >= MAX_USERS {
             return api_error::<String>("too many users (10000 at most)");
         }
-        keys.insert(key.clone(), UserMeta { name, limit_bytes: body.limit_bytes, max_devices });
+        keys.insert(key.clone(), UserMeta { name: name.clone(), limit_bytes: body.limit_bytes, max_devices });
     }
 
     let mut stats = state.user_stats.write().unwrap_or_else(|e| e.into_inner());
     stats.insert(key.clone(), Arc::new(UserStats::new(body.limit_bytes)));
     drop(stats);
 
-    if let Err(e) = save_config_keys(&state) {
+    let meta = UserMeta { name, limit_bytes: body.limit_bytes, max_devices };
+    if let Err(e) = save_key_change(&state, KeyChange::Add(vec![(key.clone(), meta)])) {
         tracing::error!("Failed to save config after creating user: {}", e);
         // Not on disk, so not kept in memory either: a restart would lose it silently.
         state.access_keys.write().unwrap_or_else(|e| e.into_inner()).remove(&key);
         state.user_stats.write().unwrap_or_else(|e| e.into_inner()).remove(&key);
-        return api_error::<String>("failed to save configuration");
+        return api_error::<String>(save_error_message(&e));
     }
 
     tracing::info!("API: created user key (fp={})", crate::dispatcher::key_fp(&key));
     (StatusCode::OK, ApiResponse::success(key))
+}
+
+/// Puts a new traffic limit into a user's live counters, keeping the counts.
+/// Returns the counters that were there, to put back if the save fails.
+fn replace_stats_limit(state: &ApiState, key: &str, limit: Option<u64>) -> Option<Arc<UserStats>> {
+    let mut stats = state.user_stats.write().unwrap_or_else(|e| e.into_inner());
+    let old = stats.get(key).cloned();
+    let entry = stats.entry(key.to_string()).or_insert_with(|| Arc::new(UserStats::new(limit)));
+    *entry = Arc::new(UserStats {
+        bytes_up: AtomicU64::new(entry.bytes_up.load(Ordering::Relaxed)),
+        bytes_down: AtomicU64::new(entry.bytes_down.load(Ordering::Relaxed)),
+        connections: AtomicU64::new(entry.connections.load(Ordering::Relaxed)),
+        limit_bytes: limit,
+        created_at: entry.created_at,
+    });
+    old
+}
+
+/// Undoes a change that could not be saved: memory goes back to what the file
+/// says, so a restart does not silently change it.
+fn restore_user(state: &ApiState, key: &str, meta: Option<UserMeta>, stats: Option<Arc<UserStats>>) {
+    match meta {
+        Some(m) => {
+            state.access_keys.write().unwrap_or_else(|e| e.into_inner()).insert(key.to_string(), m);
+        }
+        None => {
+            state.access_keys.write().unwrap_or_else(|e| e.into_inner()).remove(key);
+        }
+    }
+    let mut live = state.user_stats.write().unwrap_or_else(|e| e.into_inner());
+    match stats {
+        Some(s) => {
+            live.insert(key.to_string(), s);
+        }
+        None => {
+            live.remove(key);
+        }
+    }
 }
 
 async fn delete_user(
@@ -978,23 +1174,21 @@ async fn delete_user(
         return api_unauthorized::<String>();
     }
 
-    {
-        let mut keys = state.access_keys.write().unwrap_or_else(|e| e.into_inner());
-        if keys.remove(&key).is_none() {
-            return api_error::<String>("User not found");
-        }
-    }
+    let old_meta = match state.access_keys.write().unwrap_or_else(|e| e.into_inner()).remove(&key) {
+        Some(m) => m,
+        None => return api_error::<String>("User not found"),
+    };
+    let old_stats = state.user_stats.write().unwrap_or_else(|e| e.into_inner()).remove(&key);
 
-    {
-        let mut stats = state.user_stats.write().unwrap_or_else(|e| e.into_inner());
-        stats.remove(&key);
-    }
-    state.devices.clear(&ostp_core::subscription::token_for_key(&key));
-
-    if let Err(e) = save_config_keys(&state) {
+    if let Err(e) = save_key_change(&state, KeyChange::Remove(key.clone())) {
         tracing::error!("Failed to save config after removing user: {}", e);
-        return api_error::<String>("failed to save configuration");
+        restore_user(&state, &key, Some(old_meta), old_stats);
+        return api_error::<String>(save_error_message(&e));
     }
+    // Only once the removal is on disk: the record of its devices goes with it.
+    let devices = state.devices.clone();
+    let token = ostp_core::subscription::token_for_key(&key);
+    let _ = tokio::task::spawn_blocking(move || devices.clear(&token)).await;
 
     (StatusCode::OK, ApiResponse::success("User removed".to_string()))
 }
@@ -1009,12 +1203,15 @@ async fn update_user(
         return api_unauthorized::<String>();
     }
 
-    let name = match check_name(body.name) {
+    // Absent = unchanged, `null` = cleared (a name removed, no limit).
+    let name = match body.name.map(check_name).transpose() {
         Ok(n) => n,
         Err(m) => return api_error::<String>(m),
     };
-    if let Err(m) = check_limit(body.limit_bytes) {
-        return api_error::<String>(m);
+    if let Some(Some(l)) = body.limit_bytes {
+        if let Err(m) = check_limit(Some(l)) {
+            return api_error::<String>(m);
+        }
     }
     let max_devices = match body.max_devices {
         Some(n) => match check_devices(n) {
@@ -1024,36 +1221,34 @@ async fn update_user(
         None => None,
     };
 
-    {
+    let (old_meta, new_meta) = {
         let mut keys = state.access_keys.write().unwrap_or_else(|e| e.into_inner());
-        if let Some(meta) = keys.get_mut(&key) {
-            meta.name = name;
-            meta.limit_bytes = body.limit_bytes;
-            if let Some(n) = max_devices {
-                meta.max_devices = n;
-            }
-        } else {
+        let Some(meta) = keys.get_mut(&key) else {
             return api_error::<String>("User not found");
+        };
+        let old = meta.clone();
+        if let Some(n) = name {
+            meta.name = n;
         }
-    }
+        if let Some(l) = body.limit_bytes {
+            meta.limit_bytes = l;
+        }
+        if let Some(n) = max_devices {
+            meta.max_devices = n;
+        }
+        (old, meta.clone())
+    };
+    let old_stats = if body.limit_bytes.is_some() {
+        replace_stats_limit(&state, &key, new_meta.limit_bytes)
+    } else {
+        None
+    };
 
-    {
-        let mut stats = state.user_stats.write().unwrap_or_else(|e| e.into_inner());
-        let entry = stats.entry(key.clone())
-            .or_insert_with(|| Arc::new(UserStats::new(body.limit_bytes)));
-        
-        *entry = Arc::new(UserStats {
-            bytes_up: AtomicU64::new(entry.bytes_up.load(Ordering::Relaxed)),
-            bytes_down: AtomicU64::new(entry.bytes_down.load(Ordering::Relaxed)),
-            connections: AtomicU64::new(entry.connections.load(Ordering::Relaxed)),
-            limit_bytes: body.limit_bytes,
-            created_at: entry.created_at,
-        });
-    }
-
-    if let Err(e) = save_config_keys(&state) {
+    if let Err(e) = save_key_change(&state, KeyChange::Set { key: key.clone(), meta: new_meta }) {
         tracing::error!("Failed to save config after updating user: {}", e);
-        return api_error::<String>("failed to save configuration");
+        let current_stats = state.user_stats.read().unwrap_or_else(|e| e.into_inner()).get(&key).cloned();
+        restore_user(&state, &key, Some(old_meta), if body.limit_bytes.is_some() { old_stats } else { current_stats });
+        return api_error::<String>(save_error_message(&e));
     }
 
     (StatusCode::OK, ApiResponse::success("User updated".to_string()))
@@ -1072,31 +1267,21 @@ async fn handle_set_limit(
         return api_error(m);
     }
 
-    {
+    let (old_meta, new_meta) = {
         let mut keys = state.access_keys.write().unwrap_or_else(|e| e.into_inner());
-        if let Some(meta) = keys.get_mut(&key) {
-            meta.limit_bytes = body.limit_bytes;
-        } else {
+        let Some(meta) = keys.get_mut(&key) else {
             return api_error("user not found");
-        }
-    }
+        };
+        let old = meta.clone();
+        meta.limit_bytes = body.limit_bytes;
+        (old, meta.clone())
+    };
+    let old_stats = replace_stats_limit(&state, &key, body.limit_bytes);
 
-    let mut stats = state.user_stats.write().unwrap_or_else(|e| e.into_inner());
-    let entry = stats.entry(key.clone())
-        .or_insert_with(|| Arc::new(UserStats::new(body.limit_bytes)));
-
-    *entry = Arc::new(UserStats {
-        bytes_up: AtomicU64::new(entry.bytes_up.load(Ordering::Relaxed)),
-        bytes_down: AtomicU64::new(entry.bytes_down.load(Ordering::Relaxed)),
-        connections: AtomicU64::new(entry.connections.load(Ordering::Relaxed)),
-        limit_bytes: body.limit_bytes,
-        created_at: entry.created_at,
-    });
-    drop(stats);
-
-    if let Err(e) = save_config_keys(&state) {
+    if let Err(e) = save_key_change(&state, KeyChange::Set { key: key.clone(), meta: new_meta }) {
         tracing::error!("Failed to save config after setting user limit: {}", e);
-        return api_error("failed to save configuration");
+        restore_user(&state, &key, Some(old_meta), old_stats);
+        return api_error(save_error_message(&e));
     }
 
     (StatusCode::OK, ApiResponse::success(true))
@@ -1278,14 +1463,15 @@ async fn handle_subscribe(
     use axum::response::IntoResponse;
 
     // Validate that the key exists in a tightly scoped block to drop the guard
-    let key_exists = {
+    let max_devices = {
         let keys = state.access_keys.read().unwrap_or_else(|e| e.into_inner());
-        keys.contains_key(&key)
+        keys.get(&key).map(|m| m.max_devices)
     };
 
-    if !key_exists {
-        // Guessing is capped server-wide (see LOGIN_BUCKET for why not per
-        // address); a correct key is never counted or refused.
+    let Some(max_devices) = max_devices else {
+        // Guessing is capped server-wide (behind the tunnel and the HTTPS
+        // frontend the peer is always loopback, so not per address); a correct
+        // key is never counted or refused.
         if !SUBSCRIBE_MISSES.allowed(SUBSCRIBE_SOURCE) {
             return StatusCode::TOO_MANY_REQUESTS.into_response();
         }
@@ -1293,6 +1479,21 @@ async fn handle_subscribe(
         return (StatusCode::NOT_FOUND, Json(serde_json::json!({
             "ok": false,
             "error": "invalid access key"
+        }))).into_response();
+    };
+
+    // The same device limit as the subscription endpoint: this one hands out the
+    // same profile, so it must not be a way around the limit.
+    let header = |name: &str| headers.get(name).and_then(|v| v.to_str().ok()).unwrap_or("");
+    let hwid = crate::devices::Hwid::parse(header("x-hwid"), header("x-device-os"), header("x-device-model"));
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let token = ostp_core::subscription::token_for_key(&key);
+    if let Err(refusal) = state.devices.check_blocking(&token, max_devices, hwid, now).await {
+        let (code, message) = refusal.code_and_message();
+        return (StatusCode::FORBIDDEN, Json(serde_json::json!({
+            "ok": false,
+            "error": code,
+            "message": message
         }))).into_response();
     }
 
@@ -1322,18 +1523,20 @@ async fn handle_subscribe(
         }))).into_response();
     }
 
-    let transport = if chosen.tls {
+    let carrier = if chosen.tls {
         serde_json::json!({ "mode": "uot", "tls": true, "ws_path": chosen.path })
     } else {
         serde_json::json!({ "mode": "udp" })
     };
 
-    // Default: return full client config JSON
-    let config = serde_json::json!({
+    // Default: return full client config JSON. `server_pk` makes it a v6 profile
+    // when the server has a key (without it the client would speak v5 and not
+    // check the server); `carrier` is the section new configs write.
+    let mut config = serde_json::json!({
         "mode": "client",
         "server": chosen.server(),
         "access_key": key,
-        "transport": transport,
+        "carrier": carrier,
         "socks5_bind": "127.0.0.1:1088",
         "tun": {
             "enable": false,
@@ -1344,15 +1547,15 @@ async fn handle_subscribe(
             "ips": [],
             "processes": []
         },
-        "turn": {
-            "enabled": false
-        },
         "mux": {
             "enabled": false,
             "sessions": 1
         },
         "debug": false
     });
+    if let Some(pk) = state.server_pk {
+        config["server_pk"] = serde_json::Value::String(ostp_core::server_key::encode_key(&pk));
+    }
 
     (StatusCode::OK, Json(serde_json::json!({
         "ok": true,
@@ -1545,8 +1748,101 @@ mod tests {
         }
         let v = parse_config(&path).unwrap();
         assert_eq!(v["n"].as_array().unwrap().len(), 16);
-        assert!(!dir.join("config.json.tmp").exists());
+        let leftovers = std::fs::read_dir(&dir).unwrap().filter_map(|e| e.ok()).filter(|e| e.file_name().to_string_lossy().ends_with(".tmp")).count();
+        assert_eq!(leftovers, 0);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn meta(name: Option<&str>, limit: Option<u64>) -> UserMeta {
+        UserMeta { name: name.map(String::from), limit_bytes: limit, max_devices: None }
+    }
+
+    /// A change is applied to the list on disk: a user the CLI added and the
+    /// server has not reloaded yet survives, and so do unknown fields.
+    #[test]
+    fn test_key_change_keeps_what_is_on_disk() {
+        let mut cfg = serde_json::json!({
+            "mode": "server",
+            "access_keys": ["cli-added-key", {"access_key": "kept-key", "name": "old", "note": "x"}]
+        });
+        apply_key_change(&mut cfg, &KeyChange::Add(vec![("new-key-0001".into(), meta(None, None))])).unwrap();
+        apply_key_change(&mut cfg, &KeyChange::Set { key: "kept-key".into(), meta: meta(Some("new"), Some(5)) }).unwrap();
+        let list = cfg["access_keys"].as_array().unwrap();
+        assert_eq!(list.len(), 3);
+        assert_eq!(list[0], "cli-added-key");
+        assert_eq!(list[1]["name"], "new");
+        assert_eq!(list[1]["limit_bytes"], 5);
+        assert_eq!(list[1]["note"], "x");
+        assert_eq!(list[2], "new-key-0001", "a user with nothing to say stays a bare string");
+
+        apply_key_change(&mut cfg, &KeyChange::Remove("kept-key".into())).unwrap();
+        assert_eq!(cfg["access_keys"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            apply_key_change(&mut cfg, &KeyChange::Add(vec![("cli-added-key".into(), meta(None, None))])),
+            Err(ERR_ALREADY_IN_FILE.to_string())
+        );
+        assert_eq!(
+            apply_key_change(&mut cfg, &KeyChange::Set { key: "gone".into(), meta: meta(None, None) }),
+            Err(ERR_NOT_IN_FILE.to_string())
+        );
+    }
+
+    #[test]
+    fn test_login_limit_is_per_address_with_a_larger_global_cap() {
+        let now = Instant::now();
+        let mut l = LoginLimiter::new(now);
+        let a: std::net::IpAddr = "203.0.113.1".parse().unwrap();
+        let b: std::net::IpAddr = "203.0.113.2".parse().unwrap();
+        for _ in 0..10 {
+            assert!(l.reserve(a, now));
+        }
+        assert!(!l.reserve(a, now), "one address is out of attempts");
+        assert!(l.reserve(b, now), "another address is not locked out by it");
+        l.refund(b);
+        // A minute later the address has 10 attempts again.
+        assert!(l.reserve(a, now + std::time::Duration::from_secs(60)));
+        // The server-wide ceiling still holds against many addresses.
+        let mut allowed = 0;
+        for i in 0..400u32 {
+            let ip: std::net::IpAddr = std::net::Ipv4Addr::from(0x0a00_0000 + i).into();
+            allowed += usize::from(l.reserve(ip, now));
+        }
+        assert!(allowed < 400 && allowed > 100, "{allowed}");
+    }
+
+    #[test]
+    fn test_login_source_groups_ipv6_by_64() {
+        let x: std::net::IpAddr = "2001:db8:1:2:aaaa::1".parse().unwrap();
+        let y: std::net::IpAddr = "2001:db8:1:2:bbbb::9".parse().unwrap();
+        assert_eq!(login_source(x), login_source(y));
+        let v4: std::net::IpAddr = "198.51.100.7".parse().unwrap();
+        assert_eq!(login_source(v4), v4);
+    }
+
+    #[test]
+    fn test_panel_files_cannot_be_framed() {
+        let h = panel_headers("text/html");
+        assert!(h.iter().any(|(k, v)| *k == header::X_FRAME_OPTIONS && v == "DENY"));
+        assert!(h.iter().any(|(k, v)| *k == header::X_CONTENT_TYPE_OPTIONS && v == "nosniff"));
+        assert!(h.iter().any(|(k, v)| *k == header::CONTENT_SECURITY_POLICY && v.contains("frame-ancestors 'none'")));
+    }
+
+    #[test]
+    fn test_build_version_carries_the_channel() {
+        let v = build_version();
+        assert!(v.starts_with(env!("CARGO_PKG_VERSION")), "{v}");
+        assert!(!v.starts_with('v'));
+    }
+
+    #[test]
+    fn test_update_request_tells_absent_from_null() {
+        let r: UpdateUserRequest = serde_json::from_str(r#"{"max_devices": 2}"#).unwrap();
+        assert_eq!(r.name, None);
+        assert_eq!(r.limit_bytes, None);
+        let r: UpdateUserRequest = serde_json::from_str(r#"{"name": null, "limit_bytes": 7}"#).unwrap();
+        assert_eq!(r.name, Some(None));
+        assert_eq!(r.limit_bytes, Some(Some(7)));
+        assert_eq!(r.max_devices, None);
     }
 
     /// A config that does not parse is not overwritten.
@@ -1721,13 +2017,17 @@ async fn handle_bulk_create_users(
     }
     // Save keys by dropping lock, then saving to config
     drop(keys);
-    if let Err(e) = save_config_keys(&state) {
+    let added = new_keys
+        .iter()
+        .map(|k| (k.clone(), UserMeta { name: None, limit_bytes: payload.limit_bytes, max_devices: bulk_devices }))
+        .collect();
+    if let Err(e) = save_key_change(&state, KeyChange::Add(added)) {
         tracing::error!("Failed to save config after bulk create: {}", e);
         let mut keys = state.access_keys.write().unwrap_or_else(|e| e.into_inner());
         for k in &new_keys {
             keys.remove(k);
         }
-        return api_error("failed to save configuration");
+        return api_error(save_error_message(&e));
     }
 
     (StatusCode::OK, ApiResponse::success(new_keys))

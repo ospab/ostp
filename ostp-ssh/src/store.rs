@@ -189,6 +189,16 @@ impl Store {
         self.servers.iter().map(ServerInfo::from).collect()
     }
 
+    /// The host key remembered for this login on this machine, when it is in
+    /// the list: a connection to it is checked against that key before any
+    /// password or key is sent.
+    pub fn known_host_key(&self, target: &Target) -> Option<String> {
+        self.servers
+            .iter()
+            .find(|s| s.host.eq_ignore_ascii_case(&target.host) && s.port == target.port && s.user == target.user)
+            .map(|s| s.host_key.clone())
+    }
+
     pub fn get(&self, id: &str) -> Result<&Server> {
         self.servers.iter().find(|s| s.id == id).ok_or_else(|| anyhow!("no such server"))
     }

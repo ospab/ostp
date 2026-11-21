@@ -106,6 +106,17 @@ pub fn run(action: ManageAction, config_path: &Path, json_out: bool) -> ! {
         ManageAction::Logs { .. } => Shown::Logs,
         ManageAction::Restart => Shown::Restart,
     };
+    // A user change is one edit of the file: a change the server's panel made in
+    // between (or another CLI) is not overwritten.
+    let _lock = matches!(
+        action,
+        ManageAction::UserAdd { .. }
+            | ManageAction::UserSet { .. }
+            | ManageAction::UserRemove { .. }
+            | ManageAction::UserRename { .. }
+            | ManageAction::UserLimit { .. }
+    )
+    .then(|| ostp_server::config_io::lock_config(config_path));
     let result = match action {
         ManageAction::Install { port, host, user } => install(config_path, port, host.as_deref(), &user),
         ManageAction::Status => status(config_path),
@@ -169,13 +180,19 @@ fn save(config_path: &Path, v: &Value) -> Result<()> {
 fn find_user(v: &Value, who: &str) -> Result<usize> {
     let keys = v["access_keys"].as_array().ok_or_else(|| anyhow!("the config has no access_keys"))?;
     let who = who.trim();
-    keys.iter()
-        .enumerate()
-        .find(|(i, u)| {
-            let (key, name) = key_and_name(u);
-            who == (i + 1).to_string() || who == key || (!name.is_empty() && who.eq_ignore_ascii_case(&name))
+    // An exact key first, then a name, and a number last: a user named "2" must
+    // not shadow user #2's key or the name of another.
+    let by_key = keys.iter().position(|u| key_and_name(u).0 == who);
+    let by_name = || {
+        keys.iter().position(|u| {
+            let name = key_and_name(u).1;
+            !name.is_empty() && who.eq_ignore_ascii_case(&name)
         })
-        .map(|(i, _)| i)
+    };
+    let by_number = || who.parse::<usize>().ok().filter(|n| (1..=keys.len()).contains(n)).map(|n| n - 1);
+    by_key
+        .or_else(by_name)
+        .or_else(by_number)
         .ok_or_else(|| {
             let names: Vec<String> = keys
                 .iter()

@@ -76,10 +76,61 @@ pub struct PanelOpts {
     pub no_restart: bool,
 }
 
+/// What `panel enable` needs from a person or a pipe. Asked before the config
+/// lock is taken: the lock is never held while waiting for input.
+struct EnableInput {
+    username: Option<String>,
+    password: Option<String>,
+}
+
+fn enable_input(config_path: &Path) -> Result<EnableInput> {
+    let v = read_json(config_path)?;
+    let api = api_obj(&v);
+    let tty = std::io::stdin().is_terminal();
+    let has_hash = !str_of(&api, "password_hash").is_empty();
+    let username = if str_of(&api, "username").is_empty() {
+        let name = if tty { prompt_line("Sign-in name [admin]: ")? } else { String::new() };
+        Some(if name.is_empty() { "admin".to_string() } else { name })
+    } else {
+        None
+    };
+    let password = if !tty {
+        // Piped (the manager over SSH, a script): the password it sends is the
+        // one to set, also when one exists. An empty pipe keeps the old one.
+        let first = read_secret("")?;
+        if first.is_empty() && has_hash {
+            None
+        } else {
+            if first.chars().count() < 8 {
+                bail!("the password must be at least 8 characters");
+            }
+            Some(first)
+        }
+    } else if !has_hash {
+        println!("  The panel needs a password (it controls the server).");
+        Some(read_new_password()?)
+    } else {
+        None
+    };
+    Ok(EnableInput { username, password })
+}
+
 pub fn run(action: PanelAction, config_path: &Path) -> Result<()> {
+    // Input first, the lock after: see `enable_input`.
+    let enable = match &action {
+        PanelAction::Enable(_) => Some(enable_input(config_path)?),
+        _ => None,
+    };
+    let new_password = match &action {
+        PanelAction::Passwd { .. } => Some(read_new_password()?),
+        _ => None,
+    };
+    // One command, one edit: a user added by another process in between is kept.
+    let _lock = ostp_server::config_io::lock_config(config_path);
     match action {
         PanelAction::Status => status(config_path),
         PanelAction::Enable(o) => {
+            let enable = enable.expect("read above");
             let mut v = read_json(config_path)?;
             let mut api = api_obj(&v);
             api["enabled"] = true.into();
@@ -93,12 +144,13 @@ pub fn run(action: PanelAction, config_path: &Path) -> Result<()> {
                 api["webpath"] = crate::cert_cmd::random_path().trim_start_matches('/').into();
             }
             if str_of(&api, "username").is_empty() {
-                let name = if std::io::stdin().is_terminal() { prompt_line("Sign-in name [admin]: ")? } else { String::new() };
-                api["username"] = if name.is_empty() { "admin".into() } else { name.into() };
+                api["username"] = enable.username.unwrap_or_else(|| "admin".into()).into();
+            }
+            if let Some(p) = &enable.password {
+                api["password_hash"] = hash(p).into();
             }
             if str_of(&api, "password_hash").is_empty() {
-                println!("  The panel needs a password (it controls the server).");
-                api["password_hash"] = hash(&read_new_password()?).into();
+                bail!("the panel needs a password: run ostp panel passwd");
             }
             v["api"] = api;
             save(config_path, &v)?;
@@ -132,7 +184,7 @@ pub fn run(action: PanelAction, config_path: &Path) -> Result<()> {
             if str_of(&api, "username").is_empty() {
                 bail!("no sign-in name yet: ostp panel passwd --user NAME");
             }
-            api["password_hash"] = hash(&read_new_password()?).into();
+            api["password_hash"] = hash(&new_password.expect("read above")).into();
             v["api"] = api;
             save(config_path, &v)?;
             println!("  {} Password set for \"{}\"; signed-in sessions end on restart", "✓".green(), str_of(&v["api"], "username"));

@@ -124,6 +124,9 @@ fn install() -> Result<()> {
 }
 
 pub fn run(action: OvernetAction, config_path: &Path) -> Result<()> {
+    // One command, one edit of the file.
+    let _lock = (!matches!(action, OvernetAction::Status | OvernetAction::Install))
+        .then(|| ostp_server::config_io::lock_config(config_path));
     match action {
         OvernetAction::Status => status(config_path),
         OvernetAction::Install => install(),

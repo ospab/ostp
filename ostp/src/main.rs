@@ -83,8 +83,15 @@ enum Commands {
     Connect {
         url: String,
     },
-    /// Uninstall OSTP: stop service, remove binary and configuration files
-    Uninstall,
+    /// Uninstall OSTP: stop service, remove the binary (the configuration stays unless --purge)
+    Uninstall {
+        /// Do not ask for confirmation (required when there is no terminal)
+        #[arg(long)]
+        yes: bool,
+        /// Also delete the configuration, certificates and every user key
+        #[arg(long)]
+        purge: bool,
+    },
     /// Update OSTP: re-run the install script to fetch and install the latest version
     Update {
         /// Release branch to update from (stable, beta, alpha)
@@ -199,7 +206,6 @@ struct LegacyArgs {
     links: bool,
     check: bool,
     url: Option<String>,
-    uninstall: bool,
     update: bool,
     update_branch: String,
     target_version: Option<String>,
@@ -852,7 +858,13 @@ fn keep_copy_before_replacing(path: &std::path::Path, force: bool, interactive: 
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or_default();
-    let copy = dated_copy_path(path, secs);
+    let mut copy = dated_copy_path(path, secs);
+    // Two runs in one second must not overwrite the first copy.
+    let mut n = 1;
+    while copy.exists() {
+        copy = PathBuf::from(format!("{}.{n}", dated_copy_path(path, secs).display()));
+        n += 1;
+    }
     fs::copy(path, &copy).map_err(|e| anyhow!("cannot copy {:?} to {:?}: {e}; nothing was changed", path, copy))?;
     #[cfg(unix)]
     {
@@ -1321,7 +1333,6 @@ async fn run_app() -> Result<()> {
         links: false,
         check: false,
         url: None,
-        uninstall: false,
         update: false,
         update_branch: "stable".to_string(),
         target_version: None,
@@ -1365,7 +1376,7 @@ async fn run_app() -> Result<()> {
             Commands::Links { view: None, .. } => { args.links = true; }
             Commands::Check => { args.check = true; }
             Commands::Connect { url } => { args.url = Some(url); }
-            Commands::Uninstall => { args.uninstall = true; }
+            Commands::Uninstall { yes, purge } => return cmd_uninstall(&args.config, yes, purge),
             Commands::Update { branch, version } => { args.update = true; args.update_branch = branch; args.target_version = version; }
             Commands::Import { url } => { args.import = Some(url); }
             Commands::ProxyEnv => { args.proxy_env = true; }
@@ -1389,10 +1400,6 @@ async fn run_app() -> Result<()> {
                 return changelog_cmd::run(changelog_cmd::Options { all, last, version, lang });
             }
         }
-    }
-
-    if args.uninstall {
-        return cmd_uninstall();
     }
 
     if args.update {
@@ -1996,7 +2003,25 @@ async fn run_app() -> Result<()> {
 }
 
 #[cfg(unix)]
-fn cmd_uninstall() -> Result<()> {
+fn cmd_uninstall(config_path: &std::path::Path, yes: bool, purge: bool) -> Result<()> {
+    use std::io::IsTerminal;
+    let config_dir = config_dir_of(config_path);
+    if !yes {
+        if !std::io::stdin().is_terminal() {
+            anyhow::bail!("`ostp uninstall` removes the service and the program; pass --yes to confirm (and --purge to delete the configuration too)");
+        }
+        print!(
+            "This removes the OSTP service and program{}. Type yes to continue: ",
+            if purge { format!(", and deletes {} with every user key", config_dir.display()) } else { String::new() }
+        );
+        std::io::Write::flush(&mut std::io::stdout()).ok();
+        let mut answer = String::new();
+        std::io::stdin().read_line(&mut answer)?;
+        if !answer.trim().eq_ignore_ascii_case("yes") {
+            println!("[ostp] Nothing was removed.");
+            return Ok(());
+        }
+    }
 
     println!("[ostp] Uninstalling");
 
@@ -2018,13 +2043,24 @@ fn cmd_uninstall() -> Result<()> {
     }
 
     // 5. Take the OSTP site back out of nginx/apache/caddy, if one was added
-    webserver::uninstall(std::path::Path::new("/etc/ostp"));
+    webserver::uninstall(&config_dir);
 
-    // 6. Remove configuration directory (certificates included)
-    let config_dir = std::path::Path::new("/etc/ostp");
-    if config_dir.exists() {
-        fs::remove_dir_all(config_dir)?;
-        println!("[ostp] Removed {}", config_dir.display());
+    // 6. The configuration (certificates included) only with --purge. The
+    // directory goes whole only when it is the install's own; for a config
+    // kept somewhere shared, just the config file and its copy.
+    if purge {
+        if config_dir == std::path::Path::new("/etc/ostp") {
+            if config_dir.exists() {
+                fs::remove_dir_all(&config_dir)?;
+                println!("[ostp] Removed {}", config_dir.display());
+            }
+        } else if config_path.exists() {
+            fs::remove_file(config_path)?;
+            let _ = fs::remove_file(config_path.with_extension("json.bak"));
+            println!("[ostp] Removed {} (the directory {} is left as it is)", config_path.display(), config_dir.display());
+        }
+    } else {
+        println!("[ostp] Configuration kept in {} (delete it with --purge).", config_dir.display());
     }
 
     println!("[ostp] Done.");
@@ -2032,7 +2068,7 @@ fn cmd_uninstall() -> Result<()> {
 }
 
 #[cfg(not(unix))]
-fn cmd_uninstall() -> Result<()> {
+fn cmd_uninstall(_config_path: &std::path::Path, _yes: bool, _purge: bool) -> Result<()> {
     anyhow::bail!("`ostp uninstall` works on Linux only");
 }
 
