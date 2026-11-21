@@ -51,9 +51,10 @@ jobs:
             cargo-check-
       - name: Dummy dist for rust-embed
         run: mkdir -p ostp-control/dist && touch ostp-control/dist/index.html
-      # Unit and end-to-end tests (v6 wire, roaming) of the core, client, server and CLI.
+      # Unit and end-to-end tests (v6 wire, roaming) of the core, client, server and CLI;
+      # the Android JNI bridge is built for the host and its exports are checked against Kotlin.
       - name: cargo test
-        run: cargo test -p ostp-core -p ostp-client -p ostp-server -p ostp -p ostp-ssh
+        run: cargo test -p ostp-core -p ostp-client -p ostp-server -p ostp -p ostp-ssh -p ostp-jni
 
   linux-binary:
     name: Linux binary (x86_64, musl)

@@ -90,4 +90,12 @@ object OstpClientSdk {
     @Keep
     @JvmStatic
     external fun serversCall(dataDir: String, masterKey: String, requestJson: String): String
+
+    /**
+     * Replaces the exclusions of the running client (JSON with `domains`,
+     * `ips`, `processes`); false when no client runs or the JSON is invalid.
+     */
+    @Keep
+    @JvmStatic
+    external fun updateExclusions(json: String): Boolean
 }
