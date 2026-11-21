@@ -26,11 +26,16 @@ pub const TARGET_DELAY: Duration = Duration::from_millis(100);
 /// Frames allowed whatever the rate: a slow link still moves, and a short
 /// queue never starves the writer between two refills.
 pub const MIN_FRAMES: usize = 64;
-/// Until the first measurement (about 1 MB): enough for a fast start.
-pub const START_FRAMES: usize = 768;
+/// Until the first measurement (about 170 KB). It was 768 frames (1 MB),
+/// which at 3 Mbit/s is 2.8 s of queue, at every new connection, which is
+/// exactly when a client that reconnected is waiting for its pages. The
+/// meter now measures within about `SAMPLE_WINDOW` of busy time, and a fast
+/// link earns its longer queue from that.
+pub const START_FRAMES: usize = 128;
 /// Bytes of a typical full frame, to turn a rate into frames.
 const FRAME_BYTES: u64 = 1350;
-/// A rate sample covers at least this much backlogged time.
+/// A rate sample covers at least this much backlogged time, added up over
+/// busy periods however short.
 const SAMPLE_WINDOW: Duration = Duration::from_millis(100);
 /// Unsent bytes the kernel keeps for a TCP client (Linux). `sendmsg()` adds
 /// no new buffers past it (Documentation/networking/ip-sysctl.rst,
@@ -93,30 +98,36 @@ impl Drain {
 
 /// Measures a writer's drain rate: only time when frames were waiting counts,
 /// since an idle connection says nothing about how fast it could go.
+///
+/// A write that follows one which left frames waiting drained its bytes in
+/// the time between the two: that interval is busy time. Busy time is added
+/// up across busy periods until there is `SAMPLE_WINDOW` of it. It used to
+/// need 100 ms of backlog without a break and started over whenever the
+/// queue ran empty, which on a fast link happens all the time: the estimate
+/// then hardly ever moved.
 pub struct Meter {
     drain: Arc<Drain>,
-    since: Option<Instant>,
+    /// When the last write ended, if it left frames waiting.
+    last: Option<Instant>,
+    busy: Duration,
     bytes: u64,
 }
 
 impl Meter {
     pub fn new(drain: Arc<Drain>) -> Self {
-        Self { drain, since: None, bytes: 0 }
+        Self { drain, last: None, busy: Duration::ZERO, bytes: 0 }
     }
 
     /// `bytes` were just written; `backlog` frames still wait.
     pub fn written(&mut self, bytes: usize, backlog: usize, now: Instant) {
-        if backlog == 0 {
-            self.since = None;
-            self.bytes = 0;
-            return;
+        if let Some(last) = self.last {
+            self.busy += now.saturating_duration_since(last);
+            self.bytes += bytes as u64;
         }
-        let since = *self.since.get_or_insert(now);
-        self.bytes += bytes as u64;
-        let over = now.saturating_duration_since(since);
-        if over >= SAMPLE_WINDOW {
-            self.drain.sample(self.bytes, over);
-            self.since = Some(now);
+        self.last = (backlog > 0).then_some(now);
+        if self.busy >= SAMPLE_WINDOW {
+            self.drain.sample(self.bytes, self.busy);
+            self.busy = Duration::ZERO;
             self.bytes = 0;
         }
     }
@@ -180,6 +191,21 @@ mod tests {
         }
         let r = d.rate();
         assert!((600_000..=700_000).contains(&r), "{r}");
+    }
+
+    /// A fast link whose queue runs empty every other frame is still measured.
+    #[test]
+    fn short_busy_periods_add_up_to_a_sample() {
+        let d = Arc::new(Drain::default());
+        let mut m = Meter::new(d.clone());
+        let t0 = Instant::now();
+        // A frame every millisecond, every other one leaving nothing behind.
+        for i in 0..=200u64 {
+            m.written(1350, (i % 2 == 0) as usize, t0 + Duration::from_millis(i));
+        }
+        // 100 busy intervals of 1 ms with 1350 B each: 1.35 MB/s.
+        let r = d.rate();
+        assert!((1_300_000..=1_400_000).contains(&r), "{r}");
     }
 
     #[test]

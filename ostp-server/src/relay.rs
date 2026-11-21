@@ -9,7 +9,139 @@ use tokio::sync::mpsc;
 
 use crate::dispatcher::Dispatcher;
 use crate::send_gate::{SendGate, StreamWindow};
-use crate::{RemoteState, SessionBackpressure, StreamOut, UiEvent};
+use crate::{FromTarget, RemoteState, SessionBackpressure, StreamOut, UiEvent};
+
+/// A target connection that is up. The server loop starts its reader and
+/// writer (`start`) only if the stream is still wanted; dropped instead, it
+/// closes the connection and gives the key's connection slot back.
+pub(crate) struct Connected {
+    reader: tokio::net::tcp::OwnedReadHalf,
+    writer: tokio::net::tcp::OwnedWriteHalf,
+    permit: tokio::sync::OwnedSemaphorePermit,
+    gate: Arc<SendGate>,
+    payload: Option<Arc<std::sync::atomic::AtomicUsize>>,
+    window: Option<Arc<StreamWindow>>,
+    v6: bool,
+}
+
+/// The outcome of a stream's `Connect`, for the server loop. `token` tells
+/// this attempt apart from the stream ending meanwhile or a newer session
+/// under the same id (`Dispatcher::finish_connect`).
+pub(crate) struct ConnectDone {
+    pub session_id: u32,
+    pub stream_id: u32,
+    pub token: u64,
+    pub target: String,
+    pub result: Result<Connected, String>,
+}
+
+pub(crate) type ConnectTx = mpsc::UnboundedSender<ConnectDone>;
+
+/// What the server loop keeps of a started target connection.
+pub(crate) struct Started {
+    pub writer: tokio::net::tcp::OwnedWriteHalf,
+    pub cancel_tx: mpsc::Sender<()>,
+    pub window: Option<Arc<StreamWindow>>,
+}
+
+impl Connected {
+    /// Starts reading the target toward the client.
+    pub fn start(self, session_id: u32, stream_id: u32, stream_tx: mpsc::UnboundedSender<FromTarget>) -> Started {
+        let Connected { reader, writer, permit, gate, payload, window, v6 } = self;
+        let (cancel_tx, cancel_rx) = mpsc::channel::<()>(1);
+        let reader_window = window.clone();
+        tokio::spawn(async move {
+            let _permit = permit;
+            read_target(reader, cancel_rx, gate, payload, reader_window, v6, session_id, stream_id, stream_tx).await;
+        });
+        Started { writer, cancel_tx, window }
+    }
+}
+
+/// How much stream data one datagram of the session carries: read anew for
+/// each read, because it grows while the session finds the path's MTU (a
+/// handle shared with the machine).
+fn frame_payload(handle: &Option<Arc<std::sync::atomic::AtomicUsize>>) -> usize {
+    handle
+        .as_ref()
+        .map_or(1300, |h| h.load(std::sync::atomic::Ordering::Relaxed))
+        .saturating_sub(ostp_core::relay::DATA_OVERHEAD)
+        .max(1)
+}
+
+/// Reads a target and hands its data to the server loop, no faster than the
+/// client-facing session may send it.
+///
+/// Before a read the reader waits until the session has room, and sizes the
+/// read to it; after the read it claims frames for what it got (`claim`,
+/// atomic) and hands over only what it claimed, waiting for more room for
+/// the rest. A target that answers long after the reader parked therefore
+/// cannot push its read past the budget, and readers woken together share
+/// the budget rather than each spending all of it.
+#[allow(clippy::too_many_arguments)]
+async fn read_target(
+    mut reader: tokio::net::tcp::OwnedReadHalf,
+    mut cancel_rx: mpsc::Receiver<()>,
+    gate: Arc<SendGate>,
+    payload: Option<Arc<std::sync::atomic::AtomicUsize>>,
+    window: Option<Arc<StreamWindow>>,
+    v6: bool,
+    session_id: u32,
+    stream_id: u32,
+    stream_tx: mpsc::UnboundedSender<FromTarget>,
+) {
+    let message = |out: StreamOut| FromTarget { session_id, stream_id, gate: gate.clone(), out };
+    let mut buf = vec![0_u8; READ_BUF];
+    'reading: loop {
+        let room = tokio::select! {
+            _ = cancel_rx.recv() => break,
+            room = gate.wait_for_room() => room,
+        };
+        let fp = frame_payload(&payload);
+        let mut want = (room as usize).saturating_mul(fp).clamp(1, READER_QUANTUM.min(READ_BUF));
+        if let Some(window) = &window {
+            let credit = tokio::select! {
+                _ = cancel_rx.recv() => break,
+                credit = window.acquire() => credit,
+            };
+            want = want.min(credit as usize).max(1);
+        }
+        let n = tokio::select! {
+            _ = cancel_rx.recv() => break,
+            read_res = reader.read(&mut buf[..want]) => match read_res {
+                Ok(0) if v6 => {
+                    let _ = stream_tx.send(message(StreamOut::Fin));
+                    break;
+                }
+                Ok(0) | Err(_) => {
+                    let _ = stream_tx.send(message(StreamOut::Close));
+                    break;
+                }
+                Ok(n) => n,
+            },
+        };
+        if let Some(window) = &window {
+            window.spend(n as i64);
+        }
+        let mut off = 0;
+        while off < n {
+            let need = (n - off).div_ceil(fp) as i64;
+            let got = tokio::select! {
+                _ = cancel_rx.recv() => break 'reading,
+                got = gate.claim(need) => got,
+            };
+            let len = (got as usize).saturating_mul(fp).min(n - off);
+            if stream_tx.send(message(StreamOut::Data(buf[off..off + len].to_vec(), got))).is_err() {
+                gate.sent(got);
+                break 'reading;
+            }
+            off += len;
+            // The other streams' turn before this one takes from the budget
+            // again.
+            tokio::task::yield_now().await;
+        }
+    }
+}
 
 /// Largest read from a target at once. 4 KiB meant a syscall and a message
 /// per three datagrams plus a short fourth one; 64 KiB fills whole frames.
@@ -25,6 +157,11 @@ const READER_QUANTUM: usize = 16 * 1024;
 /// Datagrams from the client waiting to go out of one UDP-associate stream;
 /// past this they are dropped, as UDP may.
 const UDP_STREAM_QUEUE: usize = 256;
+
+/// Errors in a row after which a UDP association stops reading its outbound
+/// proxy's socket (direct replies still arrive), and the pause after each.
+const PROXY_UDP_MAX_ERRORS: u32 = 64;
+const PROXY_UDP_ERROR_BACKOFF: std::time::Duration = std::time::Duration::from_millis(50);
 
 fn clean_ipv6_mapped_v4(addr: std::net::SocketAddr) -> std::net::SocketAddr {
     match addr {
@@ -84,16 +221,15 @@ pub async fn handle_relay_message(
     socket: &crate::transport::udp::UdpSockets,
     remotes: &mut HashMap<(u32, u32), RemoteState>,
     ui_event_tx: &mpsc::UnboundedSender<UiEvent>,
-    stream_tx: mpsc::UnboundedSender<(u32, u32, StreamOut)>,
     udp_reply_tx: mpsc::Sender<(u32, u32, String, Vec<u8>)>,
-    connect_tx: mpsc::UnboundedSender<(u32, u32, String, Result<(tokio::net::tcp::OwnedWriteHalf, mpsc::Sender<()>, Option<Arc<StreamWindow>>), String>)>,
+    connect_tx: ConnectTx,
     router: std::sync::Arc<crate::router::Router>,
     tcp_map: &std::sync::Arc<tokio::sync::RwLock<HashMap<std::net::SocketAddr, tokio::sync::mpsc::Sender<Bytes>>>>,
     session_backpressure: &SessionBackpressure,
 ) -> Result<()> {
     let msg = RelayMessage::decode(&payload)?;
     handle_message(
-        peer_addr, session_id, stream_id, msg, dispatcher, socket, remotes, ui_event_tx, stream_tx, udp_reply_tx,
+        peer_addr, session_id, stream_id, msg, dispatcher, socket, remotes, ui_event_tx, udp_reply_tx,
         connect_tx, router, tcp_map, session_backpressure,
     )
     .await
@@ -109,9 +245,8 @@ pub async fn handle_message(
     socket: &crate::transport::udp::UdpSockets,
     remotes: &mut HashMap<(u32, u32), RemoteState>,
     ui_event_tx: &mpsc::UnboundedSender<UiEvent>,
-    stream_tx: mpsc::UnboundedSender<(u32, u32, StreamOut)>,
     udp_reply_tx: mpsc::Sender<(u32, u32, String, Vec<u8>)>,
-    connect_tx: mpsc::UnboundedSender<(u32, u32, String, Result<(tokio::net::tcp::OwnedWriteHalf, mpsc::Sender<()>, Option<Arc<StreamWindow>>), String>)>,
+    connect_tx: ConnectTx,
     router: std::sync::Arc<crate::router::Router>,
     tcp_map: &std::sync::Arc<tokio::sync::RwLock<HashMap<std::net::SocketAddr, tokio::sync::mpsc::Sender<Bytes>>>>,
     session_backpressure: &SessionBackpressure,
@@ -121,8 +256,12 @@ pub async fn handle_message(
             if !open_v6_stream(session_id, stream_id, dispatcher, socket, ui_event_tx, tcp_map).await {
                 return Ok(());
             }
+            let token = dispatcher.begin_connect(session_id, stream_id);
+            let refuse = |target: String, why: &str| {
+                let _ = connect_tx.send(ConnectDone { session_id, stream_id, token, target, result: Err(why.into()) });
+            };
             let Some(permit) = dispatcher.stream_permit(session_id) else {
-                let _ = connect_tx.send((session_id, stream_id, target, Err("too many open connections for this key".into())));
+                refuse(target, "too many open connections for this key");
                 return Ok(());
             };
 
@@ -142,17 +281,16 @@ pub async fn handle_message(
                 // Encrypted DNS would skip the filtering; refused, the device
                 // falls back to plain port 53 (Android's "Private DNS:
                 // automatic", Chrome's secure DNS upgrade).
-                let _ = connect_tx.send((session_id, stream_id, target, Err("encrypted DNS is blocked: this server filters DNS".into())));
+                refuse(target, "encrypted DNS is blocked: this server filters DNS");
                 return Ok(());
             } else if router.overnet().refuses_encrypted_dns(&connect_target) {
                 // Same fallback, so `.ov` names reach the server's port-53 answer.
-                let _ = connect_tx.send((session_id, stream_id, target, Err("encrypted DNS is blocked: this server serves .ov".into())));
+                refuse(target, "encrypted DNS is blocked: this server serves .ov");
                 return Ok(());
             }
 
             let target_clone = connect_target.clone();
             let connect_tx_clone = connect_tx.clone();
-            let stream_tx_clone = stream_tx.clone();
             let router_clone = router.clone();
             // Get-or-create this session's gate. A brand new session may not
             // have had its first update yet, so it starts open (a fresh
@@ -161,88 +299,25 @@ pub async fn handle_message(
                 let mut map = session_backpressure.write().unwrap_or_else(|e| e.into_inner());
                 map.entry(session_id).or_insert_with(|| Arc::new(SendGate::new(32))).clone()
             };
-            // How much stream data one datagram of this session carries: read
-            // anew for each read, because it grows while the session finds
-            // the path's MTU (a handle shared with the machine).
-            let payload_handle = dispatcher.max_payload_handle(session_id);
-            let frame_payload_now = move || {
-                payload_handle
-                    .as_ref()
-                    .map_or(1300, |h| h.load(std::sync::atomic::Ordering::Relaxed))
-                    .saturating_sub(ostp_core::relay::DATA_OVERHEAD)
-                    .max(1)
-            };
+            let payload = dispatcher.max_payload_handle(session_id);
             // The client grants this stream's download as its program reads it.
             let window = dispatcher
                 .flow_control(session_id)
                 .then(|| Arc::new(StreamWindow::new(ostp_core::relay::INITIAL_STREAM_WINDOW as i64)));
-            let reader_window = window.clone();
             // v6: the target's end of stream is a half-close (`Fin`), not the
             // end of the stream; in v5 it is the `Close` it always was.
             let v6 = dispatcher.is_v6(session_id);
             tokio::spawn(async move {
                 let stream_res = router_clone.route_tcp(&target_clone, peer_addr.ip()).await;
-                // Held by the reader below: released when the connection ends,
-                // or right here when it fails.
-                let permit = permit;
-                match stream_res {
-                    Ok(stream) => {
-                        let (mut reader, writer) = stream.into_split();
-                        let (cancel_tx, mut cancel_rx) = mpsc::channel::<()>(1);
-                        tokio::spawn(async move {
-                            let _permit = permit;
-                            let mut buf = vec![0_u8; READ_BUF];
-                            loop {
-                                // Read no more than the client-facing session may
-                                // send now (its congestion window and pacing), so a
-                                // fast target does not flood a slower client path.
-                                // The budget is updated on every ACK and tick and
-                                // wakes this task at once.
-                                let budget = gate.acquire().await;
-                                let frame_payload = frame_payload_now();
-                                let mut want = (budget as usize).saturating_mul(frame_payload).clamp(1, READER_QUANTUM.min(READ_BUF));
-                                if let Some(window) = &reader_window {
-                                    let credit = tokio::select! {
-                                        _ = cancel_rx.recv() => break,
-                                        credit = window.acquire() => credit,
-                                    };
-                                    want = want.min(credit as usize).max(1);
-                                }
-                                tokio::select! {
-                                    _ = cancel_rx.recv() => break,
-                                    read_res = reader.read(&mut buf[..want]) => {
-                                        match read_res {
-                                            Ok(0) if v6 => {
-                                                let _ = stream_tx_clone.send((session_id, stream_id, StreamOut::Fin));
-                                                break;
-                                            }
-                                            Ok(0) | Err(_) => {
-                                                let _ = stream_tx_clone.send((session_id, stream_id, StreamOut::Close));
-                                                break;
-                                            }
-                                            Ok(n) => {
-                                                gate.spend(n.div_ceil(frame_payload) as i64);
-                                                if let Some(window) = &reader_window {
-                                                    window.spend(n as i64);
-                                                }
-                                                if stream_tx_clone.send((session_id, stream_id, StreamOut::Data(buf[..n].to_vec()))).is_err() {
-                                                    break;
-                                                }
-                                                // The other streams' turn before this
-                                                // one takes from the budget again.
-                                                tokio::task::yield_now().await;
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        });
-                        let _ = connect_tx_clone.send((session_id, stream_id, target_clone, Ok((writer, cancel_tx, window))));
-                    }
-                    Err(e) => {
-                        let _ = connect_tx_clone.send((session_id, stream_id, target_clone, Err(e.to_string())));
-                    }
-                }
+                // The reader is started by the server loop, and only if the
+                // stream is still open by then: a stream (or session) that
+                // ended while this connect was under way used to keep the
+                // target's connection, its reader and the key's slot forever.
+                let result = stream_res.map_err(|e| e.to_string()).map(|stream| {
+                    let (reader, writer) = stream.into_split();
+                    Connected { reader, writer, permit, gate, payload, window, v6 }
+                });
+                let _ = connect_tx_clone.send(ConnectDone { session_id, stream_id, token, target: target_clone, result });
             });
         }
         RelayMessage::Data(data) => {
@@ -352,6 +427,13 @@ pub async fn handle_message(
                 Ok(s) => std::sync::Arc::new(s),
                 Err(e) => {
                     let _ = ui_event_tx.send(UiEvent::Log(format!("UDP bind failed: {e}")));
+                    // As when the slot is refused above: v6 opened the stream,
+                    // so the client is told and the stream is released (v5:
+                    // silent, as before). The permit goes back when dropped.
+                    if dispatcher.is_v6(session_id) {
+                        let _ = send_relay_to_stream(session_id, stream_id, RelayMessage::Error(format!("UDP associate failed: {e}")), dispatcher, socket, ui_event_tx, tcp_map).await;
+                        dispatcher.release_stream(session_id, stream_id);
+                    }
                     return Ok(());
                 }
             };
@@ -387,8 +469,12 @@ pub async fn handle_message(
                 let proxy_sock = session_router.get_proxy_sock();
                 let mut direct_buf = vec![0u8; 65536];
                 let mut proxy_buf = vec![0u8; 65536];
+                // Errors in a row from the proxy's socket. One error is a bad
+                // packet; a socket failing every time (closed, or ICMP
+                // errors) used to spin this loop at full speed.
+                let mut proxy_errors = 0_u32;
                 loop {
-                    if let Some(ref p) = proxy_sock {
+                    if let Some(p) = proxy_sock.as_ref().filter(|_| proxy_errors < PROXY_UDP_MAX_ERRORS) {
                         tokio::select! {
                             _ = cancel_rx.recv() => break,
                             res = rx_sock.recv_from(&mut direct_buf) => {
@@ -397,8 +483,18 @@ pub async fn handle_message(
                                 } else { break; }
                             }
                             res = p.recv_from(&mut proxy_buf) => {
-                                if let Ok((len, target_str)) = res {
-                                    let _ = udp_reply_clone.try_send((session_id, stream_id, target_str, proxy_buf[..len].to_vec()));
+                                match res {
+                                    Ok((len, target_str)) => {
+                                        proxy_errors = 0;
+                                        let _ = udp_reply_clone.try_send((session_id, stream_id, target_str, proxy_buf[..len].to_vec()));
+                                    }
+                                    Err(e) => {
+                                        proxy_errors += 1;
+                                        if proxy_errors == PROXY_UDP_MAX_ERRORS {
+                                            tracing::debug!("UDP association [{session_id}:{stream_id}]: the proxy socket keeps failing ({e}), no longer read");
+                                        }
+                                        tokio::time::sleep(PROXY_UDP_ERROR_BACKOFF).await;
+                                    }
                                 }
                             }
                         }
@@ -561,6 +657,13 @@ async fn send_one(
     // UDP of a v6 session goes as an unsequenced datagram that is never
     // resent; everything else is stream data.
     let datagram = matches!(msg, RelayMessage::UdpData(..)) && dispatcher.is_v6(session_id);
+    // Data (TCP or UDP) may be dropped from a full TCP/TLS queue; the stream
+    // and session control messages wait for room.
+    let urgency = if matches!(msg, RelayMessage::Data(_) | RelayMessage::UdpData(..)) {
+        crate::Urgency::Data
+    } else {
+        crate::Urgency::Control
+    };
     let payload = Bytes::from(msg.encode());
     let outbound = if datagram {
         dispatcher.datagram_to_session(session_id, stream_id, payload)?
@@ -572,7 +675,7 @@ async fn send_one(
         {
             let map = tcp_map.read().await;
             if let Some(tx) = map.get(&peer_addr) {
-                crate::queue_to_tcp(tx, frame.clone());
+                crate::queue_to_tcp(tx, frame.clone(), urgency);
                 sent_tcp = true;
             }
         }
