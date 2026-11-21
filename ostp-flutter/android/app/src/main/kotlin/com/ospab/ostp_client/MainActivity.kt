@@ -52,6 +52,11 @@ class MainActivity : FlutterActivity() {
                     val configJson = call.argument<String>("configJson")
                     if (configJson == null || configJson.length > MAX_CONFIG_BYTES) {
                         result.error("BAD_CONFIG", "Config is missing or too large", null)
+                    } else if (configJson.isEmpty()) {
+                        // No active profile: drop the saved config so the tile cannot start a stale one.
+                        getSharedPreferences("OstpPrefs", android.content.Context.MODE_PRIVATE)
+                            .edit().remove("latest_config_json").apply()
+                        result.success(true)
                     } else {
                         try {
                             val prefs = getSharedPreferences("OstpPrefs", android.content.Context.MODE_PRIVATE)
@@ -86,6 +91,14 @@ class MainActivity : FlutterActivity() {
                             result.error("ERROR", e.message, null)
                         }
                     }
+                }
+                "cancelPendingStart" -> {
+                    // Dart gave up waiting for the consent dialog: forget the request so a
+                    // later start is not BUSY and a late "allow" does not start the VPN.
+                    pendingStartResult = null
+                    pendingConfigJson = null
+                    try { finishActivity(VPN_REQUEST_CODE) } catch (_: Throwable) {}
+                    result.success(true)
                 }
                 "stopTunnel" -> {
                     try {
@@ -311,6 +324,12 @@ class MainActivity : FlutterActivity() {
         if (requestCode == VPN_REQUEST_CODE) {
             val reply = pendingStartResult
             pendingStartResult = null
+            if (reply == null) {
+                // The request was cancelled from Dart (timeout): ignore a late answer.
+                pendingConfigJson = null
+                super.onActivityResult(requestCode, resultCode, data)
+                return
+            }
             if (resultCode == RESULT_OK) {
                 try {
                     startVpnService()

@@ -281,6 +281,17 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin, 
   }
 
   void _updateLatestConfigJson() {
+    final p = _activeProfile;
+    if (p == null || p.serverAddr.isEmpty || p.accessKey.isEmpty) {
+      // No active profile: keep no config around, so the quick-settings tile has
+      // nothing to start (it opens the app instead).
+      widget.prefs.remove('latest_config_json');
+      _call('saveConfig', {"configJson": ""}).catchError((e) {
+        debugPrint('saveConfig (clear) failed: $e');
+        return null;
+      });
+      return;
+    }
     final configMap = _buildConfigMap();
     widget.prefs.setString('latest_config_json', jsonEncode(configMap));
     final json = jsonEncode(configMap);
@@ -374,8 +385,10 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin, 
           return;
         }
 
+        // startClient can take a while; the state comes from the real service
+        // (isRunning), so wait longer instead of reporting a failure too early.
         bool started = false;
-        for (int i = 0; i < 10 && mounted; i++) {
+        for (int i = 0; i < 60 && mounted; i++) {
           await Future.delayed(const Duration(milliseconds: 500));
           final isRunning = await _call<bool>('isRunning');
           if (isRunning == true) {
@@ -392,6 +405,11 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin, 
           _snack('The VPN service did not start. See Logs for the reason.');
         }
       } on TimeoutException {
+        // The consent dialog may still be open natively: drop the request, so the
+        // next start is not BUSY and a late "allow" does not start the VPN.
+        try {
+          await _call('cancelPendingStart');
+        } catch (_) {}
         _setDisconnected();
         _snack('The system did not answer in time. Try again.');
       } catch (e, stackTrace) {

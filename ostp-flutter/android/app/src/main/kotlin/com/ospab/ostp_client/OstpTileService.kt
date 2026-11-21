@@ -33,6 +33,12 @@ class OstpTileService : TileService() {
             val prefs = getSharedPreferences("OstpPrefs", Context.MODE_PRIVATE)
             val configJson = prefs.getString("latest_config_json", null)
             
+            if (!hasUsableConfig(configJson)) {
+                // No active profile (or nothing saved yet): there is nothing to connect to.
+                openApp()
+                updateTile()
+                return
+            }
             if (configJson != null) {
                 // Check if VPN consent is needed
                 val vpnIntent = android.net.VpnService.prepare(this)
@@ -64,9 +70,8 @@ class OstpTileService : TileService() {
                     updateTile()
                     return
                 }
-                qsTile?.state = Tile.STATE_ACTIVE
-                qsTile?.label = "OSTP VPN"
-                qsTile?.updateTile()
+                // Not marked active here: the tile follows the real state, which the
+                // service reports through requestListeningState once the core is up.
             } else {
                 // Если конфигурация еще не сохранена, открыть приложение
                 val appIntent = packageManager.getLaunchIntentForPackage(packageName)?.apply {
@@ -77,6 +82,24 @@ class OstpTileService : TileService() {
                     startActivityAndCollapse(appIntent)
                 }
             }
+        }
+    }
+
+    private fun openApp() {
+        val appIntent = packageManager.getLaunchIntentForPackage(packageName)?.apply {
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP)
+        }
+        if (appIntent != null) startActivityAndCollapse(appIntent)
+    }
+
+    // A config without a server address or an access key cannot connect.
+    private fun hasUsableConfig(configJson: String?): Boolean {
+        if (configJson.isNullOrEmpty()) return false
+        return try {
+            val o = org.json.JSONObject(configJson)
+            o.optString("server_addr").isNotEmpty() && o.optString("access_key").isNotEmpty()
+        } catch (_: Throwable) {
+            false
         }
     }
 
