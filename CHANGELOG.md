@@ -8,6 +8,8 @@ Older history is on the [Releases](https://github.com/ospab/ostp/releases) page 
 
 ## [Unreleased]
 
+## [0.5.0-beta.1] - 2026-11-22
+
 ### Added
 - Access keys can expire: `expires_at` (Unix seconds, UTC) in an `access_keys` entry, `ostp manage user-add/user-set --expires YYYY-MM-DD|<N>d|never`, a date field in the panel, and in the apps' user editor (server management). A client with an expired key is told so inside the tunnel (new close reason 6, "the access key has expired") and does not reconnect; clients before alpha.6 see a plain close, 0.4.x clients are refused as with a used-up traffic limit. Subscriptions are served as before. Covered by unit and end-to-end tests; the panel field is not tested.
 - A server can describe itself to its clients, and nothing of it is visible before connecting: a `server_info` section in the server config (name, location, contact, an "about" text in Markdown), editable with `ostp manage server-info`, in the panel and in the apps. Together with what the server reports about itself (version, carriers, log privacy, IPv6, DNS filtering) and the key's traffic, limit, expiry and device limit, it is sent only inside the tunnel, on request (new relay messages `InfoRequest`/`ServerInfo`, offered with a `Features` bit; older peers never see them), at most once per 10 s per session. The specification describes them.
