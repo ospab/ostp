@@ -66,6 +66,18 @@ async fn start_server_full(
     config_path: Option<std::path::PathBuf>,
     api: Option<SocketAddr>,
 ) -> SocketAddr {
+    let meta = ostp_server::api::UserMeta { name: None, limit_bytes: None, max_devices: None, expires_at: None };
+    start_server_with(protocol, bind_ip, config_path, api, meta).await
+}
+
+/// The same, with `meta` for the one key.
+async fn start_server_with(
+    protocol: Option<serde_json::Value>,
+    bind_ip: Option<&str>,
+    config_path: Option<std::path::PathBuf>,
+    api: Option<SocketAddr>,
+    meta: ostp_server::api::UserMeta,
+) -> SocketAddr {
     let addr: SocketAddr = format!("127.0.0.1:{}", free_port()).parse().unwrap();
     let mut cfg = serde_json::json!({
         "listen": addr.to_string(),
@@ -83,7 +95,7 @@ async fn start_server_full(
         bind_addrs: vec![addr.to_string()],
         server_public_ip: None,
         bind_ip: bind_ip.map(str::to_string),
-        access_keys: vec![(KEY.to_string(), ostp_server::api::UserMeta { name: None, limit_bytes: None, max_devices: None })],
+        access_keys: vec![(KEY.to_string(), meta)],
         outbound: None,
         api_config: api.map(|a| ostp_server::api::ApiConfig {
             enabled: true,
@@ -251,6 +263,8 @@ async fn v6_profile_works(mode: &str) {
     let mut client = Client::from_link(&link_to(server, Some(public)), mode).await;
     assert!(client.wait_log("Connection established", Duration::from_secs(10)).await, "log:\n{}", client.log_text());
     client.echo_through(echo, b"hello over v6").await;
+    // The server said it answers `InfoRequest`, and its answer came back whole.
+    assert!(client.wait_log("Server info received", Duration::from_secs(5)).await, "log:\n{}", client.log_text());
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -979,6 +993,32 @@ async fn removing_the_key_closes_the_session_with_a_reason_and_the_client_stops_
     assert_eq!(client.metrics.connection_state.load(Ordering::Relaxed), 0);
     assert_eq!(live_sessions(api).await, Some(0));
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// An expired key: the handshake completes and the server says why inside
+/// the tunnel (`Close(KeyExpired)`); the client stops and does not reconnect.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_expired_key_is_told_inside_the_tunnel_and_the_client_stops() {
+    let (protocol, public) = section(false);
+    let meta = ostp_server::api::UserMeta { name: None, limit_bytes: None, max_devices: None, expires_at: Some(1) };
+    let server = start_server_with(Some(protocol), None, None, None, meta).await;
+    let client = Client::from_link(&link_to(server, Some(public)), "udp").await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while client.closed.lock().unwrap().is_none() && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let (_, message) = client
+        .closed
+        .lock()
+        .unwrap()
+        .clone()
+        .unwrap_or_else(|| panic!("the client was not told; log:\n{}", client.log_text()));
+    assert!(message.contains("the access key has expired"), "{message}");
+    assert!(client.stopped.load(Ordering::Relaxed), "the tunnel is reported stopped");
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let log = client.log_text();
+    assert!(log.matches("Connection established").count() <= 1, "no second connection:\n{log}");
+    assert!(!log.to_lowercase().contains("reconnect"), "{log}");
 }
 
 /// The client stops on purpose: the server frees the session at once, not

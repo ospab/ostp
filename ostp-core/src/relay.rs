@@ -29,6 +29,14 @@ pub enum RelayMessage {
     /// connection), with the reason (`ABORT_*`). Tag 4 like `Close`; a v5 peer
     /// never gets it.
     Abort(u8),
+    /// Stream 0, client to server: "send me your `ServerInfo`". Sent only to
+    /// a server that announced FEATURE_SERVER_INFO; an older server would
+    /// not know the tag (it drops what it cannot decode).
+    InfoRequest,
+    /// Stream 0, server to client: one piece of the server-info JSON (see
+    /// `server_info_messages`), `more` = further pieces follow. The JSON is
+    /// split so each piece fits one datagram; stream 0 keeps them in order.
+    ServerInfo { more: bool, chunk: Vec<u8> },
 }
 
 /// `RelayMessage::Abort` reasons.
@@ -41,6 +49,15 @@ pub const ABORT_FLOW_CONTROL: u8 = 2;
 
 /// Per-stream flow control (`Window`).
 pub const FEATURE_FLOW_CONTROL: u32 = 1;
+/// The server answers `InfoRequest` with `ServerInfo` (who runs it, what it
+/// offers, this key's usage and expiry). Asked for in a v6 session too, where
+/// flow control needs no negotiation: a server that predates the bit answers
+/// without it, and the client then never sends `InfoRequest`.
+pub const FEATURE_SERVER_INFO: u32 = 2;
+/// The largest server-info JSON a client accepts, in bytes.
+pub const SERVER_INFO_MAX: usize = 32 << 10;
+/// Bytes a `ServerInfo` piece adds around its chunk: tag, flag and length.
+pub const SERVER_INFO_OVERHEAD: usize = 4;
 /// What a stream's sender may send before the first `Window`, in each
 /// direction. It bounds the memory a slow destination (a site that takes an
 /// upload slowly, an app that reads slowly) can make the other side hold,
@@ -66,6 +83,12 @@ impl RelayMessage {
             RelayMessage::Window(bytes) => encode_with_len(12, &bytes.to_be_bytes()),
             RelayMessage::Fin => vec![13],
             RelayMessage::Abort(reason) => vec![4, *reason],
+            RelayMessage::InfoRequest => vec![14],
+            RelayMessage::ServerInfo { more, chunk } => {
+                let mut out = vec![15, u8::from(*more)];
+                out.extend_from_slice(&encode_with_len(0, chunk)[1..]);
+                out
+            }
             RelayMessage::UdpData(addr, data) => {
                 let addr_bytes = addr.as_bytes();
                 let mut buf = Vec::with_capacity(1 + 2 + addr_bytes.len() + 2 + data.len());
@@ -135,6 +158,12 @@ impl RelayMessage {
                 let data = input[data_offset+2..data_offset+2+data_len].to_vec();
                 Ok(RelayMessage::UdpData(addr, data))
             }
+            14 => Ok(RelayMessage::InfoRequest),
+            15 => {
+                let flag = *input.get(1).ok_or_else(|| anyhow!("server info piece too short"))?;
+                let chunk = decode_with_len(&input[2..])?.to_vec();
+                Ok(RelayMessage::ServerInfo { more: flag & 1 != 0, chunk })
+            }
             11 | 12 => {
                 let payload = decode_with_len(&input[1..])?;
                 let value = u32::from_be_bytes(payload.try_into().map_err(|_| anyhow!("invalid flow control payload"))?);
@@ -142,6 +171,52 @@ impl RelayMessage {
             }
             _ => Err(anyhow!("unknown relay message type {}", input[0])),
         }
+    }
+}
+
+/// `json` as `ServerInfo` pieces that each fit a datagram carrying at most
+/// `max_payload` bytes; the last one has `more: false`.
+pub fn server_info_messages(json: &[u8], max_payload: usize) -> Vec<RelayMessage> {
+    let size = max_payload.saturating_sub(SERVER_INFO_OVERHEAD).clamp(1, u16::MAX as usize);
+    if json.is_empty() {
+        return vec![RelayMessage::ServerInfo { more: false, chunk: Vec::new() }];
+    }
+    let count = json.len().div_ceil(size);
+    json.chunks(size)
+        .enumerate()
+        .map(|(i, c)| RelayMessage::ServerInfo { more: i + 1 < count, chunk: c.to_vec() })
+        .collect()
+}
+
+/// Puts `ServerInfo` pieces back together.
+#[derive(Debug, Default)]
+pub struct ServerInfoAssembler {
+    buf: Vec<u8>,
+    overflow: bool,
+}
+
+impl ServerInfoAssembler {
+    /// Adds a piece. Returns the whole JSON text after the last piece, or
+    /// `None` (more to come, or the document was too large or not UTF-8,
+    /// in which case it is dropped and the next one starts clean).
+    pub fn push(&mut self, more: bool, chunk: &[u8]) -> Option<String> {
+        if !self.overflow {
+            if self.buf.len() + chunk.len() > SERVER_INFO_MAX {
+                self.overflow = true;
+                self.buf = Vec::new();
+            } else {
+                self.buf.extend_from_slice(chunk);
+            }
+        }
+        if more {
+            return None;
+        }
+        let whole = std::mem::take(&mut self.buf);
+        let overflow = std::mem::replace(&mut self.overflow, false);
+        if overflow {
+            return None;
+        }
+        String::from_utf8(whole).ok()
     }
 }
 
@@ -206,6 +281,40 @@ mod tests {
         // The v5 close is the one byte it always was and still decodes as it did.
         assert_eq!(RelayMessage::Close.encode(), vec![4]);
         assert!(matches!(RelayMessage::decode(&[4]).unwrap(), RelayMessage::Close));
+    }
+
+    #[test]
+    fn server_info_is_split_to_fit_and_put_back_together() {
+        assert_eq!(RelayMessage::InfoRequest.encode(), vec![14]);
+        assert!(matches!(RelayMessage::decode(&[14]).unwrap(), RelayMessage::InfoRequest));
+        let json: Vec<u8> = (0..5000u32).map(|i| b'a' + (i % 26) as u8).collect();
+        let pieces = server_info_messages(&json, 1200);
+        assert!(pieces.len() > 1);
+        let mut asm = ServerInfoAssembler::default();
+        let mut out = None;
+        for (i, p) in pieces.iter().enumerate() {
+            let wire = p.encode();
+            assert!(wire.len() <= 1200, "a piece fits the datagram");
+            match RelayMessage::decode(&wire).unwrap() {
+                RelayMessage::ServerInfo { more, chunk } => {
+                    assert_eq!(more, i + 1 < pieces.len());
+                    out = asm.push(more, &chunk);
+                }
+                _ => panic!("expected ServerInfo"),
+            }
+        }
+        assert_eq!(out.unwrap().as_bytes(), &json[..]);
+        // Small: one piece.
+        let one = server_info_messages(b"{}", 1200);
+        assert_eq!(one.len(), 1);
+        assert_eq!(ServerInfoAssembler::default().push(false, b"{}").as_deref(), Some("{}"));
+        // Too large: dropped, and the next one is read cleanly.
+        let mut asm = ServerInfoAssembler::default();
+        assert_eq!(asm.push(true, &vec![b'x'; SERVER_INFO_MAX]), None);
+        assert_eq!(asm.push(false, b"y"), None);
+        assert_eq!(asm.push(false, b"{}").as_deref(), Some("{}"));
+        assert!(RelayMessage::decode(&[15]).is_err());
+        assert!(RelayMessage::decode(&[15, 0, 0, 5, 1]).is_err());
     }
 
     #[test]

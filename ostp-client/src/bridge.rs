@@ -406,6 +406,11 @@ pub struct Bridge {
     /// Proxy events taken off the channel while the sending window was full,
     /// in their order (see `HELD_PROXY_MAX`).
     held_proxy: std::collections::VecDeque<ProxyEvent>,
+    /// The session that asks for the server's info: the first whose server
+    /// announced FEATURE_SERVER_INFO since the sessions were set up.
+    info_session: Option<usize>,
+    /// The pieces of a `ServerInfo` being received.
+    info_pieces: ostp_core::relay::ServerInfoAssembler,
 }
 
 /// Proxy events the loop takes off the channel while the window is full, to
@@ -469,6 +474,8 @@ impl Bridge {
             proxy_guard: None,
             established_once: false,
             held_proxy: std::collections::VecDeque::new(),
+            info_session: None,
+            info_pieces: Default::default(),
         })
     }
 
@@ -556,6 +563,10 @@ impl Bridge {
                     self.check_link(&tx, &proxy_tx).await;
                     if self.link != Link::Idle {
                         self.emit_metrics(&tx).await;
+                    }
+                    // An app asked for the server's info (`app::request_server_info`).
+                    if crate::app::take_server_info_request() {
+                        self.send_info_request().await;
                     }
                 }
                 udp_msg = async {
@@ -741,6 +752,26 @@ impl Bridge {
             // v5: which streams use flow control the server says per stream,
             // with its first `Window`.
             tracing::debug!("server features: {bits:#x}");
+            // The server answers `InfoRequest`: asked once per setup of the
+            // sessions, on the first one that said so.
+            if bits & ostp_core::relay::FEATURE_SERVER_INFO != 0 && self.info_session.is_none() {
+                self.info_session = Some(session_index);
+                crate::app::set_server_info_supported(true);
+                self.send_info_request().await;
+            }
+            return;
+        }
+        if let RelayMessage::ServerInfo { more, ref chunk } = relay_msg {
+            if wire_stream_id != 0 || Some(session_index) != self.info_session {
+                return;
+            }
+            if let Some(text) = self.info_pieces.push(more, chunk) {
+                // Kept only when it is a JSON object, as the server sends it.
+                if serde_json::from_str::<serde_json::Value>(&text).is_ok_and(|v| v.is_object()) {
+                    crate::app::set_server_info(Some(text));
+                    let _ = tx.send(UiEvent::Log("Server info received".to_string())).await;
+                }
+            }
             return;
         }
         // Every other message is about a local connection. One that is gone
@@ -802,7 +833,9 @@ impl Bridge {
             | RelayMessage::Ping(_)
             | RelayMessage::Connect(_)
             | RelayMessage::Pong(_)
-            | RelayMessage::Features(_) => {}
+            | RelayMessage::Features(_)
+            | RelayMessage::InfoRequest
+            | RelayMessage::ServerInfo { .. } => {}
         }
     }
 
@@ -900,6 +933,8 @@ impl Bridge {
                     tx.send(UiEvent::Log(stop_msg.to_string())).await.ok();
                 } else {
                     crate::app::set_stop_notice(None);
+                    // What a server said about itself belongs to that connection.
+                    crate::app::set_server_info(None);
                     tx.send(UiEvent::Log("Connecting to remote server...".to_string())).await.ok();
                     tx.send(UiEvent::Metrics { status: ConnectionStatus::Handshaking, rtt_ms: 0.0, queue_ms: 0.0, throughput_bps: 0 }).await.ok();
                     self.metrics.connection_state.store(1, Ordering::Relaxed);
@@ -961,6 +996,9 @@ impl Bridge {
                         let _ = tx.send(UiEvent::Log(format!("Config reload failed: {err}"))).await;
                     }
                 }
+            }
+            Some(BridgeCommand::RequestServerInfo) => {
+                self.send_info_request().await;
             }
             Some(BridgeCommand::Shutdown) | None => return false,
         }
@@ -1379,17 +1417,35 @@ impl Bridge {
     /// Tells each new session what this client supports. A 0.4.5 server drops
     /// the message; a newer one answers and from then on gives each stream a
     /// window (see `ostp_core::relay::INITIAL_STREAM_WINDOW`).
+    ///
+    /// Every session also asks whether the server answers `InfoRequest`
+    /// (FEATURE_SERVER_INFO); a server that does not know the bit answers
+    /// without it and is never sent the request. In v6 that is the only bit:
+    /// flow control is part of every v6 stream, nothing to negotiate.
     async fn send_features(&mut self) {
-        let payload = Bytes::from(RelayMessage::Features(ostp_core::relay::FEATURE_FLOW_CONTROL).encode());
+        use ostp_core::relay::{FEATURE_FLOW_CONTROL, FEATURE_SERVER_INFO};
+        self.info_session = None;
+        self.info_pieces = Default::default();
+        crate::app::set_server_info_supported(false);
         for session in self.sessions.iter_mut() {
-            // Flow control is part of every v6 stream: nothing to negotiate.
-            if session.machine.is_v6() {
-                continue;
-            }
-            if let Ok(ProtocolAction::SendDatagram(frame)) = session.machine.on_event(OstpEvent::Outbound(0, payload.clone())) {
+            let bits = if session.machine.is_v6() { FEATURE_SERVER_INFO } else { FEATURE_FLOW_CONTROL | FEATURE_SERVER_INFO };
+            let payload = Bytes::from(RelayMessage::Features(bits).encode());
+            if let Ok(ProtocolAction::SendDatagram(frame)) = session.machine.on_event(OstpEvent::Outbound(0, payload)) {
                 let _ = send_datagram(&session.socket, &frame, false).await;
                 self.metrics.bytes_sent.fetch_add(frame.len() as u64, Ordering::Relaxed);
             }
+        }
+    }
+
+    /// Asks the server for its info (`ServerInfo`), on the session whose
+    /// server said it answers. Nothing is sent to one that did not.
+    async fn send_info_request(&mut self) {
+        let Some(index) = self.info_session else { return };
+        let Some(session) = self.sessions.get_mut(index) else { return };
+        let payload = Bytes::from(RelayMessage::InfoRequest.encode());
+        if let Ok(ProtocolAction::SendDatagram(frame)) = session.machine.on_event(OstpEvent::Outbound(0, payload)) {
+            let _ = send_datagram(&session.socket, &frame, false).await;
+            self.metrics.bytes_sent.fetch_add(frame.len() as u64, Ordering::Relaxed);
         }
     }
 

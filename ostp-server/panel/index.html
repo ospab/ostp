@@ -361,6 +361,19 @@ tr:last-child td { border-bottom: 0; }
           <button class="btn primary" id="btn-save-config" data-t="save">Save</button>
         </div>
       </div>
+      <form class="card" id="f-info" style="margin-bottom:14px">
+        <h3 data-t="info_title">Server info</h3>
+        <p class="muted small" data-t="info_help">What clients see about this server. It is sent only inside the tunnel, to clients that have a key; nothing of it is shown before a connection.</p>
+        <div class="grid two">
+          <div class="field"><label class="lbl" for="si-name" data-t="info_name">Name</label><input class="input" id="si-name" maxlength="128" /></div>
+          <div class="field"><label class="lbl" for="si-location" data-t="info_location">Location</label><input class="input" id="si-location" maxlength="128" /></div>
+        </div>
+        <div class="field"><label class="lbl" for="si-contact" data-t="info_contact">Contact</label><input class="input" id="si-contact" maxlength="128" /></div>
+        <div class="field"><label class="lbl" for="si-about" data-t="info_about">About (Markdown, 8 KiB at most)</label><textarea class="input" id="si-about" rows="6" spellcheck="true"></textarea></div>
+        <div class="small muted" id="si-facts"></div>
+        <div class="row" style="justify-content:flex-end"><button class="btn primary" data-t="save">Save</button></div>
+        <p id="info-note" class="note" role="status"></p>
+      </form>
       <div class="card">
         <textarea class="input" id="config" rows="28" spellcheck="false" data-tl="config"></textarea>
         <p id="config-note" class="note" role="status"></p>
@@ -494,6 +507,7 @@ tr:last-child td { border-bottom: 0; }
     <div class="field" id="mu-key-field"><label class="lbl" for="mu-key" data-t="access_key_opt">Access key (optional)</label>
       <div class="row"><input class="input mono grow" id="mu-key" maxlength="128" spellcheck="false" autocomplete="off" /><button type="button" class="btn" id="mu-gen" data-t="generate">Generate</button></div></div>
     <div class="field"><label class="lbl" for="mu-limit" data-t="limit_gb">Traffic limit, GB (empty = unlimited)</label><input class="input" id="mu-limit" type="number" min="0.01" step="any" /></div>
+    <div class="field"><label class="lbl" for="mu-expires" data-t="expires_field">Expires (end of that day, UTC; empty = never)</label><input class="input" id="mu-expires" type="date" min="1970-01-02" max="9999-12-31" /></div>
     <div class="field"><label class="lbl" for="mu-devices" data-t="devices_limit">Devices (empty = unlimited)</label><input class="input" id="mu-devices" type="number" min="1" max="1000" step="1" inputmode="numeric" />
       <div class="small muted" data-t="devices_hint">A device is counted when its app fetches the subscription with its device ID turned on.</div></div>
     <div class="field hidden" id="mu-devices-field"><div class="lbl" data-t="devices_seen">Devices that fetched the subscription</div><div id="mu-devices-list" class="small"></div></div>
@@ -546,6 +560,11 @@ const I18N = {
     bulk_create: 'Bulk create', add_user: 'Add user', edit_user: 'Edit user', search: 'Search by name or key',
     all: 'All', online: 'Online', near_limit: '80% of limit or more', user: 'User', sessions: 'Sessions',
     traffic: 'Traffic ↓ / ↑', limit: 'Limit', unlimited: 'unlimited', save: 'Save', reload: 'Reload', clear: 'Clear',
+    expires_field: 'Expires (end of that day, UTC; empty = never)', expired: 'expired', expires_on: 'until {d}',
+    info_title: 'Server info', info_help: 'What clients see about this server. It is sent only inside the tunnel, to clients that have a key; nothing of it is shown before a connection.',
+    info_name: 'Name', info_location: 'Location', info_contact: 'Contact', info_about: 'About (Markdown, 8 KiB at most)',
+    info_facts: 'Clients also see: version {v}, carriers {c}, log privacy {p}, IPv6 {ip}, DNS filtering {dns}.',
+    info_saved: 'Server info saved', f_info: 'Server info not saved: {err}', ev_info: 'Changed the server info', yes: 'yes', no: 'no',
     routing_sub: 'Outbound rules: which destinations go direct and which through the upstream proxy.',
     routing_help: 'A list of rules; each has domain_suffix and/or ip_cidr lists and an action ("proxy", "direct" or "block"). Applied immediately and saved to config.json.',
     config_sub: "The server's config.json. Access keys reload on their own; other changes need a restart.",
@@ -656,6 +675,11 @@ const I18N = {
     bulk_create: 'Создать пачкой', add_user: 'Добавить', edit_user: 'Изменить пользователя', search: 'Поиск по имени или ключу',
     all: 'Все', online: 'Онлайн', near_limit: '80% лимита и больше', user: 'Пользователь', sessions: 'Сессии',
     traffic: 'Трафик ↓ / ↑', limit: 'Лимит', unlimited: 'без лимита', save: 'Сохранить', reload: 'Перечитать', clear: 'Очистить',
+    expires_field: 'Действует до (конец этого дня по UTC; пусто = бессрочно)', expired: 'истёк', expires_on: 'до {d}',
+    info_title: 'О сервере', info_help: 'Что клиенты видят об этом сервере. Передаётся только внутри туннеля, клиентам с ключом; до подключения не видно ничего.',
+    info_name: 'Название', info_location: 'Расположение', info_contact: 'Контакт', info_about: 'Описание (Markdown, до 8 КиБ)',
+    info_facts: 'Ещё клиенты видят: версия {v}, транспорты {c}, приватность логов {p}, IPv6 {ip}, DNS-фильтрация {dns}.',
+    info_saved: 'Сведения о сервере сохранены', f_info: 'Сведения о сервере не сохранены: {err}', ev_info: 'Изменены сведения о сервере', yes: 'да', no: 'нет',
     routing_sub: 'Правила выхода: какие адреса идут напрямую, а какие через вышестоящий прокси.',
     routing_help: 'Список правил: у каждого списки domain_suffix и/или ip_cidr и action ("proxy", "direct" или "block"). Применяется сразу и сохраняется в config.json.',
     config_sub: 'config.json сервера. Ключи доступа подхватываются сами, остальное — после перезапуска.',
@@ -803,6 +827,16 @@ function readDevices() {
   const n = Number(raw);
   return Number.isInteger(n) && n >= 1 && n <= 1000 ? n : undefined;
 }
+// Expiry: '' = never (null); a date = the end of that day, UTC, in Unix seconds.
+function readExpires() {
+  const raw = $('mu-expires').value;
+  if (!raw) return null;
+  const [y, m, d] = raw.split('-').map(Number);
+  const s = Date.UTC(y, m - 1, d, 23, 59, 59) / 1000;
+  return Number.isFinite(s) && s > 0 ? s : undefined;
+}
+const isoDay = s => new Date(s * 1000).toISOString().slice(0, 10);
+const isExpired = u => u.expires_at != null && Date.now() / 1000 >= u.expires_at;
 function toast(msg, err = false) {
   const el = document.createElement('div');
   el.className = 'toast' + (err ? ' err' : '');
@@ -1200,7 +1234,9 @@ function renderUsers() {
          <div class="bar ${r >= 1 ? 'full' : r >= .8 ? 'warn' : ''}"><div style="width:${Math.min(100, r * 100).toFixed(1)}%"></div></div>`;
     return `<tr data-key="${esc(u.access_key)}">
       <td><div class="row"><span class="dot ${u.online ? 'on' : ''}" title="${u.online ? esc(t('online')) : ''}"></span><div>
-        <div class="user-name">${esc(u.name || '—')}</div>
+        <div class="user-name">${esc(u.name || '—')}${u.expires_at != null
+          ? (isExpired(u) ? ` <span class="pill bad">${esc(t('expired'))} ${esc(isoDay(u.expires_at))}</span>`
+            : ` <span class="pill">${esc(t('expires_on', { d: isoDay(u.expires_at) }))}</span>`) : ''}</div>
         <button class="key" data-act="copykey" title="${esc(t('copy'))}" aria-label="${esc(t('copy') + ': ' + who)}">${esc(u.access_key.slice(0, 6))}…${esc(u.access_key.slice(-4))}</button></div></div></td>
       <td class="hide-sm">${u.connections}</td>
       <td class="small">↓ ${fmtBytes(u.bytes_down)}<br><span class="muted">↑ ${fmtBytes(u.bytes_up)}</span></td>
@@ -1272,6 +1308,7 @@ let editing = null;
 function fillUserForm(u) {
   $('mu-name').value = u?.name || '';
   $('mu-limit').value = u?.limit_bytes ? +(u.limit_bytes / GB).toPrecision(4) : '';
+  $('mu-expires').value = u?.expires_at != null ? isoDay(u.expires_at) : '';
 }
 let editingDevices; // the limit as the server has it; undefined while unknown
 async function loadDevices(u) {
@@ -1343,6 +1380,8 @@ $('f-user').addEventListener('submit', async e => {
   if (limit_bytes === undefined) { toast(t('limit_bad'), true); $('mu-limit').focus(); return; }
   const max_devices = readDevices();
   if (max_devices === undefined) { toast(t('devices_bad'), true); $('mu-devices').focus(); return; }
+  const expires_at = readExpires();
+  if (expires_at === undefined) { toast(t('expires_field'), true); $('mu-expires').focus(); return; }
   // The server refuses an existing key too; checking here saves the round trip.
   const key = editing ? null : ($('mu-key').value.trim() || null);
   if (key && !/^[^\p{White_Space}\p{Cc}\/?#%\\]{8,128}$/u.test(key)) { toast(t('key_bad'), true); $('mu-key').focus(); return; }
@@ -1352,18 +1391,19 @@ $('f-user').addEventListener('submit', async e => {
       if (editing) {
         // Another admin may have saved this user since the form was opened.
         const cur = await api(`users/${encodeURIComponent(editing.access_key)}`);
-        if ((cur.name || null) !== (editing.name || null) || (cur.limit_bytes || null) !== (editing.limit_bytes || null)) {
+        if ((cur.name || null) !== (editing.name || null) || (cur.limit_bytes || null) !== (editing.limit_bytes || null)
+            || (cur.expires_at ?? null) !== (editing.expires_at ?? null)) {
           editing = cur; fillUserForm(cur); toast(t('user_changed'), true); refresh();
           return;
         }
         // The limit is sent only when it was read from the server: an unknown one stays as it is.
-        const body = { name, limit_bytes };
+        const body = { name, limit_bytes, expires_at };
         if (editingDevices !== undefined) body.max_devices = max_devices;
         await api(`users/${encodeURIComponent(editing.access_key)}`, { method: 'PUT', body });
         audit('ev_edit', name || editing.access_key.slice(0, 8)); toast(t('saved'));
         closeModals(); refresh();
       } else {
-        const created = await api('users', { method: 'POST', body: { access_key: key, name, limit_bytes, max_devices } });
+        const created = await api('users', { method: 'POST', body: { access_key: key, name, limit_bytes, max_devices, expires_at } });
         audit('ev_add', name || String(created).slice(0, 8)); toast(t('created'));
         closeModals(); await refresh();
         const u = users.find(x => x.access_key === created);
@@ -1460,7 +1500,39 @@ $('btn-save-rules').addEventListener('click', e => busy(e.currentTarget, async (
   } catch (err) { setNote('rules-note', t('f_rules', { err: err.message }), true); }
 }));
 
+// ── server info (sent to clients inside the tunnel) ───────────────────
+const INFO_FIELDS = ['name', 'location', 'contact', 'about'];
+let infoSnap = null;
+const infoText = () => JSON.stringify(INFO_FIELDS.map(f => $('si-' + f).value));
+async function loadServerInfo(force) {
+  if (!force && infoSnap !== null && infoText() !== infoSnap) return; // being edited
+  try {
+    const info = await api('server/info');
+    const op = info.operator || {};
+    INFO_FIELDS.forEach(f => { $('si-' + f).value = op[f] || ''; });
+    infoSnap = infoText();
+    const s = info.server || {};
+    $('si-facts').textContent = t('info_facts', {
+      v: s.version || '?', c: (s.carriers || []).join(', '), p: s.log_privacy || '?',
+      ip: t(s.ipv6 ? 'yes' : 'no'), dns: t(s.dns_filtering ? 'yes' : 'no'),
+    });
+  } catch (err) { setNote('info-note', t('f_load', { err: err.message }), true); }
+}
+$('f-info').addEventListener('submit', e => {
+  e.preventDefault();
+  busy($('f-info').querySelector('.btn.primary'), async () => {
+    const body = {};
+    INFO_FIELDS.forEach(f => { const v = $('si-' + f).value.trim(); if (v) body[f] = $('si-' + f).value; });
+    try {
+      await api('server/info', { method: 'PUT', body });
+      audit('ev_info', ''); toast(t('info_saved')); setNote('info-note', '');
+      await loadServerInfo(true);
+    } catch (err) { setNote('info-note', t('f_info', { err: err.message }), true); }
+  });
+});
+
 async function loadConfig(force) {
+  loadServerInfo(force);
   if (!force && edited('config', configSnap)) return;
   setNote('config-note', '');
   try { $('config').value = JSON.stringify(await api('server/config'), null, 2); configSnap = $('config').value; }

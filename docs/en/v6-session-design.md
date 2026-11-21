@@ -114,6 +114,9 @@ An established session can be told why it ended. The server sends an authenticat
 | 3 | The traffic limit is used up |
 | 4 | Too many sessions for this key |
 | 5 | The server is shutting down |
+| 6 | The key has expired |
+
+A key whose expiry has passed still completes the handshake; the server then sends `Close` with reason 6 at once, so the reason reaches the client only inside the authenticated session. A v5 client with an expired key is refused like one whose traffic limit is used up. A client that does not know reason 6 reads it as 0.
 
 The client stops, shows the reason and does not retry by itself. This does not weaken the stealth rule: a packet of an unknown session still gets nothing, because only a session that passed authentication is answered, and an observer cannot make one. Reason 1 is the only case where the app may offer one tap to reconnect on the same transport.
 

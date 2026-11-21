@@ -12,6 +12,7 @@
 //! - `DELETE /api/users/:key`        -- Remove access key
 //! - `PUT  /api/users/:key/limit`    -- Set traffic limit for a user
 //! - `POST /api/users/:key/reset`    -- Reset user traffic counters
+//! - `GET|PUT /api/server/info`      -- What clients are told about the server (in the tunnel)
 
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -181,6 +182,16 @@ pub struct UserMeta {
     /// Devices (HWIDs) a subscription may serve; `None` = no limit.
     #[serde(default)]
     pub max_devices: Option<u32>,
+    /// When the key stops working, Unix seconds (UTC); `None` = never.
+    #[serde(default)]
+    pub expires_at: Option<u64>,
+}
+
+impl UserMeta {
+    /// Whether the key has expired at `now` (Unix seconds).
+    pub fn is_expired(&self, now: u64) -> bool {
+        ostp_core::access_keys::is_expired(self.expires_at, now)
+    }
 }
 
 // ── Request/Response types ───────────────────────────────────────────────────
@@ -200,6 +211,8 @@ struct ServerStatus {
     /// `strict`, `normal` or `debug`: what this server's log may say.
     log_privacy: &'static str,
     endpoint: Endpoint,
+    /// What clients get inside the tunnel: `{operator?, server}`.
+    server_info: serde_json::Value,
 }
 
 #[derive(Serialize)]
@@ -236,6 +249,9 @@ pub struct CreateUserRequest {
     pub name: Option<String>,
     pub limit_bytes: Option<u64>,
     pub max_devices: Option<u32>,
+    /// Unix seconds (UTC); absent or `null` = never.
+    #[serde(default)]
+    pub expires_at: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -249,6 +265,9 @@ pub struct UpdateUserRequest {
     /// Absent = unchanged; `null` = no limit; a number = that many devices.
     #[serde(default, deserialize_with = "present")]
     pub max_devices: Option<Option<u32>>,
+    /// Absent = unchanged; `null` = never expires; a number = Unix seconds (UTC).
+    #[serde(default, deserialize_with = "present")]
+    pub expires_at: Option<Option<u64>>,
 }
 
 /// Tells a field that is absent from one that is `null`: a request from a panel
@@ -360,6 +379,7 @@ pub fn create_api_router(state: ApiState) -> Router {
     let api_router = Router::new()
         .route("/server/status", get(handle_status))
         .route("/server/config", get(handle_get_config).put(handle_put_config))
+        .route("/server/info", get(handle_get_server_info).put(handle_put_server_info))
         .route(
             "/users",
             get(handle_list_users).post(handle_create_user),
@@ -759,6 +779,15 @@ fn check_devices(n: Option<u32>) -> Result<Option<u32>, &'static str> {
     }
 }
 
+/// An expiry is a Unix time no later than the year 9999; 0 means none.
+fn check_expires(t: Option<u64>) -> Result<Option<u64>, &'static str> {
+    match t {
+        Some(0) | None => Ok(None),
+        Some(t) if t <= ostp_core::access_keys::MAX_EXPIRES_AT => Ok(Some(t)),
+        Some(_) => Err("expiry is too far in the future (the year 9999 at most)"),
+    }
+}
+
 fn check_limit(limit: Option<u64>) -> Result<(), &'static str> {
     match limit {
         Some(l) if l > MAX_LIMIT_BYTES => Err("traffic limit is too large (1 PiB at most)"),
@@ -801,7 +830,12 @@ fn save_error_message(e: &str) -> &'static str {
 /// there is nothing to say about the user.
 fn key_entry(key: &str, meta: &UserMeta, existing: Option<&serde_json::Value>) -> serde_json::Value {
     use serde_json::Value;
-    if existing.is_none_or(|e| e.is_string()) && meta.name.is_none() && meta.limit_bytes.is_none() && meta.max_devices.is_none() {
+    if existing.is_none_or(|e| e.is_string())
+        && meta.name.is_none()
+        && meta.limit_bytes.is_none()
+        && meta.max_devices.is_none()
+        && meta.expires_at.is_none()
+    {
         return Value::String(key.to_string());
     }
     let mut obj = match existing {
@@ -813,6 +847,7 @@ fn key_entry(key: &str, meta: &UserMeta, existing: Option<&serde_json::Value>) -
         ("name", meta.name.clone().map(Value::String)),
         ("limit_bytes", meta.limit_bytes.map(|n| Value::Number(n.into()))),
         ("max_devices", meta.max_devices.map(|n| Value::Number(n.into()))),
+        ("expires_at", meta.expires_at.map(|t| Value::Number(t.into()))),
     ] {
         match value {
             Some(v) => {
@@ -978,9 +1013,60 @@ async fn handle_status(
             subscription_prefix: state.subscription_prefix.clone(),
             dns_enabled,
         },
+        server_info: crate::server_info::info_value(&state.router.info.operator(), &state.router.facts()),
     };
 
     (StatusCode::OK, ApiResponse::success(status))
+}
+
+/// What clients are told about this server inside the tunnel.
+async fn handle_get_server_info(State(state): State<ApiState>, headers: axum::http::HeaderMap) -> impl IntoResponse {
+    if !check_token(&state, &headers) {
+        return api_unauthorized::<serde_json::Value>();
+    }
+    (StatusCode::OK, ApiResponse::success(crate::server_info::info_value(&state.router.info.operator(), &state.router.facts())))
+}
+
+/// Replaces the operator's info (`server_info` in config.json): every field
+/// sent is set, an empty or missing one removed. Too long a field is refused
+/// rather than cut, so the panel shows what is kept.
+async fn handle_put_server_info(
+    State(state): State<ApiState>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<crate::server_info::OperatorInfo>,
+) -> impl IntoResponse {
+    use crate::server_info::{ABOUT_MAX, SHORT_FIELD_MAX};
+    if !check_token(&state, &headers) {
+        return api_unauthorized::<serde_json::Value>();
+    }
+    let too_long = [body.name.as_deref(), body.location.as_deref(), body.contact.as_deref()]
+        .into_iter()
+        .flatten()
+        .any(|s| s.trim().chars().count() > SHORT_FIELD_MAX);
+    if too_long {
+        return api_error("name, location and contact are 128 characters at most");
+    }
+    if body.about.as_ref().is_some_and(|a| a.len() > ABOUT_MAX) {
+        return api_error("the description is 8 KiB at most");
+    }
+    let info = body.sanitized();
+    if let Some(ref path) = state.config_path {
+        let saved = edit_config(path, false, |config| {
+            let obj = config.as_object_mut().ok_or("config root is not an object")?;
+            if info.is_empty() {
+                obj.remove("server_info");
+            } else {
+                obj.insert("server_info".into(), serde_json::to_value(&info).map_err(|e| e.to_string())?);
+            }
+            Ok(())
+        });
+        if let Err(e) = saved {
+            tracing::error!("Failed to save config after changing server_info: {}", e);
+            return api_error("failed to save configuration");
+        }
+    }
+    state.router.info.set_operator(info);
+    (StatusCode::OK, ApiResponse::success(crate::server_info::info_value(&state.router.info.operator(), &state.router.facts())))
 }
 
 async fn handle_list_users(
@@ -1005,6 +1091,7 @@ async fn handle_list_users(
                 limit_bytes: st.limit_bytes,
                 online: st.connections.load(Ordering::Relaxed) > 0,
                 last_seen: None,
+                expires_at: meta.expires_at,
             }
         } else {
             UserStatsSnapshot {
@@ -1016,6 +1103,7 @@ async fn handle_list_users(
                 limit_bytes: meta.limit_bytes,
                 online: false,
                 last_seen: None,
+                expires_at: meta.expires_at,
             }
         }
     }).collect();
@@ -1051,6 +1139,7 @@ async fn handle_get_user(
             limit_bytes: st.limit_bytes,
             online: st.connections.load(Ordering::Relaxed) > 0,
             last_seen: None,
+            expires_at: meta.expires_at,
         }
     } else {
         UserStatsSnapshot {
@@ -1062,6 +1151,7 @@ async fn handle_get_user(
             limit_bytes: meta.limit_bytes,
             online: false,
             last_seen: None,
+            expires_at: meta.expires_at,
         }
     };
 
@@ -1088,6 +1178,10 @@ async fn handle_create_user(
         Ok(n) => n,
         Err(m) => return api_error::<String>(m),
     };
+    let expires_at = match check_expires(body.expires_at) {
+        Ok(t) => t,
+        Err(m) => return api_error::<String>(m),
+    };
     let key = match body.access_key.filter(|k| !k.is_empty()) {
         Some(k) => {
             if let Err(m) = check_key(&k) {
@@ -1107,14 +1201,14 @@ async fn handle_create_user(
         if keys.len() >= MAX_USERS {
             return api_error::<String>("too many users (10000 at most)");
         }
-        keys.insert(key.clone(), UserMeta { name: name.clone(), limit_bytes: body.limit_bytes, max_devices });
+        keys.insert(key.clone(), UserMeta { name: name.clone(), limit_bytes: body.limit_bytes, max_devices, expires_at });
     }
 
     let mut stats = state.user_stats.write().unwrap_or_else(|e| e.into_inner());
     stats.insert(key.clone(), Arc::new(UserStats::new(body.limit_bytes)));
     drop(stats);
 
-    let meta = UserMeta { name, limit_bytes: body.limit_bytes, max_devices };
+    let meta = UserMeta { name, limit_bytes: body.limit_bytes, max_devices, expires_at };
     if let Err(e) = save_key_change(&state, KeyChange::Add(vec![(key.clone(), meta)])) {
         tracing::error!("Failed to save config after creating user: {}", e);
         // Not on disk, so not kept in memory either: a restart would lose it silently.
@@ -1220,6 +1314,13 @@ async fn update_user(
         },
         None => None,
     };
+    let expires_at = match body.expires_at {
+        Some(t) => match check_expires(t) {
+            Ok(t) => Some(t),
+            Err(m) => return api_error::<String>(m),
+        },
+        None => None,
+    };
 
     let (old_meta, new_meta) = {
         let mut keys = state.access_keys.write().unwrap_or_else(|e| e.into_inner());
@@ -1235,6 +1336,9 @@ async fn update_user(
         }
         if let Some(n) = max_devices {
             meta.max_devices = n;
+        }
+        if let Some(t) = expires_at {
+            meta.expires_at = t;
         }
         (old, meta.clone())
     };
@@ -1694,6 +1798,32 @@ mod tests {
     }
 
     #[test]
+    fn expiry_requests() {
+        assert_eq!(check_expires(None), Ok(None));
+        assert_eq!(check_expires(Some(0)), Ok(None));
+        assert_eq!(check_expires(Some(1_767_225_599)), Ok(Some(1_767_225_599)));
+        assert!(check_expires(Some(u64::MAX)).is_err());
+        let r: UpdateUserRequest = serde_json::from_str(r#"{"name": "a"}"#).unwrap();
+        assert_eq!(r.expires_at, None, "absent: unchanged");
+        let r: UpdateUserRequest = serde_json::from_str(r#"{"expires_at": null}"#).unwrap();
+        assert_eq!(r.expires_at, Some(None), "null: cleared");
+        let r: UpdateUserRequest = serde_json::from_str(r#"{"expires_at": 5}"#).unwrap();
+        assert_eq!(r.expires_at, Some(Some(5)));
+        let c: CreateUserRequest = serde_json::from_str(r#"{"expires_at": 7}"#).unwrap();
+        assert_eq!(c.expires_at, Some(7));
+        // Written to config.json only when set, and dropped when cleared.
+        let mut m = meta(Some("a"), None);
+        m.expires_at = Some(9);
+        let e = key_entry("k", &m, None);
+        assert_eq!(e["expires_at"], 9);
+        m.expires_at = None;
+        assert!(key_entry("k", &m, Some(&e)).get("expires_at").is_none());
+        assert!(!m.is_expired(0));
+        m.expires_at = Some(10);
+        assert!(m.is_expired(10) && !m.is_expired(9));
+    }
+
+    #[test]
     fn test_check_name_and_limit() {
         assert_eq!(check_name(None), Ok(None));
         assert_eq!(check_name(Some("  ".into())), Ok(None));
@@ -1754,7 +1884,7 @@ mod tests {
     }
 
     fn meta(name: Option<&str>, limit: Option<u64>) -> UserMeta {
-        UserMeta { name: name.map(String::from), limit_bytes: limit, max_devices: None }
+        UserMeta { name: name.map(String::from), limit_bytes: limit, max_devices: None, expires_at: None }
     }
 
     /// A change is applied to the list on disk: a user the CLI added and the
@@ -1972,6 +2102,9 @@ pub struct BulkCreateRequest {
     pub count: usize,
     pub limit_bytes: Option<u64>,
     pub max_devices: Option<u32>,
+    /// Unix seconds (UTC); absent or `null` = never.
+    #[serde(default)]
+    pub expires_at: Option<u64>,
 }
 
 async fn handle_bulk_create_users(
@@ -1993,6 +2126,10 @@ async fn handle_bulk_create_users(
         Ok(n) => n,
         Err(m) => return api_error(m),
     };
+    let bulk_expires = match check_expires(payload.expires_at) {
+        Ok(t) => t,
+        Err(m) => return api_error(m),
+    };
 
     let mut new_keys = Vec::new();
     let mut keys = match state.access_keys.write() {
@@ -2012,6 +2149,7 @@ async fn handle_bulk_create_users(
             name: None,
             limit_bytes: payload.limit_bytes,
             max_devices: bulk_devices,
+            expires_at: bulk_expires,
         });
         new_keys.push(key);
     }
@@ -2019,7 +2157,7 @@ async fn handle_bulk_create_users(
     drop(keys);
     let added = new_keys
         .iter()
-        .map(|k| (k.clone(), UserMeta { name: None, limit_bytes: payload.limit_bytes, max_devices: bulk_devices }))
+        .map(|k| (k.clone(), UserMeta { name: None, limit_bytes: payload.limit_bytes, max_devices: bulk_devices, expires_at: bulk_expires }))
         .collect();
     if let Err(e) = save_key_change(&state, KeyChange::Add(added)) {
         tracing::error!("Failed to save config after bulk create: {}", e);

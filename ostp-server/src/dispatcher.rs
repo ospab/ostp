@@ -75,6 +75,9 @@ pub struct UserStatsSnapshot {
     pub limit_bytes: Option<u64>,
     pub online: bool,
     pub last_seen: Option<u64>,
+    /// When the key stops working, Unix seconds (UTC); `None` = never.
+    #[serde(default)]
+    pub expires_at: Option<u64>,
 }
 
 pub struct PeerState {
@@ -88,7 +91,12 @@ pub struct PeerState {
     /// v6: the streams of this session by id (the client's odd ids), to hold
     /// the limit and refuse a reused id. Unused by a v5 session.
     pub streams: ostp_core::streams::StreamIds,
+    /// When this session was last sent its `ServerInfo` (see `allow_info_request`).
+    pub last_info: Option<std::time::Instant>,
 }
+
+/// A session gets its `ServerInfo` at most this often.
+pub const INFO_REQUEST_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
 
 pub struct Dispatcher {
     peer_machines: HashMap<u32, PeerState>,
@@ -331,6 +339,7 @@ impl Dispatcher {
                 limit_bytes: us.limit_bytes,
                 online: online_keys.contains_key(key),
                 last_seen: last_seen_unix,
+                expires_at: None,
             }
         }).collect()
     }
@@ -462,13 +471,23 @@ impl Dispatcher {
         if let Some(session_id) = session_id_opt {
             let key_opt = self.peer_machines.get(&session_id).map(|ps| ps.access_key.clone());
             if let Some(access_key) = key_opt {
-                // Check if key is still valid and not over limit
-                let key_valid = self.access_keys.read().unwrap_or_else(|e| e.into_inner()).contains_key(&access_key);
+                // Check if key is still valid, not expired and not over limit
+                let (key_valid, expired) = match self.access_keys.read().unwrap_or_else(|e| e.into_inner()).get(&access_key) {
+                    Some(meta) => (true, meta.is_expired(ostp_core::access_keys::unix_now())),
+                    None => (false, false),
+                };
                 let user_stats = self.get_or_create_user_stats(&access_key);
-                if !key_valid || user_stats.is_over_limit() {
-                    tracing::info!("Dropping session {} for key {} (valid={}, over_limit={})",
-                        session_id, key_fp(&access_key), key_valid, user_stats.is_over_limit());
-                    self.drop_session_with(session_id, if key_valid { CloseReason::TrafficLimit } else { CloseReason::KeyRevoked });
+                if !key_valid || expired || user_stats.is_over_limit() {
+                    tracing::info!("Dropping session {} for key {} (valid={}, expired={}, over_limit={})",
+                        session_id, key_fp(&access_key), key_valid, expired, user_stats.is_over_limit());
+                    let reason = if !key_valid {
+                        CloseReason::KeyRevoked
+                    } else if expired {
+                        CloseReason::KeyExpired
+                    } else {
+                        CloseReason::TrafficLimit
+                    };
+                    self.drop_session_with(session_id, reason);
                     return Ok(DispatchOutcome::Unauthorized);
                 }
             }
@@ -746,6 +765,22 @@ impl Dispatcher {
                                 self.drop_session(candidate_session_id);
                             }
 
+                            // An expired key: a v5 client is refused as for a used-up
+                            // limit; a v6 one gets its session and at once a
+                            // `Close(KeyExpired)`, so the reason reaches it only
+                            // inside the authenticated tunnel. It takes no slot
+                            // from the key's other sessions.
+                            let expired = self
+                                .access_keys
+                                .read()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .get(&candidate_key)
+                                .is_some_and(|m| m.is_expired(now));
+                            if expired && !is_v6 {
+                                crate::logs::key_expired(&key_fp(&candidate_key), peer);
+                                return Ok(DispatchOutcome::Unauthorized);
+                            }
+
                             // This key's oldest session makes room.
                             let mine: Vec<(u32, std::time::Instant)> = self
                                 .peer_machines
@@ -753,7 +788,7 @@ impl Dispatcher {
                                 .filter(|(_, ps)| ps.access_key == candidate_key)
                                 .map(|(&sid, ps)| (sid, ps.last_seen))
                                 .collect();
-                            if mine.len() >= MAX_SESSIONS_PER_KEY {
+                            if !expired && mine.len() >= MAX_SESSIONS_PER_KEY {
                                 if let Some(&(oldest, _)) = mine.iter().min_by_key(|(_, seen)| *seen) {
                                     tracing::info!("Key {} has {} sessions, dropping the oldest ({})", key_fp(&candidate_key), mine.len(), oldest);
                                     self.drop_session_with(oldest, CloseReason::TooManySessions);
@@ -778,6 +813,7 @@ impl Dispatcher {
                                 access_key: candidate_key.clone(),
                                 flow_control: false,
                                 streams: ostp_core::streams::StreamIds::new(ostp_core::streams::Side::Server),
+                                last_info: None,
                             });
                             self.addr_to_session.insert(peer, candidate_session_id);
                             // The id belonged to a session dropped since the
@@ -806,6 +842,13 @@ impl Dispatcher {
                                 }
                             }
 
+                            // The handshake reply goes out now, the `Close` with
+                            // the next tick, after it.
+                            if expired {
+                                crate::logs::key_expired(&key_fp(&candidate_key), peer);
+                                self.drop_session_with(candidate_session_id, CloseReason::KeyExpired);
+                            }
+
                             return Ok(DispatchOutcome::Accepted {
                                 responses: response_opt.into_iter().collect(),
                                 app_payloads: Vec::new(),
@@ -826,6 +869,34 @@ impl Dispatcher {
     /// in v6, in v5 only when the client announced it (FEATURE_FLOW_CONTROL).
     pub fn flow_control(&self, session_id: u32) -> bool {
         self.peer_machines.get(&session_id).is_some_and(|ps| ps.flow_control || ps.machine.is_v6())
+    }
+
+    /// Whether this session may be sent its `ServerInfo` now: once per
+    /// `INFO_REQUEST_INTERVAL`, so a client cannot make the server do the
+    /// work (and send the bytes) in a loop. A yes counts as the send.
+    pub fn allow_info_request(&mut self, session_id: u32) -> bool {
+        let now = std::time::Instant::now();
+        let Some(ps) = self.peer_machines.get_mut(&session_id) else { return false };
+        if ps.last_info.is_some_and(|t| now.duration_since(t) < INFO_REQUEST_INTERVAL) {
+            return false;
+        }
+        ps.last_info = Some(now);
+        true
+    }
+
+    /// The `key` part of this session's `ServerInfo`: its key's traffic,
+    /// limit, expiry and device limit.
+    pub fn key_info(&self, session_id: u32) -> Option<serde_json::Value> {
+        let key = &self.peer_machines.get(&session_id)?.access_key;
+        let meta = self.access_keys.read().unwrap_or_else(|e| e.into_inner()).get(key).cloned()?;
+        let used = self
+            .user_stats
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(key)
+            .map(|s| s.bytes_up.load(Ordering::Relaxed) + s.bytes_down.load(Ordering::Relaxed))
+            .unwrap_or(0);
+        Some(crate::server_info::key_value(used, meta.limit_bytes, meta.expires_at, meta.max_devices))
     }
 
     pub fn set_flow_control(&mut self, session_id: u32) {
@@ -996,16 +1067,19 @@ impl Dispatcher {
         {
             let keys = housekeeping.then(|| self.access_keys.read().unwrap_or_else(|e| e.into_inner()));
             let stats = housekeeping.then(|| self.user_stats.read().unwrap_or_else(|e| e.into_inner()));
+            let unix_now = ostp_core::access_keys::unix_now();
             for (&sid, peer_state) in &self.peer_machines {
                 if peer_state.machine.state() == OstpState::Closed {
                     expired.push(sid);
                     continue;
                 }
                 let (Some(keys), Some(stats)) = (&keys, &stats) else { continue };
-                let key_valid = keys.contains_key(&peer_state.access_key);
+                let meta = keys.get(&peer_state.access_key);
+                let key_valid = meta.is_some();
+                let expired = meta.is_some_and(|m| m.is_expired(unix_now));
                 // No entry yet: nothing counted, so nothing over the limit.
                 let over_limit = stats.get(&peer_state.access_key).is_some_and(|s| s.is_over_limit());
-                if now.duration_since(peer_state.last_seen) > timeout_dur || !key_valid || over_limit {
+                if now.duration_since(peer_state.last_seen) > timeout_dur || !key_valid || expired || over_limit {
                     expired.push(sid);
                 }
             }
@@ -1018,7 +1092,10 @@ impl Dispatcher {
             // the client; a session closed by the client or idle for ten
             // minutes has nobody to tell.
             let (reason, close) = if let Some(ps) = peer_state_opt {
-                let key_valid = self.access_keys.read().unwrap_or_else(|e| e.into_inner()).contains_key(&ps.access_key);
+                let (key_valid, expired) = match self.access_keys.read().unwrap_or_else(|e| e.into_inner()).get(&ps.access_key) {
+                    Some(meta) => (true, meta.is_expired(ostp_core::access_keys::unix_now())),
+                    None => (false, false),
+                };
                 let user_stats = self.get_or_create_user_stats(&ps.access_key);
                 if ps.machine.state() == OstpState::Closed {
                     ("closed by the client", None)
@@ -1026,6 +1103,8 @@ impl Dispatcher {
                     ("inactive >10min", None)
                 } else if !key_valid {
                     ("key deleted", Some(CloseReason::KeyRevoked))
+                } else if expired {
+                    ("key expired", Some(CloseReason::KeyExpired))
                 } else if user_stats.is_over_limit() {
                     ("traffic limit exceeded", Some(CloseReason::TrafficLimit))
                 } else {
@@ -1282,7 +1361,7 @@ mod roaming_tests {
 
     /// A dispatcher and a client with an established session on `home`.
     fn established(home: SocketAddr) -> (Dispatcher, ProtocolMachine) {
-        let keys = Arc::new(RwLock::new(HashMap::from([(KEY.to_string(), crate::api::UserMeta { name: None, limit_bytes: None, max_devices: None })])));
+        let keys = Arc::new(RwLock::new(HashMap::from([(KEY.to_string(), crate::api::UserMeta { name: None, limit_bytes: None, max_devices: None, expires_at: None })])));
         let mut dispatcher = Dispatcher::new(base_config(NoiseRole::Responder), keys);
 
         let secrets = ostp_core::crypto::derive_all_secrets(KEY.as_bytes());
@@ -1313,7 +1392,7 @@ mod roaming_tests {
     }
 
     fn new_dispatcher() -> Dispatcher {
-        let keys = Arc::new(RwLock::new(HashMap::from([(KEY.to_string(), crate::api::UserMeta { name: None, limit_bytes: None, max_devices: None })])));
+        let keys = Arc::new(RwLock::new(HashMap::from([(KEY.to_string(), crate::api::UserMeta { name: None, limit_bytes: None, max_devices: None, expires_at: None })])));
         Dispatcher::new(base_config(NoiseRole::Responder), keys)
     }
 
@@ -1692,7 +1771,7 @@ mod roaming_tests {
     fn transitional_with_other_key_only() -> (Dispatcher, [u8; 32]) {
         let keys = Arc::new(RwLock::new(HashMap::from([(
             "some-other-key-0123456789abcdef".to_string(),
-            crate::api::UserMeta { name: None, limit_bytes: None, max_devices: None },
+            crate::api::UserMeta { name: None, limit_bytes: None, max_devices: None, expires_at: None },
         )])));
         let mut dispatcher = Dispatcher::new(base_config(NoiseRole::Responder), keys);
         let (private, public) = ostp_core::crypto::noise::generate_server_key();
@@ -1743,6 +1822,77 @@ mod roaming_tests {
         let (frames, _) = dispatcher.on_tick();
         let (closed, _) = client_reads(&mut client, &frames_to(&frames, home));
         assert_eq!(closed.map(|c| c.0), Some(CloseReason::TrafficLimit));
+        assert_eq!(dispatcher.active_sessions(), 0);
+    }
+
+    #[test]
+    fn server_info_is_rate_limited_and_carries_the_key() {
+        let (mut dispatcher, _client, _) = connected_v6();
+        {
+            let mut keys = dispatcher.access_keys.write().unwrap();
+            let m = keys.get_mut(KEY).unwrap();
+            m.limit_bytes = Some(1000);
+            m.expires_at = Some(1_767_225_599);
+            m.max_devices = Some(2);
+        }
+        let k = dispatcher.key_info(SID).unwrap();
+        assert_eq!(k["limit_bytes"], 1000);
+        assert_eq!(k["expires_at"], 1_767_225_599u64);
+        assert_eq!(k["max_devices"], 2);
+        assert!(k["used_bytes"].is_u64());
+        assert!(dispatcher.allow_info_request(SID));
+        assert!(!dispatcher.allow_info_request(SID), "one per interval");
+        assert!(!dispatcher.allow_info_request(SID + 1), "no such session");
+        assert!(dispatcher.key_info(SID + 1).is_none());
+    }
+
+    fn set_expiry(dispatcher: &Dispatcher, expires_at: Option<u64>) {
+        dispatcher.access_keys.write().unwrap().get_mut(KEY).unwrap().expires_at = expires_at;
+    }
+
+    #[test]
+    fn an_expiring_key_sends_close_6_to_its_live_session() {
+        let (mut dispatcher, mut client, home) = connected_v6();
+        // Not yet: the session stays.
+        set_expiry(&dispatcher, Some(ostp_core::access_keys::unix_now() + 3600));
+        let (_, dropped) = dispatcher.on_tick();
+        assert!(dropped.is_empty());
+        assert_eq!(dispatcher.active_sessions(), 1);
+        // Past: the next slow pass closes it with the reason.
+        set_expiry(&dispatcher, Some(1));
+        dispatcher.last_housekeeping = None;
+        let (frames, dropped) = dispatcher.on_tick();
+        assert_eq!(dropped, vec![SID]);
+        let (closed, _) = client_reads(&mut client, &frames_to(&frames, home));
+        assert_eq!(closed.map(|c| c.0), Some(CloseReason::KeyExpired));
+        assert_eq!(dispatcher.active_sessions(), 0);
+    }
+
+    #[test]
+    fn an_expired_v6_key_completes_the_handshake_and_is_told_inside_the_tunnel() {
+        let (private, public) = ostp_core::crypto::noise::generate_server_key();
+        let mut dispatcher = new_dispatcher();
+        dispatcher.set_wire_versions(Some(private), true);
+        set_expiry(&dispatcher, Some(1));
+        let (mut client, msg1) = v6_client(public);
+        let home = addr("203.0.113.6:4000");
+        let reply = accepted_reply(dispatcher.on_datagram(home, msg1).unwrap()).expect("the handshake is answered");
+        client.on_event(OstpEvent::Inbound(reply)).unwrap();
+        assert_eq!(client.state(), OstpState::Established);
+        assert_eq!(dispatcher.active_sessions(), 0, "no session is kept for an expired key");
+        let (frames, _) = dispatcher.on_tick();
+        let (closed, _) = client_reads(&mut client, &frames_to(&frames, home));
+        assert_eq!(closed.map(|c| c.0), Some(CloseReason::KeyExpired));
+        let stats = dispatcher.user_stats_ref();
+        assert_eq!(stats.read().unwrap()[KEY].connections.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn an_expired_v5_key_is_refused_like_a_used_up_limit() {
+        let mut dispatcher = new_dispatcher();
+        set_expiry(&dispatcher, Some(1));
+        let outcome = dispatcher.on_datagram(addr("198.51.100.20:40000"), v5_first_datagram(KEY, SID)).unwrap();
+        assert!(accepted_reply(outcome).is_none());
         assert_eq!(dispatcher.active_sessions(), 0);
     }
 

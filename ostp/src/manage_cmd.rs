@@ -47,6 +47,10 @@ pub enum ManageAction {
         /// How many devices may use the subscription (0 or absent: no limit)
         #[arg(long)]
         devices: Option<u32>,
+        /// When the key stops working: YYYY-MM-DD (the end of that day, UTC),
+        /// <N>d (N days from now) or never (absent: never)
+        #[arg(long)]
+        expires: Option<String>,
     },
     /// Change a user in one write: number, name or access key, then what changes.
     /// An option left out keeps its value; 0 removes a limit.
@@ -60,6 +64,10 @@ pub enum ManageAction {
         /// Device limit of the subscription (0 removes it)
         #[arg(long)]
         devices: Option<u32>,
+        /// When the key stops working: YYYY-MM-DD (the end of that day, UTC),
+        /// <N>d (N days from now) or never (removes the expiry)
+        #[arg(long)]
+        expires: Option<String>,
     },
     /// Remove a user: number (as in `ostp links`), name or access key
     UserRemove { user: String },
@@ -80,6 +88,23 @@ pub enum ManageAction {
     },
     /// The DNS filter's settings (from the config)
     Dns,
+    /// What the server tells its clients about itself inside the tunnel: who
+    /// runs it, where, how to reach them, and a description. An option left
+    /// out keeps its value; an empty one removes it.
+    ServerInfo {
+        #[arg(long)]
+        name: Option<String>,
+        #[arg(long)]
+        location: Option<String>,
+        #[arg(long)]
+        contact: Option<String>,
+        /// Description in Markdown (8 KiB at most)
+        #[arg(long, conflicts_with = "about_file")]
+        about: Option<String>,
+        /// Read the description from this file (Markdown)
+        #[arg(long)]
+        about_file: Option<std::path::PathBuf>,
+    },
     /// Restart the service
     Restart,
 }
@@ -103,6 +128,7 @@ pub fn run(action: ManageAction, config_path: &Path, json_out: bool) -> ! {
         ManageAction::UserLimit { .. } => Shown::UserLimit,
         ManageAction::UserDevices { .. } => Shown::UserDevices,
         ManageAction::Dns => Shown::Dns,
+        ManageAction::ServerInfo { .. } => Shown::ServerInfo,
         ManageAction::Logs { .. } => Shown::Logs,
         ManageAction::Restart => Shown::Restart,
     };
@@ -115,23 +141,31 @@ pub fn run(action: ManageAction, config_path: &Path, json_out: bool) -> ! {
             | ManageAction::UserRemove { .. }
             | ManageAction::UserRename { .. }
             | ManageAction::UserLimit { .. }
+            | ManageAction::ServerInfo { .. }
     )
     .then(|| ostp_server::config_io::lock_config(config_path));
     let result = match action {
         ManageAction::Install { port, host, user } => install(config_path, port, host.as_deref(), &user),
         ManageAction::Status => status(config_path),
         ManageAction::Users => users(config_path),
-        ManageAction::UserAdd { name, key, limit_bytes, devices } => {
-            user_add(config_path, &name, key.as_deref(), Limits { bytes: limit_bytes, devices })
-        }
-        ManageAction::UserSet { user, name, limit_bytes, devices } => {
-            user_set(config_path, &user, name.as_deref(), Limits { bytes: limit_bytes, devices })
-        }
+        ManageAction::UserAdd { name, key, limit_bytes, devices, expires } => parse_expires(expires.as_deref())
+            .and_then(|expires| user_add(config_path, &name, key.as_deref(), Limits { bytes: limit_bytes, devices, expires })),
+        ManageAction::UserSet { user, name, limit_bytes, devices, expires } => parse_expires(expires.as_deref())
+            .and_then(|expires| user_set(config_path, &user, name.as_deref(), Limits { bytes: limit_bytes, devices, expires })),
         ManageAction::UserRemove { user } => user_remove(config_path, &user),
         ManageAction::UserRename { user, name } => user_rename(config_path, &user, &name),
         ManageAction::UserLimit { user, devices } => user_limit(config_path, &user, devices),
         ManageAction::UserDevices { user } => user_devices(config_path, &user),
         ManageAction::Dns => dns_info(config_path),
+        ManageAction::ServerInfo { name, location, contact, about, about_file } => {
+            let about = match about_file {
+                Some(path) => std::fs::read_to_string(&path)
+                    .with_context(|| format!("cannot read {}", path.display()))
+                    .map(Some),
+                None => Ok(about),
+            };
+            about.and_then(|about| server_info_set(config_path, OperatorChange { name, location, contact, about }))
+        }
         ManageAction::Logs { lines } => logs(lines),
         ManageAction::Restart => restart().map(|active| json!({ "active": active })),
     };
@@ -374,6 +408,7 @@ fn status(config_path: &Path) -> Result<Value> {
             "login": !str_of("username").is_empty() && !str_of("password_hash").is_empty(),
         },
         "overnet": overnet_status(&v),
+        "server_info": server_info_of(&v, &server, config_path),
         "system": system_info(),
     }))
 }
@@ -386,6 +421,7 @@ fn read_stats(config_path: &Path) -> Option<ostp_server::StatsFile> {
 fn users(config_path: &Path) -> Result<Value> {
     let (_, server) = load(config_path)?;
     let stats = read_stats(config_path);
+    let now = ostp_core::access_keys::unix_now();
     let list: Vec<Value> = server
         .access_keys
         .iter()
@@ -409,6 +445,9 @@ fn users(config_path: &Path) -> Result<Value> {
                 "last_seen": s.and_then(|s| s.last_seen),
                 "limit_bytes": u.limit(),
                 "max_devices": u.max_devices(),
+                // Unix seconds (UTC) or null; `expired` once it has passed.
+                "expires_at": u.expires_at(),
+                "expired": ostp_core::access_keys::is_expired(u.expires_at(), now),
             })
         })
         .collect();
@@ -416,11 +455,19 @@ fn users(config_path: &Path) -> Result<Value> {
 }
 
 /// Limits given to `user-add`/`user-set`: absent keeps (or, on add, means
-/// none), 0 removes.
+/// none), 0 removes. `expires`: `Some(None)` removes the expiry.
 #[derive(Default, Clone, Copy)]
 struct Limits {
     bytes: Option<u64>,
     devices: Option<u32>,
+    expires: Option<Option<u64>>,
+}
+
+/// `--expires`: absent keeps; `never` is `Some(None)`.
+fn parse_expires(value: Option<&str>) -> Result<Option<Option<u64>>> {
+    value
+        .map(|v| ostp_core::access_keys::parse_expiry(v, ostp_core::access_keys::unix_now()).map_err(|e| anyhow!("--expires {e}")))
+        .transpose()
 }
 
 /// 1 PiB, as the panel allows.
@@ -477,7 +524,76 @@ fn apply_limits(entry: &mut Value, limits: Limits) -> Result<()> {
         }
         None => {}
     }
+    match limits.expires {
+        Some(None) => {
+            obj.remove("expires_at");
+        }
+        Some(Some(t)) => {
+            obj.insert("expires_at".into(), t.into());
+        }
+        None => {}
+    }
     Ok(())
+}
+
+/// Changes to the `server_info` section: `None` keeps a field, an empty
+/// string removes it.
+#[derive(Default)]
+struct OperatorChange {
+    name: Option<String>,
+    location: Option<String>,
+    contact: Option<String>,
+    about: Option<String>,
+}
+
+/// What the server tells its clients about itself (`server_info` in the
+/// status and in the tunnel): the operator's section of the config and the
+/// facts this machine and config give.
+fn server_info_of(v: &Value, server: &ServerConfig, config_path: &Path) -> Value {
+    let operator = ostp_server::server_info::OperatorInfo::from_config(v);
+    let dns_filtering = v
+        .get("dns")
+        .filter(|d| !d.is_null())
+        .and_then(|d| serde_json::from_value::<ostp_dns::DnsSettings>(d.clone()).ok())
+        .is_some_and(|s| s.enabled);
+    let facts = ostp_server::server_info::ServerFacts {
+        version: ostp_server::api::build_version().to_string(),
+        carriers: ostp_server::server_info::carriers(crate::cert_cmd::tls_settings(config_path).is_ok()),
+        log_privacy: ostp_client::config::LogCfg::resolve(server.log.as_ref(), server.debug.unwrap_or(false)).as_str().to_string(),
+        ipv6: ostp_server::router::has_ipv6_egress(),
+        dns_filtering,
+    };
+    ostp_server::server_info::info_value(&operator, &facts)
+}
+
+fn server_info_set(config_path: &Path, change: OperatorChange) -> Result<Value> {
+    use ostp_server::server_info::{OperatorInfo, ABOUT_MAX};
+    if change.about.as_ref().is_some_and(|a| a.len() > ABOUT_MAX) {
+        bail!("the description is {} bytes; 8 KiB at most", change.about.as_ref().map_or(0, String::len));
+    }
+    let (mut v, _) = load(config_path)?;
+    let mut info = OperatorInfo::from_config(&v);
+    for (field, value) in [
+        (&mut info.name, change.name),
+        (&mut info.location, change.location),
+        (&mut info.contact, change.contact),
+        (&mut info.about, change.about),
+    ] {
+        if let Some(new) = value {
+            *field = Some(new);
+        }
+    }
+    // Cleaned and cut as the server reads it; empty fields drop out.
+    let info = info.sanitized();
+    let obj = v.as_object_mut().ok_or_else(|| anyhow!("the config is not a JSON object"))?;
+    if info.is_empty() {
+        obj.remove("server_info");
+    } else {
+        obj.insert("server_info".into(), serde_json::to_value(&info)?);
+    }
+    save(config_path, &v)?;
+    let (v, server) = load(config_path)?;
+    Ok(json!({ "server_info": server_info_of(&v, &server, config_path) }))
 }
 
 fn user_add(config_path: &Path, name: &str, key: Option<&str>, limits: Limits) -> Result<Value> {
@@ -720,6 +836,7 @@ mod tests {
                 limit_bytes: None,
                 online: true,
                 last_seen: Some(9),
+                expires_at: None,
             }],
         };
         std::fs::write(dir.path().join(ostp_server::STATS_FILE), serde_json::to_vec(&stats).unwrap()).unwrap();
@@ -769,7 +886,7 @@ mod tests {
         let dir = temp_config(&server());
         let cfg = dir.path().join("config.json");
 
-        let added = user_add(&cfg, "tablet", Some("my-own-key-1234"), Limits { bytes: Some(5 << 30), devices: Some(2) }).unwrap();
+        let added = user_add(&cfg, "tablet", Some("my-own-key-1234"), Limits { bytes: Some(5 << 30), devices: Some(2), expires: None }).unwrap();
         assert_eq!(added["user"]["key"], "my-own-key-1234");
         assert_eq!(added["user"]["limit_bytes"], 5u64 << 30);
         assert_eq!(added["user"]["max_devices"], 2);
@@ -778,7 +895,7 @@ mod tests {
         assert!(user_add(&cfg, "bad", Some("a/b/c/d/e"), Limits::default()).is_err());
 
         // Only what is given changes; 0 removes a limit.
-        let set = user_set(&cfg, "tablet", Some("tablet-2"), Limits { bytes: Some(0), devices: None }).unwrap();
+        let set = user_set(&cfg, "tablet", Some("tablet-2"), Limits { bytes: Some(0), devices: None, expires: None }).unwrap();
         assert_eq!(set["user"]["name"], "tablet-2");
         assert_eq!(set["user"]["limit_bytes"], Value::Null);
         assert_eq!(set["user"]["max_devices"], 2);
@@ -786,14 +903,75 @@ mod tests {
         assert!(v["access_keys"][2].get("limit_bytes").is_none());
 
         // A bare key gains limits and keeps its key.
-        let set = user_set(&cfg, "1", None, Limits { bytes: Some(1 << 30), devices: Some(1) }).unwrap();
+        let set = user_set(&cfg, "1", None, Limits { bytes: Some(1 << 30), devices: Some(1), expires: None }).unwrap();
         assert_eq!(set["user"]["key"], "00112233445566778899aabbccddeeff");
         assert_eq!(set["user"]["limit_bytes"], 1u64 << 30);
 
         assert!(user_set(&cfg, "tablet-2", Some("phone"), Limits::default()).is_err(), "names stay unique");
-        assert!(user_set(&cfg, "tablet-2", None, Limits { bytes: Some(1 << 51), devices: None }).is_err());
-        assert!(user_set(&cfg, "tablet-2", None, Limits { bytes: None, devices: Some(1001) }).is_err());
+        assert!(user_set(&cfg, "tablet-2", None, Limits { bytes: Some(1 << 51), devices: None, expires: None }).is_err());
+        assert!(user_set(&cfg, "tablet-2", None, Limits { bytes: None, devices: Some(1001), expires: None }).is_err());
         assert!(user_set(&cfg, "nobody", None, Limits::default()).is_err());
+    }
+
+    #[test]
+    fn an_expiry_is_set_shown_and_removed() {
+        let dir = temp_config(&server());
+        let cfg = dir.path().join("config.json");
+        let expires = parse_expires(Some("2025-12-31")).unwrap();
+        assert_eq!(expires, Some(Some(1_767_225_599)));
+        let added = user_add(&cfg, "tv", None, Limits { expires, ..Limits::default() }).unwrap();
+        assert_eq!(added["user"]["expires_at"], 1_767_225_599u64);
+        assert_eq!(added["user"]["expired"], true, "that day is past");
+        let later = parse_expires(Some("30d")).unwrap();
+        let set = user_set(&cfg, "tv", None, Limits { expires: later, ..Limits::default() }).unwrap();
+        assert_eq!(set["user"]["expired"], false);
+        // Another change keeps it.
+        let set = user_set(&cfg, "tv", None, Limits { devices: Some(2), ..Limits::default() }).unwrap();
+        assert_eq!(set["user"]["expires_at"], later.unwrap().unwrap());
+        let set = user_set(&cfg, "tv", None, Limits { expires: parse_expires(Some("never")).unwrap(), ..Limits::default() }).unwrap();
+        assert_eq!(set["user"]["expires_at"], Value::Null);
+        let (v, _) = load(&cfg).unwrap();
+        assert!(v["access_keys"][2].get("expires_at").is_none());
+        assert!(parse_expires(Some("2025-02-30")).is_err());
+        assert_eq!(parse_expires(None).unwrap(), None);
+    }
+
+    #[test]
+    fn server_info_is_set_cleared_and_shown_in_the_status_shape() {
+        let dir = temp_config(&server());
+        let cfg = dir.path().join("config.json");
+        let out = server_info_set(&cfg, OperatorChange {
+            name: Some("My VPN".into()),
+            location: Some("Helsinki".into()),
+            about: Some("# Hello\n\nRules here.".into()),
+            ..Default::default()
+        })
+        .unwrap();
+        let info = &out["server_info"];
+        assert_eq!(info["operator"]["name"], "My VPN");
+        assert_eq!(info["operator"]["about"], "# Hello\n\nRules here.");
+        assert!(info["operator"].get("contact").is_none());
+        assert_eq!(info["server"]["carriers"], json!(["udp"]));
+        assert!(info["server"]["version"].is_string());
+        assert!(info["server"]["ipv6"].is_boolean());
+        assert_eq!(info["server"]["dns_filtering"], false);
+        assert_eq!(info["server"]["log_privacy"], "normal");
+        // Absent keeps, empty removes.
+        let out = server_info_set(&cfg, OperatorChange { name: Some(String::new()), contact: Some("@me".into()), ..Default::default() }).unwrap();
+        assert!(out["server_info"]["operator"].get("name").is_none());
+        assert_eq!(out["server_info"]["operator"]["location"], "Helsinki");
+        assert_eq!(out["server_info"]["operator"]["contact"], "@me");
+        let out = server_info_set(&cfg, OperatorChange {
+            location: Some(String::new()),
+            contact: Some(String::new()),
+            about: Some(String::new()),
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(out["server_info"].get("operator").is_none());
+        let (v, _) = load(&cfg).unwrap();
+        assert!(v.get("server_info").is_none(), "an empty section is removed");
+        assert!(server_info_set(&cfg, OperatorChange { about: Some("x".repeat(9000)), ..Default::default() }).is_err());
     }
 
     #[test]

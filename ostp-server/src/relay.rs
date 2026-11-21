@@ -359,12 +359,29 @@ pub async fn handle_message(
         }
         RelayMessage::KeepAlive => {}
         RelayMessage::Features(bits) => {
-            let both = bits & ostp_core::relay::FEATURE_FLOW_CONTROL;
-            if both != 0 {
+            use ostp_core::relay::{FEATURE_FLOW_CONTROL, FEATURE_SERVER_INFO};
+            let both = bits & (FEATURE_FLOW_CONTROL | FEATURE_SERVER_INFO);
+            if both & FEATURE_FLOW_CONTROL != 0 {
                 dispatcher.set_flow_control(session_id);
             }
             send_relay_to_stream(session_id, stream_id, RelayMessage::Features(both), dispatcher, socket, ui_event_tx, tcp_map).await?;
         }
+        RelayMessage::InfoRequest => {
+            // Only on the control stream, and only as often as the session is allowed.
+            if stream_id != 0 || !dispatcher.allow_info_request(session_id) {
+                return Ok(());
+            }
+            let Some(key) = dispatcher.key_info(session_id) else { return Ok(()) };
+            let mut doc = crate::server_info::info_value(&router.info.operator(), &router.facts());
+            doc["key"] = key;
+            let json = serde_json::to_vec(&doc).unwrap_or_default();
+            let max = dispatcher.max_payload(session_id).unwrap_or(1200);
+            for piece in ostp_core::relay::server_info_messages(&json, max) {
+                send_relay_to_stream(session_id, 0, piece, dispatcher, socket, ui_event_tx, tcp_map).await?;
+            }
+        }
+        // Only a server sends these.
+        RelayMessage::ServerInfo { .. } => {}
         RelayMessage::Window(bytes) => {
             if let Some(window) = remotes.get(&(session_id, stream_id)).and_then(|r| r.window.as_ref()) {
                 window.grant(bytes as i64);

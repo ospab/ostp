@@ -454,8 +454,8 @@ mod tests {
 
     fn service() -> SubscriptionService {
         let mut keys = HashMap::new();
-        keys.insert("key-a".to_string(), UserMeta { name: Some("alice".into()), limit_bytes: Some(1000), max_devices: None });
-        keys.insert("key-b".to_string(), UserMeta { name: None, limit_bytes: None, max_devices: None });
+        keys.insert("key-a".to_string(), UserMeta { name: Some("alice".into()), limit_bytes: Some(1000), max_devices: None, expires_at: None });
+        keys.insert("key-b".to_string(), UserMeta { name: None, limit_bytes: None, max_devices: None, expires_at: None });
         let stats = HashMap::from([("key-a".to_string(), Arc::new(UserStats::new(Some(1000))))]);
         stats["key-a"].bytes_up.store(10, std::sync::atomic::Ordering::Relaxed);
         stats["key-a"].bytes_down.store(32, std::sync::atomic::Ordering::Relaxed);
@@ -600,7 +600,7 @@ x-device-model: PC
     async fn a_key_added_later_is_found() {
         let svc = service();
         assert!(svc.key_for(&token_for_key("key-a")).is_some());
-        svc.keys.write().unwrap().insert("key-c".into(), UserMeta { name: None, limit_bytes: None, max_devices: None });
+        svc.keys.write().unwrap().insert("key-c".into(), UserMeta { name: None, limit_bytes: None, max_devices: None, expires_at: None });
         assert_eq!(svc.key_for(&token_for_key("key-c")).as_deref(), Some("key-c"));
         svc.keys.write().unwrap().remove("key-a");
         assert!(svc.key_for(&token_for_key("key-a")).is_none(), "a removed key stops working at once");

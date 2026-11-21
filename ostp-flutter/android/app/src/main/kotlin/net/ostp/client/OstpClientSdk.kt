@@ -98,4 +98,20 @@ object OstpClientSdk {
     @Keep
     @JvmStatic
     external fun updateExclusions(json: String): Boolean
+
+    /**
+     * What the connected server said about itself inside the tunnel (JSON:
+     * operator, server, key), or "" when it has not (yet).
+     */
+    @Keep
+    @JvmStatic
+    external fun getServerInfo(): String
+
+    /**
+     * Asks the connected server for its info again; false when no connected
+     * server supports it. Read the answer with getServerInfo shortly after.
+     */
+    @Keep
+    @JvmStatic
+    external fun requestServerInfo(): Boolean
 }

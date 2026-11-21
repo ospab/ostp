@@ -47,7 +47,7 @@ Sessions are tracked by `session_id`, not by address. When a frame that decrypts
 An optional REST API (`api.rs`), enabled via the `api` block in `config.json`, exposes server status, per-user traffic statistics, and key management for building panels/dashboards (e.g. 3x-ui-style integrations):
 
 - **Authentication**: either a static Bearer `token` (also used for relay-node federation, below), or a username/password-hash login (`POST /login`) issuing a session token — comparisons are constant-time to avoid timing side-channels. Without a sign-in (neither a token nor a username with a password hash) the API does not start at all, whatever the bind address: `127.0.0.1` is no protection, because every client reaches the server's loopback through the tunnel as `10.1.0.1`. An empty `"token": ""` counts as no token. `ostp panel enable` sets a sign-in.
-- **Endpoints** (under the configured `webpath`): `GET /server/status`, `GET`/`PUT /server/config`, `GET`/`POST /users`, `GET`/`PUT`/`DELETE /users/{key}`, `PUT /users/{key}/limit`, `POST /users/{key}/reset`, `POST /users/bulk`, `GET`/`POST`/`DELETE /audit`, `GET`/`PUT /router/rules`, and `GET /subscribe/{key}` (no Bearer token needed — the access key itself authenticates the request, returning a ready-to-use client config or `ostp://` share link).
+- **Endpoints** (under the configured `webpath`): `GET /server/status`, `GET`/`PUT /server/config`, `GET`/`POST /users`, `GET`/`PUT`/`DELETE /users/{key}`, `PUT /users/{key}/limit`, `POST /users/{key}/reset`, `POST /users/bulk`, `GET`/`PUT /server/info`, `GET`/`POST`/`DELETE /audit`, `GET`/`PUT /router/rules`, and `GET /subscribe/{key}` (no Bearer token needed — the access key itself authenticates the request, returning a ready-to-use client config or `ostp://` share link).
 - See the [Management API wiki page](https://github.com/ospab/ostp/wiki/Management-API) for the full request/response reference.
 
 ### Web panel: `ostp panel`
@@ -78,15 +78,50 @@ Every 30 seconds the server writes per-user traffic to `.ostp_stats.json` next t
 | Command | What it does |
 |---|---|
 | `ostp manage install [--port N] [--host H] [--user NAME]` | First install: writes a server config with one user, opens the port in ufw or firewalld if one is active, registers and starts the service. On a configured server only makes sure the service runs |
-| `ostp manage status` | Version, service state, sessions, users, listen address, TLS domain and certificate, subscriptions, panel, and the system: OS, load, memory, disk |
-| `ostp manage users` | Every user with links, subscription URL and traffic |
-| `ostp manage user-add NAME`, `user-remove WHO`, `user-rename WHO NAME` | WHO is a number (as in `ostp links`), a name or a key. The running server picks up the change from the file; the last user cannot be removed |
+| `ostp manage status` | Version, service state, sessions, users, listen address, TLS domain and certificate, subscriptions, panel, `server_info` (what clients are told, see below), and the system: OS, load, memory, disk |
+| `ostp manage users` | Every user with links, subscription URL, traffic, limits and `expires_at` (Unix seconds or `null`) with `expired` |
+| `ostp manage user-add NAME [--key K] [--limit-bytes N] [--devices N] [--expires WHEN]`, `user-remove WHO`, `user-rename WHO NAME` | WHO is a number (as in `ostp links`), a name or a key. The running server picks up the change from the file; the last user cannot be removed |
+| `ostp manage user-set WHO [--name N] [--limit-bytes N] [--devices N] [--expires WHEN]` | Changes a user in one write; an option left out keeps its value, 0 removes a limit, `--expires never` removes the expiry |
+| `ostp manage server-info [--name T] [--location T] [--contact T] [--about T \| --about-file PATH]` | Sets what the server tells its clients about itself; an option left out keeps its value, an empty one removes it |
 | `ostp manage user-limit WHO --devices N` | Limits the devices that may use the user's subscription (0 removes the limit); see [tls.md](tls.md#device-limit) |
 | `ostp manage user-devices WHO` | Devices that fetched the user's subscription, read from `devices.json` |
 | `ostp manage logs [-n N]` | The service log's last lines |
 | `ostp manage restart` | Restarts the service, reports whether it stayed up |
 
 `install.sh -y [-b beta] [--port N] [--host H] [--user NAME]` installs without the setup wizard and runs `ostp manage install` on a first install.
+
+### Key expiry
+
+An `access_keys` entry may have `expires_at`: when the key stops working, in Unix seconds (UTC). Absent means never.
+
+```json
+"access_keys": [{ "access_key": "...", "name": "alice", "expires_at": 1767225599 }]
+```
+
+`--expires` of `user-add` and `user-set` takes `YYYY-MM-DD` (the end of that day, UTC), `<N>d` (N days from now) or `never`. The panel's user form has a date field for it, and the users table marks an expired key. The running server reads the change from the file within a few seconds, like other key changes.
+
+What happens when a key has expired:
+
+- A new v6 session completes its handshake and is closed at once with `Close` reason 6 (*the key has expired*), so the reason reaches the client only inside the tunnel. The app stops and says to ask the server owner to extend the key; it does not reconnect by itself. A v5 client is refused as with a used-up traffic limit.
+- A live session is closed with the same reason on the server's periodic check (every few seconds).
+- The subscription is still served as before, links included: whether a key works is decided in the tunnel, not by anything reachable without connecting.
+
+### Server info
+
+A server can tell its clients who runs it. The `server_info` section of the config, every field optional:
+
+```json
+"server_info": {
+  "name": "My VPN",
+  "location": "Helsinki",
+  "contact": "@owner",
+  "about": "Markdown: rules, news, how to pay."
+}
+```
+
+`name`, `location` and `contact` are one line of up to 128 characters; `about` is Markdown of up to 8 KiB (the apps render a safe subset; the server passes the text as it is). Set it with `ostp manage server-info`, in the panel (*Configuration → Server info*) or in the file; the running server reads changes within a few seconds.
+
+Clients get it only inside an established session, never before or outside a connection: nothing new for a prober to read. With it the server reports its version, what it offers (`udp`, and `tls` when configured), the log privacy mode, whether it reaches IPv6 and whether its DNS filter is on, plus the asking key's traffic, limit, expiry and device limit. The format is in [specification.md](specification.md#83-server-info-v5-and-v6). `ostp manage status` and the panel's `GET /server/info` show the same `operator` and `server` parts.
 
 ---
 

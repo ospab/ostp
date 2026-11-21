@@ -24,6 +24,8 @@ pub struct Router {
     /// DNS answers for IPv6 addresses (AAAA) that clients ask through the
     /// tunnel are empty (see `ostp_dns::empty_answer_for_aaaa`).
     pub ipv6_egress: bool,
+    /// What the server tells a client about itself inside the tunnel.
+    pub info: Arc<crate::server_info::ServerInfoState>,
 }
 
 /// Whether an IPv6 socket can be made and routed to a public address. A UDP
@@ -53,6 +55,18 @@ impl Router {
             overnet: Arc::new(RwLock::new(Overnet::new(OvernetConfig::default()))),
             local: Arc::new(RwLock::new((false, None))),
             debug,
+            info: Arc::new(crate::server_info::ServerInfoState::default()),
+        }
+    }
+
+    /// What this server reports about itself (`ServerInfo`, `server`).
+    pub fn facts(&self) -> crate::server_info::ServerFacts {
+        crate::server_info::ServerFacts {
+            version: crate::api::build_version().to_string(),
+            carriers: self.info.carriers(),
+            log_privacy: ostp_core::logpriv::privacy().as_str().to_string(),
+            ipv6: self.ipv6_egress,
+            dns_filtering: self.dns_server.enabled(),
         }
     }
 

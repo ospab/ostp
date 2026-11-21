@@ -185,6 +185,8 @@ Everything the client and server exchange after the handshake — proxied TCP co
 | 10 | `UdpData(addr, bytes)` | Length-prefixed target address plus a UDP datagram payload |
 | 11 | `Features(bits)` | 4-byte big-endian bit set; stream 0, once per session (see below) |
 | 12 | `Window(bytes)` | 4-byte big-endian byte count; flow-control grant for the stream |
+| 14 | `InfoRequest` | No payload; stream 0, client to server: asks for `ServerInfo` (see 8.3) |
+| 15 | `ServerInfo(more, bytes)` | 1 flag byte (bit 0: more pieces follow), 2-byte big-endian length, a piece of the server-info JSON; stream 0, server to client |
 
 ### 8.1 Per-stream flow control
 
@@ -207,9 +209,27 @@ A v6 session (see [v6-session-design.md](v6-session-design.md)) changes the foll
 - **`Fin` (tag 13, no payload)** says "I will write no more" on the stream; the other direction keeps flowing. It rides in sequenced `Data`, so it arrives after every byte before it. The stream is over, and both sides release its state, when both have sent `Fin`. A program's end of stream (TCP FIN) is a `Fin`; the receiver passes it on as the end of the write side of its socket.
 - **`Close` (tag 4)** is the abort. In v6 it carries one reason byte (`[4, reason]`: 0 closed abruptly, 1 I/O error, 2 flow control broken); the receiver resets the connection it feeds (TCP RST) and releases the stream. `Error` ends a stream too. A v5 `Close` stays the single byte `[4]`.
 - **A reset stream** (the sender gave up on a frame of it, or the peer said so with `Abandon`) is treated like an abort: the program's connection is reset, the server closes the target. A reset of stream 0 ends the session.
-- **The session `Close` (frame kind 3, stream 0)** carries `reason(1) text(0..=64, UTF-8)` in v6 (an empty payload is reason 0; a v5 `Close` has no payload). Reasons: 0 normal stop by the peer, 1 the server is restarting, 2 the key was revoked or removed, 3 the traffic limit is used up, 4 too many sessions for the key, 5 the server is shutting down. It is a tracked frame, resent until acknowledged and acted on when it arrives; only a session that passed authentication ever gets one. A client that receives it stops and does not reconnect by itself. See [v6-session-design.md](v6-session-design.md).
-- **Flow control is part of every stream.** There is no `Features` exchange and no first `Window`: each direction of each stream starts with `INITIAL_STREAM_WINDOW` (8 MiB) and `Window(n)` only adds to it. A sender that goes past the allowance by more than a window (16 MiB waiting at the server) has its stream aborted; the server's 32 MiB reset of v5 does not apply.
+- **The session `Close` (frame kind 3, stream 0)** carries `reason(1) text(0..=64, UTF-8)` in v6 (an empty payload is reason 0; a v5 `Close` has no payload). Reasons: 0 normal stop by the peer, 1 the server is restarting, 2 the key was revoked or removed, 3 the traffic limit is used up, 4 too many sessions for the key, 5 the server is shutting down, 6 the key has expired. A peer that does not know a reason reads it as 0. It is a tracked frame, resent until acknowledged and acted on when it arrives; only a session that passed authentication ever gets one. A client that receives it stops and does not reconnect by itself. See [v6-session-design.md](v6-session-design.md).
+- **Flow control is part of every stream.** There is no `Features` exchange for it and no first `Window`: each direction of each stream starts with `INITIAL_STREAM_WINDOW` (8 MiB) and `Window(n)` only adds to it. A sender that goes past the allowance by more than a window (16 MiB waiting at the server) has its stream aborted; the server's 32 MiB reset of v5 does not apply.
 - **UDP** is `UdpData` carried in an unsequenced `Datagram` frame (kind 7) on the stream opened by `UdpAssociate`: not ordered, not retransmitted, counted against the congestion window.
+
+### 8.3 Server info (v5 and v6)
+
+A server tells a client that holds a key about itself, only inside the established session; nothing of it is reachable before a session authenticates, so a prober learns nothing more.
+
+- The client sends `Features` on stream 0 after the handshake, in v6 too: bit 1 (`FEATURE_SERVER_INFO`) in v6, bits 0 and 1 in v5. A server that supports it answers with the bits both support, bit 1 included. A server from before it answers without bit 1 (an alpha.6 server answers `Features(0)` in v6; a 0.4.5 server only ever echoes bit 0), and the client then never sends `InfoRequest`.
+- The client sends `InfoRequest` once after each setup of its sessions, on the first session whose server set bit 1, and again when the app asks. The server answers at most once per 10 seconds per session; other requests are dropped.
+- The answer is a JSON object split into `ServerInfo` pieces that each fit one datagram; stream 0 keeps them in order and the last one has bit 0 of its flag clear. A client keeps at most 32 KiB and drops a document that is larger or not a JSON object:
+
+```
+{
+  "operator": { "name": "...", "location": "...", "contact": "...", "about": "Markdown..." },
+  "server": { "version": "0.5.0-alpha.7", "carriers": ["udp", "tls"], "log_privacy": "normal", "ipv6": true, "dns_filtering": false },
+  "key": { "used_bytes": 123, "limit_bytes": 1000, "expires_at": 1767225599, "max_devices": 3 }
+}
+```
+
+`operator` and each key in it appear only when the operator set them (`server_info` in the server config). `carriers` is what the server offers (`udp`, plus `tls` when TLS is configured); `ipv6` whether the server can reach IPv6 destinations; `dns_filtering` whether its DNS filter is on; `log_privacy` the active log mode. `key` is the asking key's traffic (both directions), traffic limit, expiry (Unix seconds, UTC) and device limit; `null` means none.
 
 ---
 

@@ -18,6 +18,7 @@ pub enum Shown {
     UserDevices,
     Logs,
     Dns,
+    ServerInfo,
     Restart,
 }
 
@@ -57,7 +58,16 @@ fn limits_line(u: &Value) -> String {
         Some(d) => d.to_string(),
         None => "unlimited".into(),
     };
-    format!("traffic {traffic}, devices {devices}")
+    let mut line = format!("traffic {traffic}, devices {devices}");
+    if let Some(t) = u["expires_at"].as_u64() {
+        let date = ostp_core::access_keys::format_date(t);
+        if u["expired"].as_bool() == Some(true) {
+            line.push_str(&format!(", {}", format!("expired {date}").red()));
+        } else {
+            line.push_str(&format!(", until {date}"));
+        }
+    }
+    line
 }
 
 /// One user in full: key, limits, links and subscription.
@@ -105,7 +115,7 @@ fn users_table(v: &Value) -> Vec<String> {
         ));
     }
     out.push(String::new());
-    out.push("  Links of a user: ostp links. Change one: ostp manage user-set NAME --limit-bytes N --devices N".dimmed().to_string());
+    out.push("  Links of a user: ostp links. Change one: ostp manage user-set NAME --limit-bytes N --devices N --expires YYYY-MM-DD".dimmed().to_string());
     out
 }
 
@@ -258,7 +268,28 @@ pub fn render(shown: Shown, v: &Value) -> Vec<String> {
             tree(v, 2, &mut out);
             out
         }
+        Shown::ServerInfo => server_info(&v["server_info"]),
     }
+}
+
+/// The server's info as its clients get it.
+fn server_info(v: &Value) -> Vec<String> {
+    let op = &v["operator"];
+    let field = |k: &str| op[k].as_str().unwrap_or("-").to_string();
+    let mut out = vec![
+        ok("Saved; clients get it inside the tunnel (the running server picks it up within a few seconds)"),
+        format!("  Name:     {}", field("name")),
+        format!("  Location: {}", field("location")),
+        format!("  Contact:  {}", field("contact")),
+    ];
+    match op["about"].as_str() {
+        Some(about) => {
+            out.push("  About:".into());
+            out.extend(about.lines().map(|l| format!("    {l}")));
+        }
+        None => out.push("  About:    -".into()),
+    }
+    out
 }
 
 #[cfg(test)]
@@ -280,6 +311,18 @@ mod tests {
         assert_eq!(render(Shown::UserLimit, &v), vec!["  ✓ pops: at most 1 device(s) on the subscription"]);
         let v = json!({ "limit": { "key": "k", "name": "pops", "max_devices": null } });
         assert_eq!(render(Shown::UserLimit, &v), vec!["  ✓ pops: no device limit"]);
+    }
+
+    #[test]
+    fn an_expiry_shows_in_the_limits() {
+        colored::control::set_override(false);
+        let u = json!({ "limit_bytes": null, "max_devices": null, "expires_at": 1767225599u64, "expired": true });
+        assert_eq!(limits_line(&u), "traffic unlimited, devices unlimited, expired 2025-12-31");
+        let u = json!({ "limit_bytes": null, "max_devices": null, "expires_at": 1767225599u64, "expired": false });
+        assert_eq!(limits_line(&u), "traffic unlimited, devices unlimited, until 2025-12-31");
+        let lines = render(Shown::ServerInfo, &json!({ "server_info": { "operator": { "name": "n", "about": "a\nb" } } }));
+        assert!(lines.iter().any(|l| l == "  Name:     n"));
+        assert!(lines.iter().any(|l| l == "    b"));
     }
 
     #[test]

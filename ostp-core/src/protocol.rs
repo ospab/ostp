@@ -243,6 +243,9 @@ pub enum CloseReason {
     TooManySessions = 4,
     /// The server is shutting down.
     ServerShutdown = 5,
+    /// The key's expiry date has passed. A client older than this reason
+    /// reads it as `Normal`.
+    KeyExpired = 6,
 }
 
 impl CloseReason {
@@ -254,6 +257,7 @@ impl CloseReason {
             3 => Some(Self::TrafficLimit),
             4 => Some(Self::TooManySessions),
             5 => Some(Self::ServerShutdown),
+            6 => Some(Self::KeyExpired),
             _ => None,
         }
     }
@@ -3860,6 +3864,7 @@ mod tests {
             CloseReason::TrafficLimit,
             CloseReason::TooManySessions,
             CloseReason::ServerShutdown,
+            CloseReason::KeyExpired,
         ];
         for (i, reason) in reasons.into_iter().enumerate() {
             assert_eq!(reason.to_wire() as usize, i);
@@ -3878,7 +3883,7 @@ mod tests {
             assert!(tick(&mut server).wire.is_empty());
             assert_eq!(server.state(), OstpState::Closed);
         }
-        assert_eq!(CloseReason::from_wire(6), None);
+        assert_eq!(CloseReason::from_wire(7), None);
     }
 
     #[test]

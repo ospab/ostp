@@ -1919,6 +1919,7 @@ async fn run_app() -> Result<()> {
                     name: uc.name(),
                     limit_bytes: uc.limit(),
                     max_devices: uc.max_devices(),
+                    expires_at: uc.expires_at(),
                 })
             }).collect::<Vec<_>>();
             let domain = server_cfg.domain.clone().filter(|d| !d.is_empty());

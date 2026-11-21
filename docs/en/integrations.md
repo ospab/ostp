@@ -51,6 +51,15 @@ Two answers of the server have their own handling:
 
 The CLI sends the ID only with `"send_hwid": true` in the config (see [client.md](client.md)).
 
+### Server info and key expiry
+
+A server sends its info to a connected client only inside the tunnel (see [specification.md](specification.md#83-server-info-v5-and-v6)). The client asks for it once after each connection when the server says it supports it, and on demand:
+
+- Rust (desktop, Tauri): `ostp_client::app::server_info() -> Option<String>` returns the latest JSON (`operator`, `server`, `key`), `None` before it arrived or with a server that does not support it; it is cleared when a new connection starts and kept after the tunnel stops. `ostp_client::app::request_server_info() -> bool` asks again (false, nothing sent, while no connected server supports it); `BridgeCommand::RequestServerInfo` does the same through the bridge's command channel.
+- Android: `OstpClientSdk.getServerInfo(): String` (the JSON, or `""`) and `OstpClientSdk.requestServerInfo(): Boolean`.
+
+A key that has expired is closed by the server with reason 6; the stop reason the apps show says that the access key has expired and to ask the server owner to extend it.
+
 ## Your own server from the apps
 
 Both apps can install OSTP on a VPS and manage it afterwards, for people who have bought a server and do not want to learn Linux. The SSH work is done by the `ostp-ssh` crate, shared by the desktop app (Tauri commands in `ostp-gui/src-tauri/src/servers.rs`) and Android (`serversCall` in `ostp-jni`).

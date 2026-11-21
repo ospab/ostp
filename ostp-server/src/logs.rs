@@ -28,6 +28,10 @@ pub(crate) fn over_limit(key_fp: &str, peer: SocketAddr) {
     tracing::warn!(target: DISPATCHER, "User {key_fp} exceeded traffic limit, rejecting handshake from {}", fmt_peer(peer));
 }
 
+pub(crate) fn key_expired(key_fp: &str, peer: SocketAddr) {
+    tracing::warn!(target: DISPATCHER, "User {key_fp}: the key has expired, refusing the session from {}", fmt_peer(peer));
+}
+
 pub(crate) fn new_session(session_id: u32, peer: SocketAddr, v6: bool, active: usize, replay: usize) {
     tracing::info!(
         target: DISPATCHER,

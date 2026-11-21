@@ -410,6 +410,32 @@ pub extern "system" fn Java_net_ostp_client_OstpClientSdk_updateExclusions(
     })
 }
 
+/// What the connected server said about itself inside the tunnel, as JSON
+/// (`ostp_client::app::server_info`), or "" when it has not (yet).
+#[no_mangle]
+pub extern "system" fn Java_net_ostp_client_OstpClientSdk_getServerInfo(mut env: JNIEnv, _class: JClass) -> jstring {
+    guarded!("getServerInfo", panic_jstring(&mut env), {
+        let text = ostp_client::app::server_info().unwrap_or_default();
+        match env.new_string(text.replace('\0', "")) {
+            Ok(s) => s.into_raw(),
+            Err(_) => std::ptr::null_mut(),
+        }
+    })
+}
+
+/// Asks the connected server for its info again (`getServerInfo` has the
+/// answer shortly after); false when no connected server supports it.
+#[no_mangle]
+pub extern "system" fn Java_net_ostp_client_OstpClientSdk_requestServerInfo(_env: JNIEnv, _class: JClass) -> jboolean {
+    guarded!("requestServerInfo", jni::sys::JNI_FALSE, {
+        if ostp_client::app::request_server_info() {
+            jni::sys::JNI_TRUE
+        } else {
+            jni::sys::JNI_FALSE
+        }
+    })
+}
+
 #[no_mangle]
 pub extern "system" fn Java_net_ostp_client_OstpClientSdk_stopClient(
     env: JNIEnv,

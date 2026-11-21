@@ -56,6 +56,7 @@ pub fn server_close_message(reason: ostp_core::CloseReason, note: &str) -> Strin
         TrafficLimit => "The server closed the connection: the traffic limit of your key is used up. Ask the server owner to raise it.",
         TooManySessions => "The server closed the connection: too many sessions are open with this key, and this was the oldest. Close it on your other devices, then connect again.",
         ServerShutdown => "The server closed the connection: it is shutting down. Connect again later.",
+        KeyExpired => "The server closed the connection: the access key has expired. Ask the server owner to extend it.",
     };
     let note: String = note.chars().filter(|c| !c.is_control()).collect();
     let note = note.trim();
@@ -80,6 +81,47 @@ pub fn stop_notice() -> Option<String> {
     STOP_NOTICE.lock().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
+static SERVER_INFO: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+static SERVER_INFO_SUPPORTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static SERVER_INFO_WANTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The latest info the connected server sent about itself inside the tunnel,
+/// as the JSON it sent:
+/// `{ "operator": {name, location, contact, about}, "server": {version,
+/// carriers, log_privacy, ipv6, dns_filtering}, "key": {used_bytes,
+/// limit_bytes, expires_at, max_devices} }` (`operator` and its keys only
+/// when set). `None` before the server sent it, with a server that does not
+/// support it, and after a new connection starts. It stays after the tunnel
+/// stops, so an app can show it next to the stop reason (an expired key).
+pub fn server_info() -> Option<String> {
+    SERVER_INFO.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+pub(crate) fn set_server_info(json: Option<String>) {
+    *SERVER_INFO.lock().unwrap_or_else(|e| e.into_inner()) = json;
+}
+
+pub(crate) fn set_server_info_supported(yes: bool) {
+    SERVER_INFO_SUPPORTED.store(yes, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Asks the connected server for its info again; the answer replaces what
+/// `server_info` returns (the bridge sends the request within half a second).
+/// False, and nothing is sent, while no connected server supports it. The
+/// server answers a session at most once per 10 seconds.
+pub fn request_server_info() -> bool {
+    let supported = SERVER_INFO_SUPPORTED.load(std::sync::atomic::Ordering::Relaxed);
+    if supported {
+        SERVER_INFO_WANTED.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    supported
+}
+
+/// Whether an app asked for the server's info since the last call.
+pub(crate) fn take_server_info_request() -> bool {
+    SERVER_INFO_WANTED.swap(false, std::sync::atomic::Ordering::Relaxed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -87,14 +129,31 @@ mod tests {
 
     #[test]
     fn every_reason_has_a_message_and_the_actionable_ones_say_what_to_do() {
-        for byte in 0..=5u8 {
+        for byte in 0..=6u8 {
             let reason = CloseReason::from_wire(byte).unwrap();
             let m = server_close_message(reason, "");
             assert!(m.starts_with("The server closed the connection"), "{m}");
         }
         assert!(server_close_message(CloseReason::KeyRevoked, "").contains("Ask the server owner"));
         assert!(server_close_message(CloseReason::TrafficLimit, "").contains("Ask the server owner"));
+        assert!(server_close_message(CloseReason::KeyExpired, "").contains("has expired"));
         assert!(server_close_message(CloseReason::ServerRestarting, "").contains("Connect again"));
+    }
+
+    #[test]
+    fn server_info_is_asked_for_only_when_supported() {
+        set_server_info_supported(false);
+        let _ = take_server_info_request();
+        assert!(!request_server_info());
+        assert!(!take_server_info_request());
+        set_server_info_supported(true);
+        assert!(request_server_info());
+        assert!(take_server_info_request());
+        assert!(!take_server_info_request(), "taken once");
+        set_server_info(Some("{}".into()));
+        assert_eq!(server_info().as_deref(), Some("{}"));
+        set_server_info(None);
+        set_server_info_supported(false);
     }
 
     #[test]
@@ -113,6 +172,9 @@ pub enum BridgeCommand {
     /// The default network changed (Wi-Fi to cellular, SIM switch). Starts the
     /// recovery at once: move the session to a new socket, else reconnect.
     NetworkChanged,
+    /// Ask the connected server for its info again (`server_info`). Nothing
+    /// is sent to a server that does not support it.
+    RequestServerInfo,
     Shutdown,
 }
 

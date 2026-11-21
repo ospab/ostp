@@ -39,6 +39,7 @@ mod send_gate;
 pub(crate) mod carrier_queue;
 mod subscription;
 pub mod devices;
+pub mod server_info;
 
 pub use subscription::SubscriptionSettings;
 
@@ -249,6 +250,17 @@ pub async fn run_server(params: ServerParams) -> Result<()> {
     }
     let traffic = dispatcher.user_stats_ref();
 
+    // The operator's `server_info`, read now and on every reload; clients
+    // get it only inside the tunnel (see `server_info`).
+    let info_state = Arc::new(server_info::ServerInfoState::default());
+    info_state.set_carriers(server_info::carriers(tls.is_some()));
+    if let Some(path) = &config_path {
+        if let Ok(cfg) = config_io::parse_config(path) {
+            info_state.set_operator(server_info::OperatorInfo::from_config(&cfg));
+        }
+    }
+    let info_reload = info_state.clone();
+
     // Background config hot-reloader for access keys
     let shared_keys_clone = shared_keys.clone();
     let user_stats_clone = dispatcher.user_stats_ref();
@@ -290,6 +302,8 @@ pub async fn run_server(params: ServerParams) -> Result<()> {
                                     mode: String,
                                     #[serde(default)]
                                     access_keys: Vec<ostp_core::access_keys::AccessKeyEntry>,
+                                    #[serde(default)]
+                                    server_info: Option<serde_json::Value>,
                                 }
                                 
                                 let mut stripped = json_comments::StripComments::new(content.as_bytes());
@@ -303,11 +317,17 @@ pub async fn run_server(params: ServerParams) -> Result<()> {
                                 match serde_json::from_str::<ServerReloadConfig>(&content_str) {
                                     Ok(cfg) => {
                                         if cfg.mode == "server" {
+                                            let operator = cfg
+                                                .server_info
+                                                .and_then(|v| serde_json::from_value::<server_info::OperatorInfo>(v).ok())
+                                                .unwrap_or_default();
+                                            info_reload.set_operator(operator);
                                             let mut new_keys = HashMap::new();
                                             for uc in cfg.access_keys {
                                                 let max_devices = uc.max_devices();
+                                                let expires_at = uc.expires_at();
                                                 let (k, name, limit_bytes) = uc.into_parts();
-                                                new_keys.insert(k, crate::api::UserMeta { name, limit_bytes, max_devices });
+                                                new_keys.insert(k, crate::api::UserMeta { name, limit_bytes, max_devices, expires_at });
                                             }
                                             
                                             // 1. Update shared_keys
@@ -369,12 +389,11 @@ pub async fn run_server(params: ServerParams) -> Result<()> {
     dns_server.set_proxy(dns::proxy_url(outbound.as_ref()));
     dns_server.start();
     // Initialize Router
-    let router = std::sync::Arc::new(router::Router::new(
-        outbound.clone(),
-        bind_ip,
-        dns_server.clone(),
-        debug,
-    ));
+    let router = {
+        let mut r = router::Router::new(outbound.clone(), bind_ip, dns_server.clone(), debug);
+        r.info = info_state.clone();
+        std::sync::Arc::new(r)
+    };
     {
         let panel_port = api_config
             .as_ref()
@@ -1113,6 +1132,7 @@ fn final_stats(stats: &Arc<RwLock<HashMap<String, Arc<dispatcher::UserStats>>>>,
                 limit_bytes: us.limit_bytes,
                 online: false,
                 last_seen: None,
+                expires_at: None,
             })
             .collect(),
     }
@@ -1461,7 +1481,7 @@ mod traffic_tests {
     use std::sync::atomic::Ordering;
 
     fn meta(limit: Option<u64>) -> api::UserMeta {
-        api::UserMeta { name: None, limit_bytes: limit, max_devices: None }
+        api::UserMeta { name: None, limit_bytes: limit, max_devices: None, expires_at: None }
     }
 
     #[test]

@@ -51,6 +51,7 @@ async fn start_server_on(binds: Vec<SocketAddr>) -> SocketAddr {
                 name: None,
                 limit_bytes: None,
                 max_devices: None,
+                expires_at: None,
             },
         )],
         outbound: None,
