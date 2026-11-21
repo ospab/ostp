@@ -1017,6 +1017,9 @@ impl Bridge {
             }
         }
         self.sessions.clear();
+        // No session left to ask; what the server said stays readable.
+        self.info_session = None;
+        crate::app::set_server_info_supported(false);
         self.standby = None;
         self.udp_rx = None;
         self.clear_routes();
