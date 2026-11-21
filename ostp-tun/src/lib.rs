@@ -2,7 +2,9 @@ use anyhow::Result;
 
 pub struct OstpTunOptions {
     pub server_ip: std::net::IpAddr,
-    pub bypass_ips: Vec<std::net::IpAddr>,
+    /// Networks (address, prefix length) that bypass the tunnel: excluded IPs, CIDRs
+    /// and resolved excluded domains. The server itself is `server_ip`.
+    pub bypass_nets: Vec<(std::net::IpAddr, u8)>,
     pub dns_server: Option<String>,
     pub kill_switch: bool,
     pub mtu: u16,
@@ -25,6 +27,40 @@ pub fn capture_ipv6(server_ip: std::net::IpAddr) -> bool {
         return false;
     }
     true
+}
+
+/// Network address of `ip`/`prefix` (host bits cleared); the prefix is clamped to the
+/// address family's width.
+pub fn network_of(ip: std::net::IpAddr, prefix: u8) -> (std::net::IpAddr, u8) {
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            let p = prefix.min(32);
+            let mask = if p == 0 { 0 } else { u32::MAX << (32 - u32::from(p)) };
+            (std::net::IpAddr::V4(std::net::Ipv4Addr::from(u32::from(v4) & mask)), p)
+        }
+        std::net::IpAddr::V6(v6) => {
+            let p = prefix.min(128);
+            let mask = if p == 0 { 0 } else { u128::MAX << (128 - u32::from(p)) };
+            (std::net::IpAddr::V6(std::net::Ipv6Addr::from(u128::from(v6) & mask)), p)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::network_of;
+
+    #[test]
+    fn network_clears_host_bits() {
+        let (n, p) = network_of("10.20.30.40".parse().unwrap(), 16);
+        assert_eq!((n.to_string(), p), ("10.20.0.0".to_string(), 16));
+        let (n, p) = network_of("1.2.3.4".parse().unwrap(), 0);
+        assert_eq!((n.to_string(), p), ("0.0.0.0".to_string(), 0));
+        let (n, p) = network_of("1.2.3.4".parse().unwrap(), 99);
+        assert_eq!((n.to_string(), p), ("1.2.3.4".to_string(), 32));
+        let (n, p) = network_of("2001:db8::1".parse().unwrap(), 32);
+        assert_eq!((n.to_string(), p), ("2001:db8::".to_string(), 32));
+    }
 }
 
 pub struct OstpTunInterface {

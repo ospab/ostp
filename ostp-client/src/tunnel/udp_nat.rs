@@ -29,56 +29,24 @@ pub async fn run_udp_nat(
                     Some((payload, src, dst)) => {
                         if payload.is_empty() { continue; }
 
-                        if !sessions.contains_key(&src) {
-                            let (session_tx, mut session_rx) = mpsc::channel::<(Vec<u8>, SocketAddr)>(1024);
-                            sessions.insert(src, session_tx);
-
-                            let proxy_addr_clone = proxy_addr.clone();
-                            let tx_clone = tx.clone();
-                            
-                            let current = matcher.read().await.clone();
-                            let mut should_bypass = false;
-                            if current.match_ip(&dst.ip()) {
-                                should_bypass = true;
-                                if debug {
-                                    crate::logs::udp_nat_bypass_ip(src, dst);
-                                }
-                            } else if let Some(name) = current
-                                .excluded_process(crate::tunnel::process_lookup::Proto::Udp, src)
-                                .await
-                            {
-                                should_bypass = true;
-                                if debug {
-                                    crate::logs::udp_nat_bypass_process(&name, src, dst);
-                                }
+                        // Deliver the packet; if the session ended meanwhile (idle
+                        // timeout), start a new one and deliver to it instead of
+                        // dropping the first packet of the next burst.
+                        let mut pending = Some((payload, dst));
+                        for _ in 0..2 {
+                            let Some(item) = pending.take() else { break };
+                            if !sessions.contains_key(&src) {
+                                let session_tx = spawn_session(
+                                    src, dst, &proxy_addr, &tx, &matcher, debug,
+                                    phys_if_index, &phys_if_name,
+                                ).await;
+                                sessions.insert(src, session_tx);
                             }
-
-                            let p_if_idx = phys_if_index;
-                            let p_if_name = phys_if_name.clone();
-
-                            tokio::spawn(async move {
-                                if should_bypass {
-                                    if debug {
-                                        tracing::info!("Starting UDP BYPASS session for {}", src);
-                                    }
-                                    let res = start_udp_bypass_session(src, p_if_idx, p_if_name, &mut session_rx, tx_clone).await;
-                                    if res.is_err() {
-                                        crate::logs::udp_session_ended("UDP BYPASS", src, &format!("{:?}", res.err()));
-                                    }
-                                } else {
-                                    tracing::debug!("Starting UDP NAT session for {}", src);
-                                    let res = start_udp_session(src, proxy_addr_clone, &mut session_rx, tx_clone).await;
-                                    if res.is_err() {
-                                        crate::logs::udp_session_ended("UDP NAT", src, &format!("{:?}", res.err()));
-                                    }
-                                }
-                            });
-                        }
-
-                        if let Some(sender) = sessions.get(&src) {
-                            match sender.try_send((payload, dst)) {
-                                Err(mpsc::error::TrySendError::Closed(_)) => {
+                            let Some(sender) = sessions.get(&src) else { break };
+                            match sender.try_send(item) {
+                                Err(mpsc::error::TrySendError::Closed(item)) => {
                                     sessions.remove(&src);
+                                    pending = Some(item);
                                 }
                                 Err(mpsc::error::TrySendError::Full(_)) => {
                                     // Drop packet to avoid blocking the TUN interface loop
@@ -96,6 +64,64 @@ pub async fn run_udp_nat(
         }
     }
 }
+
+/// Starts a NAT session task for `src` (direct bypass or through the local proxy,
+/// decided by the exclusion matcher) and returns the sender feeding it.
+#[allow(clippy::too_many_arguments)]
+async fn spawn_session(
+    src: SocketAddr,
+    dst: SocketAddr,
+    proxy_addr: &str,
+    tx: &Arc<Mutex<netstack_smoltcp::udp::WriteHalf>>,
+    matcher: &Arc<tokio::sync::RwLock<crate::tunnel::exclusion::ExclusionMatcher>>,
+    debug: bool,
+    phys_if_index: Option<u32>,
+    phys_if_name: &Option<String>,
+) -> mpsc::Sender<(Vec<u8>, SocketAddr)> {
+    let (session_tx, mut session_rx) = mpsc::channel::<(Vec<u8>, SocketAddr)>(1024);
+    let proxy_addr_clone = proxy_addr.to_string();
+    let tx_clone = tx.clone();
+
+    let current = matcher.read().await.clone();
+    let mut should_bypass = false;
+    if current.match_ip(&dst.ip()) {
+        should_bypass = true;
+        if debug {
+            crate::logs::udp_nat_bypass_ip(src, dst);
+        }
+    } else if let Some(name) = current
+        .excluded_process(crate::tunnel::process_lookup::Proto::Udp, src)
+        .await
+    {
+        should_bypass = true;
+        if debug {
+            crate::logs::udp_nat_bypass_process(&name, src, dst);
+        }
+    }
+
+    let p_if_name = phys_if_name.clone();
+    tokio::spawn(async move {
+        if should_bypass {
+            if debug {
+                tracing::info!("Starting UDP BYPASS session for {}", src);
+            }
+            let res = start_udp_bypass_session(src, phys_if_index, p_if_name, &mut session_rx, tx_clone).await;
+            if let Err(e) = res {
+                crate::logs::udp_session_ended("UDP BYPASS", src, &format!("{:?}", e));
+            }
+        } else {
+            tracing::debug!("Starting UDP NAT session for {}", src);
+            let res = start_udp_session(src, proxy_addr_clone, &mut session_rx, tx_clone).await;
+            if let Err(e) = res {
+                crate::logs::udp_session_ended("UDP NAT", src, &format!("{:?}", e));
+            }
+        }
+    });
+    session_tx
+}
+
+/// Idle time after which a UDP session (bypass or tunnel) is torn down.
+const UDP_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
 async fn start_udp_bypass_session(
     client_src: SocketAddr,
@@ -127,22 +153,19 @@ async fn start_udp_bypass_session(
         let _ = crate::tunnel::proxy::bind_socket_to_interface(&socket, name);
     }
 
-    // A single select! loop over both directions, rather than spawning a
-    // separate task for the read side, so the whole session - physical
-    // socket included - is torn down the moment this function returns
-    // (e.g. when session_rx closes). The previous spawned-task version left
-    // that task (and its Arc<UdpSocket> clone, keeping the OS socket fd
-    // alive) running forever after this function returned: nothing ever
-    // cancelled it, so every bypassed UDP flow (any excluded app/IP in TUN
-    // mode) leaked one socket + one task for the lifetime of the process.
+    // A single select! loop over both directions, so the whole session - physical
+    // socket included - is torn down the moment this function returns: when
+    // session_rx closes or after UDP_IDLE_TIMEOUT without outbound packets
+    // (the timer restarts on every loop iteration, i.e. on any activity).
     use futures::SinkExt;
     let mut buf = [0u8; 65536];
     loop {
         tokio::select! {
-            outbound = session_rx.recv() => {
+            outbound = tokio::time::timeout(UDP_IDLE_TIMEOUT, session_rx.recv()) => {
                 match outbound {
-                    Some((payload, dst)) => { socket.send_to(&payload, dst).await?; }
-                    None => break,
+                    Ok(Some((payload, dst))) => { socket.send_to(&payload, dst).await?; }
+                    // Channel closed or idle: dropping the socket ends the flow.
+                    Ok(None) | Err(_) => break,
                 }
             }
             inbound = socket.recv_from(&mut buf) => {
@@ -227,7 +250,7 @@ async fn start_udp_session(
     
     let mut buf = vec![0u8; 65536];
     
-    let timeout = std::time::Duration::from_secs(300); // 5 min idle timeout
+    let timeout = UDP_IDLE_TIMEOUT;
     let mut tcp_buf = [0u8; 1];
 
     loop {

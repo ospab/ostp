@@ -1,5 +1,5 @@
 // Windows routing table helpers. A default route through ostp_tun takes all traffic;
-// /32 routes via the physical gateway keep the server and excluded IPs outside it.
+// routes via the physical gateway keep the server and excluded networks outside it.
 // Process exclusions are not handled here.
 
 #[cfg(target_os = "windows")]
@@ -217,35 +217,50 @@ pub mod sys {
         }
     }
 
-    /// Add bypass routes for a list of resolved IP addresses (typically from exclusion config).
-    /// Each IP gets a /32 host route via the physical gateway so it bypasses the TUN.
-    /// Returns list of (ip, gw, if_index) that were successfully added, for later cleanup.
+    /// Netmask for a prefix length (0..=32).
+    pub fn prefix_mask(prefix: u8) -> Ipv4Addr {
+        let p = u32::from(prefix.min(32));
+        let bits: u32 = if p == 0 { 0 } else { u32::MAX << (32 - p) };
+        Ipv4Addr::from(bits)
+    }
+
+    /// Network address of `ip`/`prefix` (host bits cleared; route.exe rejects them).
+    pub fn network_of(ip: Ipv4Addr, prefix: u8) -> Ipv4Addr {
+        Ipv4Addr::from(u32::from(ip) & u32::from(prefix_mask(prefix)))
+    }
+
+    /// Add bypass routes for a list of networks (the server, resolved excluded domains,
+    /// excluded IPs and CIDRs). Each one gets a route via the physical gateway so it
+    /// bypasses the TUN. Returns the (network, prefix, gw, if_index) rows that were
+    /// successfully added, for later cleanup.
     pub fn add_bypass_routes(
-        ips: &[Ipv4Addr],
+        nets: &[(Ipv4Addr, u8)],
         gw: Ipv4Addr,
         if_index: u32,
         metric: u32,
-    ) -> Vec<(Ipv4Addr, Ipv4Addr, u32)> {
+    ) -> Vec<(Ipv4Addr, u8, Ipv4Addr, u32)> {
         let mut added = Vec::new();
         let mut seen = std::collections::HashSet::new();
-        let mask = Ipv4Addr::new(255, 255, 255, 255);
-        for &ip in ips {
-            // The server IP is passed both as server_ip and inside bypass_ips, so
+        for &(ip, prefix) in nets {
+            let prefix = prefix.min(32);
+            let net = network_of(ip, prefix);
+            let mask = prefix_mask(prefix);
+            // The server IP is passed both as server_ip and inside the exclusions, so
             // dedupe to avoid a guaranteed "already exists" failure on the second add.
-            if !seen.insert(ip) {
+            if !seen.insert((net, prefix)) {
                 continue;
             }
-            // Purge any pre-existing /32 for this dest (e.g. a stale route via an
+            // Purge any pre-existing route for this dest (e.g. a stale route via an
             // old gateway from a previous session) so add_ipv4_route below installs
             // the correct one instead of failing with ERROR_OBJECT_ALREADY_EXISTS.
-            delete_routes_for_dest(ip, mask);
-            match add_ipv4_route(ip, mask, gw, if_index, metric) {
+            delete_routes_for_dest(net, mask);
+            match add_ipv4_route(net, mask, gw, if_index, metric) {
                 Ok(()) => {
-                    added.push((ip, gw, if_index));
+                    added.push((net, prefix, gw, if_index));
                 }
                 Err(e) => {
-                    // `ip` is the address of an excluded site or of the server.
-                    tracing::warn!("bypass route add {} via {gw} (if {if_index}) failed: {e}", ostp_core::logpriv::fmt_target(format_args!("{ip}/32")));
+                    // `net` is the address of an excluded site or of the server.
+                    tracing::warn!("bypass route add {} via {gw} (if {if_index}) failed: {e}", ostp_core::logpriv::fmt_target(format_args!("{net}/{prefix}")));
                 }
             }
         }
@@ -253,10 +268,9 @@ pub mod sys {
     }
 
     /// Remove all bypass routes previously added by add_bypass_routes.
-    pub fn remove_bypass_routes(routes: &[(Ipv4Addr, Ipv4Addr, u32)]) {
-        for &(ip, gw, if_index) in routes {
-            let mask = Ipv4Addr::new(255, 255, 255, 255);
-            let _ = delete_ipv4_route(ip, mask, gw, if_index);
+    pub fn remove_bypass_routes(routes: &[(Ipv4Addr, u8, Ipv4Addr, u32)]) {
+        for &(net, prefix, gw, if_index) in routes {
+            let _ = delete_ipv4_route(net, prefix_mask(prefix), gw, if_index);
         }
     }
 }
