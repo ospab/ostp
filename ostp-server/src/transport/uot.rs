@@ -27,6 +27,14 @@ pub const IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 /// which any frame, valid or not, used to reset.
 pub const AUTH_TIMEOUT: Duration = Duration::from_secs(20);
 
+/// The longest one frame may take to be written to the client. A client that
+/// stops reading (or a path that died without a reset) used to hold the
+/// writer, its queue of up to 16384 frames and the connection for as long as
+/// the kernel kept retrying, since nothing was ever read from it again. The
+/// session survives, as with `IDLE_TIMEOUT`: the client can carry on over a
+/// new connection.
+pub const WRITE_STALL_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// `unauth` is the source's slot among not-yet-authenticated connections; it
 /// is given back as soon as the server has answered (a reply is only ever
 /// sent to a valid handshake or a live session), or when the connection ends.
@@ -51,6 +59,23 @@ async fn handle_tcp_connection_with_idle<S>(
     unauth: Option<UnauthGuard>,
     idle: Duration,
     auth_timeout: Duration,
+) -> Result<()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    handle_tcp_connection_with_timeouts(stream, peer_addr, tcp_map, udp_tx, unauth, idle, auth_timeout, WRITE_STALL_TIMEOUT).await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_tcp_connection_with_timeouts<S>(
+    stream: S,
+    peer_addr: SocketAddr,
+    tcp_map: Arc<RwLock<HashMap<SocketAddr, mpsc::Sender<Bytes>>>>,
+    udp_tx: mpsc::Sender<(Bytes, SocketAddr)>,
+    unauth: Option<UnauthGuard>,
+    idle: Duration,
+    auth_timeout: Duration,
+    write_stall: Duration,
 ) -> Result<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -81,7 +106,14 @@ where
             let mut out = BytesMut::with_capacity(2 + packet.len());
             out.put_u16(packet.len() as u16);
             out.put_slice(&packet);
-            if write_half.write_all(&out).await.is_err() { break; }
+            match tokio::time::timeout(write_stall, write_half.write_all(&out)).await {
+                Ok(Ok(())) => {}
+                Ok(Err(_)) => break,
+                Err(_) => {
+                    crate::logs::connection_closed(peer_addr, &format_args!("the client read nothing for {write_stall:?}"));
+                    break;
+                }
+            }
             // How fast this connection really drains (see carrier_queue).
             meter.written(out.len(), rx.len(), std::time::Instant::now());
             if !writer_authed.swap(true, Ordering::Relaxed) {
@@ -288,6 +320,35 @@ mod tests {
         client.read_exact(&mut reply).await.unwrap();
         tokio::time::sleep(Duration::from_millis(600)).await;
         assert!(!handle.is_finished(), "an answered connection stays open past the deadline");
+    }
+
+    /// A client that stops reading is cut off once a write has waited for
+    /// the stall timeout, and its entry is removed.
+    #[tokio::test]
+    async fn a_client_that_stops_reading_is_closed() {
+        let tcp_map: Arc<RwLock<HashMap<SocketAddr, mpsc::Sender<Bytes>>>> =
+            Arc::new(RwLock::new(HashMap::new()));
+        let (udp_tx, _udp_rx) = mpsc::channel(16);
+        let (_client, server) = tokio::io::duplex(4096);
+        let handle = tokio::spawn(handle_tcp_connection_with_timeouts(
+            server, peer(), tcp_map.clone(), udp_tx, None,
+            Duration::from_secs(30), Duration::from_secs(30), Duration::from_millis(200),
+        ));
+        let tx = loop {
+            if let Some(tx) = tcp_map.read().await.get(&peer()).cloned() { break tx; }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        };
+        // Far more than the pipe holds; the client never reads.
+        for _ in 0..64 {
+            let _ = tx.try_send(Bytes::from(vec![0u8; 1000]));
+        }
+        drop(tx);
+        tokio::time::timeout(Duration::from_secs(3), handle)
+            .await
+            .expect("a stalled writer must end the connection")
+            .unwrap()
+            .unwrap();
+        assert!(!tcp_map.read().await.contains_key(&peer()));
     }
 
     /// A connection that goes quiet is closed and unregistered, while one

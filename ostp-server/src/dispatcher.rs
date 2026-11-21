@@ -146,7 +146,29 @@ pub struct Dispatcher {
     /// Set when the server is stopping: no new session is accepted, only the
     /// acknowledgements of the `Close` frames are read.
     closing_only: bool,
+    /// Target connections being set up, by stream, with the token of the
+    /// attempt (`begin_connect`). An entry goes when the stream ends or its
+    /// session does, so a connect that completes afterwards is dropped.
+    connecting: HashMap<(u32, u32), u64>,
+    next_connect: u64,
+    /// Session ids taken over by a new handshake while the old session's
+    /// streams may still be open (`take_replaced`).
+    replaced: Vec<u32>,
+    /// Addresses a session roamed away from, and when (`take_vacated`).
+    vacated: Vec<(SocketAddr, std::time::Instant)>,
+    /// The last slow pass of `on_tick` (`HOUSEKEEPING_INTERVAL`); `None`:
+    /// the next tick makes one.
+    last_housekeeping: Option<std::time::Instant>,
 }
+
+/// How often `on_tick` purges the replay caches and checks sessions for
+/// expiry, a removed key or a used-up limit. Every 10 ms tick did it: a scan
+/// of up to 50,000 cache entries and two locks and a lookup per session,
+/// 100 times a second, on the packet loop. None of it needs to be prompt to
+/// the millisecond: the drift window is 300 s, the idle timeout 10 min.
+const HOUSEKEEPING_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+/// Addresses vacated but not yet reported, at most.
+const MAX_VACATED: usize = 4096;
 
 /// A session that was sent a `Close`, until it is acknowledged.
 struct ClosingSession {
@@ -221,6 +243,11 @@ impl Dispatcher {
             closing: HashMap::new(),
             pending_frames: Vec::new(),
             closing_only: false,
+            connecting: HashMap::new(),
+            next_connect: 0,
+            replaced: Vec::new(),
+            vacated: Vec::new(),
+            last_housekeeping: None,
         }
     }
 
@@ -475,6 +502,9 @@ impl Dispatcher {
                     crate::logs::roamed(session_id, peer_state.last_addr, peer);
                     if self.addr_to_session.get(&peer_state.last_addr) == Some(&session_id) {
                         self.addr_to_session.remove(&peer_state.last_addr);
+                        if self.vacated.len() < MAX_VACATED {
+                            self.vacated.push((peer_state.last_addr, std::time::Instant::now()));
+                        }
                     }
                     peer_state.last_addr = peer;
                     self.addr_to_session.insert(peer, session_id);
@@ -750,6 +780,15 @@ impl Dispatcher {
                                 streams: ostp_core::streams::StreamIds::new(ostp_core::streams::Side::Server),
                             });
                             self.addr_to_session.insert(peer, candidate_session_id);
+                            // The id belonged to a session dropped since the
+                            // last tick (replaced just above, or ended): the
+                            // tick would not report it any more, since the id
+                            // is live again, and the old session's streams
+                            // would keep writing into this one. The server
+                            // loop closes them before anything else arrives.
+                            if self.dropped.contains(&candidate_session_id) && !self.replaced.contains(&candidate_session_id) {
+                                self.replaced.push(candidate_session_id);
+                            }
                             user_stats.connections.fetch_add(1, Ordering::Relaxed);
                             self.trials.mark_known(peer.ip());
                             self.roaming.mark_known(peer.ip());
@@ -825,6 +864,8 @@ impl Dispatcher {
     /// its state is released, and later frames of it are dropped. A no-op for
     /// a v5 session and for a stream that is not open.
     pub fn release_stream(&mut self, session_id: u32, stream_id: u32) {
+        // A connect still under way is no longer wanted (v5 and v6).
+        self.connecting.remove(&(session_id, stream_id));
         if let Some(ps) = self.peer_machines.get_mut(&session_id) {
             if !ps.machine.is_v6() {
                 return;
@@ -832,6 +873,55 @@ impl Dispatcher {
             let _ = ps.streams.close(stream_id);
             let _ = ps.machine.on_event(OstpEvent::ReleaseStream(stream_id));
         }
+    }
+
+    /// A target connection for this stream is being set up; the token goes
+    /// with it to `finish_connect`.
+    pub fn begin_connect(&mut self, session_id: u32, stream_id: u32) -> u64 {
+        self.next_connect += 1;
+        self.connecting.insert((session_id, stream_id), self.next_connect);
+        self.next_connect
+    }
+
+    /// The connect with this token completed: whether its stream is still
+    /// wanted. False when the stream was closed or reset meanwhile, the
+    /// session ended, or a newer attempt (or session) took the stream's place.
+    pub fn finish_connect(&mut self, session_id: u32, stream_id: u32, token: u64) -> bool {
+        if self.connecting.get(&(session_id, stream_id)) != Some(&token) {
+            return false;
+        }
+        self.connecting.remove(&(session_id, stream_id));
+        self.peer_machines.contains_key(&session_id)
+    }
+
+    /// Session ids whose old session was dropped and the id taken by a new
+    /// handshake since the last call: the old session's streams must be
+    /// closed now, before the new session opens its own.
+    pub fn take_replaced(&mut self) -> Vec<u32> {
+        std::mem::take(&mut self.replaced)
+    }
+
+    /// Addresses that a session left (it roamed) at least `grace` ago and
+    /// that no session uses now: a TCP/TLS connection from one of them carries
+    /// nothing any more. Each is reported once.
+    pub fn take_vacated(&mut self, grace: std::time::Duration) -> Vec<SocketAddr> {
+        if self.vacated.is_empty() {
+            return Vec::new();
+        }
+        let now = std::time::Instant::now();
+        let mut out = Vec::new();
+        let addr_to_session = &self.addr_to_session;
+        self.vacated.retain(|&(addr, since)| {
+            if addr_to_session.contains_key(&addr) {
+                return false;
+            }
+            if now.duration_since(since) < grace {
+                return true;
+            }
+            out.push(addr);
+            false
+        });
+        out
     }
 
     /// Streams the core reset on its own tick since the last call.
@@ -875,17 +965,20 @@ impl Dispatcher {
     }
 
     pub fn on_tick(&mut self) -> (Vec<(Bytes, SocketAddr)>, Vec<u32>) {
-        // Purge expired handshakes from replay cache (older than 5 min drift allowance)
-        let current_sys_time = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        self.replay_cache.retain(|_, &mut ts| current_sys_time.abs_diff(ts) <= 300);
-        self.hs_replies.retain(|_, (ts, _)| current_sys_time.abs_diff(*ts) <= 300);
+        let now = std::time::Instant::now();
+        let housekeeping = self.last_housekeeping.map_or(true, |last| now.duration_since(last) >= HOUSEKEEPING_INTERVAL);
+        if housekeeping {
+            self.last_housekeeping = Some(now);
+            // Purge expired handshakes from replay cache (older than 5 min drift allowance)
+            let current_sys_time = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            self.replay_cache.retain(|_, &mut ts| current_sys_time.abs_diff(ts) <= 300);
+            self.hs_replies.retain(|_, (ts, _)| current_sys_time.abs_diff(*ts) <= 300);
 
-        // Drop cached secrets/junk-markers for keys that have been deleted, so the
-        // caches can't grow without bound as keys churn.
-        {
+            // Drop cached secrets/junk-markers for keys that have been deleted, so the
+            // caches can't grow without bound as keys churn.
             let keys = self.access_keys.read().unwrap_or_else(|e| e.into_inner());
             self.secrets_cache.retain(|k, _| keys.contains_key(k));
             self.junk_cache.retain(|k, _| keys.contains_key(k));
@@ -895,16 +988,26 @@ impl Dispatcher {
         let mut dropped_earlier = std::mem::take(&mut self.dropped);
         let mut frames = Vec::new();
         let mut expired = Vec::new();
-        let now = std::time::Instant::now();
         let timeout_dur = std::time::Duration::from_secs(600); // 10 minute session timeout (mobile NAT can be up to 5-10min)
 
-        // Gather expired or invalid sessions
-        for (&sid, peer_state) in &self.peer_machines {
-            let key_valid = self.access_keys.read().unwrap_or_else(|e| e.into_inner()).contains_key(&peer_state.access_key);
-            let user_stats = self.get_or_create_user_stats(&peer_state.access_key);
-            let closed = peer_state.machine.state() == OstpState::Closed;
-            if closed || now.duration_since(peer_state.last_seen) > timeout_dur || !key_valid || user_stats.is_over_limit() {
-                expired.push(sid);
+        // Gather expired or invalid sessions: one closed by its client on
+        // every tick, the rest on the slow pass, with each lock taken once
+        // (the order the hot reload takes them in: keys, then stats).
+        {
+            let keys = housekeeping.then(|| self.access_keys.read().unwrap_or_else(|e| e.into_inner()));
+            let stats = housekeeping.then(|| self.user_stats.read().unwrap_or_else(|e| e.into_inner()));
+            for (&sid, peer_state) in &self.peer_machines {
+                if peer_state.machine.state() == OstpState::Closed {
+                    expired.push(sid);
+                    continue;
+                }
+                let (Some(keys), Some(stats)) = (&keys, &stats) else { continue };
+                let key_valid = keys.contains_key(&peer_state.access_key);
+                // No entry yet: nothing counted, so nothing over the limit.
+                let over_limit = stats.get(&peer_state.access_key).is_some_and(|s| s.is_over_limit());
+                if now.duration_since(peer_state.last_seen) > timeout_dur || !key_valid || over_limit {
+                    expired.push(sid);
+                }
             }
         }
 
@@ -1086,6 +1189,8 @@ impl Dispatcher {
 
     fn remove_session(&mut self, session_id: u32) -> Option<PeerState> {
         let state = self.peer_machines.remove(&session_id)?;
+        // Its connects under way are not wanted any more.
+        self.connecting.retain(|&(sid, _), _| sid != session_id);
         // A newer session of the same client may have taken this address;
         // removing its entry would push every packet of it onto the slow
         // roaming scan.
@@ -1796,6 +1901,66 @@ mod roaming_tests {
         assert_eq!(dispatcher.peer_machines[&SID].last_addr, roamed);
         assert_eq!(dispatcher.addr_to_session.get(&roamed), Some(&SID));
         assert_eq!(dispatcher.addr_to_session.get(&home), None);
+    }
+
+    /// A key removed after the first tick is noticed on the next slow pass,
+    /// not on every 10 ms tick.
+    #[test]
+    fn expiry_checks_run_on_the_slow_pass() {
+        let (mut dispatcher, _client) = established(addr("198.51.100.1:40000"));
+        assert!(dispatcher.on_tick().1.is_empty());
+        remove_key(&dispatcher);
+        assert!(dispatcher.on_tick().1.is_empty(), "not checked again within the interval");
+        dispatcher.last_housekeeping = Some(std::time::Instant::now() - HOUSEKEEPING_INTERVAL);
+        assert_eq!(dispatcher.on_tick().1, vec![SID]);
+    }
+
+    /// A new handshake that takes the id of a session dropped since the last
+    /// tick reports the id at once, so the old session's streams are closed
+    /// before the new one opens its own; the tick no longer reports it.
+    #[test]
+    fn a_reused_session_id_is_reported_as_replaced() {
+        let (private, public) = ostp_core::crypto::noise::generate_server_key();
+        let mut dispatcher = new_dispatcher();
+        dispatcher.set_wire_versions(Some(private), true);
+        let (_c1, msg1) = v6_client_with_sid(public, SID);
+        assert!(accepted_reply(dispatcher.on_datagram(addr("203.0.113.1:4000"), msg1).unwrap()).is_some());
+        assert!(dispatcher.take_replaced().is_empty());
+        let (_c2, msg2) = v6_client_with_sid(public, SID);
+        assert!(accepted_reply(dispatcher.on_datagram(addr("203.0.113.2:4000"), msg2).unwrap()).is_some());
+        assert_eq!(dispatcher.take_replaced(), vec![SID]);
+        assert_eq!(dispatcher.active_sessions(), 1);
+    }
+
+    /// A connect that completes after its stream ended, or after its session
+    /// was replaced, is not wanted.
+    #[test]
+    fn a_connect_that_outlives_its_stream_is_dropped() {
+        let (mut dispatcher, _client) = established(addr("198.51.100.1:40000"));
+        let t1 = dispatcher.begin_connect(SID, 1);
+        assert!(dispatcher.finish_connect(SID, 1, t1));
+        let t3 = dispatcher.begin_connect(SID, 3);
+        dispatcher.release_stream(SID, 3);
+        assert!(!dispatcher.finish_connect(SID, 3, t3), "the stream was closed meanwhile");
+        let t5 = dispatcher.begin_connect(SID, 5);
+        dispatcher.drop_session(SID);
+        assert!(!dispatcher.finish_connect(SID, 5, t5), "the session ended meanwhile");
+    }
+
+    /// The address a session roamed away from is reported after the grace
+    /// period, once, and not while a session uses it again.
+    #[test]
+    fn a_vacated_address_is_reported_after_the_grace() {
+        let home = addr("198.51.100.1:40000");
+        let roamed = addr("198.51.100.2:40001");
+        let (mut dispatcher, mut client) = established(home);
+        let d1 = send(&mut client, b"one");
+        dispatcher.on_datagram(home, d1).unwrap();
+        let d2 = send(&mut client, b"two");
+        dispatcher.on_datagram(roamed, d2).unwrap();
+        assert!(dispatcher.take_vacated(std::time::Duration::from_secs(60)).is_empty());
+        assert_eq!(dispatcher.take_vacated(std::time::Duration::ZERO), vec![home]);
+        assert!(dispatcher.take_vacated(std::time::Duration::ZERO).is_empty());
     }
 
     #[test]

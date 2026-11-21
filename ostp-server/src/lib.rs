@@ -89,12 +89,25 @@ pub(crate) const V6_QUEUED_UPLOAD_LIMIT: usize = 2 * ostp_core::relay::INITIAL_S
 
 /// What a task that reads a target hands to the server loop.
 pub(crate) enum StreamOut {
-    Data(Vec<u8>),
+    /// Data, and the frames the reader claimed for it from the session's
+    /// send gate (`SendGate::claim`); the loop reports them sent.
+    Data(Vec<u8>, i64),
     /// v6: the target sent its last byte (half-close).
     Fin,
     /// The target's connection ended or failed: `Close` in a v5 session, an
     /// abort with a reason in v6.
     Close,
+}
+
+/// A message from a target's reader, with the send gate of the session it
+/// was started for. A gate that is no longer the session's (the session ended,
+/// or its id was taken by a new handshake) marks a message for a session that
+/// is gone: it is discarded rather than sent into another one.
+pub(crate) struct FromTarget {
+    pub session_id: u32,
+    pub stream_id: u32,
+    pub gate: Arc<send_gate::SendGate>,
+    pub out: StreamOut,
 }
 
 pub(crate) struct RemoteState {
@@ -675,12 +688,14 @@ async fn run_server_loop(
     stats_file: Option<std::path::PathBuf>,
 ) -> Result<()> {
     let mut remotes: HashMap<(u32, u32), RemoteState> = HashMap::new();
-    let (stream_tx, mut stream_rx) = mpsc::unbounded_channel::<(u32, u32, StreamOut)>();
+    // Unbounded, but holds no more data than the readers claimed from their
+    // sessions' send gates (see `send_gate`), plus the ends of streams.
+    let (stream_tx, mut stream_rx) = mpsc::unbounded_channel::<FromTarget>();
     let (udp_reply_tx, mut udp_reply_rx) = mpsc::channel::<(u32, u32, String, Vec<u8>)>(UDP_REPLY_QUEUE);
     // Flow control: bytes of a stream written to its target, to be granted
     // back to the client as a `Window`.
     let (grant_tx, mut grant_rx) = mpsc::unbounded_channel::<(u32, u32, u32)>();
-    let (connect_tx, mut connect_rx) = mpsc::unbounded_channel::<(u32, u32, String, Result<(tokio::net::tcp::OwnedWriteHalf, mpsc::Sender<()>, Option<Arc<send_gate::StreamWindow>>), String>)>();
+    let (connect_tx, mut connect_rx) = mpsc::unbounded_channel::<relay::ConnectDone>();
 
     let tcp_map = std::sync::Arc::new(tokio::sync::RwLock::new(HashMap::new()));
 
@@ -864,7 +879,7 @@ async fn run_server_loop(
                 if let Some((packet, peer)) = received {
                     if let Err(e) = handle_udp_packet(
                         packet, peer, &mut dispatcher, &tcp_map, &socket, &mut remotes, &ui_event_tx,
-                        stream_tx.clone(), udp_reply_tx.clone(), connect_tx.clone(),
+                        udp_reply_tx.clone(), connect_tx.clone(),
                         router.clone(),
                         &mut peer_last_seen, &mut peer_available, &mut last_empty_app_log,
                         &session_backpressure
@@ -873,9 +888,21 @@ async fn run_server_loop(
                     }
                 }
             }
-            Some((session_id, stream_id, out)) = stream_rx.recv() => {
+            Some(FromTarget { session_id, stream_id, gate, out }) = stream_rx.recv() => {
+                if let StreamOut::Data(_, frames) = &out {
+                    // Sent below, or discarded: either way no longer queued.
+                    gate.sent(*frames);
+                }
+                let current = session_backpressure
+                    .read()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get(&session_id)
+                    .is_some_and(|g| Arc::ptr_eq(g, &gate));
+                if !current {
+                    continue;
+                }
                 match out {
-                    StreamOut::Data(data) => {
+                    StreamOut::Data(data, _) => {
                         let _ = relay::send_relay_to_stream(session_id, stream_id, RelayMessage::Data(data), &mut dispatcher, &socket, &ui_event_tx, &tcp_map).await;
                     }
                     StreamOut::Fin => {
@@ -908,9 +935,19 @@ async fn run_server_loop(
             Some((session_id, stream_id, target, data)) = udp_reply_rx.recv() => {
                 let _ = relay::send_relay_to_stream(session_id, stream_id, RelayMessage::UdpData(target, data), &mut dispatcher, &socket, &ui_event_tx, &tcp_map).await;
             }
-            Some((session_id, stream_id, target, res)) = connect_rx.recv() => {
-                match res {
-                    Ok((writer, cancel_tx, window)) => {
+            Some(relay::ConnectDone { session_id, stream_id, token, target, result }) = connect_rx.recv() => {
+                // The stream (or its session) may have ended while the
+                // connect was under way: then the connection is dropped here,
+                // which closes it, and the key's slot goes back.
+                let wanted = dispatcher.finish_connect(session_id, stream_id, token);
+                match result {
+                    Ok(connected) if !wanted => {
+                        drop(connected);
+                        let _ = ui_event_tx.send(UiEvent::Log(format!("Stream [{session_id}:{stream_id}] ended before its target answered, connection closed")));
+                    }
+                    Err(_) if !wanted => {}
+                    Ok(connected) => {
+                        let relay::Started { writer, cancel_tx, window } = connected.start(session_id, stream_id, stream_tx.clone());
                         let (data_tx, mut data_rx) = mpsc::unbounded_channel::<Bytes>();
                         let queued = Arc::new(std::sync::atomic::AtomicUsize::new(0));
                         let writer_queued = queued.clone();
@@ -1102,12 +1139,48 @@ async fn tcp_headroom(
     }
 }
 
-pub(crate) fn queue_to_tcp(tx: &tokio::sync::mpsc::Sender<bytes::Bytes>, frame: bytes::Bytes) {
-    if let Err(tokio::sync::mpsc::error::TrySendError::Full(_)) = tx.try_send(frame) {
-        let n = TCP_QUEUE_DROPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-        if n.is_power_of_two() {
-            tracing::warn!("a TCP/TLS client does not keep up: frame dropped from its full send queue ({n} so far)");
-        }
+/// What a frame on its way to a TCP/TLS client is.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Urgency {
+    /// Stream data from a target: on a full queue it is dropped, and the
+    /// client's NACK has it resent.
+    Data,
+    /// Handshake replies, acknowledgements, resends and the stream and
+    /// session control messages: nothing would resend a lost ACK or
+    /// handshake reply, and a lost `Close` or `Fin` costs a whole RTO. These
+    /// wait for room (up to `TCP_CONTROL_WAIT`) instead of being dropped.
+    Control,
+}
+
+/// How long a control frame waits for room in a full queue. A client that
+/// reads nothing for this long is cut off by its writer anyway
+/// (`transport::uot::WRITE_STALL_TIMEOUT`).
+const TCP_CONTROL_WAIT: Duration = Duration::from_secs(10);
+/// Control frames waiting for room at once, server-wide: past this they are
+/// dropped like data, so a stalled client cannot pile up tasks.
+const TCP_CONTROL_WAITING_MAX: usize = 4096;
+static TCP_CONTROL_WAITING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+pub(crate) fn queue_to_tcp(tx: &tokio::sync::mpsc::Sender<bytes::Bytes>, frame: bytes::Bytes, urgency: Urgency) {
+    use std::sync::atomic::Ordering;
+    let frame = match tx.try_send(frame) {
+        Err(tokio::sync::mpsc::error::TrySendError::Full(frame)) => frame,
+        _ => return,
+    };
+    if urgency == Urgency::Control && TCP_CONTROL_WAITING.fetch_add(1, Ordering::Relaxed) < TCP_CONTROL_WAITING_MAX {
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            let _ = tokio::time::timeout(TCP_CONTROL_WAIT, tx.send(frame)).await;
+            TCP_CONTROL_WAITING.fetch_sub(1, Ordering::Relaxed);
+        });
+        return;
+    }
+    if urgency == Urgency::Control {
+        TCP_CONTROL_WAITING.fetch_sub(1, Ordering::Relaxed);
+    }
+    let n = TCP_QUEUE_DROPS.fetch_add(1, Ordering::Relaxed) + 1;
+    if n.is_power_of_two() {
+        tracing::warn!("a TCP/TLS client does not keep up: frame dropped from its full send queue ({n} so far)");
     }
 }
 
@@ -1136,9 +1209,8 @@ async fn handle_udp_packet(
     socket: &transport::udp::UdpSockets,
     remotes: &mut HashMap<(u32, u32), RemoteState>,
     ui_event_tx: &mpsc::UnboundedSender<UiEvent>,
-    stream_tx: mpsc::UnboundedSender<(u32, u32, StreamOut)>,
     udp_reply_tx: mpsc::Sender<(u32, u32, String, Vec<u8>)>,
-    connect_tx: mpsc::UnboundedSender<(u32, u32, String, Result<(tokio::net::tcp::OwnedWriteHalf, mpsc::Sender<()>, Option<Arc<send_gate::StreamWindow>>), String>)>,
+    connect_tx: relay::ConnectTx,
     router: std::sync::Arc<crate::router::Router>,
     peer_last_seen: &mut HashMap<IpAddr, Instant>,
     peer_available: &mut HashMap<IpAddr, bool>,
@@ -1146,7 +1218,14 @@ async fn handle_udp_packet(
     session_backpressure: &SessionBackpressure,
 ) -> Result<()> {
     let size = packet.len();
-    match dispatcher.on_datagram(peer, packet.clone()) {
+    let outcome = dispatcher.on_datagram(peer, packet.clone());
+    // A new handshake took the id of a dropped session: its streams are
+    // closed before the new session can open any.
+    for sid in dispatcher.take_replaced() {
+        let _ = ui_event_tx.send(UiEvent::Info(format!("Session {sid} replaced by a new handshake, releasing the old one's resources")));
+        release_session(sid, remotes, session_backpressure);
+    }
+    match outcome {
         Ok(DispatchOutcome::Junk) => return Ok(()),
         Ok(DispatchOutcome::Unauthorized) => {
             let _ = ui_event_tx.send(UiEvent::UnauthorizedProbe { peer: peer.ip(), bytes: size });
@@ -1180,7 +1259,7 @@ async fn handle_udp_packet(
                 {
                     let map = tcp_map.read().await;
                     if let Some(tx) = map.get(&peer_addr) {
-                        queue_to_tcp(tx, resp.clone());
+                        queue_to_tcp(tx, resp.clone(), Urgency::Control);
                         sent_tcp = true;
                     }
                 }
@@ -1215,7 +1294,6 @@ async fn handle_udp_packet(
                     socket,
                     remotes,
                     ui_event_tx,
-                    stream_tx.clone(),
                     udp_reply_tx.clone(),
                     connect_tx.clone(),
                     router.clone(),
@@ -1232,7 +1310,7 @@ async fn handle_udp_packet(
                     Ok(msg @ RelayMessage::UdpData(..)) => {
                         if let Err(e) = relay::handle_message(
                             peer_addr, session_id, stream_id, msg, dispatcher, socket, remotes, ui_event_tx,
-                            stream_tx.clone(), udp_reply_tx.clone(), connect_tx.clone(), router.clone(), tcp_map, session_backpressure,
+                            udp_reply_tx.clone(), connect_tx.clone(), router.clone(), tcp_map, session_backpressure,
                         ).await {
                             logs::relay_rejected(session_id, stream_id, &e);
                         }
@@ -1312,7 +1390,7 @@ async fn handle_tick(
         {
             let map = tcp_map.read().await;
             if let Some(tx) = map.get(&peer_addr) {
-                queue_to_tcp(tx, frame.clone());
+                queue_to_tcp(tx, frame.clone(), Urgency::Control);
                 sent_tcp = true;
             }
         }
@@ -1328,27 +1406,42 @@ async fn handle_tick(
     for (session_id, stream_id) in dispatcher.take_resets() {
         relay::reset_stream(session_id, stream_id, remotes, dispatcher, ui_event_tx);
     }
-    if !dropped_sessions.is_empty() {
-        let mut map = session_backpressure.write().unwrap_or_else(|e| e.into_inner());
-        for sid in &dropped_sessions {
-            map.remove(sid);
-        }
-    }
     for sid in dropped_sessions {
         let _ = ui_event_tx.send(UiEvent::Info(format!("Session {sid} expired, releasing resources")));
-        let mut streams_to_cancel = Vec::new();
-        for &(session_id, stream_id) in remotes.keys() {
-            if session_id == sid {
-                streams_to_cancel.push((session_id, stream_id));
-            }
-        }
-        for key in streams_to_cancel {
-            if let Some(state) = remotes.remove(&key) {
-                let _ = state.cancel_tx.try_send(());
+        release_session(sid, remotes, session_backpressure);
+    }
+    // A TCP/TLS connection that its session left (it roamed to another one)
+    // a while ago and that no session uses: closed now instead of after the
+    // idle timeout, with its queue and its drain entry. Dropping the map's
+    // sender ends the writer once it has written what is queued.
+    let vacated = dispatcher.take_vacated(VACATED_GRACE);
+    if !vacated.is_empty() {
+        let mut map = tcp_map.write().await;
+        for addr in vacated {
+            if map.remove(&addr).is_some() {
+                let _ = ui_event_tx.send(UiEvent::Log("A TCP/TLS connection its session left is closed".to_string()));
             }
         }
     }
     Ok(())
+}
+
+/// How long a connection a session roamed away from is kept, in case the
+/// client still uses it (a datagram from it moves the session back).
+const VACATED_GRACE: Duration = Duration::from_secs(30);
+
+/// The session is gone (expired, dropped, or its id taken by a new
+/// handshake): its targets are closed and its send gate forgotten, so that
+/// what its readers still hand over is discarded.
+fn release_session(sid: u32, remotes: &mut HashMap<(u32, u32), RemoteState>, session_backpressure: &SessionBackpressure) {
+    session_backpressure.write().unwrap_or_else(|e| e.into_inner()).remove(&sid);
+    remotes.retain(|&(session_id, _), state| {
+        if session_id != sid {
+            return true;
+        }
+        let _ = state.cancel_tx.try_send(());
+        false
+    });
 }
 
 #[cfg(test)]
