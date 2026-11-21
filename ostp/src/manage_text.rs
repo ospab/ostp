@@ -20,6 +20,7 @@ pub enum Shown {
     Dns,
     ServerInfo,
     Restart,
+    SubIds,
 }
 
 /// Binary size with a unit, as people read it: 1.5 GiB.
@@ -269,7 +270,33 @@ pub fn render(shown: Shown, v: &Value) -> Vec<String> {
             out
         }
         Shown::ServerInfo => server_info(&v["server_info"]),
+        Shown::SubIds => sub_ids(v),
     }
+}
+
+/// `sub-ids`: who still has an old-style link, or who just got a new one.
+fn sub_ids(v: &Value) -> Vec<String> {
+    let list = v["users"].as_array().cloned().unwrap_or_default();
+    let assigned = v["assigned"].as_bool() == Some(true);
+    if list.is_empty() {
+        return vec![ok("Every user has a subscription id")];
+    }
+    let mut out = vec![if assigned {
+        ok(&format!("New subscription links for {} user(s); their old links no longer work:", list.len()))
+    } else {
+        format!("  {} user(s) still have the old kind of link (a hash of the access key):", list.len())
+    }];
+    for u in &list {
+        let mut line = format!("    [{}] {}", u["number"].as_u64().unwrap_or(0), name_of(u));
+        if let Some(s) = u["subscription"].as_str() {
+            line.push_str(&format!("  {}", s.cyan()));
+        }
+        out.push(line);
+    }
+    if !assigned {
+        out.push("  ostp manage sub-ids --assign-missing gives each a random one (their current links stop working).".dimmed().to_string());
+    }
+    out
 }
 
 /// The server's info as its clients get it.
@@ -311,6 +338,13 @@ mod tests {
         assert_eq!(render(Shown::UserLimit, &v), vec!["  ✓ pops: at most 1 device(s) on the subscription"]);
         let v = json!({ "limit": { "key": "k", "name": "pops", "max_devices": null } });
         assert_eq!(render(Shown::UserLimit, &v), vec!["  ✓ pops: no device limit"]);
+        colored::control::set_override(false);
+        let v = json!({ "assigned": false, "users": [{ "number": 2, "name": "pops", "key": "k", "subscription": null }] });
+        let lines = render(Shown::SubIds, &v);
+        assert_eq!(lines[1], "    [2] pops");
+        assert!(lines[2].contains("--assign-missing"));
+        let v = json!({ "assigned": true, "users": [] });
+        assert_eq!(render(Shown::SubIds, &v), vec!["  ✓ Every user has a subscription id"]);
     }
 
     #[test]

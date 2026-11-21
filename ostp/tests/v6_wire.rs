@@ -66,7 +66,7 @@ async fn start_server_full(
     config_path: Option<std::path::PathBuf>,
     api: Option<SocketAddr>,
 ) -> SocketAddr {
-    let meta = ostp_server::api::UserMeta { name: None, limit_bytes: None, max_devices: None, expires_at: None };
+    let meta = ostp_server::api::UserMeta { name: None, limit_bytes: None, max_devices: None, expires_at: None, sub_id: None };
     start_server_with(protocol, bind_ip, config_path, api, meta).await
 }
 
@@ -1000,7 +1000,7 @@ async fn removing_the_key_closes_the_session_with_a_reason_and_the_client_stops_
 #[tokio::test(flavor = "multi_thread")]
 async fn an_expired_key_is_told_inside_the_tunnel_and_the_client_stops() {
     let (protocol, public) = section(false);
-    let meta = ostp_server::api::UserMeta { name: None, limit_bytes: None, max_devices: None, expires_at: Some(1) };
+    let meta = ostp_server::api::UserMeta { name: None, limit_bytes: None, max_devices: None, expires_at: Some(1), sub_id: None };
     let server = start_server_with(Some(protocol), None, None, None, meta).await;
     let client = Client::from_link(&link_to(server, Some(public)), "udp").await;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);

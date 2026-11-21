@@ -89,6 +89,9 @@ fn change(config_path: &Path, enabled: Option<bool>, o: SubOpts) -> Result<()> {
     if let Some(p) = &o.path {
         let p = format!("/{}", p.trim().trim_matches('/'));
         sub["path"] = p.into();
+    } else if let Some(p) = prefix_on_enable(&sub, before.is_enabled(), enabled == Some(true)) {
+        println!("  {} Subscription path: {p} (random; `ostp sub set --path <p>` changes it)", "✓".green());
+        sub["path"] = p.into();
     }
     if let Some(n) = &o.name {
         sub["name"] = n.trim().into();
@@ -148,6 +151,15 @@ fn change(config_path: &Path, enabled: Option<bool>, o: SubOpts) -> Result<()> {
     Ok(())
 }
 
+/// The prefix to write when subscriptions are turned on: a random one when
+/// they were off and the config names no path, so the URL does not tell a
+/// scanner where to look. A config that has a path (even "/sub") keeps it, and
+/// one already serving keeps its default "/sub": URLs in use never change.
+fn prefix_on_enable(sub: &serde_json::Value, was_enabled: bool, enabling: bool) -> Option<String> {
+    let has_path = sub.get("path").and_then(|p| p.as_str()).is_some_and(|p| !p.trim_matches('/').is_empty());
+    (enabling && !was_enabled && !has_path).then(ostp_core::subscription::random_prefix)
+}
+
 pub(crate) fn web_kind(f: Frontend) -> Option<Kind> {
     match f {
         Frontend::Builtin => None,
@@ -157,14 +169,31 @@ pub(crate) fn web_kind(f: Frontend) -> Option<Kind> {
     }
 }
 
+/// The route to paste into a site the operator keeps by hand: the same one the
+/// OSTP-managed site gets, which replaces OSTP's bare 404 for an unknown token
+/// with the web server's own error page.
 fn snippet(kind: Kind, prefix: &str, port: u16) -> String {
+    let route = webserver::sub_route(kind, prefix, port, true);
+    let route = route.trim_end();
     match kind {
         Kind::Nginx => format!(
-            "    location ^~ {prefix}/ {{\n        proxy_pass http://127.0.0.1:{port};\n        proxy_set_header Host $host;\n        proxy_set_header X-Real-IP $remote_addr;\n    }}"
+            "{route}\n    # If this server has its own `error_page 404`, point the location's error_page there instead."
         ),
-        Kind::Apache => format!("    ProxyPass {prefix}/ http://127.0.0.1:{port}{prefix}/"),
-        Kind::Caddy => format!("    handle {prefix}/* {{\n        reverse_proxy 127.0.0.1:{port}\n    }}"),
+        Kind::Apache => format!("{route}\n    # Apache older than 2.4.47: write `ProxyErrorOverride On` without the code."),
+        Kind::Caddy => route.to_string(),
     }
+}
+
+/// Whether the site's route for the prefix makes the web server answer an
+/// unknown token with its own 404 (sites written before 0.5.0 do not).
+fn vhost_hides_unknown_tokens(config_path: &Path) -> bool {
+    let manifest = webserver::manifest_path(&crate::config_dir_of(config_path));
+    let Ok(raw) = std::fs::read_to_string(manifest) else { return false };
+    let Ok(m) = serde_json::from_str::<webserver::Manifest>(&raw) else { return false };
+    m.files_created
+        .iter()
+        .filter_map(|f| std::fs::read_to_string(f).ok())
+        .any(|site| ["proxy_intercept_errors on", "ProxyErrorOverride On", "@ostp_not_found status 404"].iter().any(|d| site.contains(d)))
 }
 
 /// Whether the site OSTP wrote for the web server already forwards `prefix`.
@@ -209,6 +238,14 @@ fn status(config_path: &Path) -> Result<()> {
             s.path(),
             if fwd { "" } else { "(ostp sub set --vhost, or add it by hand)" }
         );
+        if fwd && !vhost_hides_unknown_tokens(config_path) {
+            println!(
+                "    {} {} shows OSTP's own 404 for an unknown token, unlike its 404 for other paths\n      \
+                 (ostp sub set --vhost rewrites the OSTP-managed site; a site kept by hand: see `ostp sub enable` output or docs)",
+                "!".yellow(),
+                kind.as_str()
+            );
+        }
     }
     if s.is_enabled() {
         println!("\n  URLs: ostp sub urls");
@@ -236,7 +273,7 @@ fn urls(config_path: &Path, who: Option<&str>) -> Result<()> {
         if !hit {
             continue;
         }
-        if let Some(url) = crate::subscription_url_for(&server, &key) {
+        if let Some(url) = crate::subscription_url_for(&server, &user.sub_token()) {
             let label = if name.is_empty() { format!("key {}", i + 1) } else { name };
             println!("  [{}] {label:<16} {url}", i + 1);
             shown += 1;
@@ -246,4 +283,37 @@ fn urls(config_path: &Path, who: Option<&str>) -> Result<()> {
         bail!("no user matches {}", who.unwrap_or("(any)"));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn enabling_writes_a_random_prefix_only_when_none_is_configured() {
+        let p = prefix_on_enable(&json!({}), false, true).expect("off and no path: a random one");
+        assert_eq!(p.len(), 11);
+        assert!(p.starts_with('/') && p[1..].bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit()), "{p}");
+        assert_eq!(prefix_on_enable(&json!({ "path": "/sub" }), false, true), None, "an explicit /sub is kept");
+        assert_eq!(prefix_on_enable(&json!({ "path": "/mine" }), false, true), None);
+        assert_eq!(prefix_on_enable(&json!({}), true, true), None, "already serving on the default /sub: unchanged");
+        assert_eq!(prefix_on_enable(&json!({}), false, false), None, "only when turning it on");
+    }
+
+    #[test]
+    fn printed_snippets_make_the_web_server_answer_unknown_tokens_itself() {
+        let n = snippet(Kind::Nginx, "/abc", 50000);
+        assert!(n.contains("location ^~ /abc/ {"));
+        assert!(n.contains("proxy_intercept_errors on;"));
+        assert!(n.contains("error_page 404 = @ostp_not_found;"));
+        assert!(n.contains("location @ostp_not_found {\n        return 404;"));
+        let a = snippet(Kind::Apache, "/abc", 50000);
+        assert!(a.contains("ProxyPass /abc/ http://127.0.0.1:50000/abc/"));
+        assert!(a.contains("<Location \"/abc/\">") && a.contains("ProxyErrorOverride On 404"));
+        let c = snippet(Kind::Caddy, "/abc", 50000);
+        assert!(c.contains("reverse_proxy 127.0.0.1:50000 {"));
+        assert!(c.contains("@ostp_not_found status 404"));
+        assert!(c.contains("handle_response @ostp_not_found {\n                error 404"));
+    }
 }

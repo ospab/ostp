@@ -115,7 +115,7 @@ enum Commands {
         #[command(subcommand)]
         action: cert_cmd::CertAction,
     },
-    /// Subscription server: per-user https://<domain>/sub/<token> URLs (server only)
+    /// Subscription server: per-user https://<domain><path>/<token> URLs (server only)
     Sub {
         #[command(subcommand)]
         action: sub_cmd::SubAction,
@@ -329,8 +329,9 @@ fn share_links_for(
     links
 }
 
-/// `https://<domain>[:port]<path>/<token>` when subscriptions are on.
-fn subscription_url_for(server_cfg: &ostp_client::config::ServerConfig, key: &str) -> Option<String> {
+/// `https://<domain>[:port]<path>/<token>` when subscriptions are on; `token` is
+/// the user's `sub_token()` (its `sub_id`, or the legacy hash of the key).
+fn subscription_url_for(server_cfg: &ostp_client::config::ServerConfig, token: &str) -> Option<String> {
     let sub = server_cfg.subscription.as_ref().filter(|s| s.is_enabled())?;
     let tls = server_cfg.tls.as_ref().filter(|t| t.is_enabled())?;
     let domain = server_cfg.domain.as_deref().filter(|d| !d.is_empty())?;
@@ -338,7 +339,7 @@ fn subscription_url_for(server_cfg: &ostp_client::config::ServerConfig, key: &st
         domain,
         tls.public_port.unwrap_or(443),
         &sub.path(),
-        &ostp_core::subscription::token_for_key(key),
+        token,
     ))
 }
 
@@ -370,7 +371,7 @@ fn qr_clients(server_cfg: &ostp_client::config::ServerConfig, config_path: &Path
         .map(|(idx, user)| {
             let key = user.key();
             let mut links: Vec<(String, String)> = Vec::new();
-            if let Some(url) = subscription_url_for(server_cfg, &key) {
+            if let Some(url) = subscription_url_for(server_cfg, &user.sub_token()) {
                 links.push(("SUB".into(), url));
             }
             for (label, link) in share_links_for(server_cfg, &key, config_path) {
@@ -810,6 +811,13 @@ fn listen_addr_port(listen: &str) -> u16 {
     listen.rsplit_once(':').and_then(|(_, p)| p.parse().ok()).unwrap_or(50000)
 }
 
+/// `access_keys` entries for new users: each key with a random subscription id.
+fn new_user_entries(keys: &[String]) -> Vec<serde_json::Value> {
+    keys.iter()
+        .map(|k| serde_json::json!({ "access_key": k, "sub_id": ostp_core::subscription::new_sub_id() }))
+        .collect()
+}
+
 /// Number of `access_keys` in a config file, when it reads as one.
 fn count_access_keys(path: &std::path::Path) -> Option<usize> {
     let text = fs::read_to_string(path).ok()?;
@@ -1079,7 +1087,7 @@ fn run_setup_wizard(config_path: &std::path::Path) -> Result<Option<PathBuf>> {
                 "config_version": ostp_client::migrate::CURRENT_VERSION,
                 "log_level": "info",
                 "listen": listen,
-                "access_keys": access_keys,
+                "access_keys": new_user_entries(&access_keys),
                 "outbound": {
                     "enabled": false,
                     "protocol": "socks5",
@@ -1177,7 +1185,7 @@ fn run_setup_wizard(config_path: &std::path::Path) -> Result<Option<PathBuf>> {
                 "config_version": ostp_client::migrate::CURRENT_VERSION,
                 "log_level": "info",
                 "listen": listen,
-                "access_keys": access_keys,
+                "access_keys": new_user_entries(&access_keys),
                 "outbound": {
                     "enabled": false,
                     "protocol": "socks5",
@@ -1632,8 +1640,10 @@ async fn run_app() -> Result<()> {
   "listen": "0.0.0.0:50000",
   
   // List of valid keys. Clients must use one of these to connect.
+  // sub_id is the user's subscription link token (random; `ostp manage
+  // user-set <user> --new-sub-id` replaces it).
   "access_keys": [
-    "{}"
+    {{ "access_key": "{}", "sub_id": "{sid}" }}
   ],
   
   // Optional proxy for outbound traffic.
@@ -1688,11 +1698,12 @@ async fn run_app() -> Result<()> {
   }},
 
   // Subscriptions (needs tls + domain): every key gets
-  // https://<domain>/sub/<token>, which apps re-fetch to pick up changes.
+  // https://<domain><path>/<token>, which apps re-fetch to pick up changes.
+  // The path is random so it does not tell a scanner where to look.
   // `ostp links` prints the URLs.
   "subscription": {{
     "enabled": false,
-    "path": "/sub",
+    "path": "{sub_path}",
     "update_interval_hours": 12,
     "include": ["tls", "udp"]
   }},
@@ -1729,6 +1740,7 @@ async fn run_app() -> Result<()> {
 
   "debug": false
 }}"#, key, ws = cert_cmd::random_path(), cv = ostp_client::migrate::CURRENT_VERSION,
+            sid = ostp_core::subscription::new_sub_id(), sub_path = ostp_core::subscription::random_prefix(),
             pk = key_cmd::new_section()["server_key"].as_str().unwrap_or_default())
         } else if mode_str == "relay" {
             r#"{
@@ -1858,7 +1870,7 @@ async fn run_app() -> Result<()> {
                     for (label, link) in share_links_for(&server_cfg, &key.key(), &args.config) {
                         println!("  [{}] {label:<3}  {}", idx + 1, link.to_uri());
                     }
-                    if let Some(url) = subscription_url_for(&server_cfg, &key.key()) {
+                    if let Some(url) = subscription_url_for(&server_cfg, &key.sub_token()) {
                         println!("  [{}] SUB  {url}", idx + 1);
                     }
                 }
@@ -1920,6 +1932,7 @@ async fn run_app() -> Result<()> {
                     limit_bytes: uc.limit(),
                     max_devices: uc.max_devices(),
                     expires_at: uc.expires_at(),
+                    sub_id: uc.sub_id(),
                 })
             }).collect::<Vec<_>>();
             let domain = server_cfg.domain.clone().filter(|d| !d.is_empty());
@@ -2134,6 +2147,17 @@ fn cmd_migrate(config_path: &std::path::Path, dry_run: bool) -> Result<()> {
     for u in &m.unknown_keys {
         let hint = u.suggestion.as_ref().map(|s| format!(" - did you mean \"{s}\"?")).unwrap_or_default();
         println!("{} unknown setting \"{}\" is ignored by ostp{hint}", "[warn]".yellow().bold(), u.path);
+    }
+    // Never done by the migration: a sub_id changes the user's link.
+    let legacy = m.output["access_keys"]
+        .as_array()
+        .map_or(0, |a| a.iter().filter(|e| ostp_core::access_keys::sub_id_of(e).is_none()).count());
+    if m.kind == migrate::ConfigKind::Server && legacy > 0 {
+        println!(
+            "{} {legacy} user(s) have the old kind of subscription link (a hash of the access key, not revocable). \
+             `ostp manage sub-ids --assign-missing` gives them random ones; their current links then stop working.",
+            "[info]".cyan().bold()
+        );
     }
 
     if m.is_up_to_date() {

@@ -122,7 +122,8 @@ fn append_keys(v: &mut serde_json::Value, new_keys: &[String]) -> Result<()> {
         .entry("access_keys")
         .or_insert_with(|| serde_json::Value::Array(Vec::new()));
     let list = list.as_array_mut().context("access_keys in the config is not a list")?;
-    list.extend(new_keys.iter().cloned().map(serde_json::Value::String));
+    // Each new user gets a random subscription id from the start.
+    list.extend(new_keys.iter().map(|k| serde_json::json!({ "access_key": k, "sub_id": ostp_core::subscription::new_sub_id() })));
     Ok(())
 }
 
@@ -307,7 +308,8 @@ mod tests {
         let list = keys.as_array().unwrap();
         assert_eq!(list.len(), 3);
         assert_eq!(list[0], "old");
-        assert!(list[1..].iter().all(|k| k.as_str().is_some_and(|s| s.len() == 32 && s.chars().all(|c| c.is_ascii_hexdigit()))), "{keys}");
+        assert!(list[1..].iter().all(|k| k["access_key"].as_str().is_some_and(|s| s.len() == 32 && s.chars().all(|c| c.is_ascii_hexdigit()))), "{keys}");
+        assert!(list[1..].iter().all(|k| k["sub_id"].as_str().is_some_and(ostp_core::subscription::is_valid_sub_id)), "{keys}");
         assert_eq!(std::fs::read_to_string(server.with_extension("json.bak")).unwrap(), body);
         let _ = std::fs::remove_file(server.with_extension("json.bak"));
         let _ = std::fs::remove_file(server);
@@ -327,7 +329,8 @@ mod tests {
     fn append_keys_creates_a_missing_list_and_refuses_a_wrong_one() {
         let mut v = serde_json::json!({"mode":"server"});
         append_keys(&mut v, &["a".to_string()]).unwrap();
-        assert_eq!(v["access_keys"], serde_json::json!(["a"]));
+        assert_eq!(v["access_keys"][0]["access_key"], "a");
+        assert!(ostp_core::subscription::is_valid_sub_id(v["access_keys"][0]["sub_id"].as_str().unwrap()));
         let mut bad = serde_json::json!({"mode":"server","access_keys":"x"});
         assert!(append_keys(&mut bad, &["a".to_string()]).is_err());
     }

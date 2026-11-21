@@ -185,12 +185,21 @@ pub struct UserMeta {
     /// When the key stops working, Unix seconds (UTC); `None` = never.
     #[serde(default)]
     pub expires_at: Option<u64>,
+    /// The subscription URL token; `None` = the legacy hash of the key.
+    #[serde(default)]
+    pub sub_id: Option<String>,
 }
 
 impl UserMeta {
     /// Whether the key has expired at `now` (Unix seconds).
     pub fn is_expired(&self, now: u64) -> bool {
         ostp_core::access_keys::is_expired(self.expires_at, now)
+    }
+
+    /// The token in this user's subscription URL: `sub_id`, or the legacy
+    /// hash of `key` when the user has none.
+    pub fn sub_token(&self, key: &str) -> String {
+        ostp_core::subscription::token_for(key, self.sub_id.as_deref())
     }
 }
 
@@ -395,6 +404,7 @@ pub fn create_api_router(state: ApiState) -> Router {
         .route("/users/{key}/devices", get(handle_list_devices).delete(handle_clear_devices))
         .route("/users/{key}/devices/{hwid}", axum::routing::delete(handle_remove_device))
         .route("/users/{key}/share", get(handle_user_share))
+        .route("/users/{key}/sub-id", post(handle_new_sub_id))
         .route("/qr", post(handle_qr))
         .route("/subscribe/{key}", get(handle_subscribe))
         .route("/login", post(handle_login))
@@ -809,6 +819,8 @@ enum KeyChange {
     Add(Vec<(String, UserMeta)>),
     /// New name, limit and device limit of a user that is in the file.
     Set { key: String, meta: UserMeta },
+    /// A new subscription id for a user that is in the file; the old link stops working.
+    NewSubId { key: String, sub_id: String },
     Remove(String),
 }
 
@@ -828,13 +840,20 @@ fn save_error_message(e: &str) -> &'static str {
 /// An `access_keys` entry for `key`. Fields this server does not know about
 /// stay as they are in `existing`; the short form (a bare string) is used when
 /// there is nothing to say about the user.
+///
+/// `sub_id` is written only for a new user (no `existing`): an edit of the
+/// name or limits keeps the `sub_id` the file has, so it can never bring back
+/// an id that `ostp manage user-set --new-sub-id` replaced in the file a moment
+/// before. A new id goes in through [`KeyChange::NewSubId`].
 fn key_entry(key: &str, meta: &UserMeta, existing: Option<&serde_json::Value>) -> serde_json::Value {
     use serde_json::Value;
+    let new_sub_id = if existing.is_none() { meta.sub_id.clone().filter(|s| !s.is_empty()) } else { None };
     if existing.is_none_or(|e| e.is_string())
         && meta.name.is_none()
         && meta.limit_bytes.is_none()
         && meta.max_devices.is_none()
         && meta.expires_at.is_none()
+        && new_sub_id.is_none()
     {
         return Value::String(key.to_string());
     }
@@ -857,6 +876,9 @@ fn key_entry(key: &str, meta: &UserMeta, existing: Option<&serde_json::Value>) -
                 obj.remove(field);
             }
         }
+    }
+    if let Some(id) = new_sub_id {
+        obj.insert("sub_id".to_string(), Value::String(id));
     }
     Value::Object(obj)
 }
@@ -882,6 +904,19 @@ fn apply_key_change(config: &mut serde_json::Value, change: &KeyChange) -> Resul
         KeyChange::Set { key, meta } => {
             let i = position(list, key).ok_or(ERR_NOT_IN_FILE)?;
             list[i] = key_entry(key, meta, Some(&list[i]));
+        }
+        KeyChange::NewSubId { key, sub_id } => {
+            let i = position(list, key).ok_or(ERR_NOT_IN_FILE)?;
+            let mut obj = match &list[i] {
+                serde_json::Value::Object(o) => o.clone(),
+                _ => {
+                    let mut o = serde_json::Map::new();
+                    o.insert("access_key".to_string(), serde_json::Value::String(key.clone()));
+                    o
+                }
+            };
+            obj.insert("sub_id".to_string(), serde_json::Value::String(sub_id.clone()));
+            list[i] = serde_json::Value::Object(obj);
         }
         KeyChange::Remove(key) => list.retain(|e| key_of(e).as_deref() != Some(key.as_str())),
     }
@@ -1192,6 +1227,14 @@ async fn handle_create_user(
         None => ostp_core::keys::access_key_hex(),
     };
 
+    // A new user gets a random subscription id from the start.
+    let meta = UserMeta {
+        name,
+        limit_bytes: body.limit_bytes,
+        max_devices,
+        expires_at,
+        sub_id: Some(ostp_core::subscription::new_sub_id()),
+    };
     {
         let mut keys = state.access_keys.write().unwrap_or_else(|e| e.into_inner());
         // Inserting over an existing key would silently reset that user's traffic and limit.
@@ -1201,14 +1244,13 @@ async fn handle_create_user(
         if keys.len() >= MAX_USERS {
             return api_error::<String>("too many users (10000 at most)");
         }
-        keys.insert(key.clone(), UserMeta { name: name.clone(), limit_bytes: body.limit_bytes, max_devices, expires_at });
+        keys.insert(key.clone(), meta.clone());
     }
 
     let mut stats = state.user_stats.write().unwrap_or_else(|e| e.into_inner());
     stats.insert(key.clone(), Arc::new(UserStats::new(body.limit_bytes)));
     drop(stats);
 
-    let meta = UserMeta { name, limit_bytes: body.limit_bytes, max_devices, expires_at };
     if let Err(e) = save_key_change(&state, KeyChange::Add(vec![(key.clone(), meta)])) {
         tracing::error!("Failed to save config after creating user: {}", e);
         // Not on disk, so not kept in memory either: a restart would lose it silently.
@@ -1478,8 +1520,8 @@ async fn handle_user_share(
     if !check_token(&state, &headers) {
         return api_unauthorized::<UserShare>();
     }
-    let name = match state.access_keys.read().unwrap_or_else(|e| e.into_inner()).get(&key) {
-        Some(meta) => meta.name.clone().filter(|n| !n.is_empty()),
+    let (name, token) = match state.access_keys.read().unwrap_or_else(|e| e.into_inner()).get(&key) {
+        Some(meta) => (meta.name.clone().filter(|n| !n.is_empty()), meta.sub_token(&key)),
         None => return api_error("user not found"),
     };
     let owndns = state.dns_server.enabled();
@@ -1499,16 +1541,54 @@ async fn handle_user_share(
         l.dnsall = dnsall;
         l.to_uri()
     });
-    let subscription = match (&state.subscription_prefix, &state.tls_link) {
-        (Some(prefix), Some(t)) => Some(ostp_core::subscription::subscription_url(
-            &t.host,
-            t.port,
-            prefix,
-            &ostp_core::subscription::token_for_key(&key),
-        )),
-        _ => None,
-    };
+    let subscription = subscription_url_of(&state, &token);
     (StatusCode::OK, ApiResponse::success(UserShare { tls, udp: udp.to_uri(), subscription }))
+}
+
+/// The full subscription URL for a token, when subscriptions are served.
+fn subscription_url_of(state: &ApiState, token: &str) -> Option<String> {
+    match (&state.subscription_prefix, &state.tls_link) {
+        (Some(prefix), Some(t)) => Some(ostp_core::subscription::subscription_url(&t.host, t.port, prefix, token)),
+        _ => None,
+    }
+}
+
+#[derive(Serialize)]
+struct NewSubId {
+    sub_id: String,
+    /// The new URL; `None` when subscriptions are off.
+    subscription: Option<String>,
+}
+
+/// Gives a user a new random subscription id: the old link (a previous id, or
+/// the legacy hash of the key) stops working at once. The device record is
+/// keyed by the access key, so it stays with the user.
+async fn handle_new_sub_id(
+    State(state): State<ApiState>,
+    headers: axum::http::HeaderMap,
+    Path(key): Path<String>,
+) -> impl IntoResponse {
+    if !check_token(&state, &headers) {
+        return api_unauthorized::<NewSubId>();
+    }
+    let sub_id = ostp_core::subscription::new_sub_id();
+    let old_meta = {
+        let mut keys = state.access_keys.write().unwrap_or_else(|e| e.into_inner());
+        let Some(meta) = keys.get_mut(&key) else {
+            return api_error("user not found");
+        };
+        let old = meta.clone();
+        meta.sub_id = Some(sub_id.clone());
+        old
+    };
+    if let Err(e) = save_key_change(&state, KeyChange::NewSubId { key: key.clone(), sub_id: sub_id.clone() }) {
+        tracing::error!("Failed to save config after a new subscription id: {}", e);
+        state.access_keys.write().unwrap_or_else(|e| e.into_inner()).insert(key.clone(), old_meta);
+        return api_error(save_error_message(&e));
+    }
+    tracing::info!("API: new subscription id for a user (fp={})", crate::dispatcher::key_fp(&key));
+    let subscription = subscription_url_of(&state, &sub_id);
+    (StatusCode::OK, ApiResponse::success(NewSubId { sub_id, subscription }))
 }
 
 /// Renders a QR code on the server, so the panel needs no script from
@@ -1884,7 +1964,36 @@ mod tests {
     }
 
     fn meta(name: Option<&str>, limit: Option<u64>) -> UserMeta {
-        UserMeta { name: name.map(String::from), limit_bytes: limit, max_devices: None, expires_at: None }
+        UserMeta { name: name.map(String::from), limit_bytes: limit, max_devices: None, expires_at: None, sub_id: None }
+    }
+
+    /// `sub_id` goes in with a new user and with `NewSubId`; an ordinary edit
+    /// keeps the one the file has and never writes the one held in memory.
+    #[test]
+    fn test_sub_id_is_written_on_create_and_rotation_only() {
+        let id = "0123456789abcdef0123456789abcdef";
+        let mut cfg = serde_json::json!({ "mode": "server", "access_keys": ["legacy-key"] });
+        let mut m = meta(None, None);
+        m.sub_id = Some(id.into());
+        apply_key_change(&mut cfg, &KeyChange::Add(vec![("new-key".into(), m.clone())])).unwrap();
+        assert_eq!(cfg["access_keys"][1]["sub_id"], id, "a new user is written with its id even with nothing else to say");
+
+        // The CLI rotated the id in the file; the server still holds the old one.
+        cfg["access_keys"][1]["sub_id"] = "ffffffffffffffffffffffffffffffff".into();
+        m.name = Some("bob".into());
+        apply_key_change(&mut cfg, &KeyChange::Set { key: "new-key".into(), meta: m }).unwrap();
+        assert_eq!(cfg["access_keys"][1]["sub_id"], "ffffffffffffffffffffffffffffffff");
+        assert_eq!(cfg["access_keys"][1]["name"], "bob");
+
+        // A bare-string user becomes an object with the new id; the legacy one stops.
+        apply_key_change(&mut cfg, &KeyChange::NewSubId { key: "legacy-key".into(), sub_id: id.into() }).unwrap();
+        assert_eq!(cfg["access_keys"][0], serde_json::json!({ "access_key": "legacy-key", "sub_id": id }));
+        let e: ostp_core::access_keys::AccessKeyEntry = serde_json::from_value(cfg["access_keys"][0].clone()).unwrap();
+        assert_eq!(e.sub_token(), id);
+        assert_eq!(
+            apply_key_change(&mut cfg, &KeyChange::NewSubId { key: "gone".into(), sub_id: id.into() }),
+            Err(ERR_NOT_IN_FILE.to_string())
+        );
     }
 
     /// A change is applied to the list on disk: a user the CLI added and the
@@ -2132,6 +2241,7 @@ async fn handle_bulk_create_users(
     };
 
     let mut new_keys = Vec::new();
+    let mut added = Vec::new();
     let mut keys = match state.access_keys.write() {
         Ok(k) => k,
         Err(e) => e.into_inner(),
@@ -2145,20 +2255,19 @@ async fn handle_bulk_create_users(
         // handshake's pre-shared key, so a captured handshake can be guessed
         // against offline. (Sixteen hex digits of a UUIDv4 are only 60 bits.)
         let key = ostp_core::keys::access_key_hex();
-        keys.insert(key.clone(), UserMeta {
+        let meta = UserMeta {
             name: None,
             limit_bytes: payload.limit_bytes,
             max_devices: bulk_devices,
             expires_at: bulk_expires,
-        });
+            sub_id: Some(ostp_core::subscription::new_sub_id()),
+        };
+        keys.insert(key.clone(), meta.clone());
+        added.push((key.clone(), meta));
         new_keys.push(key);
     }
     // Save keys by dropping lock, then saving to config
     drop(keys);
-    let added = new_keys
-        .iter()
-        .map(|k| (k.clone(), UserMeta { name: None, limit_bytes: payload.limit_bytes, max_devices: bulk_devices, expires_at: bulk_expires }))
-        .collect();
     if let Err(e) = save_key_change(&state, KeyChange::Add(added)) {
         tracing::error!("Failed to save config after bulk create: {}", e);
         let mut keys = state.access_keys.write().unwrap_or_else(|e| e.into_inner());

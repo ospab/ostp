@@ -148,12 +148,12 @@ Share links carry the same options: `ostp://KEY@vpn.example.com:443?type=uot&tls
 
 ## Subscriptions
 
-With a domain and TLS set up, the server can give every user a subscription URL, `https://vpn.example.com/sub/<token>`. It returns that user's current links, TLS first, then UDP. Apps re-fetch it periodically, so a new port, path or certificate setting on the server reaches clients without handing out new links.
+With a domain and TLS set up, the server can give every user a subscription URL, `https://vpn.example.com/<path>/<token>`. It returns that user's current links, TLS first, then UDP. Apps re-fetch it periodically, so a new port, path or certificate setting on the server reaches clients without handing out new links.
 
 ```jsonc
 "subscription": {
   "enabled": true,
-  "path": "/sub",                 // URL prefix
+  "path": "/k3v9x0q2md",          // URL prefix; "/sub" when absent
   "name": "My VPN",               // title shown in apps; the domain by default
   "update_interval_hours": 12,    // how often apps refresh it
   "include": ["tls", "udp"]       // which links to hand out
@@ -164,11 +164,13 @@ Nothing turns subscriptions on by itself: they have their own command.
 
 ```
 ostp sub status                       # on or off, settings, what is missing
-ostp sub enable [--path /sub] [--name "My VPN"] [--interval 12] [--include tls,udp]
+ostp sub enable [--path /p] [--name "My VPN"] [--interval 12] [--include tls,udp]
 ostp sub set --interval 6             # change settings without turning them on or off
 ostp sub disable
 ostp sub urls [number|name|key]       # users' subscription URLs
 ```
+
+The path: when `ostp sub enable` turns subscriptions on and the config names no path, it writes a random one, `/` and 10 characters of `[a-z0-9]`, and prints it, so the URL does not tell a scanner where to look. `--path` sets one of your own. A config that already has a path keeps it, `/sub` included, and a config that serves subscriptions without a `path` keeps the default `/sub`: URLs in use never change on their own. `ostp init` writes a random path into a new config.
 
 Each command changes exactly what it names, keeps a copy of the config in `config.json.bak` and does not restart the service: changes apply after `systemctl restart ostp`. When nginx, apache or caddy holds 443, the subscription path must be forwarded to OSTP. `ostp sub` does not touch the web server on its own: it prints the block to add, and with `--vhost` it rewrites the site OSTP created (config test first, rollback on failure).
 
@@ -176,9 +178,12 @@ Each command changes exactly what it names, keeps a copy of the config in `confi
 
 Opened in a browser, the subscription URL shows a page for a person instead of raw links: what the link is and why not to share it, traffic used, how to connect (get the app, paste the address or scan the QR code), the individual links for manual setup, and a link to the repository. It is in Russian and English, picked from the browser's language. Apps and subscription managers get what they always got.
 
-- The token is a hash of the access key. The key itself never appears in the URL, so it stays out of web-server logs, but the token still unlocks the links: treat a subscription URL as carefully as a key.
+- The token is the user's `sub_id` in `access_keys`: 32 random lowercase hex characters, unrelated to the access key. New users get one when they are created (`ostp manage user-add`, the panel, bulk create, `ostp key gen --add`, the setup wizards). The key never appears in the URL, so it stays out of web-server logs, but the token still unlocks the links: treat a subscription URL as carefully as a key.
+- A new link: `ostp manage user-set WHO --new-sub-id`, or *New subscription link* in the panel's Share dialog (API: `POST /users/{key}/sub-id`). The old link stops working at once; the access key and the user's devices stay as they are.
+- Users from before `sub_id` existed have none, and their token is still a hash of the access key, so their links keep working. Such a token cannot be revoked without changing the key, and anyone with the key can compute it. `ostp manage sub-ids` lists these users; `ostp manage sub-ids --assign-missing` gives each a `sub_id` and lists who changed. Their old links then stop working, so hand out the new ones. Nothing assigns them by itself. Once a user has a `sub_id`, only it works.
 - Subscriptions are served only inside TLS, or to a local web server (nginx, apache, caddy) that terminated TLS itself. They are never answered in plain HTTP on the OSTP port.
-- An unknown token gets the same decoy as any other path.
+- An unknown token (or a request other than GET/HEAD under the path, or a source that ran out of failed lookups) gets the same decoy as any other path when OSTP serves TLS itself.
+- Behind nginx, apache or caddy, OSTP answers such a request with an empty `404`, and the route OSTP writes or prints makes the web server put its own 404 page in its place, so the subscription path answers like any other path on the site: nginx `proxy_intercept_errors on` with `error_page 404` to a location that does `return 404`; Apache `ProxyErrorOverride On 404` in a `<Location>` (Apache before 2.4.47 cannot list codes and replaces every error there, including the device-limit 403 body); Caddy a `handle_response` for status 404 with `error 404`. Only 404 is replaced: the 403 of a valid token reaches the app unchanged. A site written by an older version lacks this; `ostp sub status` says so, and `ostp sub set --vhost` rewrites the OSTP-managed site.
 - By default the answer is one link per line. With `Accept: application/json` or `?format=json` it is JSON with the name, update interval, links and traffic usage. The `Profile-Update-Interval`, `Profile-Title` and `Subscription-Userinfo` headers are understood by third-party subscription managers too.
 
 ### Device limit
@@ -191,7 +196,7 @@ A user can have `max_devices` (in `access_keys`, in the panel's user form, or `o
 - A user without a limit is not asked for an ID, and a device that sends one is only recorded.
 - An unknown token still gets the decoy; the limit is never mentioned to someone without a valid token.
 
-The record is `devices.json` next to the config (mode 0600), keyed by the subscription token, never by the key. The panel lists a user's devices in the user form and removes one to free its slot; `ostp manage user-devices WHO` prints them.
+The record is `devices.json` next to the config (mode 0600), keyed by a hash of the access key (the old-style token), never by the key and never by `sub_id`: a new subscription link keeps the user's devices. The panel lists a user's devices in the user form and removes one to free its slot; `ostp manage user-devices WHO` prints them.
 
 The desktop and Android apps and `ostp import` send the ID only when the owner turned it on (*Send a device ID to subscriptions*, or `send_hwid` in the client config; see [integrations.md](integrations.md)).
 

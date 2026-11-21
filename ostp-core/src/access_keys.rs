@@ -1,6 +1,6 @@
 //! `access_keys` entries in a server config come in two forms: a bare key
 //! string, or an object `{ "access_key", "name", "limit_bytes", "max_devices",
-//! "expires_at" }`.
+//! "expires_at", "sub_id" }`.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -18,6 +18,10 @@ pub enum AccessKeyEntry {
         /// When the key stops working, Unix seconds (UTC); absent = never.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         expires_at: Option<u64>,
+        /// The subscription URL token (32 lowercase hex, random). Absent: the
+        /// legacy token, a hash of the key, keeps working.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sub_id: Option<String>,
     },
     KeyOnly(String),
 }
@@ -58,6 +62,20 @@ impl AccessKeyEntry {
         }
     }
 
+    /// The subscription id as written in the config (shape not checked here;
+    /// config validation does that).
+    pub fn sub_id(&self) -> Option<String> {
+        match self {
+            AccessKeyEntry::KeyOnly(_) => None,
+            AccessKeyEntry::Detailed { sub_id, .. } => sub_id.clone().filter(|s| !s.is_empty()),
+        }
+    }
+
+    /// The URL token of this user's subscription: `sub_id`, or the legacy hash.
+    pub fn sub_token(&self) -> String {
+        crate::subscription::token_for(&self.key(), self.sub_id().as_deref())
+    }
+
     /// `(key, name, limit_bytes)`.
     pub fn into_parts(self) -> (String, Option<String>, Option<u64>) {
         match self {
@@ -82,6 +100,19 @@ pub fn key_and_name(entry: &Value) -> (String, String) {
         _ => entry["name"].as_str().unwrap_or_default().to_string(),
     };
     (key_of(entry).unwrap_or_default(), name)
+}
+
+/// The `sub_id` of an entry parsed as untyped JSON; `None` for a bare key or
+/// an object without one.
+pub fn sub_id_of(entry: &Value) -> Option<String> {
+    entry.get("sub_id").and_then(Value::as_str).filter(|s| !s.is_empty()).map(str::to_string)
+}
+
+/// The subscription URL token of an entry parsed as untyped JSON: its
+/// `sub_id`, or the legacy hash of its key.
+pub fn sub_token_of(entry: &Value) -> Option<String> {
+    let key = key_of(entry)?;
+    Some(crate::subscription::token_for(&key, sub_id_of(entry).as_deref()))
 }
 
 /// Whether a key with this expiry has expired at `now` (Unix seconds). The
@@ -184,6 +215,15 @@ mod tests {
         assert_eq!(e.into_parts(), ("k".into(), None, None));
         let e: AccessKeyEntry = serde_json::from_value(json!({"access_key": "k", "expires_at": 1767225599u64})).unwrap();
         assert_eq!(e.expires_at(), Some(1_767_225_599));
+        let id = "0123456789abcdef0123456789abcdef";
+        let e: AccessKeyEntry = serde_json::from_value(json!({"access_key": "k", "sub_id": id})).unwrap();
+        assert_eq!(e.sub_id().as_deref(), Some(id));
+        assert_eq!(e.sub_token(), id);
+        assert_eq!(sub_token_of(&json!({"access_key": "k", "sub_id": id})).as_deref(), Some(id));
+        let legacy = crate::subscription::token_for_key("k");
+        assert_eq!(sub_token_of(&json!("k")), Some(legacy.clone()));
+        assert_eq!(serde_json::from_value::<AccessKeyEntry>(json!("k")).unwrap().sub_token(), legacy);
+        assert!(!serde_json::to_string(&serde_json::from_value::<AccessKeyEntry>(json!({"access_key": "k"})).unwrap()).unwrap().contains("sub_id"));
         // Written back only when set.
         assert!(!serde_json::to_string(&serde_json::from_value::<AccessKeyEntry>(json!({"access_key": "k"})).unwrap()).unwrap().contains("expires_at"));
     }

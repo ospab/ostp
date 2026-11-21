@@ -68,6 +68,16 @@ pub enum ManageAction {
         /// <N>d (N days from now) or never (removes the expiry)
         #[arg(long)]
         expires: Option<String>,
+        /// Give the user a new random subscription link; the old one stops working
+        #[arg(long)]
+        new_sub_id: bool,
+    },
+    /// Users whose subscription link is still the old kind (a hash of the
+    /// access key). With --assign-missing, gives each of them a random
+    /// subscription id: their current links stop working, so hand out the new ones.
+    SubIds {
+        #[arg(long)]
+        assign_missing: bool,
     },
     /// Remove a user: number (as in `ostp links`), name or access key
     UserRemove { user: String },
@@ -123,6 +133,7 @@ pub fn run(action: ManageAction, config_path: &Path, json_out: bool) -> ! {
         ManageAction::Users => Shown::Users,
         ManageAction::UserAdd { .. } => Shown::UserAdd,
         ManageAction::UserSet { .. } => Shown::UserSet,
+        ManageAction::SubIds { .. } => Shown::SubIds,
         ManageAction::UserRemove { .. } => Shown::UserRemove,
         ManageAction::UserRename { .. } => Shown::UserRename,
         ManageAction::UserLimit { .. } => Shown::UserLimit,
@@ -138,6 +149,7 @@ pub fn run(action: ManageAction, config_path: &Path, json_out: bool) -> ! {
         action,
         ManageAction::UserAdd { .. }
             | ManageAction::UserSet { .. }
+            | ManageAction::SubIds { assign_missing: true }
             | ManageAction::UserRemove { .. }
             | ManageAction::UserRename { .. }
             | ManageAction::UserLimit { .. }
@@ -150,8 +162,11 @@ pub fn run(action: ManageAction, config_path: &Path, json_out: bool) -> ! {
         ManageAction::Users => users(config_path),
         ManageAction::UserAdd { name, key, limit_bytes, devices, expires } => parse_expires(expires.as_deref())
             .and_then(|expires| user_add(config_path, &name, key.as_deref(), Limits { bytes: limit_bytes, devices, expires })),
-        ManageAction::UserSet { user, name, limit_bytes, devices, expires } => parse_expires(expires.as_deref())
-            .and_then(|expires| user_set(config_path, &user, name.as_deref(), Limits { bytes: limit_bytes, devices, expires })),
+        ManageAction::UserSet { user, name, limit_bytes, devices, expires, new_sub_id } => parse_expires(expires.as_deref())
+            .and_then(|expires| {
+                user_set(config_path, &user, name.as_deref(), Limits { bytes: limit_bytes, devices, expires }, new_sub_id)
+            }),
+        ManageAction::SubIds { assign_missing } => sub_ids(config_path, assign_missing),
         ManageAction::UserRemove { user } => user_remove(config_path, &user),
         ManageAction::UserRename { user, name } => user_rename(config_path, &user, &name),
         ManageAction::UserLimit { user, devices } => user_limit(config_path, &user, devices),
@@ -315,7 +330,11 @@ fn install(config_path: &Path, port: u16, host: Option<&str>, user: &str) -> Res
             "config_version": ostp_client::migrate::CURRENT_VERSION,
             "log_level": "info",
             "listen": format!("0.0.0.0:{port}"),
-            "access_keys": [{ "access_key": crate::generate_secure_key("hex"), "name": user }],
+            "access_keys": [{
+                "access_key": crate::generate_secure_key("hex"),
+                "name": user,
+                "sub_id": ostp_core::subscription::new_sub_id(),
+            }],
             "api": { "enabled": false, "bind": "127.0.0.1:9090", "webpath": "", "username": "", "password_hash": "" },
             // A new server has a key and, for legacy clients, still accepts the old handshake.
             "protocol": crate::key_cmd::new_section(),
@@ -438,7 +457,10 @@ fn users(config_path: &Path) -> Result<Value> {
                 "name": u.name().unwrap_or_default(),
                 "key": key,
                 "links": links,
-                "subscription": crate::subscription_url_for(&server, &key),
+                "subscription": crate::subscription_url_for(&server, &u.sub_token()),
+                // false: the link is still the old kind, a hash of the key
+                // (`ostp manage sub-ids --assign-missing` replaces it).
+                "sub_id": u.sub_id().is_some(),
                 "bytes_up": s.map(|s| s.bytes_up),
                 "bytes_down": s.map(|s| s.bytes_down),
                 "online": s.map(|s| s.online),
@@ -612,7 +634,8 @@ fn user_add(config_path: &Path, name: &str, key: Option<&str>, limits: Limits) -
         }
         None => crate::generate_secure_key("hex"),
     };
-    let mut entry = json!({ "access_key": key, "name": name });
+    // A new user gets a random subscription id from the start.
+    let mut entry = json!({ "access_key": key, "name": name, "sub_id": ostp_core::subscription::new_sub_id() });
     apply_limits(&mut entry, limits)?;
     v["access_keys"]
         .as_array_mut()
@@ -656,7 +679,7 @@ fn user_rename(config_path: &Path, who: &str, name: &str) -> Result<Value> {
     Ok(json!({ "renamed": { "key": key, "name": name } }))
 }
 
-fn user_set(config_path: &Path, who: &str, name: Option<&str>, limits: Limits) -> Result<Value> {
+fn user_set(config_path: &Path, who: &str, name: Option<&str>, limits: Limits, new_sub_id: bool) -> Result<Value> {
     let (mut v, _) = load(config_path)?;
     let i = find_user(&v, who)?;
     let name = name.map(check_name).transpose()?;
@@ -670,11 +693,55 @@ fn user_set(config_path: &Path, who: &str, name: Option<&str>, limits: Limits) -
     if let Some(n) = name {
         entry["name"] = n.into();
     }
+    if new_sub_id {
+        entry["sub_id"] = ostp_core::subscription::new_sub_id().into();
+    }
     let (key, _) = key_and_name(entry);
     save(config_path, &v)?;
     let all = users(config_path)?;
     let user = all["users"].as_array().and_then(|u| u.iter().find(|u| u["key"] == key.as_str()).cloned());
     Ok(json!({ "user": user }))
+}
+
+/// Users without a `sub_id`; with `assign`, each gets one (their old links
+/// stop working) and the list says who changed.
+fn sub_ids(config_path: &Path, assign: bool) -> Result<Value> {
+    let (mut v, _) = load(config_path)?;
+    let keys = v["access_keys"].as_array_mut().ok_or_else(|| anyhow!("the config has no access_keys"))?;
+    let mut missing = Vec::new();
+    for (i, entry) in keys.iter_mut().enumerate() {
+        if ostp_core::access_keys::sub_id_of(entry).is_some() {
+            continue;
+        }
+        let (key, name) = key_and_name(entry);
+        if key.is_empty() {
+            continue;
+        }
+        if assign {
+            if !entry.is_object() {
+                *entry = json!({ "access_key": key });
+            }
+            entry["sub_id"] = ostp_core::subscription::new_sub_id().into();
+        }
+        missing.push((i + 1, key, name));
+    }
+    if assign && !missing.is_empty() {
+        save(config_path, &v)?;
+    }
+    let (_, server) = load(config_path)?;
+    let list: Vec<Value> = missing
+        .into_iter()
+        .map(|(number, key, name)| {
+            let token = server.access_keys.get(number - 1).map(|u| u.sub_token());
+            json!({
+                "number": number,
+                "name": name,
+                "key": key,
+                "subscription": token.and_then(|t| crate::subscription_url_for(&server, &t)),
+            })
+        })
+        .collect();
+    Ok(json!({ "assigned": assign, "users": list }))
 }
 
 fn user_limit(config_path: &Path, who: &str, devices: u32) -> Result<Value> {
@@ -895,7 +962,7 @@ mod tests {
         assert!(user_add(&cfg, "bad", Some("a/b/c/d/e"), Limits::default()).is_err());
 
         // Only what is given changes; 0 removes a limit.
-        let set = user_set(&cfg, "tablet", Some("tablet-2"), Limits { bytes: Some(0), devices: None, expires: None }).unwrap();
+        let set = user_set(&cfg, "tablet", Some("tablet-2"), Limits { bytes: Some(0), devices: None, expires: None }, false).unwrap();
         assert_eq!(set["user"]["name"], "tablet-2");
         assert_eq!(set["user"]["limit_bytes"], Value::Null);
         assert_eq!(set["user"]["max_devices"], 2);
@@ -903,14 +970,77 @@ mod tests {
         assert!(v["access_keys"][2].get("limit_bytes").is_none());
 
         // A bare key gains limits and keeps its key.
-        let set = user_set(&cfg, "1", None, Limits { bytes: Some(1 << 30), devices: Some(1), expires: None }).unwrap();
+        let set = user_set(&cfg, "1", None, Limits { bytes: Some(1 << 30), devices: Some(1), expires: None }, false).unwrap();
         assert_eq!(set["user"]["key"], "00112233445566778899aabbccddeeff");
         assert_eq!(set["user"]["limit_bytes"], 1u64 << 30);
 
-        assert!(user_set(&cfg, "tablet-2", Some("phone"), Limits::default()).is_err(), "names stay unique");
-        assert!(user_set(&cfg, "tablet-2", None, Limits { bytes: Some(1 << 51), devices: None, expires: None }).is_err());
-        assert!(user_set(&cfg, "tablet-2", None, Limits { bytes: None, devices: Some(1001), expires: None }).is_err());
-        assert!(user_set(&cfg, "nobody", None, Limits::default()).is_err());
+        assert!(user_set(&cfg, "tablet-2", Some("phone"), Limits::default(), false).is_err(), "names stay unique");
+        assert!(user_set(&cfg, "tablet-2", None, Limits { bytes: Some(1 << 51), devices: None, expires: None }, false).is_err());
+        assert!(user_set(&cfg, "tablet-2", None, Limits { bytes: None, devices: Some(1001), expires: None }, false).is_err());
+        assert!(user_set(&cfg, "nobody", None, Limits::default(), false).is_err());
+    }
+
+    fn sub_id_at(cfg: &Path, i: usize) -> Option<String> {
+        let (v, _) = load(cfg).unwrap();
+        ostp_core::access_keys::sub_id_of(&v["access_keys"][i])
+    }
+
+    #[test]
+    fn new_users_get_a_sub_id_and_set_can_replace_it() {
+        let dir = temp_config(&server());
+        let cfg = dir.path().join("config.json");
+        let added = user_add(&cfg, "laptop", None, Limits::default()).unwrap();
+        assert_eq!(added["user"]["sub_id"], true);
+        let first = sub_id_at(&cfg, 2).expect("a new user has a sub_id");
+        assert!(ostp_core::subscription::is_valid_sub_id(&first));
+
+        // Other changes keep it; --new-sub-id replaces it.
+        user_set(&cfg, "laptop", Some("laptop-2"), Limits::default(), false).unwrap();
+        assert_eq!(sub_id_at(&cfg, 2).as_deref(), Some(first.as_str()));
+        user_set(&cfg, "laptop-2", None, Limits::default(), true).unwrap();
+        let second = sub_id_at(&cfg, 2).unwrap();
+        assert_ne!(first, second);
+
+        // A bare-string user becomes an object with an id and keeps its key.
+        assert!(sub_id_at(&cfg, 0).is_none());
+        user_set(&cfg, "1", None, Limits::default(), true).unwrap();
+        let (v, _) = load(&cfg).unwrap();
+        assert_eq!(v["access_keys"][0]["access_key"], "00112233445566778899aabbccddeeff");
+        assert!(sub_id_at(&cfg, 0).is_some());
+    }
+
+    #[test]
+    fn sub_ids_lists_and_only_on_request_assigns_the_missing_ones() {
+        let dir = temp_config(&server());
+        let cfg = dir.path().join("config.json");
+        let before = std::fs::read(&cfg).unwrap();
+        let listed = sub_ids(&cfg, false).unwrap();
+        assert_eq!(listed["assigned"], false);
+        assert_eq!(listed["users"].as_array().unwrap().len(), 2);
+        assert_eq!(std::fs::read(&cfg).unwrap(), before, "listing changes nothing");
+
+        let done = sub_ids(&cfg, true).unwrap();
+        assert_eq!(done["users"][1]["name"], "phone");
+        assert!(sub_id_at(&cfg, 0).is_some() && sub_id_at(&cfg, 1).is_some());
+        assert_eq!(sub_ids(&cfg, true).unwrap()["users"].as_array().unwrap().len(), 0, "nothing left to assign");
+    }
+
+    #[test]
+    fn the_new_sub_id_flags_parse() {
+        use clap::Parser;
+        #[derive(clap::Parser)]
+        struct Cli {
+            #[command(subcommand)]
+            action: ManageAction,
+        }
+        let c = Cli::try_parse_from(["manage", "user-set", "alice", "--new-sub-id"]).unwrap();
+        assert!(matches!(c.action, ManageAction::UserSet { new_sub_id: true, .. }));
+        let c = Cli::try_parse_from(["manage", "user-set", "alice", "--name", "bob"]).unwrap();
+        assert!(matches!(c.action, ManageAction::UserSet { new_sub_id: false, .. }));
+        let c = Cli::try_parse_from(["manage", "sub-ids", "--assign-missing"]).unwrap();
+        assert!(matches!(c.action, ManageAction::SubIds { assign_missing: true }));
+        let c = Cli::try_parse_from(["manage", "sub-ids"]).unwrap();
+        assert!(matches!(c.action, ManageAction::SubIds { assign_missing: false }));
     }
 
     #[test]
@@ -923,12 +1053,12 @@ mod tests {
         assert_eq!(added["user"]["expires_at"], 1_767_225_599u64);
         assert_eq!(added["user"]["expired"], true, "that day is past");
         let later = parse_expires(Some("30d")).unwrap();
-        let set = user_set(&cfg, "tv", None, Limits { expires: later, ..Limits::default() }).unwrap();
+        let set = user_set(&cfg, "tv", None, Limits { expires: later, ..Limits::default() }, false).unwrap();
         assert_eq!(set["user"]["expired"], false);
         // Another change keeps it.
-        let set = user_set(&cfg, "tv", None, Limits { devices: Some(2), ..Limits::default() }).unwrap();
+        let set = user_set(&cfg, "tv", None, Limits { devices: Some(2), ..Limits::default() }, false).unwrap();
         assert_eq!(set["user"]["expires_at"], later.unwrap().unwrap());
-        let set = user_set(&cfg, "tv", None, Limits { expires: parse_expires(Some("never")).unwrap(), ..Limits::default() }).unwrap();
+        let set = user_set(&cfg, "tv", None, Limits { expires: parse_expires(Some("never")).unwrap(), ..Limits::default() }, false).unwrap();
         assert_eq!(set["user"]["expires_at"], Value::Null);
         let (v, _) = load(&cfg).unwrap();
         assert!(v["access_keys"][2].get("expires_at").is_none());

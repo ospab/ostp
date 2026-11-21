@@ -245,7 +245,8 @@ where
         // internet, only inside TLS or from a local web server that ended it.
         if let Some(sub) = ctx.subscription.as_ref().filter(|_| via_tls || is_trusted_proxy(peer)) {
             if request_path(&buf[..head_len]).is_some_and(|p| sub.wants(&p)) {
-                if let Some(resp) = sub.respond(&buf[..head_len], client_ip(&buf[..head_len], peer)).await {
+                let resp = sub.respond(&buf[..head_len], client_ip(&buf[..head_len], peer)).await;
+                if let Some(resp) = subscription_answer(resp, via_tls, peer) {
                     drop(permit);
                     s.write_all(&resp).await?;
                     let _ = s.shutdown().await;
@@ -289,6 +290,27 @@ where
         unauth,
     )
     .await
+}
+
+/// What a request under the subscription prefix gets, given the service's
+/// answer (`None`: unknown or malformed token, a method other than GET/HEAD,
+/// or a source out of failed lookups).
+///
+/// - Behind a local web server (plaintext from a trusted proxy): a bare 404
+///   with no body. The web server only forwards the prefix to OSTP, so its
+///   own 404 for any other path must be what this one turns into: the snippets
+///   OSTP writes tell it to replace a 404 from OSTP with its own error page
+///   (nginx `proxy_intercept_errors`, Apache `ProxyErrorOverride`, Caddy
+///   `handle_response`). Without that, a 404 with OSTP's decoy body next to
+///   the web server's own 404 page would tell a prober OSTP is there.
+/// - Otherwise (`None` returned): the caller goes on to the decoy, exactly as
+///   for any other unknown path.
+fn subscription_answer(resp: Option<Vec<u8>>, via_tls: bool, peer: SocketAddr) -> Option<Vec<u8>> {
+    match resp {
+        Some(r) => Some(r),
+        None if !via_tls && is_trusted_proxy(peer) => Some(BARE_NOT_FOUND.to_vec()),
+        None => None,
+    }
 }
 
 /// A slot among the source's not-yet-authenticated UoT connections.
@@ -436,6 +458,9 @@ async fn read_more<S: AsyncRead + Unpin>(s: &mut S, buf: &mut BytesMut, deadline
 }
 
 const TOO_MANY: &[u8] = b"HTTP/1.1 429 Too Many Requests\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+/// What a local web server gets for a subscription request that is not
+/// answered; it replaces this with its own error page.
+const BARE_NOT_FOUND: &[u8] = b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
 const NOT_FOUND: &[u8] = b"HTTP/1.1 404 Not Found\r\nContent-Type: text/html\r\nContent-Length: 48\r\nConnection: close\r\n\r\n<html><body><h1>404 Not Found</h1></body></html>";
 
 /// Takes the admission permit: a connection handed to the decoy has been
@@ -599,6 +624,57 @@ mod tests {
         c.read_to_end(&mut resp).await.unwrap();
         assert!(resp.starts_with(b"HTTP/1.1 404 Not Found"));
         assert!(udp_rx.try_recv().is_err());
+    }
+
+    /// Sends one request from `peer` to a listener that serves subscriptions
+    /// under `/sub`, and returns the whole answer.
+    async fn ask_subscription(peer: SocketAddr, req: String) -> Vec<u8> {
+        let (ctx, _udp_rx) = ctx(Some("/s3cr3t"));
+        let mut ctx = Arc::try_unwrap(ctx).ok().unwrap();
+        ctx.subscription = Some(Arc::new(crate::subscription::service_for_tests()));
+        let ctx = Arc::new(ctx);
+        let (mut client, server) = tokio::io::duplex(64 * 1024);
+        let permit = ctx.pending.clone().try_acquire_owned().unwrap();
+        tokio::spawn(handle_conn(server, peer, ctx, permit, Instant::now() + CLASSIFY_TIMEOUT));
+        client.write_all(req.as_bytes()).await.unwrap();
+        let mut resp = Vec::new();
+        client.read_to_end(&mut resp).await.unwrap();
+        resp
+    }
+
+    #[tokio::test]
+    async fn behind_a_web_server_an_unknown_token_gets_a_bare_404() {
+        let unknown = ostp_core::subscription::token_for_key("nobody");
+        for req in [
+            format!("GET /sub/{unknown} HTTP/1.1\r\nHost: h\r\n\r\n"),
+            "GET /sub/not-a-token HTTP/1.1\r\nHost: h\r\n\r\n".to_string(),
+            format!("POST /sub/{} HTTP/1.1\r\nHost: h\r\nContent-Length: 0\r\n\r\n", ostp_core::subscription::token_for_key("key-a")),
+        ] {
+            let resp = ask_subscription(local(), req).await;
+            assert_eq!(resp, BARE_NOT_FOUND, "{}", String::from_utf8_lossy(&resp));
+        }
+        // A known token is still served.
+        let good = format!("GET /sub/{} HTTP/1.1\r\nHost: h\r\n\r\n", ostp_core::subscription::token_for_key("key-a"));
+        assert!(ask_subscription(local(), good).await.starts_with(b"HTTP/1.1 200 OK"));
+    }
+
+    #[tokio::test]
+    async fn from_the_internet_the_prefix_gets_the_same_decoy_as_any_path() {
+        // Plaintext from a public address: the subscription is never consulted,
+        // and the prefix looks like any other unknown path.
+        let unknown = ostp_core::subscription::token_for_key("nobody");
+        let under = ask_subscription(public(), format!("GET /sub/{unknown} HTTP/1.1\r\nHost: h\r\n\r\n")).await;
+        let other = ask_subscription(public(), "GET /elsewhere/x HTTP/1.1\r\nHost: h\r\n\r\n".to_string()).await;
+        assert_eq!(under, NOT_FOUND);
+        assert_eq!(under, other);
+    }
+
+    #[test]
+    fn unanswered_subscription_requests_are_a_bare_404_only_from_a_local_web_server() {
+        assert_eq!(subscription_answer(None, false, local()).as_deref(), Some(BARE_NOT_FOUND));
+        assert_eq!(subscription_answer(None, true, local()), None, "inside OSTP's own TLS: the decoy");
+        assert_eq!(subscription_answer(None, true, public()), None);
+        assert_eq!(subscription_answer(Some(b"x".to_vec()), false, local()).as_deref(), Some(&b"x"[..]));
     }
 
     #[tokio::test]

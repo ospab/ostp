@@ -3,7 +3,13 @@
 //!
 //! Served by the sniffing listener, only over TLS or from a local web server
 //! that terminated TLS: the token is a credential and must not travel in
-//! clear. Unknown tokens get the same decoy as any other path.
+//! clear. Unknown tokens get the same decoy as any other path; behind a
+//! local web server, a bare 404 the web server replaces with its own error
+//! page (see `transport::sniff::subscription_answer`).
+//!
+//! A user's token is its `sub_id`, or the legacy hash of its key when it has
+//! none. Devices are recorded by the legacy hash in either case, so a new
+//! `sub_id` neither loses nor duplicates them.
 
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -142,16 +148,20 @@ impl SubscriptionService {
         Some(Request { token: token.to_ascii_lowercase(), json, html, ru, head_only, hwid })
     }
 
-    /// The access key a token belongs to. Tokens are hashes of the keys, so
-    /// they come from an index instead of hashing every key per request. The
-    /// index is trusted only while its key still exists; on a miss it is
-    /// rebuilt when the key count changed or it is older than `INDEX_MIN_AGE`
-    /// (a key replaced by another in under that time is picked up on the next
-    /// miss after it).
+    /// The access key a token belongs to. A user's token is its `sub_id`, or
+    /// for a user without one the legacy hash of the key; a user with a
+    /// `sub_id` is found by it only. Tokens come from an index instead of
+    /// hashing every key per request. A hit is trusted only while its key
+    /// still exists and still has that token (so a replaced `sub_id` stops at
+    /// once); on a miss the index is rebuilt when the key count changed or it
+    /// is older than `INDEX_MIN_AGE` (a new `sub_id`, or a key replaced by
+    /// another, in under that time is picked up on the next miss after it).
     fn key_for(&self, token: &str) -> Option<String> {
         let keys = self.keys.read().unwrap_or_else(|e| e.into_inner());
         let mut index = self.lookups.index.lock().unwrap_or_else(|e| e.into_inner());
-        let hit = |index: &TokenIndex| index.by_token.get(token).filter(|k| keys.contains_key(*k)).cloned();
+        let hit = |index: &TokenIndex| {
+            index.by_token.get(token).filter(|k| keys.get(*k).is_some_and(|m| m.sub_token(k) == token)).cloned()
+        };
         if let Some(key) = hit(&index) {
             return Some(key);
         }
@@ -159,7 +169,7 @@ impl SubscriptionService {
         if !stale {
             return None;
         }
-        index.by_token = keys.keys().map(|k| (token_for_key(k), k.clone())).collect();
+        index.by_token = keys.iter().map(|(k, m)| (m.sub_token(k), k.clone())).collect();
         index.built = Some(Instant::now());
         index.keys_at_build = keys.len();
         hit(&index)
@@ -224,7 +234,10 @@ impl SubscriptionService {
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
         self.prune_devices_sometimes();
         let mut device_notice = false;
-        if let Err(refusal) = self.devices.check_blocking(&req.token, max_devices, req.hwid.clone(), now).await {
+        // Devices are recorded per access key (by its legacy hash, never the
+        // key itself), not per URL token: a new `sub_id` keeps the record.
+        let device_user = token_for_key(&key);
+        if let Err(refusal) = self.devices.check_blocking(&device_user, max_devices, req.hwid.clone(), now).await {
             // A person who opened the link in a browser has no device ID to send:
             // a page that says what to do is better than raw JSON. It carries no
             // links; the apps still get the 403 they understand.
@@ -448,14 +461,21 @@ fn header_text(s: &str) -> String {
     }
 }
 
+/// Two users without `sub_id` (`key-a` named alice with a 1000-byte limit,
+/// `key-b`) under the prefix `/sub`; for this module's tests and the sniffer's.
+#[cfg(test)]
+pub(crate) fn service_for_tests() -> SubscriptionService {
+    tests::service()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn service() -> SubscriptionService {
+    pub(super) fn service() -> SubscriptionService {
         let mut keys = HashMap::new();
-        keys.insert("key-a".to_string(), UserMeta { name: Some("alice".into()), limit_bytes: Some(1000), max_devices: None, expires_at: None });
-        keys.insert("key-b".to_string(), UserMeta { name: None, limit_bytes: None, max_devices: None, expires_at: None });
+        keys.insert("key-a".to_string(), UserMeta { name: Some("alice".into()), limit_bytes: Some(1000), max_devices: None, expires_at: None, sub_id: None });
+        keys.insert("key-b".to_string(), UserMeta { name: None, limit_bytes: None, max_devices: None, expires_at: None, sub_id: None });
         let stats = HashMap::from([("key-a".to_string(), Arc::new(UserStats::new(Some(1000))))]);
         stats["key-a"].bytes_up.store(10, std::sync::atomic::Ordering::Relaxed);
         stats["key-a"].bytes_down.store(32, std::sync::atomic::Ordering::Relaxed);
@@ -600,10 +620,53 @@ x-device-model: PC
     async fn a_key_added_later_is_found() {
         let svc = service();
         assert!(svc.key_for(&token_for_key("key-a")).is_some());
-        svc.keys.write().unwrap().insert("key-c".into(), UserMeta { name: None, limit_bytes: None, max_devices: None, expires_at: None });
+        svc.keys.write().unwrap().insert("key-c".into(), UserMeta { name: None, limit_bytes: None, max_devices: None, expires_at: None, sub_id: None });
         assert_eq!(svc.key_for(&token_for_key("key-c")).as_deref(), Some("key-c"));
         svc.keys.write().unwrap().remove("key-a");
         assert!(svc.key_for(&token_for_key("key-a")).is_none(), "a removed key stops working at once");
+    }
+
+    #[tokio::test]
+    async fn a_user_with_a_sub_id_is_found_by_it_only() {
+        let svc = service();
+        let id = ostp_core::subscription::new_sub_id();
+        svc.keys.write().unwrap().get_mut("key-a").unwrap().sub_id = Some(id.clone());
+        assert_eq!(svc.key_for(&id).as_deref(), Some("key-a"));
+        assert!(svc.key_for(&token_for_key("key-a")).is_none(), "the legacy hash no longer works");
+        // A user without one keeps the legacy token.
+        assert_eq!(svc.key_for(&token_for_key("key-b")).as_deref(), Some("key-b"));
+        let ok = svc.respond(&get(&format!("/sub/{id}"), "*/*"), client()).await.unwrap();
+        assert!(ok.starts_with(b"HTTP/1.1 200 OK"));
+        assert!(svc.respond(&get(&format!("/sub/{}", token_for_key("key-a")), "*/*"), client()).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_new_sub_id_retires_the_old_one_at_once_and_keeps_the_devices() {
+        let svc = service();
+        let first = ostp_core::subscription::new_sub_id();
+        {
+            let mut keys = svc.keys.write().unwrap();
+            let m = keys.get_mut("key-a").unwrap();
+            m.sub_id = Some(first.clone());
+            m.max_devices = Some(1);
+        }
+        let hwid = "0123456789abcdef0123456789abcdef";
+        let r = svc.respond(&get_with_device(&format!("/sub/{first}"), Some(hwid)), client()).await.unwrap();
+        assert!(r.starts_with(b"HTTP/1.1 200"), "{}", String::from_utf8_lossy(&r));
+        assert_eq!(svc.devices.list(&token_for_key("key-a")).len(), 1, "devices are recorded per key");
+
+        let second = ostp_core::subscription::new_sub_id();
+        svc.keys.write().unwrap().get_mut("key-a").unwrap().sub_id = Some(second.clone());
+        assert!(svc.key_for(&first).is_none(), "the old id is refused even while the index still holds it");
+        // The index was built under a second ago: force the rebuild a later miss would do.
+        svc.lookups.index.lock().unwrap().built = None;
+        assert_eq!(svc.key_for(&second).as_deref(), Some("key-a"));
+        // The same device passes on the new link; the slot was not lost or doubled.
+        let r = svc.respond(&get_with_device(&format!("/sub/{second}"), Some(hwid)), client()).await.unwrap();
+        assert!(r.starts_with(b"HTTP/1.1 200"), "{}", String::from_utf8_lossy(&r));
+        let other = "fedcba9876543210fedcba9876543210";
+        let r = svc.respond(&get_with_device(&format!("/sub/{second}"), Some(other)), client()).await.unwrap();
+        assert!(r.starts_with(b"HTTP/1.1 403"), "the limit still counts the first device");
     }
 
     #[tokio::test]

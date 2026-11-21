@@ -326,8 +326,9 @@ pub async fn run_server(params: ServerParams) -> Result<()> {
                                             for uc in cfg.access_keys {
                                                 let max_devices = uc.max_devices();
                                                 let expires_at = uc.expires_at();
+                                                let sub_id = uc.sub_id();
                                                 let (k, name, limit_bytes) = uc.into_parts();
-                                                new_keys.insert(k, crate::api::UserMeta { name, limit_bytes, max_devices, expires_at });
+                                                new_keys.insert(k, crate::api::UserMeta { name, limit_bytes, max_devices, expires_at, sub_id });
                                             }
                                             
                                             // 1. Update shared_keys
@@ -1481,7 +1482,7 @@ mod traffic_tests {
     use std::sync::atomic::Ordering;
 
     fn meta(limit: Option<u64>) -> api::UserMeta {
-        api::UserMeta { name: None, limit_bytes: limit, max_devices: None, expires_at: None }
+        api::UserMeta { name: None, limit_bytes: limit, max_devices: None, expires_at: None, sub_id: None }
     }
 
     #[test]

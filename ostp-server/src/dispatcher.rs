@@ -1361,7 +1361,7 @@ mod roaming_tests {
 
     /// A dispatcher and a client with an established session on `home`.
     fn established(home: SocketAddr) -> (Dispatcher, ProtocolMachine) {
-        let keys = Arc::new(RwLock::new(HashMap::from([(KEY.to_string(), crate::api::UserMeta { name: None, limit_bytes: None, max_devices: None, expires_at: None })])));
+        let keys = Arc::new(RwLock::new(HashMap::from([(KEY.to_string(), crate::api::UserMeta { name: None, limit_bytes: None, max_devices: None, expires_at: None, sub_id: None })])));
         let mut dispatcher = Dispatcher::new(base_config(NoiseRole::Responder), keys);
 
         let secrets = ostp_core::crypto::derive_all_secrets(KEY.as_bytes());
@@ -1392,7 +1392,7 @@ mod roaming_tests {
     }
 
     fn new_dispatcher() -> Dispatcher {
-        let keys = Arc::new(RwLock::new(HashMap::from([(KEY.to_string(), crate::api::UserMeta { name: None, limit_bytes: None, max_devices: None, expires_at: None })])));
+        let keys = Arc::new(RwLock::new(HashMap::from([(KEY.to_string(), crate::api::UserMeta { name: None, limit_bytes: None, max_devices: None, expires_at: None, sub_id: None })])));
         Dispatcher::new(base_config(NoiseRole::Responder), keys)
     }
 
@@ -1771,7 +1771,7 @@ mod roaming_tests {
     fn transitional_with_other_key_only() -> (Dispatcher, [u8; 32]) {
         let keys = Arc::new(RwLock::new(HashMap::from([(
             "some-other-key-0123456789abcdef".to_string(),
-            crate::api::UserMeta { name: None, limit_bytes: None, max_devices: None, expires_at: None },
+            crate::api::UserMeta { name: None, limit_bytes: None, max_devices: None, expires_at: None, sub_id: None },
         )])));
         let mut dispatcher = Dispatcher::new(base_config(NoiseRole::Responder), keys);
         let (private, public) = ostp_core::crypto::noise::generate_server_key();

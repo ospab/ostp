@@ -533,7 +533,7 @@ tr:last-child td { border-bottom: 0; }
     <div class="qr" id="ms-qr"></div>
     <div class="copy-box"><input class="input" id="ms-text" readonly data-tl="share_link" /><button class="btn" id="ms-copy" data-t="copy">Copy</button></div>
     <p class="note" id="ms-note" role="status"></p>
-    <div class="modal-actions"><button class="btn" data-close data-t="close">Close</button></div>
+    <div class="modal-actions"><button type="button" class="btn hidden" id="ms-newsub" data-t="new_sub">New subscription link</button><button class="btn" data-close data-t="close">Close</button></div>
   </div>
 </div>
 
@@ -589,6 +589,9 @@ const I18N = {
     invalid_json: 'Not valid JSON: {err}', restart_note: 'Saved. Restart the server (systemctl restart ostp) to apply non-key changes.',
     rules_saved: 'Rules applied', copied_key: 'Key copied',
     sub_note: 'The subscription URL is a credential: share it only with this user.',
+    new_sub: 'New subscription link', new_sub_confirm: 'Replace the subscription link?',
+    new_sub_confirm_text: 'The user gets a new random link and the current one stops working at once: apps that use it must be given the new one. The access key and the devices stay as they are.',
+    new_sub_done: 'New subscription link made',
     link_note: 'This link holds the access key: share it only with this user.',
     qr_failed: 'QR code unavailable', created_n: '{n} keys created',
     ev_add: 'Added user {x}', ev_edit: 'Edited user {x}', ev_del: 'Deleted user {x}', ev_reset: 'Reset traffic of {x}',
@@ -704,6 +707,9 @@ const I18N = {
     invalid_json: 'Некорректный JSON: {err}', restart_note: 'Сохранено. Перезапустите сервер (systemctl restart ostp), чтобы применить изменения кроме ключей.',
     rules_saved: 'Правила применены', copied_key: 'Ключ скопирован',
     sub_note: 'Ссылка подписки — это пароль: передавайте её только этому пользователю.',
+    new_sub: 'Новая ссылка подписки', new_sub_confirm: 'Заменить ссылку подписки?',
+    new_sub_confirm_text: 'Пользователь получит новую случайную ссылку, а текущая сразу перестанет работать: в приложения, которые ею пользуются, нужно добавить новую. Ключ доступа и устройства не меняются.',
+    new_sub_done: 'Новая ссылка подписки создана',
     link_note: 'В ссылке ключ доступа: передавайте её только этому пользователю.',
     qr_failed: 'QR-код недоступен', created_n: 'Создано ключей: {n}',
     ev_add: 'Добавлен пользователь {x}', ev_edit: 'Изменён пользователь {x}', ev_del: 'Удалён пользователь {x}', ev_reset: 'Сброшен трафик {x}',
@@ -1431,9 +1437,11 @@ $('f-bulk').addEventListener('submit', async e => {
 });
 
 // share
-let shareSeq = 0;
+let shareSeq = 0, shareUser = null;
 async function openShare(u) {
   const seq = ++shareSeq;
+  shareUser = u;
+  $('ms-newsub').classList.add('hidden');
   $('ms-title').textContent = `${t('share')}: ${u.name || u.access_key.slice(0, 8) + '…'}`;
   $('ms-qr').innerHTML = ''; $('ms-kinds').innerHTML = ''; $('ms-text').value = '';
   $('ms-note').className = 'note'; $('ms-note').textContent = '';
@@ -1445,6 +1453,7 @@ async function openShare(u) {
   if (seq !== shareSeq) return;
   const kinds = [];
   if (share.subscription) kinds.push(['subscription', t('sub_tab'), share.subscription]);
+  $('ms-newsub').classList.toggle('hidden', !share.subscription);
   if (share.tls) kinds.push(['tls', 'TLS', share.tls]);
   kinds.push(['udp', 'UDP', share.udp]);
   const seg = $('ms-kinds');
@@ -1464,6 +1473,15 @@ async function openShare(u) {
   show(kinds[0][0]);
 }
 $('ms-copy').addEventListener('click', async () => { if (await copyToast($('ms-text').value)) toast(t('copied')); });
+// A new random subscription id: the old link stops working at once. Devices stay.
+$('ms-newsub').addEventListener('click', async () => {
+  const u = shareUser;
+  if (!u || !await confirmBox(t('new_sub_confirm'), t('new_sub_confirm_text'), t('new_sub'))) return;
+  try { await api(`users/${encodeURIComponent(u.access_key)}/sub-id`, { method: 'POST' }); }
+  catch (err) { toast(apiText(err.message), true); return; }
+  toast(t('new_sub_done'));
+  openShare(u);
+});
 
 // ── routing and config editors ────────────────────────────────────────
 // What the editor held right after loading; a difference means unsaved edits.

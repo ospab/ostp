@@ -157,17 +157,7 @@ pub fn nginx_vhost(p: &VhostParams, ipv6: bool) -> String {
             )
         })
         .unwrap_or_default();
-    let sub = p
-        .subscription
-        .as_ref()
-        .map(|prefix| {
-            format!(
-                "    location ^~ {prefix}/ {{\n        proxy_pass http://127.0.0.1:{port};\n        proxy_set_header Host $host;\n        \
-                 proxy_set_header X-Real-IP $remote_addr;\n    }}\n",
-                port = p.ostp_port
-            )
-        })
-        .unwrap_or_default();
+    let sub = p.subscription.as_ref().map(|prefix| sub_route(Kind::Nginx, prefix, p.ostp_port, true)).unwrap_or_default();
     format!(
         "{HEADER}\n\
 server {{\n    listen 80;\n{v6_80}    server_name {domain};\n\n    \
@@ -206,11 +196,7 @@ pub fn apache_vhost(p: &VhostParams, modern: bool) -> String {
             format!("    ProxyPass /{webpath}/ http://{api}/{webpath}/\n    ProxyPassReverse /{webpath}/ http://{api}/{webpath}/\n")
         })
         .unwrap_or_default();
-    let sub = p
-        .subscription
-        .as_ref()
-        .map(|prefix| format!("    ProxyPass {prefix}/ http://127.0.0.1:{0}{prefix}/\n", p.ostp_port))
-        .unwrap_or_default();
+    let sub = p.subscription.as_ref().map(|prefix| sub_route(Kind::Apache, prefix, p.ostp_port, modern)).unwrap_or_default();
     format!(
         "{HEADER}\n\
 <VirtualHost *:80>\n    ServerName {domain}\n    \
@@ -232,17 +218,64 @@ pub fn caddy_site(p: &VhostParams) -> String {
         .as_ref()
         .map(|(webpath, api)| format!("    handle /{webpath}/* {{\n        reverse_proxy {api}\n    }}\n"))
         .unwrap_or_default();
-    let sub = p
-        .subscription
-        .as_ref()
-        .map(|prefix| format!("    handle {prefix}/* {{\n        reverse_proxy 127.0.0.1:{0}\n    }}\n", p.ostp_port))
-        .unwrap_or_default();
+    let sub = p.subscription.as_ref().map(|prefix| sub_route(Kind::Caddy, prefix, p.ostp_port, true)).unwrap_or_default();
+    // `error 404` rather than `respond 404`: the same error path the
+    // subscription route uses for an unknown token, so both look the same.
     format!(
-        "{HEADER}\n{domain} {{\n    handle {ws_path} {{\n        reverse_proxy 127.0.0.1:{port}\n    }}\n{sub}{panel}    handle {{\n        respond 404\n    }}\n}}\n",
+        "{HEADER}\n{domain} {{\n    handle {ws_path} {{\n        reverse_proxy 127.0.0.1:{port}\n    }}\n{sub}{panel}    handle {{\n        error 404\n    }}\n}}\n",
         domain = p.domain,
         ws_path = p.ws_path,
         port = p.ostp_port,
     )
+}
+
+/// The web-server route that forwards the subscription prefix to OSTP, as it
+/// goes into the site OSTP writes and as `ostp sub` prints it for a site the
+/// operator keeps by hand. Lines are indented for a server block / site.
+///
+/// For a token it does not know (and for a method other than GET/HEAD) OSTP
+/// answers a request from the local web server with a bare 404, and each
+/// route makes the web server replace that with its own 404 page, so the
+/// prefix answers like any other path on the site:
+/// - nginx: `proxy_intercept_errors on` hands responses with an `error_page`
+///   to nginx (https://nginx.org/en/docs/http/ngx_http_proxy_module.html#proxy_intercept_errors);
+///   `error_page 404` sends them to a named location that answers
+///   `return 404`, nginx's built-in page, as `location / { return 404; }` does
+///   (https://nginx.org/en/docs/http/ngx_http_core_module.html#error_page).
+/// - Apache: `ProxyErrorOverride On 404` inside `<Location>` (the list of codes
+///   needs 2.4.47+; older ones override every error code there)
+///   (https://httpd.apache.org/docs/2.4/mod/mod_proxy.html#proxyerroroverride).
+/// - Caddy: a `handle_response` for status 404 inside `reverse_proxy`, which
+///   drops the backend's response, and `error 404` there, Caddy's own error path
+///   (https://caddyserver.com/docs/caddyfile/directives/reverse_proxy#intercepting-responses).
+///
+/// Only 404 is replaced: the 403 a valid token gets for a device limit carries a
+/// JSON body the apps read, and passes through unchanged (except on Apache
+/// older than 2.4.47).
+pub fn sub_route(kind: Kind, prefix: &str, port: u16, apache_modern: bool) -> String {
+    match kind {
+        Kind::Nginx => format!(
+            "    location ^~ {prefix}/ {{\n        proxy_pass http://127.0.0.1:{port};\n        proxy_set_header Host $host;\n        \
+             proxy_set_header X-Real-IP $remote_addr;\n        \
+             # An unknown token: nginx's own 404 page, as for any other path.\n        \
+             proxy_intercept_errors on;\n        error_page 404 = @ostp_not_found;\n    }}\n    \
+             location @ostp_not_found {{\n        return 404;\n    }}\n"
+        ),
+        Kind::Apache => {
+            let codes = if apache_modern { " 404" } else { "" };
+            format!(
+                "    ProxyPass {prefix}/ http://127.0.0.1:{port}{prefix}/\n    <Location \"{prefix}/\">\n        \
+                 # An unknown token: Apache's own 404 page, as for any other path.\n        \
+                 ProxyErrorOverride On{codes}\n    </Location>\n"
+            )
+        }
+        Kind::Caddy => format!(
+            "    handle {prefix}/* {{\n        reverse_proxy 127.0.0.1:{port} {{\n            \
+             # An unknown token: Caddy's own 404, as for any other path.\n            \
+             @ostp_not_found status 404\n            handle_response @ostp_not_found {{\n                error 404\n            }}\n        \
+             }}\n    }}\n"
+        ),
+    }
 }
 
 fn apache_is_modern(ctl: &str) -> bool {
@@ -553,6 +586,27 @@ mod tests {
         assert!(c.contains("handle /Xk3pQ9aZr2 {\n        reverse_proxy 127.0.0.1:50000"));
         assert!(c.contains("handle /wp/* {"));
         assert!(c.contains("handle /sub/* {\n        reverse_proxy 127.0.0.1:50000"));
-        assert!(c.contains("handle {\n        respond 404"));
+        assert!(c.contains("handle {\n        error 404"));
+        assert!(c.contains("handle_response @ostp_not_found {\n                error 404"));
+    }
+
+    /// The written sites make the web server replace OSTP's bare 404 for an
+    /// unknown token with its own page; only 404 (modern Apache) is replaced.
+    #[test]
+    fn written_sites_intercept_the_subscription_404() {
+        let n = nginx_vhost(&params(true), false);
+        assert!(n.contains("proxy_intercept_errors on;\n        error_page 404 = @ostp_not_found;"));
+        assert!(n.contains("location @ostp_not_found {\n        return 404;\n    }"));
+        assert_eq!(n.matches("proxy_intercept_errors").count(), 1, "only the subscription route");
+        assert!(!nginx_vhost(&params(false), false).contains("ostp_not_found"));
+        let modern = apache_vhost(&params(true), true);
+        assert!(modern.contains("<Location \"/sub/\">\n        # An unknown token"));
+        assert!(modern.contains("ProxyErrorOverride On 404\n    </Location>"));
+        let mut old_params = params(true);
+        old_params.subscription = Some("/sub".into());
+        let old = apache_vhost(&old_params, false);
+        assert!(old.contains("ProxyErrorOverride On\n    </Location>"));
+        let c = caddy_site(&params(true));
+        assert!(c.contains("@ostp_not_found status 404"));
     }
 }

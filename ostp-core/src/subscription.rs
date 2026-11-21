@@ -1,16 +1,56 @@
 //! Subscription documents: what `https://<domain><path>/<token>` returns, and
 //! the token that addresses one access key without putting the key itself in
 //! URLs (and so in web-server access logs).
+//!
+//! The token is a user's `sub_id` when the config gives one: random, so it
+//! says nothing about the key, and replaceable without touching the key.
+//! A user without `sub_id` keeps the older token, a hash of the access key
+//! ([`token_for_key`]), so links handed out before `sub_id` existed still work.
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::share_link::ShareLink;
 
-/// The URL token for an access key: 32 hex characters, stable, one-way.
+/// The legacy URL token for an access key: 32 hex characters, stable, one-way.
+/// Also the stable per-key id the server's device record is keyed by.
 pub fn token_for_key(access_key: &str) -> String {
     let digest = Sha256::digest(format!("ostp-subscription:{access_key}").as_bytes());
     digest[..16].iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// A new subscription id: 32 lowercase hex characters (128 bits) from
+/// `rand`'s thread RNG (a CSPRNG seeded from the operating system).
+pub fn new_sub_id() -> String {
+    use rand::RngCore;
+    let mut b = [0u8; 16];
+    rand::thread_rng().fill_bytes(&mut b);
+    b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
+/// Whether `s` has the shape of a subscription id: 32 lowercase hex characters.
+pub fn is_valid_sub_id(s: &str) -> bool {
+    s.len() == 32 && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// The URL token of a user: its `sub_id` when it has one, otherwise the
+/// legacy hash of the key. A `sub_id` of the wrong shape counts as none
+/// (config validation refuses such a file, so this is only a safety net).
+pub fn token_for(access_key: &str, sub_id: Option<&str>) -> String {
+    match sub_id.filter(|s| is_valid_sub_id(s)) {
+        Some(id) => id.to_string(),
+        None => token_for_key(access_key),
+    }
+}
+
+/// A random URL prefix for a newly enabled subscription: `/` and 10
+/// characters of `[a-z0-9]`, so the path does not tell a scanner where to look.
+pub fn random_prefix() -> String {
+    use rand::Rng;
+    const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
+    let mut rng = rand::thread_rng();
+    let tail: String = (0..10).map(|_| ALPHABET[rng.gen_range(0..ALPHABET.len())] as char).collect();
+    format!("/{tail}")
 }
 
 /// `https://<host>[:port]<prefix>/<token>`; the port is left out on 443.
@@ -96,6 +136,31 @@ mod tests {
         assert_eq!(t, token_for_key("0123456789abcdef"));
         assert_ne!(t, token_for_key("0123456789abcdeg"));
         assert!(!t.contains("0123456789abcdef"));
+    }
+
+    #[test]
+    fn sub_ids_are_random_hex_and_replace_the_hash() {
+        let a = new_sub_id();
+        let b = new_sub_id();
+        assert!(is_valid_sub_id(&a) && is_valid_sub_id(&b));
+        assert_ne!(a, b);
+        assert!(!is_valid_sub_id("0123456789ABCDEF0123456789abcdef"), "lowercase only");
+        assert!(!is_valid_sub_id("0123456789abcdef"));
+        assert!(!is_valid_sub_id("0123456789abcdef0123456789abcdeg"));
+        assert_eq!(token_for("k", Some(&a)), a);
+        assert_eq!(token_for("k", None), token_for_key("k"));
+        assert_eq!(token_for("k", Some("bad")), token_for_key("k"));
+    }
+
+    #[test]
+    fn random_prefix_shape() {
+        for _ in 0..50 {
+            let p = random_prefix();
+            assert_eq!(p.len(), 11);
+            assert!(p.starts_with('/'));
+            assert!(p[1..].bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit()), "{p}");
+        }
+        assert_ne!(random_prefix(), random_prefix());
     }
 
     #[test]

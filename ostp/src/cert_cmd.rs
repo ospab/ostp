@@ -366,7 +366,7 @@ fn print_links(config_path: &Path) -> Result<()> {
         for (label, link) in crate::share_links_for(&cfg, &key.key(), config_path) {
             println!("    {label:<3}  {}", link.to_uri().green());
         }
-        if let Some(url) = crate::subscription_url_for(&cfg, &key.key()) {
+        if let Some(url) = crate::subscription_url_for(&cfg, &key.sub_token()) {
             println!("    SUB  {}", url.green());
         }
         println!("  All keys: ostp links");
@@ -491,9 +491,8 @@ async fn self_test(config_path: &Path, t: &TlsSettings) {
 
     // 3. Subscriptions, when they are on.
     let sub = subscription_prefix(&v);
-    let first_key = v["access_keys"].as_array().and_then(|a| a.first()).and_then(ostp_core::access_keys::key_of);
-    if let (Some(prefix), Some(key)) = (sub, first_key) {
-        let token = ostp_core::subscription::token_for_key(&key);
+    let first_token = v["access_keys"].as_array().and_then(|a| a.first()).and_then(ostp_core::access_keys::sub_token_of);
+    if let (Some(prefix), Some(token)) = (sub, first_token) {
         let got = async {
             use tokio::io::{AsyncReadExt, AsyncWriteExt};
             let s = tokio::time::timeout(WAIT, tokio::net::TcpStream::connect(("127.0.0.1", t.public_port)))

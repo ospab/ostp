@@ -7,7 +7,9 @@
 //! that anonymous requests can walk around is not a limit.
 //!
 //! The record is kept in `devices.json` next to the config (mode 0600), keyed
-//! by the subscription token of the access key, never by the key itself.
+//! by the legacy subscription token of the access key (`token_for_key`, a
+//! one-way hash), never by the key itself, and never by its `sub_id`: a user
+//! given a new subscription link keeps its devices.
 //! It is the operator's own file on the operator's own server; the app sends an
 //! HWID only when its owner turned that on.
 

@@ -415,6 +415,19 @@ impl UnifiedConfig {
                 if cfg.access_keys.is_empty() {
                     anyhow::bail!("a server config needs at least one access key");
                 }
+                // A subscription id is a URL token: it must have the shape the
+                // server looks up and belong to one user only.
+                let mut ids = std::collections::HashSet::new();
+                for k in &cfg.access_keys {
+                    if let Some(id) = k.sub_id() {
+                        if !ostp_core::subscription::is_valid_sub_id(&id) {
+                            anyhow::bail!("access_keys: sub_id must be 32 lowercase hex characters (got '{id}')");
+                        }
+                        if !ids.insert(id.clone()) {
+                            anyhow::bail!("access_keys: sub_id {id} is given to more than one user");
+                        }
+                    }
+                }
                 if let Some(outbound) = &cfg.outbound {
                     if outbound.enabled {
                         let action = outbound.default_action.as_deref().unwrap_or("direct");
