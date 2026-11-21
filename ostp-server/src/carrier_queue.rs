@@ -32,8 +32,32 @@ pub const START_FRAMES: usize = 768;
 const FRAME_BYTES: u64 = 1350;
 /// A rate sample covers at least this much backlogged time.
 const SAMPLE_WINDOW: Duration = Duration::from_millis(100);
-/// Unsent bytes the kernel keeps for a TCP client (Linux).
-pub const NOTSENT_LOWAT: u32 = 128 * 1024;
+/// Unsent bytes the kernel keeps for a TCP client (Linux). `sendmsg()` adds
+/// no new buffers past it (Documentation/networking/ip-sysctl.rst,
+/// tcp_notsent_lowat; `tcp_stream_memory_free`), so it is the kernel's share
+/// of the queue in front of everything the tunnel carries: 128 KiB was about
+/// 0.35 s at 3 Mbit/s. 16 KiB is the value used for interactive HTTP/2 over
+/// TCP; keeping the pipe full is TCP's congestion window's job, which this
+/// does not limit (only data not yet sent counts).
+pub const NOTSENT_LOWAT: u32 = 16 * 1024;
+/// The congestion control asked for on a TCP/TLS client's socket (Linux).
+/// BBR paces to the measured bottleneck rate instead of filling its buffer
+/// until a loss, as CUBIC does, so the queue at a slow link stays near one
+/// round trip (draft-ietf-ccwg-bbr). If the kernel has no BBR, the system's
+/// default stays.
+pub const TCP_CONGESTION: &[u8] = b"bbr";
+
+/// Asks for `TCP_CONGESTION` on an accepted TCP socket. The first outcome is
+/// logged once: BBR in use, or the kernel's default kept and why.
+#[cfg(target_os = "linux")]
+pub fn use_paced_congestion(sock: &socket2::SockRef<'_>) {
+    static LOGGED: std::sync::Once = std::sync::Once::new();
+    let res = sock.set_tcp_congestion(TCP_CONGESTION);
+    LOGGED.call_once(|| match &res {
+        Ok(()) => tracing::info!("TCP/TLS clients: BBR congestion control"),
+        Err(e) => tracing::info!("TCP/TLS clients: the kernel's default congestion control (BBR not available: {e})"),
+    });
+}
 
 /// One connection's measured drain rate, in bytes per second (0: not yet known).
 #[derive(Default)]

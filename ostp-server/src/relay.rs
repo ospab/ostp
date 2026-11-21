@@ -14,6 +14,13 @@ use crate::{RemoteState, SessionBackpressure, StreamOut, UiEvent};
 /// Largest read from a target at once. 4 KiB meant a syscall and a message
 /// per three datagrams plus a short fourth one; 64 KiB fills whole frames.
 const READ_BUF: usize = 64 * 1024;
+/// The most one reader takes from the session's send budget at a time. All
+/// readers of a session wake when the budget is refreshed and the first one
+/// used to take all of it: a bulk download, always ready, kept a page or a
+/// video waiting behind it. Taking turns in quanta gives each busy stream a
+/// share, as a round-robin scheduler does (deficit round robin, Shreedhar and
+/// Varghese 1996; the flow queueing of RFC 8290).
+const READER_QUANTUM: usize = 16 * 1024;
 
 /// Datagrams from the client waiting to go out of one UDP-associate stream;
 /// past this they are dropped, as UDP may.
@@ -193,7 +200,7 @@ pub async fn handle_message(
                                 // wakes this task at once.
                                 let budget = gate.acquire().await;
                                 let frame_payload = frame_payload_now();
-                                let mut want = (budget as usize).saturating_mul(frame_payload).clamp(1, READ_BUF);
+                                let mut want = (budget as usize).saturating_mul(frame_payload).clamp(1, READER_QUANTUM.min(READ_BUF));
                                 if let Some(window) = &reader_window {
                                     let credit = tokio::select! {
                                         _ = cancel_rx.recv() => break,
@@ -221,6 +228,9 @@ pub async fn handle_message(
                                                 if stream_tx_clone.send((session_id, stream_id, StreamOut::Data(buf[..n].to_vec()))).is_err() {
                                                     break;
                                                 }
+                                                // The other streams' turn before this
+                                                // one takes from the budget again.
+                                                tokio::task::yield_now().await;
                                             }
                                         }
                                     }
