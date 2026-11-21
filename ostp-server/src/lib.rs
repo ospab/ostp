@@ -721,7 +721,21 @@ async fn run_server_loop(
                             Err(mpsc::error::TrySendError::Closed(_)) => break,
                         }
                     }
-                    Err(_) => break,
+                    // An error ends one receive, never the socket. On Windows a
+                    // datagram sent to a client socket that has closed (a client
+                    // that moved, quit or reconnected) comes back as ICMP port
+                    // unreachable, and the next `recv_from` of this unconnected
+                    // socket fails with WSAECONNRESET; elsewhere a receive can
+                    // fail for a moment too (no buffers). Leaving the loop here
+                    // stopped all UDP for every client until a restart, while
+                    // TCP kept working.
+                    Err(e) => match e.kind() {
+                        std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionRefused => {}
+                        _ => {
+                            tracing::warn!("UDP receive error on socket {index}: {e}");
+                            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                        }
+                    },
                 }
             }
         });
