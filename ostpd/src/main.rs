@@ -38,6 +38,9 @@ enum GuiCmd {
     Start { config: String, token: String },
     Reload { config: String, token: String },
     Stop { token: String },
+    /// Ask the connected server for its information again (sent inside the
+    /// tunnel); the answer goes to the GUI as `server_info`.
+    Info { token: String },
 }
 
 #[derive(Serialize)]
@@ -48,6 +51,9 @@ enum HelperMsg {
     Log { message: String },
     Metrics { bytes_sent: u64, bytes_recv: u64, rtt_ms: u32, queue_ms: u32 },
     Error { message: String },
+    /// The connected server's information as JSON, when it arrives or changes.
+    #[serde(rename = "server_info")]
+    ServerInfo { json: String },
 }
 
 struct TunnelState {
@@ -263,6 +269,7 @@ async fn run_server(expected_token: String, port: u16) -> Result<()> {
                 let mut shutdown_rx_tick = shutdown_rx.clone();
                 tokio::spawn(async move {
                     let mut last_state = 99u8;
+                    let mut last_info: Option<String> = None;
                     loop {
                         tokio::select! {
                             _ = tokio::time::sleep(Duration::from_secs(1)) => {}
@@ -330,6 +337,13 @@ async fn run_server(expected_token: String, port: u16) -> Result<()> {
                 }
                 st.metrics = None;
                 send_msg(HelperMsg::Status { value: 0 });
+            }
+            GuiCmd::Info { token } => {
+                if token != expected_token {
+                    send_msg(HelperMsg::Error { message: "Invalid authorization token".to_string() });
+                    continue;
+                }
+                ostp_client::app::request_server_info();
             }
         }
     }

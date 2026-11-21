@@ -109,6 +109,12 @@ jobs:
         run: mkdir -p ostp-control/dist && touch ostp-control/dist/index.html
       - name: cargo test
         run: cargo test -p ostp-core -p ostp-client -p ostp-server -p ostp -p ostp-tun
+      # The desktop app's backend and its privileged helper are built only by
+      # the release otherwise: a compile error there showed up at release time.
+      - name: Desktop app and helper (compile check)
+        run: |
+          cargo check -p ostpd
+          cargo check --manifest-path ostp-gui/src-tauri/Cargo.toml
       - name: Build
         run: cargo build --release --bin ostp
       - name: wintun.dll

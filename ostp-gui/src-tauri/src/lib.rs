@@ -35,6 +35,10 @@ enum HelperMsg {
     // `queue_ms` is missing from an older helper's messages.
     Metrics { bytes_sent: u64, bytes_recv: u64, rtt_ms: u32, #[serde(default)] queue_ms: u32 },
     Error { message: String },
+    /// The connected server's information (sent inside the tunnel), when it
+    /// arrives or changes; an older helper never sends it.
+    #[serde(rename = "server_info")]
+    ServerInfo { json: String },
 }
 
 // ── Application state ─────────────────────────────────────────────────────────
@@ -666,24 +670,33 @@ where
 /// What the connected server reports about its operator, itself and this key,
 /// as JSON: `{"operator": {..}, "server": {..}, "key": {..}}`. It travels only
 /// inside the tunnel, never in the subscription document. `None` while nothing
-/// has arrived (or no tunnel runs).
-///
-/// SERVER-INFO HOOK: the core side (ostp-client, in-process session and the
-/// helper's pipe) is being added in feat/expiry-info; connect these two
-/// commands to it there. Until then they report nothing and the app shows the
-/// last copy it stored, or "Connect once to see the server's information".
+/// has arrived (or no tunnel runs). With the helper, it is what the helper
+/// last passed on.
 #[tauri::command]
-async fn get_server_info() -> Result<Option<String>, String> {
-    Ok(None)
+async fn get_server_info(state: tauri::State<'_, AppState>) -> Result<Option<String>, String> {
+    let guard = state.0.lock().await;
+    match &guard.tunnel {
+        None => Ok(None),
+        Some(TunnelHandle::InProcess(_)) => Ok(ostp_client::app::server_info()),
+        Some(TunnelHandle::Helper(h)) => Ok(h.pipe_state.lock().await.server_info.clone()),
+    }
 }
 
 /// Asks the connected server for a fresh copy of that information; true when
-/// the request was sent.
-///
-/// SERVER-INFO HOOK: see get_server_info.
+/// the request was sent (false with no tunnel, or a server without it).
 #[tauri::command]
-async fn request_server_info() -> Result<bool, String> {
-    Ok(false)
+async fn request_server_info(state: tauri::State<'_, AppState>) -> Result<bool, String> {
+    let guard = state.0.lock().await;
+    match &guard.tunnel {
+        None => Ok(false),
+        Some(TunnelHandle::InProcess(_)) => Ok(ostp_client::app::request_server_info()),
+        Some(TunnelHandle::Helper(h)) => {
+            let cmd = serde_json::json!({ "cmd": "info", "token": h.token }).to_string();
+            send_to_helper(&h.cmd_tx, format!("{cmd}
+")).await?;
+            Ok(true)
+        }
+    }
 }
 
 /// Downloads a subscription (`https://<domain>/sub/<token>`) with the same
@@ -1047,7 +1060,7 @@ async fn start_tun_via_helper(
     }).to_string();
 
     let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::channel::<String>(16);
-    let pipe_state = Arc::new(Mutex::new(HelperPipeState { connection_state: 1, bytes_sent: 0, bytes_recv: 0, rtt_ms: 0, queue_ms: 0, error_msg: None }));
+    let pipe_state = Arc::new(Mutex::new(HelperPipeState { connection_state: 1, bytes_sent: 0, bytes_recv: 0, rtt_ms: 0, queue_ms: 0, error_msg: None, server_info: None }));
     let state_for_task = pipe_state.clone();
 
     tokio::spawn(async move {
@@ -1068,6 +1081,7 @@ async fn start_tun_via_helper(
                         match msg {
                             HelperMsg::Status { value } => s.connection_state = value,
                             HelperMsg::Metrics { bytes_sent, bytes_recv, rtt_ms, queue_ms } => { s.bytes_sent = bytes_sent; s.bytes_recv = bytes_recv; s.rtt_ms = rtt_ms; s.queue_ms = queue_ms; }
+                            HelperMsg::ServerInfo { json } => s.server_info = Some(json),
                             HelperMsg::Error { message } => { 
                                 s.connection_state = 0; 
                                 s.error_msg = Some(message.clone());
@@ -1104,6 +1118,7 @@ struct HelperPipeState {
     rtt_ms: u32,
     queue_ms: u32,
     error_msg: Option<String>,
+    server_info: Option<String>,
 }
 
 /// Executable name of the ostpd for the current platform.
