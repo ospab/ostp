@@ -8,6 +8,9 @@ Older history is on the [Releases](https://github.com/ospab/ostp/releases) page 
 
 ## [Unreleased]
 
+### Fixed
+- Android app, server management: the five tabs (Status, Users, Connection, DNS, Management) did not fit a phone screen and were cut off; the tab bar now scrolls sideways.
+
 ## [0.5.0-beta.1] - 2026-11-22
 
 ### Added

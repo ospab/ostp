@@ -263,7 +263,14 @@ class _ServerScreenState extends State<ServerScreen> {
         appBar: AppBar(
           title: Text(_server['name'] as String),
           actions: [IconButton(icon: const Icon(Icons.refresh), onPressed: _refresh)],
-          bottom: const TabBar(labelPadding: EdgeInsets.symmetric(horizontal: 4), labelStyle: TextStyle(fontSize: 13, fontWeight: FontWeight.w600), tabs: [
+          // Scrollable: five tabs do not fit a phone's width (and get wider
+          // with larger system fonts); fixed tabs were squeezed and cut off.
+          bottom: const TabBar(
+              isScrollable: true,
+              tabAlignment: TabAlignment.start,
+              labelPadding: EdgeInsets.symmetric(horizontal: 14),
+              labelStyle: TextStyle(fontSize: 13, fontWeight: FontWeight.w600),
+              tabs: [
             Tab(text: 'Status'),
             Tab(text: 'Users'),
             Tab(text: 'Connection'),
