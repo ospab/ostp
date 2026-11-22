@@ -140,7 +140,7 @@ class _WelcomeScreenState extends State<WelcomeScreen> {
   List<Widget> _linkStep() => [
         const Text('Add a link', style: TextStyle(fontSize: 26, fontWeight: FontWeight.w800)),
         const SizedBox(height: 8),
-        const Text('Paste the ostp:// link or the subscription URL (https://…/sub/…) you were given.',
+        const Text('Paste the ostp:// link or the subscription URL (https://…) you were given.',
             style: TextStyle(color: Colors.white54, height: 1.4)),
         const SizedBox(height: 20),
         TextField(
@@ -151,7 +151,7 @@ class _WelcomeScreenState extends State<WelcomeScreen> {
           autofocus: true,
           style: const TextStyle(fontFamily: 'monospace', fontSize: 13),
           decoration: InputDecoration(
-            hintText: 'ostp://… or https://…/sub/…',
+            hintText: 'ostp://… or https://…',
             hintStyle: const TextStyle(color: Colors.white24),
             filled: true,
             fillColor: Theme.of(context).colorScheme.surface,

@@ -1237,7 +1237,7 @@ async function showShare(title, text) {
 }
 
 // ── SUBSCRIPTIONS ─────────────────────────────────────────────────────
-// A subscription URL (https://<domain>/sub/<token>) returns the user's
+// A subscription URL (https://<domain>/<path>/<token>) returns the user's
 // current links. Its profiles carry sub_id and are rewritten on every
 // refresh, so server-side changes reach the app without a new link.
 const SUBS_KEY = 'ostp_subscriptions_v1';

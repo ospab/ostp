@@ -9,7 +9,7 @@ import 'ostp_profile.dart';
 import 'server_info.dart';
 import 'share_link.dart';
 
-/// A subscription URL (`https://<domain>/sub/<token>`) and what it last
+/// A subscription URL (`https://<domain>/<path>/<token>`) and what it last
 /// returned. Its profiles carry `subId` and are replaced on every refresh,
 /// so server-side changes (port, path, certificate settings) reach the app
 /// without a new link.

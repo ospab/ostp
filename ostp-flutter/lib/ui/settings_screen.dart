@@ -515,7 +515,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
           // A pasted document is cut here; ShareLink.parse rejects what is still too long.
           inputFormatters: [LengthLimitingTextInputFormatter(ShareLink.maxLength + 1)],
           decoration: const InputDecoration(
-            hintText: 'ostp://... or https://.../sub/...',
+            hintText: 'ostp://... or https://...',
             helperText: 'A subscription keeps its profiles up to date',
           ),
           autofocus: true,

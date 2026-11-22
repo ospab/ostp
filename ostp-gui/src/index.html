@@ -425,8 +425,8 @@
         <!-- Step 2a: a link -->
         <div data-welcome="link" style="display:none;">
           <h1 class="welcome-title">Add a link</h1>
-          <p class="welcome-sub">Paste the ostp:// link or the subscription URL (https://…/sub/…) you were given.</p>
-          <textarea id="welcome-link" class="field-input mono" rows="4" aria-label="Link or subscription URL" placeholder="ostp://… or https://…/sub/…"></textarea>
+          <p class="welcome-sub">Paste the ostp:// link or the subscription URL (https://…) you were given.</p>
+          <textarea id="welcome-link" class="field-input mono" rows="4" aria-label="Link or subscription URL" placeholder="ostp://… or https://…"></textarea>
           <div class="choice-actions">
             <button id="btn-welcome-paste" class="btn secondary" type="button">Paste</button>
             <button id="btn-welcome-link" class="btn primary" type="button">Add</button>
@@ -510,7 +510,7 @@
       <div class="modal-content compact">
         <h3 class="modal-title">Add a link</h3>
         <div class="field-group">
-          <input id="link-input" class="field-input mono" type="text" aria-label="Link or subscription URL" placeholder="ostp://key@host:port  or  https://domain/sub/…" spellcheck="false" />
+          <input id="link-input" class="field-input mono" type="text" aria-label="Link or subscription URL" placeholder="ostp://key@host:port  or  https://domain/…" spellcheck="false" />
           <p class="field-hint">A subscription (https://) keeps its profiles in sync with the server.</p>
         </div>
         <div class="modal-actions">

@@ -62,7 +62,7 @@ class _QRScannerScreenState extends State<QRScannerScreen> {
               final List<Barcode> barcodes = capture.barcodes;
               for (final barcode in barcodes) {
                 if ((barcode.rawValue?.length ?? 0) > _maxPayload) continue;
-                // A share link, or a subscription URL (https://<domain>/sub/<token>).
+                // A share link, or a subscription URL (https://<domain>/<path>/<token>).
                 final value = extractImportable(barcode);
                 if (value != null && (value.toLowerCase().startsWith('ostp://') || isSubscriptionUrl(value))) {
                   _done = true;

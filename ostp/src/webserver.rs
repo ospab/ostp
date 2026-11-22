@@ -259,7 +259,10 @@ pub fn sub_route(kind: Kind, prefix: &str, port: u16, apache_modern: bool) -> St
              proxy_set_header X-Real-IP $remote_addr;\n        \
              # An unknown token: nginx's own 404 page, as for any other path.\n        \
              proxy_intercept_errors on;\n        error_page 404 = @ostp_not_found;\n    }}\n    \
-             location @ostp_not_found {{\n        return 404;\n    }}\n"
+             location @ostp_not_found {{\n        \
+             # The site's own `error_page 404`, if it has one, applies here\n        \
+             # too; without this nginx stops at its built-in page.\n        \
+             recursive_error_pages on;\n        return 404;\n    }}\n"
         ),
         Kind::Apache => {
             let codes = if apache_modern { " 404" } else { "" };
@@ -596,7 +599,8 @@ mod tests {
     fn written_sites_intercept_the_subscription_404() {
         let n = nginx_vhost(&params(true), false);
         assert!(n.contains("proxy_intercept_errors on;\n        error_page 404 = @ostp_not_found;"));
-        assert!(n.contains("location @ostp_not_found {\n        return 404;\n    }"));
+        assert!(n.contains("location @ostp_not_found {\n"));
+        assert!(n.contains("recursive_error_pages on;\n        return 404;\n    }"));
         assert_eq!(n.matches("proxy_intercept_errors").count(), 1, "only the subscription route");
         assert!(!nginx_vhost(&params(false), false).contains("ostp_not_found"));
         let modern = apache_vhost(&params(true), true);
