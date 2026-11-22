@@ -307,7 +307,8 @@ mod tests {
         assert!(n.contains("location ^~ /abc/ {"));
         assert!(n.contains("proxy_intercept_errors on;"));
         assert!(n.contains("error_page 404 = @ostp_not_found;"));
-        assert!(n.contains("location @ostp_not_found {\n        return 404;"));
+        assert!(n.contains("location @ostp_not_found {\n"));
+        assert!(n.contains("recursive_error_pages on;\n        return 404;"));
         let a = snippet(Kind::Apache, "/abc", 50000);
         assert!(a.contains("ProxyPass /abc/ http://127.0.0.1:50000/abc/"));
         assert!(a.contains("<Location \"/abc/\">") && a.contains("ProxyErrorOverride On 404"));
