@@ -140,7 +140,7 @@ jobs:
       - name: Desktop JavaScript syntax
         run: for f in ostp-gui/src/*.js; do node --check "$f"; done
       - name: Desktop JavaScript tests
-        run: node --test ostp-gui/test/
+        run: node --test ostp-gui/test/*.test.mjs
       - uses: subosito/flutter-action@v2
         with:
           flutter-version: '3.41.6'
