@@ -41,6 +41,8 @@ class _ServerInfoDialog extends StatefulWidget {
 class _ServerInfoDialogState extends State<_ServerInfoDialog> {
   OstpSubscription? _sub;
   String? _status;
+  // The core answered that the server sends no information (an older server).
+  bool _unsupported = false;
 
   @override
   void initState() {
@@ -57,15 +59,17 @@ class _ServerInfoDialogState extends State<_ServerInfoDialog> {
   /// The answer comes over the tunnel; the core may need a moment.
   Future<void> _askFresh() async {
     ServerInfo? fresh;
+    final sent = await ServerInfoCore.request();
     for (var i = 0; i < 6 && fresh == null; i++) {
-      fresh = await pullServerInfo(widget.prefs, ask: i == 0);
+      fresh = await pullServerInfo(widget.prefs);
       if (!mounted) return;
       if (fresh == null) await Future<void>.delayed(const Duration(seconds: 1));
     }
     if (!mounted) return;
     setState(() {
       _load();
-      _status = fresh == null ? 'The server did not answer; this is the last copy.' : null;
+      _unsupported = fresh == null && !sent;
+      _status = fresh == null && sent ? 'The server did not answer; this is the last copy.' : null;
     });
   }
 
@@ -102,6 +106,18 @@ class _ServerInfoDialogState extends State<_ServerInfoDialog> {
         child: Text(text, style: TextStyle(color: color, fontSize: 12, height: 1.4)),
       );
 
+  /// An operator field: what they wrote, or a muted note that they gave nothing.
+  static Widget _opRow(String label, String? value) {
+    if (value != null && value.isNotEmpty) return _row(label, value);
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 5),
+      child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        SizedBox(width: 104, child: Text(label, style: const TextStyle(color: Colors.white54, fontSize: 13))),
+        const Expanded(child: Text('Not given by the operator', style: TextStyle(fontSize: 13, color: Colors.white38))),
+      ]),
+    );
+  }
+
   static Widget _row(String label, String? value, {Color? color, bool mono = false}) {
     if (value == null || value.isEmpty) return const SizedBox.shrink();
     return Padding(
@@ -129,16 +145,17 @@ class _ServerInfoDialogState extends State<_ServerInfoDialog> {
     final children = <Widget>[
       if (_status != null) _note(_status!, color: Colors.white54),
       if (s == null) _note('This subscription is no longer in the app.'),
-      if (op != null) ...[
+      if (s != null) ...[
         _section('Operator'),
         _note('Written by the operator of this server, in their own words. The app does not check it.'),
-        _row('Name', op.name),
-        _row('Location', op.location),
-        _row('Contact', op.contact),
-        if (op.about != null) ...[
+        _opRow('Name', op?.name),
+        _opRow('Location', op?.location),
+        _opRow('Contact', op?.contact),
+        if (op?.about != null) ...[
           const SizedBox(height: 8),
-          MarkdownView(text: op.about!, onLink: _openLink),
-        ],
+          MarkdownView(text: op!.about!, onLink: _openLink),
+        ] else
+          _opRow('About', null),
       ],
       if (srv != null) ...[
         _section('Reported by the server'),
@@ -163,7 +180,11 @@ class _ServerInfoDialogState extends State<_ServerInfoDialog> {
       if (s != null && info == null)
         Padding(
           padding: const EdgeInsets.only(top: 14),
-          child: _note("Connect once to see the server's information.", color: Colors.white54),
+          child: _note(
+              _unsupported && sessionSubscriptionId == widget.subId
+                  ? 'This server does not send information about itself. It needs OSTP 0.5.0-beta.1 or newer.'
+                  : "Connect once to see the server's information.",
+              color: Colors.white54),
         )
       else if (s != null && s.infoAt > 0)
         Padding(

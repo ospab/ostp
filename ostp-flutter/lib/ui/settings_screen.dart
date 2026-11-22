@@ -20,6 +20,10 @@ Color _onColor(Color bg) {
   return ThemeData.estimateBrightnessForColor(bg) == Brightness.light ? Colors.black : Colors.white;
 }
 
+/// Shown for a profile without the server's key (protocol v5).
+const unverifiedServerText =
+    'The server is not verified (protocol v5): anyone who has this key can pose as this server. Ask the operator for a new link.';
+
 class SettingsScreen extends StatefulWidget {
   final SharedPreferences prefs;
   const SettingsScreen({super.key, required this.prefs});
@@ -137,6 +141,38 @@ class _SettingsScreenState extends State<SettingsScreen> {
     }
   }
 
+  Future<void> _acceptNewKey(OstpSubscription s) async {
+    await SubscriptionStore(widget.prefs).acceptKeys(s.id);
+    if (mounted) _reloadProfilesAndSubs();
+    // The rest of the new links come with the next refresh.
+    if (mounted) await _refreshSubscription(s);
+  }
+
+  Future<void> _keepOldKey(OstpSubscription s) async {
+    await SubscriptionStore(widget.prefs).keepOldKeys(s.id);
+    if (mounted) _reloadProfilesAndSubs();
+  }
+
+  /// The question after a refresh brought another key for a known server.
+  Widget _keyChangeNotice(OstpSubscription s) => Container(
+        padding: const EdgeInsets.all(10),
+        decoration: BoxDecoration(
+          border: Border.all(color: Colors.amberAccent.withOpacity(0.6)),
+          borderRadius: BorderRadius.circular(8),
+        ),
+        child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          const Text(
+            "The server's key changed in this subscription. If the operator did not tell you about a new key, someone may be intercepting the subscription.",
+            style: TextStyle(fontSize: 12, height: 1.4, color: Colors.amberAccent),
+          ),
+          const SizedBox(height: 6),
+          Wrap(spacing: 8, children: [
+            FilledButton(onPressed: () => _acceptNewKey(s), child: const Text('Accept the new key')),
+            OutlinedButton(onPressed: () => _keepOldKey(s), child: const Text('Keep the old one')),
+          ]),
+        ]),
+      );
+
   void _confirmRemoveSubscription(OstpSubscription s) {
     showDialog(
       context: context,
@@ -236,6 +272,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
     String summary = '',
     Color summaryColor = Colors.white54,
     String? error,
+    Widget? notice,
     Widget? bar,
     List<Widget> actions = const [],
     String? unavailable,
@@ -283,6 +320,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                 padding: const EdgeInsets.fromLTRB(32, 2, 12, 2),
                 child: Text(error, style: const TextStyle(fontSize: 12, color: Colors.redAccent)),
               ),
+            if (notice != null) Padding(padding: const EdgeInsets.fromLTRB(32, 6, 12, 4), child: notice),
             if (open)
               Padding(
                 padding: const EdgeInsets.only(left: 12),
@@ -331,6 +369,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
         ].join(' · '),
         summaryColor: exp?.expired == true ? Colors.redAccent : exp != null && exp.daysLeft < 7 ? Colors.amberAccent : Colors.white54,
         error: s.lastError,
+        notice: s.pendingKeys.isEmpty ? null : _keyChangeNotice(s),
         bar: limit != null && limit > 0 && used != null
             ? ClipRRect(
                 borderRadius: BorderRadius.circular(4),
@@ -614,6 +653,12 @@ class _SettingsScreenState extends State<SettingsScreen> {
                     child: Text('Protocol: ${profile?.protocol ?? 'v5'}',
                         style: const TextStyle(fontSize: 12, color: Colors.white54)),
                   ),
+                  if (profile != null && profile.serverPk.isEmpty)
+                    const Padding(
+                      padding: EdgeInsets.only(top: 4),
+                      child: Text(unverifiedServerText,
+                          style: TextStyle(fontSize: 12, height: 1.4, color: Colors.amberAccent)),
+                    ),
                   // TLS only applies to the UoT (TCP) carrier, so the section
                   // is hidden under UDP. Reactive: switching Carrier above
                   // calls setDialogState, which rebuilds this.
@@ -910,6 +955,15 @@ class _SettingsScreenState extends State<SettingsScreen> {
       trailing: Row(
         mainAxisSize: MainAxisSize.min,
         children: [
+          if (p.serverPk.isEmpty)
+            const Tooltip(
+              message: unverifiedServerText,
+              triggerMode: TooltipTriggerMode.tap,
+              child: Padding(
+                padding: EdgeInsets.symmetric(horizontal: 6),
+                child: Icon(Icons.warning_amber_rounded, size: 20, color: Colors.amberAccent),
+              ),
+            ),
           IconButton(
             icon: const Icon(Icons.share_rounded, size: 20, color: Colors.white54),
             onPressed: () => _showShareModal(p),

@@ -5,6 +5,7 @@ import 'package:flutter/services.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import 'device_limit.dart';
+import 'key_pin.dart';
 import 'ostp_profile.dart';
 import 'server_info.dart';
 import 'share_link.dart';
@@ -28,6 +29,12 @@ class OstpSubscription {
   int infoAt;
   // The server closed a session because the key expired.
   bool keyExpired;
+  // Keys the refresh found different from the pinned one, by pinKey(): the
+  // new key ('' = the link lost its key), waiting for the person's decision.
+  // keptKeys: the new key the person refused ("Keep the old one"), so the
+  // question is not asked again for the same key.
+  Map<String, String> pendingKeys;
+  Map<String, String> keptKeys;
 
   OstpSubscription({
     required this.id,
@@ -41,7 +48,10 @@ class OstpSubscription {
     this.serverInfo,
     this.infoAt = 0,
     this.keyExpired = false,
-  });
+    Map<String, String>? pendingKeys,
+    Map<String, String>? keptKeys,
+  })  : pendingKeys = pendingKeys ?? {},
+        keptKeys = keptKeys ?? {};
 
   bool get isDue =>
       DateTime.now().millisecondsSinceEpoch - updatedAt >= intervalHours * 3600 * 1000;
@@ -62,7 +72,12 @@ class OstpSubscription {
         'serverInfo': serverInfo?.toJson(),
         'infoAt': infoAt,
         'keyExpired': keyExpired,
+        'pendingKeys': pendingKeys,
+        'keptKeys': keptKeys,
       };
+
+  static Map<String, String> _strMap(Object? v) =>
+      v is Map ? {for (final e in v.entries) if (e.key is String && e.value is String) e.key as String: e.value as String} : {};
 
   factory OstpSubscription.fromJson(Map<String, dynamic> j) => OstpSubscription(
         id: j['id'] as String? ?? '',
@@ -76,6 +91,8 @@ class OstpSubscription {
         serverInfo: ServerInfo.parse(j['serverInfo']),
         infoAt: j['infoAt'] is int ? j['infoAt'] as int : 0,
         keyExpired: j['keyExpired'] == true,
+        pendingKeys: _strMap(j['pendingKeys']),
+        keptKeys: _strMap(j['keptKeys']),
       );
 }
 
@@ -260,6 +277,34 @@ class SubscriptionStore {
         await _save(subs);
       });
 
+  /// "Accept the new key": the pinned profiles of subscription [id] take the
+  /// new keys that were waiting. A refresh afterwards brings the rest of the
+  /// new links.
+  Future<void> acceptKeys(String id) => _serialized(() async {
+        final subs = load();
+        final sub = subs.where((s) => s.id == id).firstOrNull;
+        if (sub == null || sub.pendingKeys.isEmpty) return;
+        final profiles = decodeProfiles(prefs.getString(_profilesKey));
+        for (final p in profiles.where((p) => p.subId == id)) {
+          final pk = sub.pendingKeys[pinKey(p.serverAddr, p.tls ? 'tls' : p.transportMode)];
+          if (pk != null) p.serverPk = pk;
+        }
+        sub.pendingKeys = {};
+        sub.keptKeys = {};
+        await prefs.setString(_profilesKey, encodeProfiles(profiles));
+        await _save(subs);
+      });
+
+  /// "Keep the old one": the waiting keys are refused and not asked about again.
+  Future<void> keepOldKeys(String id) => _serialized(() async {
+        final subs = load();
+        final sub = subs.where((s) => s.id == id).firstOrNull;
+        if (sub == null || sub.pendingKeys.isEmpty) return;
+        sub.keptKeys = {...sub.keptKeys, ...sub.pendingKeys};
+        sub.pendingKeys = {};
+        await _save(subs);
+      });
+
   Future<void> remove(String id) => _serialized(() => _remove(id));
 
   Future<void> _remove(String id) async {
@@ -316,10 +361,29 @@ class SubscriptionStore {
     final hadActive = profiles.any((p) => p.active) || activeCarrier != null;
 
     final fresh = <OstpProfile>[];
+    final pending = <String, String>{};
+    final kept = <String, String>{};
     for (var i = 0; i < links.length; i++) {
       final l = links[i];
       final c = carrier(l.tls, l.transport);
       final prev = old.where((p) => carrier(p.tls, p.transportMode) == c).firstOrNull;
+      // The same server and carrier with another key (or none): keep the old
+      // profile and ask the person.
+      final k = pinKey(l.server, c);
+      final same = old.where((p) => pinKey(p.serverAddr, carrier(p.tls, p.transportMode)) == k).firstOrNull;
+      if (same != null) {
+        final action = pinAction(same.serverPk, l.pk ?? '', keptPk: sub.keptKeys[k]);
+        if (action != PinAction.accept) {
+          if (action == PinAction.ask) {
+            pending[k] = l.pk ?? '';
+          } else {
+            kept[k] = l.pk ?? '';
+          }
+          same.active = activeCarrier != null && activeCarrier == c;
+          fresh.add(same);
+          continue;
+        }
+      }
       fresh.add(OstpProfile(
         id: prev?.id ?? '${sub.id}-$i-${DateTime.now().microsecondsSinceEpoch}',
         name: l.name ?? '${sub.name} · ${c.toUpperCase()}',
@@ -339,6 +403,8 @@ class SubscriptionStore {
         dnsChoice: prev?.dnsChoice ?? '',
       ));
     }
+    sub.pendingKeys = pending;
+    sub.keptKeys = kept;
     // The active carrier vanished from the subscription: fall back to its best link.
     if (activeCarrier != null && !fresh.any((p) => p.active)) fresh.first.active = true;
     if (!hadActive) fresh.first.active = true;
