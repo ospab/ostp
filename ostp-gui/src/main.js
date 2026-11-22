@@ -1,6 +1,7 @@
 import { shouldAskDnsNotice, effectiveDns, filtersDns } from './dns_notice.js';
 import { classifyFetchError, cardMessage, shouldAskToSend, SEND_DIALOG } from './device_limit.js';
 import { linkPk, protocolLabel } from './server_pk.js';
+import { pinKey, pinAction } from './key_pin.js';
 import { initServers, renderServers, mountSshForm, confirmBox, fmtBytes } from './servers.js';
 import { renderMarkdown } from './markdown.js';
 import { normalizeServerInfo, subscriptionExpiry, expiryLabel, isKeyExpiredReason, LOG_PRIVACY_TEXT } from './server_info.js';
@@ -206,8 +207,13 @@ pmTransport.addEventListener('change', updateTlsVisibility);
 pmTls.addEventListener('change', updateTlsVisibility);
 
 // The protocol of the profile shown in the editor: v6 when it has the server's key.
+const UNVERIFIED_TEXT = 'The server is not verified (protocol v5): anyone who has this key can pose as this server. Ask the operator for a new link.';
 function setProtocolLine(p) {
   $('pm-protocol').textContent = `Protocol: ${protocolLabel(p)}`;
+  // A profile without the server's key cannot check the server; say so (connecting is not blocked).
+  const warn = $('pm-unverified');
+  warn.textContent = UNVERIFIED_TEXT;
+  warn.classList.toggle('hidden', !(p && p.server && !p.server_pk));
 }
 
 function setTlsFields(p) {
@@ -937,6 +943,7 @@ function profileCard(p, { compact = false, unavailable = '' } = {}) {
         <div class="profile-name">${escHtml(p.name || p.server)}</div>
         <div class="profile-server">${escHtml(unavailable || p.server)}</div>
       </div>
+      ${p.server_pk ? '' : `<span class="profile-warn" title="${escHtml(UNVERIFIED_TEXT)}" aria-label="${escHtml(UNVERIFIED_TEXT)}"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10.3 3.9L1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg></span>`}
       <span class="profile-transport-badge">${escHtml(p.transport === 'uot' && p.tls ? 'tls' : (p.transport || 'udp'))}</span>
       <div class="profile-actions">
         <button class="profile-action-btn btn-share-profile" title="Share profile" data-id="${escHtml(p.id)}">
@@ -1246,7 +1253,8 @@ function loadSubs() {
   const raw = readJson(SUBS_KEY, []);
   if (!Array.isArray(raw)) return [];
   return raw.filter(s => isObj(s) && typeof s.id === 'string' && typeof s.url === 'string').slice(0, MAX_SUBS)
-    .map(s => ({ ...s, serverInfo: normalizeServerInfo(s.serverInfo), keyExpired: s.keyExpired === true }));
+    .map(s => ({ ...s, serverInfo: normalizeServerInfo(s.serverInfo), keyExpired: s.keyExpired === true,
+      pendingKeys: isObj(s.pendingKeys) ? s.pendingKeys : {}, keptKeys: isObj(s.keptKeys) ? s.keptKeys : {} }));
 }
 function saveSubs(subs) { writeJson(SUBS_KEY, subs); }
 
@@ -1303,7 +1311,17 @@ function applySubscription(sub, doc) {
 
   const old = profiles.filter(p => p.sub_id === sub.id);
   const activeOld = old.find(p => p.id === activeId);
+  // The same server and carrier with another key (or none) keeps its old
+  // profile; the person is asked on the subscription card.
+  const pending = {}, kept = {};
   const fresh = links.map((l, i) => {
+    const k = pinKey(l.server, carrierOf(l));
+    const same = old.find(p => pinKey(p.server, carrierOf(p)) === k);
+    if (same) {
+      const act = pinAction(same.server_pk, l.server_pk, sub.keptKeys?.[k]);
+      if (act === 'ask') { pending[k] = l.server_pk || ''; return same; }
+      if (act === 'keep-old-silent') { kept[k] = l.server_pk || ''; return same; }
+    }
     const prev = old.find(p => carrierOf(p) === carrierOf(l));
     const merged = { ...(prev || {}), ...l, id: prev ? prev.id : genId(), sub_id: sub.id,
              name: l.name || `${sub.name} · ${carrierOf(l).toUpperCase()}` };
@@ -1312,6 +1330,8 @@ function applySubscription(sub, doc) {
     if (!l.dnsall) delete merged.dnsall;
     return merged;
   });
+  sub.pendingKeys = pending;
+  sub.keptKeys = kept;
   // Profiles added by hand for the same key and carrier are what this
   // subscription now provides: keep one copy, the subscription's.
   const covered = p => !p.sub_id && fresh.some(f => f.key === p.key && f.server === p.server && carrierOf(f) === carrierOf(p));
@@ -1386,6 +1406,37 @@ async function refreshSubscription(id, { quiet = false } = {}) {
   persistConfig();
 }
 
+// "Accept the new key": the pinned profiles take the waiting keys, then a
+// refresh brings the rest of the new links.
+async function acceptNewKeys(id) {
+  const subs = loadSubs();
+  const sub = subs.find(s => s.id === id);
+  if (!sub) return;
+  for (const p of profiles) {
+    if (p.sub_id !== id) continue;
+    const pk = sub.pendingKeys[pinKey(p.server, carrierOf(p))];
+    if (typeof pk === 'string') p.server_pk = pk;
+  }
+  sub.pendingKeys = {};
+  sub.keptKeys = {};
+  saveSubs(subs);
+  saveProfiles(profiles);
+  renderSubs();
+  renderProfiles();
+  await refreshSubscription(id);
+}
+
+// "Keep the old one": the waiting keys are refused and not asked about again.
+function keepOldKeys(id) {
+  const subs = loadSubs();
+  const sub = subs.find(s => s.id === id);
+  if (!sub) return;
+  sub.keptKeys = { ...sub.keptKeys, ...sub.pendingKeys };
+  sub.pendingKeys = {};
+  saveSubs(subs);
+  renderSubs();
+}
+
 async function addSubscription(url) {
   url = String(url).trim();
   const problem = subscriptionUrlProblem(url);
@@ -1431,7 +1482,7 @@ const ICON_INFO = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" s
 
 // One foldable group: a header row and its profiles. `actions` are extra
 // buttons in the header; `unavailable` marks every profile of the group.
-function profileGroup({ id, name, count, summary, error, bar, actions = '', members, open, unavailable = '' }) {
+function profileGroup({ id, name, count, summary, error, bar, actions = '', members, open, unavailable = '', notice = null }) {
   const card = document.createElement('div');
   card.className = 'sub-card group' + (open ? ' open' : '');
   card.innerHTML = `
@@ -1454,6 +1505,7 @@ function profileGroup({ id, name, count, summary, error, bar, actions = '', memb
   const err = card.querySelector('.sub-error');
   err.textContent = error || '';
   if (!error) err.remove();
+  if (notice) card.querySelector('.sub-profiles').before(notice);
   const own = card.querySelector('.sub-profiles');
   if (open) members.forEach(p => own.appendChild(profileCard(p, { compact: true, unavailable })));
   card.querySelector('.group-toggle').addEventListener('click', () => {
@@ -1470,6 +1522,28 @@ function subSummary(s) {
   const used = s.usedBytes, limit = s.limitBytes;
   const usage = used == null ? '' : (limit ? `${fmtBytes(used)} of ${fmtBytes(limit)}` : `${fmtBytes(used)} used`);
   return [usage, expiryLabel(subscriptionExpiry(s)), `updated ${timeAgo(s.updatedAt)}`].filter(Boolean).join(' · ');
+}
+
+function keyChangeNotice(id) {
+  const box = document.createElement('div');
+  box.className = 'key-change';
+  const text = document.createElement('p');
+  text.textContent = "The server's key changed in this subscription. If the operator did not tell you about a new key, someone may be intercepting the subscription.";
+  const row = document.createElement('div');
+  row.className = 'key-change-actions';
+  const accept = document.createElement('button');
+  accept.className = 'btn primary compact-btn';
+  accept.type = 'button';
+  accept.textContent = 'Accept the new key';
+  accept.addEventListener('click', () => acceptNewKeys(id));
+  const keep = document.createElement('button');
+  keep.className = 'btn secondary compact-btn';
+  keep.type = 'button';
+  keep.textContent = 'Keep the old one';
+  keep.addEventListener('click', () => keepOldKeys(id));
+  row.append(accept, keep);
+  box.append(text, row);
+  return box;
 }
 
 function renderSubs() {
@@ -1495,6 +1569,7 @@ function renderSubs() {
       count: all.length,
       summary: subSummary(s),
       error: s.lastError,
+      notice: Object.keys(s.pendingKeys).length ? keyChangeNotice(s.id) : null,
       bar: ratio != null ? `<div class="sub-bar${ratio >= 1 ? ' full' : ratio >= 0.8 ? ' warn' : ''}"><div style="width:${(ratio * 100).toFixed(1)}%"></div></div>` : '',
       members,
       open: !!q || groupOpen(s.id, all),
@@ -1542,6 +1617,9 @@ function renderSubs() {
 const INFO_PULL_MS = 60000;
 let infoPulledAt = 0;
 let infoRequested = false;
+// What the core answered to the last request for a fresh copy: false = the
+// server does not provide information (an older server); null = not asked.
+let infoRequestSent = null;
 
 // The subscription of the profile the running connection was started with.
 function sessionSubId() {
@@ -1572,7 +1650,7 @@ async function pullServerInfo({ ask = false } = {}) {
   const subId = sessionSubId();
   if (!subId || appState !== 'connected') return null;
   try {
-    if (ask) await invoke('request_server_info');
+    if (ask) infoRequestSent = (await invoke('request_server_info')) === false ? false : true;
     const info = normalizeServerInfo(await invoke('get_server_info'));
     if (info) storeServerInfo(subId, info);
     return info;
@@ -1635,7 +1713,7 @@ async function openLink(url) {
   try { openUrl(url); } catch (e) { showToast(String(e?.message || e), 'error'); }
 }
 
-function fillServerInfo(sub, status) {
+function fillServerInfo(sub, status, { unsupported = false } = {}) {
   const body = $('info-body');
   body.replaceChildren();
   const info = sub.serverInfo;
@@ -1646,17 +1724,19 @@ function fillServerInfo(sub, status) {
     p.textContent = status;
     body.appendChild(p);
   }
-  if (o) {
+  {
     const box = infoSection(body, 'Operator', 'Written by the operator of this server, in their own words. The app does not check it.');
-    infoRow(box, 'Name', o.name);
-    infoRow(box, 'Location', o.location);
-    infoRow(box, 'Contact', o.contact);
-    if (!box.children.length) box.remove();
-    if (o.about) {
+    const given = (k, v) => (v ? infoRow(box, k, v) : infoRow(box, k, 'Not given by the operator', 'is-muted'));
+    given('Name', o?.name);
+    given('Location', o?.location);
+    given('Contact', o?.contact);
+    if (o?.about) {
       const md = document.createElement('div');
       md.className = 'md';
       renderMarkdown(md, o.about, openLink);
       body.appendChild(md);
+    } else {
+      given('About', null);
     }
   }
   if (srv) {
@@ -1689,7 +1769,9 @@ function fillServerInfo(sub, status) {
   }
   const foot = document.createElement('p');
   foot.className = 'card-note';
-  foot.textContent = !info ? "Connect once to see the server's information."
+  foot.textContent = !info ? (unsupported
+      ? 'This server does not send information about itself. It needs OSTP 0.5.0-beta.1 or newer.'
+      : "Connect once to see the server's information.")
     : sub.infoAt ? `As of ${new Date(sub.infoAt).toLocaleString()}.` : '';
   if (foot.textContent) body.appendChild(foot);
 }
@@ -1709,10 +1791,12 @@ async function openServerInfo(subId) {
   for (let i = 0; i < 6 && !fresh; i++) {
     fresh = await pullServerInfo({ ask: i === 0 });
     if (seq !== infoSeq || $('info-modal').classList.contains('hidden')) return;
+    if (!fresh && infoRequestSent === false) break; // the server does not provide it: no point waiting
     if (!fresh) await new Promise(r => setTimeout(r, 1000));
   }
   const now = loadSubs().find(s => s.id === subId);
-  if (now) fillServerInfo(now, fresh ? '' : 'The server did not answer; this is the last copy.');
+  const unsupported = !fresh && infoRequestSent === false;
+  if (now) fillServerInfo(now, fresh || unsupported ? '' : 'The server did not answer; this is the last copy.', { unsupported });
 }
 
 // ── PROBER ────────────────────────────────────────────────────────────

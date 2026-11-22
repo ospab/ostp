@@ -980,6 +980,14 @@ textarea.field-input { resize: vertical; min-height: 38px; line-height: 1.4; pad
 .info-body .card-note { margin-top: 0; }
 .kv-row .v.is-warn { color: var(--c-amber); }
 .kv-row .v.is-bad { color: var(--c-red); }
+.kv-row .v.is-muted { color: var(--c-txt-2); opacity: 0.7; }
+
+/* Trust: a profile without the server's key, and a changed key in a subscription */
+.profile-warn { display: inline-flex; align-items: center; color: var(--c-amber); flex-shrink: 0; }
+.field-hint.warn-hint { color: var(--c-amber); line-height: 1.5; }
+.key-change { margin: 8px 0 4px 26px; padding: 8px 10px; border: 1px solid var(--c-amber); border-radius: var(--r-sm); }
+.key-change p { margin: 0 0 8px; font-size: 0.72rem; line-height: 1.5; color: var(--c-amber); }
+.key-change-actions { display: flex; flex-wrap: wrap; gap: 8px; }
 .md { font-size: 0.8rem; line-height: 1.55; color: var(--c-txt-1); margin: 0 2px 12px; user-select: text; overflow-wrap: anywhere; }
 .md h4, .md h5, .md h6 { font-weight: 600; margin: 10px 0 4px; }
 .md h4 { font-size: 0.92rem; }
