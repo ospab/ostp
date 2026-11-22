@@ -8,6 +8,12 @@ Older history is on the [Releases](https://github.com/ospab/ostp/releases) page 
 
 ## [Unreleased]
 
+### Added
+- Apps: a profile whose link has no server key (protocol v5, the server is not verified) is marked with a warning that says anyone with the key can pose as that server; connecting is not blocked.
+- Apps: a subscription refresh no longer replaces a server's key silently. When the key of a server changes or disappears, the old profile is kept and the subscription card asks whether to accept the new key or keep the old one (a key that appears where there was none, v5 to v6, is taken without asking). This is how SSH treats a changed host key: a subscription intercepted on the way can no longer swap the server unnoticed.
+- Apps: the server information window always shows the operator's section ("Not given by the operator" for empty fields) and says when a server does not send information about itself (it needs OSTP 0.5.0-beta.1 or newer).
+- Development: CI runs the apps' tests too (`flutter test`, `node --test` for the desktop JavaScript); only static checks ran before.
+
 ### Security
 - Subscription links can be replaced and no longer come from the access key. A new user gets a random subscription id (`sub_id`); before, the link's token was a hash of the access key, so it could not be revoked without changing the key and anyone with the key could compute it. `ostp manage user-set WHO --new-sub-id`, or "New subscription link" in the panel (`POST /users/{key}/sub-id`), gives a user a new link and the old one stops working at once; the key and the user's devices stay. Existing users keep their links; `ostp manage sub-ids` lists them and `--assign-missing` moves them to random ids only when you run it (their old links then stop working, and the command prints the new ones).
 - Behind nginx, Apache or Caddy a wrong subscription link no longer reveals OSTP: it got OSTP's own answer while any other path got the web server's 404, and comparing the two showed what was behind the path. OSTP now answers a bare 404 and the web server replaces it with its own error page, the site's own one included (nginx `proxy_intercept_errors` with `recursive_error_pages`, Apache `ProxyErrorOverride`, Caddy `handle_response`). Rewrite an OSTP-managed site with `ostp sub set --vhost`; a site kept by hand needs the new block printed by `ostp sub enable` (`ostp sub status` warns when the site is older). With OSTP's own TLS a wrong link gets the same decoy as any other path, as before.

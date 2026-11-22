@@ -133,12 +133,14 @@ jobs:
           retention-days: 14
 
   apps:
-    name: Apps (static checks)
+    name: Apps (checks and tests)
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - name: Desktop JavaScript syntax
         run: for f in ostp-gui/src/*.js; do node --check "$f"; done
+      - name: Desktop JavaScript tests
+        run: node --test ostp-gui/test/
       - uses: subosito/flutter-action@v2
         with:
           flutter-version: '3.41.6'
@@ -150,3 +152,6 @@ jobs:
         run: |
           flutter pub get
           flutter analyze --no-fatal-infos
+      - name: flutter test
+        working-directory: ostp-flutter
+        run: flutter test
