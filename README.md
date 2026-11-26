@@ -30,6 +30,12 @@ bash <(curl -Ls https://raw.githubusercontent.com/ospab/ostp/master/scripts/inst
 irm https://raw.githubusercontent.com/ospab/ostp/master/scripts/install.ps1 | iex
 ```
 
+The scripts install the stable release. A pre-release channel (`beta`, `alpha`) is chosen with `-b`: on Linux
+`bash <(curl -Ls https://raw.githubusercontent.com/ospab/ostp/master/scripts/install.sh) -b beta` (`-v VERSION` picks an exact release),
+on an installed `ostp` with `ostp update -b beta`. `ostp -V` prints the version with its channel, for example `0.5.0-beta.1`.
+To remove OSTP: `ostp uninstall` keeps the config, `ostp uninstall --purge` deletes the config, certificates and every user key too,
+`--yes` skips the question.
+
 **Apps:** the desktop client (Windows, Linux, macOS) and the Android app (arm64, armv7) are on the [Releases](https://github.com/ospab/ostp/releases) page,
 next to prebuilt `ostp` binaries for Windows, Linux (x86, x64, ARM, MIPS, RISC-V), macOS and FreeBSD.
 
@@ -50,6 +56,10 @@ ostp links           # ostp://... links for every user
 ostp links qr        # the same as QR codes, one user at a time
 ```
 
+A new install creates the server's own key. Its public half is the `pk=` part of every link: the client checks the server against it and speaks
+protocol v6. A link without `pk=` speaks the older protocol v5, where the server is not verified. A server updated from 0.4.x has no key until you run
+`ostp key server new` (links issued before stop working); `ostp key legacy on|off` keeps or ends support for clients older than 0.5.0.
+
 **2. On the client**, paste a link into the desktop or Android app, or use the command line:
 
 ```bash
@@ -63,7 +73,7 @@ Keep the link in quotes, or the shell will cut it at `&` or `?`.
 
 ```bash
 ostp cert issue --domain vpn.example.com   # HTTPS and a Let's Encrypt certificate, TLS carrier on 443
-ostp sub enable                            # per-user subscription links the apps can refresh
+ostp sub enable                            # per-user subscription links the apps can refresh (a random id per user)
 ostp panel enable                          # web panel and management API
 ostp dns enable                            # filtering DNS for connected clients
 ```
@@ -75,16 +85,27 @@ Details: [Domains and TLS](docs/en/tls.md), [Server](docs/en/server.md), [Client
 ## What is in it
 
 - Three carriers under OSTP: UDP, UoT (UDP over TCP) and TLS on 443 with a real certificate, directly or behind a web server.
+- Protocol v6: the client checks the server by its key (`pk=` in the link); streams are ordered separately, so a lost packet does not hold the others;
+  the server tells a client why it ended a session (key removed or expired, limit used up, server stopping).
+- The path MTU is found automatically (over UDP), a stalled path is detected, and the server paces what it sends to what the client takes.
 - Anything that is not a valid client gets the fallback website or a decoy answer.
 - Local SOCKS5/HTTP proxy (and the Windows system proxy), or a TUN adapter (with a kill switch on Linux and macOS).
 - Domains, IP ranges and, on Windows and Linux, processes can be excluded from the tunnel.
-- When the network changes or a path stalls, the session moves to a new socket without a new handshake.
-- Per-user subscription links, a web panel with a REST API, and a filtering DNS for connected clients.
+- When the network changes or a path stalls, the session moves to a new socket without a new handshake. If the path is lost, the client reconnects
+  on its own on the same carrier; it never changes the carrier by itself, that is your choice.
+- Per-user subscription links that can be replaced without changing the key, a web panel with a REST API, and a filtering DNS for connected clients.
+- Per-key limits: traffic, expiry date and number of devices (a device id goes to the subscription server only if you turn `send_hwid` on; it is off by default).
+- A server can describe itself to its clients (name, location, contact, a text); this travels only inside the tunnel and is shown in the apps.
+- Log privacy: `strict`, `normal` (default) or `debug`; outside `debug` no log holds sites or DNS names, and client addresses are cut or tagged.
+- Cloudflare WARP as the server's exit (`ostp warp`), optional.
 - A network prober that tries every carrier against your server and locates filtering equipment by TTL.
 - The server's outgoing traffic can go through a SOCKS5 proxy by rule or leave from a chosen address.
 - Optional `.ov` sites through [overnet](https://github.com/ospab/overnet), off by default.
+- The apps manage a server over SSH (users with limits and expiry, devices, server information), warn about a profile without a server key, and ask
+  before accepting a server key that changed on a subscription refresh.
 
-The cipher suite is `Noise_NNpsk0_25519_ChaChaPoly_BLAKE2s` with ChaCha20-Poly1305 per packet; see the [specification](docs/en/specification.md).
+The handshake is `Noise_NKpsk0_25519_ChaChaPoly_BLAKE2s` in v6 (the client knows the server's key) and `Noise_NNpsk0_25519_ChaChaPoly_BLAKE2s` in v5,
+with ChaCha20-Poly1305 per packet; see the [specification](docs/en/specification.md) and [Protocol v6](docs/en/v6-design.md).
 
 ---
 
@@ -130,22 +151,24 @@ ostp [--config PATH] [COMMAND]
 | `check` | Validate the config and print a summary |
 | `start`, `stop`, `restart` | Control the `ostp` service (Linux, registered by `setup`) |
 | `status` | Whether ostp is running, since when, and the last log lines |
-| `log [-n N] [-f]` | The log: the service journal on Linux, `ostp.log` elsewhere; `-f` follows it |
+| `log [-n N] [-f]` | The log: the service journal on Linux, `ostp.log` elsewhere; `-f` follows it; `log privacy [strict\|normal\|debug]` shows or sets what it may say |
 | `connect <URL>` | Connect once with an `ostp://` link |
 | `import <URL>` | Save an `ostp://` link or a subscription URL to the config |
-| `links [qr]` | Print the users' `ostp://` links, or show them as QR codes |
-| `key` | Server key and access keys (server): status, `gen` (`--format hex\|base64`, `-n` count), `server [new]`, `legacy on\|off` |
+| `links [qr]` | Print the users' `ostp://` links, or show them as QR codes (`--all`: a code for every link) |
+| `key` | Server key and access keys (server): status, `gen` (`--format hex\|base64`, `-n` count, `--add`), `server [new]`, `legacy on\|off` |
+| `manage ...` | Users, limits and server state: text at a terminal, JSON for the apps (server). `status`, `users`, `user-add`, `user-set` (`--name`, `--limit-bytes`, `--devices`, `--expires`, `--new-sub-id`), `user-remove`, `user-devices`, `sub-ids`, `server-info`, `logs`, `restart` |
 | `cert issue\|status\|renew` | Domain, HTTPS and the Let's Encrypt certificate (server) |
 | `sub status\|enable\|disable\|set\|urls` | Subscription links (server) |
 | `panel status\|enable\|disable\|set\|passwd\|token` | Web panel and management API (server) |
 | `dns status\|enable\|disable\|...` | Filtering DNS for clients (server) |
+| `warp register\|enable\|disable\|status\|test\|...` | Cloudflare WARP as the server's exit (server) |
 | `overnet status\|install\|enable\|disable\|exit` | `.ov` sites for clients through overnet (server) |
 | `hash-password` | Hash a password for the panel config |
 | `migrate [--dry-run]` | Upgrade the config to the current format; never done automatically |
 | `update [-b stable\|beta\|alpha] [-v VERSION]` | Install another release |
 | `changelog`, `cl` | What changed in this version (`--all`, `--last N`, `--version X`, `--lang en\|ru`) |
 | `proxy-env`, `proxy-env-clear` | Shell exports for the local proxy |
-| `uninstall` | Stop the service, remove the binary and the config |
+| `uninstall [--yes] [--purge]` | Stop the service and remove the binary; the config stays unless `--purge` |
 
 The config is `/etc/ostp/config.json` on Linux and `config.json` in the current folder on Windows; `--config` picks another file. Every command has `--help`.
 
@@ -157,7 +180,7 @@ Index: [docs/README.md](docs/README.md). Most used:
 
 - [Client](docs/en/client.md) and [Server](docs/en/server.md)
 - [Domains and TLS](docs/en/tls.md)
-- [Protocol specification](docs/en/specification.md), [Obfuscation](docs/en/obfuscation.md), [Architecture](docs/en/architecture.md)
+- [Protocol specification](docs/en/specification.md), [Protocol v6](docs/en/v6-design.md), [Obfuscation](docs/en/obfuscation.md), [Architecture](docs/en/architecture.md)
 - [Integrations and the management API](docs/en/integrations.md)
 - [Test protocol](docs/en/testing.md) run before each release
 - [Changelog](CHANGELOG.md)
@@ -168,10 +191,9 @@ Index: [docs/README.md](docs/README.md). Most used:
 
 ```bash
 cargo build --release     # the ostp binary: target/release/ostp
-cargo test --workspace
 ```
 
-Needs a current stable Rust. The desktop and Android apps have their own steps: [ostp-gui](ostp-gui/README.md), [ostp-flutter](ostp-flutter/README.md).
+Needs a current stable Rust. Tests and the larger builds run on GitHub Actions, not on a developer's machine ([CONTRIBUTING.md](CONTRIBUTING.md)). The desktop and Android apps have their own steps: [ostp-gui](ostp-gui/README.md), [ostp-flutter](ostp-flutter/README.md).
 How the repository is organized and how to send changes: [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ---

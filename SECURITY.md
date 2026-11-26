@@ -22,7 +22,7 @@ Bugs without a security impact (a feature not working, a crash you caused yourse
 
 Email **gvoprgrg@gmail.com** or write to **[@ospab0](https://t.me/ospab0)** on Telegram. Include:
 
-- the version (`ostp --version`, the app's About screen) and platform;
+- the version (`ostp -V`, which includes the channel, or the app's About screen) and platform;
 - what an attacker needs (network position, a valid key or not, local access);
 - steps or a proof of concept, and what you observed.
 
@@ -31,5 +31,11 @@ answer within days, not hours. You will be told when the fix ships and credited 
 
 ## Supported versions
 
-Fixes go into the next beta and the next stable release. Older releases are not patched; update with `ostp update` or from the
-[Releases](https://github.com/ospab/ostp/releases) page.
+| Version | Fixes |
+|---|---|
+| 0.5.x (protocol v6) | Yes. |
+| 0.4.x and older | No. |
+
+Fixes go into `alpha`, then the next beta and the next stable release. A server updated to 0.5.0 can keep serving 0.4.x clients
+for a while (`ostp key legacy on`), but those clients get none of the v6 protections, such as checking the server's key. Update with `ostp update`
+or from the [Releases](https://github.com/ospab/ostp/releases) page.
