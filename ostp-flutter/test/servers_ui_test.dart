@@ -163,6 +163,8 @@ void main() {
     await tester.pumpAndSettle();
     expect(find.textContaining(RegExp('64 days left', caseSensitive: false), findRichText: true), findsOneWidget);
 
+    await tester.ensureVisible(find.widgetWithText(Tab, 'Management'));
+    await tester.pumpAndSettle();
     await tester.tap(find.widgetWithText(Tab, 'Management'));
     await tester.pumpAndSettle();
     expect(find.text('Turn on the panel'), findsOneWidget);
@@ -177,6 +179,8 @@ void main() {
     addTearDown(() => panelState = {'enabled': false, 'bind': '127.0.0.1:9090', 'webpath': '', 'login': false});
     await tester.pumpWidget(MaterialApp(home: ServerScreen(prefs: await prefs(), server: _server)));
     await tester.pumpAndSettle();
+    await tester.ensureVisible(find.widgetWithText(Tab, 'Management'));
+    await tester.pumpAndSettle();
     await tester.tap(find.widgetWithText(Tab, 'Management'));
     await tester.pumpAndSettle();
     expect(find.text('Open the panel'), findsOneWidget);
@@ -188,6 +192,8 @@ void main() {
     panelState = {'enabled': true, 'bind': '127.0.0.1:9090', 'webpath': '', 'login': true};
     addTearDown(() => panelState = {'enabled': false, 'bind': '127.0.0.1:9090', 'webpath': '', 'login': false});
     await tester.pumpWidget(MaterialApp(home: ServerScreen(prefs: await prefs(), server: _server)));
+    await tester.pumpAndSettle();
+    await tester.ensureVisible(find.widgetWithText(Tab, 'Management'));
     await tester.pumpAndSettle();
     await tester.tap(find.widgetWithText(Tab, 'Management'));
     await tester.pumpAndSettle();
