@@ -8,6 +8,9 @@ Older history is on the [Releases](https://github.com/ospab/ostp/releases) page 
 
 ## [Unreleased]
 
+### Fixed
+- `ostp warp enable --rules` sent everything through WARP, not only what the rules name. It kept the `default_action` of the operator's `outbound` section, and an absent one (which the server reads as "proxy") or "proxy" meant every connection went to WARP: every site saw WARP's address, and DNS to public resolvers went through WARP's SOCKS5 UDP too, which on one server left clients with "could not resolve host". `--rules` now writes `default_action: "direct"`, and refuses a section whose only "proxy" is the default (that is `--all`). Run `ostp warp enable --rules` again to fix an existing config. The config check said an absent `default_action` meant "direct"; it now warns that it means "proxy". Tests: rules with a default of "proxy" or none come out with "direct".
+
 ### Added
 - Apps: a profile whose link has no server key (protocol v5, the server is not verified) is marked with a warning that says anyone with the key can pose as that server; connecting is not blocked.
 - Apps: a subscription refresh no longer replaces a server's key silently. When the key of a server changes or disappears, the old profile is kept and the subscription card asks whether to accept the new key or keep the old one (a key that appears where there was none, v5 to v6, is taken without asking). This is how SSH treats a changed host key: a subscription intercepted on the way can no longer swap the server unnoticed.

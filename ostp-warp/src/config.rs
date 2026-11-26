@@ -118,16 +118,24 @@ pub fn outbound_has_proxy_rule(outbound: &Value) -> bool {
 }
 
 /// The operator's own `outbound` section with its proxy replaced by WARP's;
-/// rules, default action and `send_from` stay as written. `Err` when there is
-/// nothing for `--rules` to act on.
+/// rules and `send_from` stay as written. The default action becomes
+/// "direct": "rules" means only what the rules send to the proxy goes through
+/// WARP. A default of "proxy" (or none, which the server reads as "proxy")
+/// sent everything there, so `--rules` worked as `--all`. `Err` when no rule
+/// sends anything to the proxy.
 pub fn outbound_for_rules(existing: Option<&Value>, listen: std::net::SocketAddr) -> Result<Value> {
     let existing = existing
         .filter(|o| !o.is_null())
         .ok_or_else(|| anyhow!("there is no `outbound` section: write the rules that should go through WARP first (action \"proxy\"), or use --all"))?;
-    if !outbound_has_proxy_rule(existing) {
-        bail!("the `outbound` section has no rule with action \"proxy\" and its default action is not \"proxy\": nothing would go through WARP; add the rules first, or use --all");
+    let rule_proxy = existing
+        .get("rules")
+        .and_then(Value::as_array)
+        .is_some_and(|r| r.iter().any(|x| action_is_proxy(x.get("action").and_then(Value::as_str))));
+    if !rule_proxy {
+        bail!("the `outbound` section has no rule with action \"proxy\": with --rules nothing would go through WARP; add the rules first, or use --all");
     }
     let mut o = existing.clone();
+    o["default_action"] = json!("direct");
     o["enabled"] = json!(true);
     o["protocol"] = json!("socks5");
     o["address"] = json!(listen.ip().to_string());
@@ -226,11 +234,22 @@ mod tests {
         assert!(outbound_for_rules(Some(&Value::Null), addr()).is_err());
         let none = json!({"enabled": true, "rules": [{"domain_suffix": ["a.com"], "action": "direct"}], "default_action": "direct"});
         assert!(outbound_for_rules(Some(&none), addr()).is_err());
+        // A default of "proxy" alone is "everything", which is --all, not rules.
         let default_proxy = json!({"enabled": true, "rules": [], "default_action": "proxy"});
-        assert!(outbound_for_rules(Some(&default_proxy), addr()).is_ok());
-        // The server reads a missing default action as "proxy".
+        assert!(outbound_for_rules(Some(&default_proxy), addr()).is_err());
         let missing = json!({"enabled": true, "rules": []});
-        assert!(outbound_for_rules(Some(&missing), addr()).is_ok());
+        assert!(outbound_for_rules(Some(&missing), addr()).is_err());
+        // Rules for the proxy with a default of "proxy" (or none, which the
+        // server reads as "proxy"): only the rules go through WARP afterwards.
+        for default in [json!("proxy"), Value::Null] {
+            let mut mixed = json!({"enabled": true, "rules": [{"domain_suffix": ["youtube.com"], "action": "proxy"}]});
+            if !default.is_null() {
+                mixed["default_action"] = default;
+            }
+            let o = outbound_for_rules(Some(&mixed), addr()).unwrap();
+            assert_eq!(o["default_action"], "direct");
+            assert_eq!(o["rules"], mixed["rules"]);
+        }
         let only_block = json!({"rules": [{"ip_cidr": ["10.0.0.0/8"], "action": "block"}], "default_action": "direct"});
         assert!(outbound_for_rules(Some(&only_block), addr()).is_err());
     }

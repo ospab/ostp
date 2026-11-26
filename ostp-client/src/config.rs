@@ -430,9 +430,18 @@ impl UnifiedConfig {
                 }
                 if let Some(outbound) = &cfg.outbound {
                     if outbound.enabled {
-                        let action = outbound.default_action.as_deref().unwrap_or("direct");
-                        if action == "direct" && outbound.rules.is_empty() {
-                            println!("[warn] outbound proxy is enabled, but default_action is 'direct' and there are no rules: nothing will use the proxy. Set default_action to 'proxy' or add rules.");
+                        // The server reads an absent default_action as "proxy"
+                        // (`parse_outbound_action`); this used to say "direct",
+                        // and operators wrote rules for the proxy expecting the
+                        // rest to go direct while everything went through it.
+                        match outbound.default_action.as_deref() {
+                            None => println!(
+                                "[warn] outbound proxy is enabled and default_action is not set: everything not matched by a rule goes through the proxy. Write default_action \"direct\" if only the rules should use it."
+                            ),
+                            Some("direct") if outbound.rules.is_empty() => println!(
+                                "[warn] outbound proxy is enabled, but default_action is 'direct' and there are no rules: nothing will use the proxy. Set default_action to 'proxy' or add rules."
+                            ),
+                            _ => {}
                         }
                     }
                 }
