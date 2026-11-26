@@ -14,6 +14,12 @@ OSTP (Ospab Stealth Transport Protocol) is an encrypted tunnel written in Rust o
 8. **ostp-ssh**: The SSH client both apps use to install OSTP on a server and manage it: password or key sign-in, a pinned host key, commands as root, a local port forward to the web panel, and the saved-servers list with sealed secrets (see [`integrations.md`](integrations.md#your-own-server-from-the-apps)).
 9. **ostp**: The unified CLI binary — runs the engine in server, client, or relay mode, and hosts the `setup`/`init`/`key`/`links`/`connect`/`import`/`migrate`/`update`/`cert`/`sub`/`panel`/`dns`/`overnet`/`manage`/`changelog` subcommands (see [`client.md`](client.md) / [`server.md`](server.md)).
 
+10. **ostp-warp**: Cloudflare WARP as an optional exit of the server: a user-space WireGuard client with a TCP/UDP stack, reached through a local SOCKS5 proxy that the server's `outbound` section points at (see [`warp-design.md`](warp-design.md)).
+
+`third_party/netstack-smoltcp` is the vendored user-space TCP/IP stack the client's TUN mode uses (a copy of the crate with `TcpStream::abort`). `ostp-gui/src-tauri` is a separate Cargo workspace, and `ostp-brain`, `ostp-prober` and `ostp-lab` are excluded from the workspace (see the root `Cargo.toml`).
+
+Inside `ostp-core` besides the state machine: the v6 handshake (`crypto/handshake_v6.rs`), v6 frames (`framing/frame.rs`), stream ids (`streams.rs`), path MTU discovery (`pmtu.rs`), stall detection (`stall.rs`), the congestion controller (`congestion.rs`), key expiry and server key helpers (`access_keys.rs`, `server_key.rs`), share links and subscription documents (`share_link.rs`, `subscription.rs`) and log privacy (`logpriv.rs`).
+
 Two further application shells consume these crates but live outside the Cargo workspace: **ostp-gui** (a Tauri desktop app for Windows and Linux) and **ostp-flutter** (the cross-platform mobile app, Android via `ostp-jni`). See [`integrations.md`](integrations.md).
 
 ---
@@ -46,9 +52,23 @@ A complete inner record (`FramedPacket`) is `[12-byte FrameHeader] + [N-byte Pay
 
 ---
 
+## Protocol v6 on the wire (0.5.0)
+
+A profile with the server's public key (`pk`) speaks v6; one without it speaks the v5 described above, which a server keeps answering while `accept_v5` is on. Both are in the code. Full layouts: [`specification.md`](specification.md), design: [`v6-design.md`](v6-design.md), [`v6-session-design.md`](v6-session-design.md).
+
+- **Handshake.** Noise `NKpsk0` (the client knows the server's static key). The datagram is `[nonce:12][tag:4][ChaCha20-masked body]`; the body is `[session_id:4][noise_len:2][Noise message][padding]`. Nothing of the Noise message is visible, and the 4-byte tag lets a server with many keys find the right one with one HMAC per key.
+- **Frame header v2**, 16 bytes inside the AEAD: `version(1)=2`, `kind(1)`, 2 random bytes, `stream_id` (u32), `stream_seq` (u32), `payload_len` (u16), `pad_len` (u16). Data headers on the outside stay masked as in v5 (see [`obfuscation.md`](obfuscation.md)).
+- **More frame kinds, v6 only:** `7 Datagram` (an unsequenced payload, used for UDP) and `8 Abandon` (the sender says some nonces will never arrive and, with a reason, that a stream is reset). `Close` carries a reason and a short text; reason 6 is an expired key. A frame kind or message a peer does not know, once authenticated, is skipped.
+- **Session layer.** The client opens odd stream ids, the server even ones; an id is never reused; at most 1024 streams are open. Order is kept per stream (`stream_seq`), so a lost frame holds back only its own stream. Each stream has its own flow-control window; `Fin` ends one direction and `Close` aborts.
+- **Features.** After the handshake the sides exchange a bit set; bit 2 means the server can send its info (`InfoRequest` and `ServerInfo`, only inside the tunnel).
+- **Automatic MTU** (RFC 8899 style, v6 over UDP): each side probes what it sends, from 1200 bytes up the ladder 1280, 1350, 1400, 1452.
+- **Carriers.** On TCP and TLS nothing is lost, so nothing is resent and the stall detector only logs. The server keeps the queue toward such a client to about 100 ms at its measured drain rate, asks for BBR and `TCP_NOTSENT_LOWAT` on the socket (Linux), and every sender to a client is held to a closed-loop budget (congestion window plus pacing, counting frames still queued).
+
+---
+
 ## Multiplexing: `RelayMessage`
 
-A `Data` frame's payload is a tag-length-value `RelayMessage`: `Connect(addr)`, `Data(bytes)`, `Close`, `ConnectOk`, `Error(msg)`, `Ping`/`Pong(ts)`, `UdpAssociate`, `UdpData(addr, bytes)`, `KeepAlive`. This is the layer that actually multiplexes many proxied TCP connections and UDP flows over one encrypted session — `stream_id` in the inner `FrameHeader` is not yet used to demultiplex; sequencing of a given proxied connection is implicit in the order of its `Connect`/`Data`/`Close` messages.
+A `Data` frame's payload is a tag-length-value `RelayMessage`: `Connect(addr)`, `Data(bytes)`, `Close`, `ConnectOk`, `Error(msg)`, `Ping`/`Pong(ts)`, `UdpAssociate`, `UdpData(addr, bytes)`, `KeepAlive`. This is the layer that actually multiplexes many proxied TCP connections and UDP flows over one encrypted session — in v5 the `stream_id` in the inner `FrameHeader` is not used to demultiplex (v6 does, see above); sequencing of a given proxied connection is implicit in the order of its `Connect`/`Data`/`Close` messages.
 
 ---
 
@@ -68,6 +88,16 @@ A `Data` frame's payload is a tag-length-value `RelayMessage`: `Connect(addr)`, 
 ## Congestion control
 
 `ostp-core::congestion` keeps a window and an RTT estimate per session. Slow start begins at 32 packets. A single loss there costs a mild cut and slow start goes on; 3 or more losses inside 500 ms, or a smoothed RTT of twice the minimum, end it. After that the window follows CUBIC (RFC 9438). A smoothed RTT of four times the minimum counts as a standing queue and the window is reduced to drain it. Sending is paced at `cwnd / min_rtt`, and the window is capped at 8,192 packets. RTO follows RFC 6298 (SRTT/RTTVAR) with Karn's rule: a retransmitted frame is never used as an RTT sample.
+
+---
+
+## Data flow
+
+1. A program connects to the local proxy (SOCKS5 or HTTP) or, in TUN mode, its packets reach the TUN adapter and `netstack-smoltcp` rebuilds the TCP and UDP flows. `exclude` rules decide whether a flow goes direct.
+2. The client turns each flow into a stream: `Connect` or `UdpAssociate`, then `Data`/`UdpData`, as `RelayMessage`s in `Data` frames (`Datagram` frames for UDP in v6).
+3. `ostp-core` frames, pads and encrypts them, applies the ARQ, congestion and flow control, and masks the header. The carrier (UDP, or UoT with optional TLS) sends the bytes. The client never changes the carrier by itself.
+4. The server (`dispatcher.rs`) finds the session by `session_id`, decrypts, and `relay` opens the target (directly, through `outbound` or through WARP), subject to `target_policy`. DNS queries to the server's resolver go to `ostp-dns`.
+5. Replies go back the same way. The bridge in `ostp-client` watches the session (silence, moves, reconnects, see [`client.md`](client.md)).
 
 ---
 

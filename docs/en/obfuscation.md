@@ -1,7 +1,7 @@
 # OSTP Traffic Obfuscation
 
 ## Goal
-OpenVPN and WireGuard have recognizable handshakes or fixed headers. OSTP masks every byte from the first one, so that DPI sees nothing but random-looking data. The limits of that claim are stated below.
+OpenVPN and WireGuard have recognizable handshakes or fixed headers. OSTP masks every byte from the first one, so that DPI sees nothing but random-looking data. (In a v5 handshake the Noise ephemeral key was visible at a fixed offset; the v6 handshake closes that, see *Protocol v6*.) The limits of that claim are stated below.
 
 ---
 
@@ -14,11 +14,12 @@ OSTP is designed so that it stays secure when everything about it is known: this
 | The user's access key (128 random bits) | Server config, the user's link | Everything below: the Noise PSK, the header-masking key, padding and junk markers are derived from it (see *Secret derivation*) |
 | Noise ephemeral keys | Memory, per session | Forward secrecy of each session's traffic keys |
 | The upgrade path (`ws_path`) | Server config, the user's link | Only hides the OSTP endpoint on a web server from scanners; the connection behind it is still authenticated by the access key |
+| The server's private key (v6) | Server config (`protocol.server_key`) | That only this server can answer a v6 handshake. Its public half, `pk`, is **public**: it is in every share link |
 | Panel login, API token, subscription tokens | Server config | Access to management, not to traffic |
 
 Public by design, and published here on purpose:
 
-- **Algorithms:** Noise `NNpsk0_25519_ChaChaPoly_BLAKE2s`, ChaCha20-Poly1305 (RFC 8439), HKDF-SHA256 (RFC 5869), HMAC-SHA256 (RFC 2104), TLS 1.2/1.3 through rustls.
+- **Algorithms:** Noise `NKpsk0_25519_ChaChaPoly_BLAKE2s` (v6) and `NNpsk0_25519_ChaChaPoly_BLAKE2s` (v5), ChaCha20-Poly1305 (RFC 8439), HKDF-SHA256 (RFC 5869), HMAC-SHA256 (RFC 2104), TLS 1.2/1.3 through rustls.
 - **Constants:** the protocol version, frame layouts, padding ranges, timers. The string `258EAFA5-E914-47DA-95CA-C5AB0DC85B11` in `ostp-core/src/http_upgrade.rs` is the WebSocket GUID from RFC 6455 §1.3. Every browser and web server has it; the WebSocket handshake through nginx, Apache or Caddy does not work without it. It is not a key and hides nothing.
 - **Code paths:** how the server tells OSTP apart from other traffic, how TTL-desync decoys work, how the prober probes.
 
@@ -32,7 +33,23 @@ Obscurity is used only on top of real security, never instead of it: the secret 
 
 ---
 
-## Secret derivation
+## Protocol v6 (0.5.0)
+
+v6 changes the handshake and the keys. Everything in the v5 sections below that is not mentioned here stays as it is for a v5 profile, and the data-packet header mask is the same in both.
+
+**Derivation.** `PRK = HKDF-Extract(salt = "ostp v6", IKM = access_key)` and each output is `HKDF-Expand(PRK, label)` under its own public label: `ostp v6 obfuscation` (8 bytes), `ostp v6 psk` (32), `ostp v6 handshake padding` (2, mapped to the same padding range as v5), `ostp v6 handshake mask` (32) and `ostp v6 handshake tag` (32). The labels are public; the access key is the only secret input. There is no version byte in the IKM; the Noise prologue `ostp v6` and the different labels separate v6 from v5.
+
+**Handshake datagram.** `[nonce:12][tag:4][body XOR keystream]`, where the nonce is random, the keystream is ChaCha20 under a key from the handshake-mask key and the direction, and the body is `[session_id:4][noise_len:2][Noise message][random padding]`. In v5 the Noise message was sent as it is, so the ephemeral X25519 key sat in clear at a fixed offset (32 bytes that always form a curve point with the top bit zero). In v6 no byte of the Noise message is visible.
+
+**The 4-byte tag** is the first 4 bytes of `HMAC-SHA256(tag_key, direction || nonce)`. It exists so a server with many keys finds the right one with one HMAC per key instead of one curve operation per key. It is not authentication: it is 32 bits, so a random datagram matches a given key's tag with probability 2^-32, and a captured datagram replays with its tag. Authentication is the Noise `NKpsk0` handshake behind it, which needs the PSK (from the access key) and, for the server's reply, the server's private key.
+
+**The 8-byte obfuscation key** masks the outer header of data datagrams, `session_id || nonce`, exactly as described under *Header masking*. It is 64 bits, derived from a 128-bit access key, so against someone who captured traffic and could search 2^64 keys it is a weaker barrier than the access key itself. What it protects is only that the header looks random; what it hides (a session id and a counter) is not secret, and the header is authenticated as AEAD associated data. Traffic confidentiality and integrity rest on the Noise session keys, not on this mask.
+
+**The server's key.** Noise `NKpsk0` makes the client verify the server: only the holder of the private key behind `pk` can complete the handshake, so a stranger who knows an access key cannot pose as the server. `pk` is not secret and is not a substitute for the access key; a v5 profile has no `pk`, and there the server is not verified.
+
+---
+
+## Secret derivation (v5)
 
 Every protocol secret — the obfuscation key, the Noise PSK, the handshake padding range, and the per-key junk marker (see below) — is derived from the shared `access_key` via a single HKDF-SHA256 pass, domain-separated by a trailing info byte per output:
 

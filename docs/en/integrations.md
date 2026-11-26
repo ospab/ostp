@@ -9,11 +9,16 @@
 - **Polling**: metrics, logs and the output of server commands are read through plain getter calls; there is no push channel.
 - **Split tunneling** is per app (Android's `VpnService` allow/deny lists); process-name exclusions do not exist on Android.
 
+- **Exports** (`Java_net_ostp_client_OstpClientSdk_*`, declared as `external fun` in `OstpClientSdk.kt`): `startClient`, `stopClient`, `getMetrics`, `getLogs`, `addLog`, `notifyNetworkChanged`, `updateExclusions`, `runProberMatrix`, `runProberTtlScan`, `runProberDpiBattery`, `fetchSubscription` (with the device ID fields, see below), `buildTag`, `checkForUpdates`, `getServerInfo`, `requestServerInfo` and `serversCall`. `nativeStartClient`, `nativeStopClient`, `nativeGetMetrics` and `nativeGetLogs` are the Rust names behind the first four.
+- **Metrics** carry the path RTT and the queue delay as separate numbers (see [client.md](client.md#rtt-and-queue-delay)).
+
 ## Desktop GUI
 `ostp-gui` is a Tauri v2 desktop application (Windows and Linux) that drives the same client engine in-process for proxy mode and through a helper for TUN mode. It has one dark theme and two buttons in the top bar: the network prober and settings.
 
 ### TUN privileges
 Creating a TUN adapter needs elevated rights, and the app should not run elevated. TUN setup is therefore done by `ostpd`, a small process the app starts and controls over a local command channel (start and stop, with a config and token). Only the helper runs elevated (UAC on Windows, polkit/pkexec on Linux). The actual adapter creation code lives in the shared `ostp-tun` crate, used by both the helper and the CLI's own native TUN path (see [`client.md`](client.md)).
+
+The helper's command channel is a TCP socket on `127.0.0.1` (port and token come in a single-use file given with `--args-file`; the helper refuses to run without a token and exits if the app does not connect within 60 s). Each line in either direction is one JSON object. The app sends `start` and `reload` (each with the client config and the token), `stop` and `info` (ask the server for its information again); a wrong token is answered with an error. The helper sends `status`, `metrics` (bytes sent and received, RTT, queue delay), `log`, `error` and `server_info`. When the app disconnects, the helper stops the tunnel and exits. On Windows the app starts the helper through a Scheduled Task that is created once (one UAC prompt) and reused, and falls back to a direct elevated launch when the task is missing.
 
 ### Updates
 The app checks GitHub for a newer stable or beta release when it opens (this can be turned off in settings) and on "Check for updates now". It only tells the user; nothing is downloaded until they press "Update now". Then the app downloads its own build from the release, checks it against the SHA-256 that GitHub publishes for every release file (no hash or a different one: nothing is installed), stops the tunnel and installs it:
@@ -22,6 +27,8 @@ The app checks GitHub for a newer stable or beta release when it opens (this can
 - Windows portable, Linux and macOS: the files next to the app (`ostp-gui`, `ostpd`, `wintun.dll`) are replaced and the app restarts. The old files are renamed to `.old` first, put back if anything fails, and removed on the next start. The folder has to be writable by the user.
 
 If the install fails, the dialog shows why and offers the release page instead.
+
+The update check offers the newest stable release and, if it is newer than that, the newest beta. Alpha releases are never offered. The build's own channel comes from the release state committed with each release, not from the version number.
 
 ### Protocol version in a link (0.5.0)
 A link or subscription entry may carry `pk=<base64url>`: the server's static public key, 32 bytes, 43 characters without padding. A profile with `pk` speaks protocol v6 and the client checks the server by that key; a profile without it speaks v5. A link whose `pk` is not valid base64url of exactly 32 bytes is refused, not read as a v5 profile. An app keeps `pk` on the profile and writes it back when the profile is shared. The prober commands take the same value as an optional `server_pk`. A v6 profile never falls back to v5 by itself; if the server does not answer, the error says the server is older than 0.5.0 or its key was replaced, and the link has to be reissued.
@@ -60,6 +67,13 @@ A server sends its info to a connected client only inside the tunnel (see [speci
 
 A key that has expired is closed by the server with reason 6; the stop reason the apps show says that the access key has expired and to ask the server owner to extend it.
 
+### Profile lists, the information window and trust warnings
+
+- **Lists.** Without subscriptions the profiles are one flat list. With subscriptions, each subscription is a folding group of its profiles and the profiles added by hand are one more group. A search field (name and server) appears once profiles and subscriptions together number 9 or more.
+- **Information window** (the *i* button): the operator's section (shown with "Not given by the operator" for empty fields), the server (version, carriers, log privacy, IPv6, DNS filtering) and the user's key (traffic used and limit, expiry, device limit). The data comes from the tunnel, never from the subscription document, and the app keeps the last copy with the subscription, so the window also works offline. A server that does not send information is said not to.
+- **No server key.** A profile without `pk` (protocol v5) is marked with a warning: anyone who has the key can pose as that server. Connecting is not blocked.
+- **Key pinning.** A subscription refresh does not replace a server's key silently. The server is the same by host, port and carrier. A new key where there was none (v5 to v6) is taken without asking. A different key, or none any more, keeps the old profile and the subscription card asks whether to accept the new key or keep the old one; a key already refused is not asked about again.
+
 ## Your own server from the apps
 
 Both apps can install OSTP on a VPS and manage it afterwards, for people who have bought a server and do not want to learn Linux. The SSH work is done by the `ostp-ssh` crate, shared by the desktop app (Tauri commands in `ostp-gui/src-tauri/src/servers.rs`) and Android (`serversCall` in `ostp-jni`).
@@ -74,6 +88,8 @@ Both apps can install OSTP on a VPS and manage it afterwards, for people who hav
 - *Connection*: UDP/TCP port, TLS on 443 with the domain and certificate expiry, getting a certificate (`ostp cert issue`), subscriptions on or off.
 - *DNS*: the server's DNS filter (block lists, safe search), shown from `ostp manage dns`. Switches for the filter, the takeover (the server answers every DNS query of its clients, whichever resolver they ask; by default it answers only queries sent to its own address, 10.1.0.1), blocking encrypted DNS (DoT/DoH, which has an effect only while the takeover is on) and safe search, and *Update lists*. The upstream resolvers, the lists with their state and the counts of rewrites and own rules are read-only here (change them in the web panel). Each change asks first, because the service restarts and connected clients drop for a few seconds. A server whose OSTP is too old for `manage dns` is told so, and nothing else is offered.
 - *Management*: the web panel (turn on with a sign-in, open, turn off), the server log, the SSH host key, rename, reboot, uninstall OSTP, forget the server.
+
+*Users* also edit limits in one write: traffic limit, device limit (`max_devices`), expiry (`expires_at`, a date or a number of days), and give a user a new random subscription link (the old one stops working). The devices that fetched a user's subscription are listed (a device is removed in the web panel). The app runs only `ostp manage` subcommands from a fixed list (`status`, `users`, `user-add`, `user-set`, `user-remove`, `user-rename`, `user-limit`, `user-devices`, `dns`, `server-info`, `logs`, `restart`) and a fixed set of actions (update, restart, reboot, uninstall, panel, certificate, subscriptions, overnet, DNS switches).
 
 Changes that restart the service are refused while this device's VPN goes through the same server, since the answer would never arrive.
 

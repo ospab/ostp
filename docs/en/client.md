@@ -2,6 +2,32 @@
 
 The client takes your applications' traffic, sends it through an encrypted session to the OSTP server and keeps that session alive. It runs as a background process or service (`ostp`, the desktop app, the Android app).
 
+## Config file
+
+The client section of `config.json` (`"mode": "client"`). Fields not listed here are ignored.
+
+| Field | Meaning |
+|---|---|
+| `server` | `host:port` of the server |
+| `access_key` | the user's access key |
+| `server_pk` | the server's static public key (base64url, 43 characters), the link's `pk`. With it the profile speaks protocol v6 and the client checks the server; without it, v5 (see [Server key](#server-key-and-protocol-version)) |
+| `mtu` | `"auto"` (default) or bytes; see *Packet size* |
+| `socks5_bind` | local proxy address, default `127.0.0.1:1088` |
+| `tun` | `enable` (TUN instead of proxy mode), `dns` (resolver the TUN mode uses), `kill_switch`. `stack` is read but there is only one stack (`netstack-smoltcp`), so it changes nothing. `wintun_path` and `ipv4_address` are not read; `ostp migrate` deletes them |
+| `carrier` (old name `transport`) | what lies under OSTP; see *Carriers* |
+| `exclude` | what bypasses the tunnel; see *Exclusions* |
+| `mux` | optional extra sessions; see *Multiplexing* |
+| `log` | `privacy`: `strict`, `normal` (default) or `debug`; see *Privacy of logs* |
+| `debug` | the old switch; `true` means `log.privacy: "debug"` when `log.privacy` is absent |
+| `send_hwid` | send a device ID when fetching a subscription; `false` when absent |
+| `gui` | kept for the apps, not read by the engine |
+
+With `tun.enable` the client runs in TUN mode, otherwise in proxy mode.
+
+## Server key and protocol version
+
+A profile with `server_pk` speaks protocol v6: the handshake is Noise `NKpsk0`, so only the holder of the server's private key can answer, and the client checks the server by that key. A `server_pk` that is not valid base64url of 32 bytes is an error, never a silent v5 profile. A profile without it speaks v5 (`NNpsk0`), where the server is not verified. The client never switches between the two by itself; if a v6 server does not answer, the error says the server is older than 0.5.0 or its key was replaced. See [specification.md](specification.md).
+
 ## Taking traffic
 
 **Local proxy.** One TCP port (`socks5_bind`, default `127.0.0.1:1088`) speaks both protocols and tells them apart by the first byte: `0x05` is SOCKS5 (RFC 1928); anything else is an HTTP proxy (`CONNECT host:port` and plain `GET http://...`).
@@ -32,14 +58,28 @@ There is no STUN/TURN client. Strict NATs are handled by roaming on `session_id`
 
 The client does not switch carrier or server on its own; that is the user's choice. Within one carrier it recovers like this:
 
-- When a session has heard nothing authenticated from the server for 10 seconds (or two keepalive intervals, if longer), it moves to a new socket of the same carrier, without a new handshake.
-- If the moved session gets no answer within a few round trips, the client checks whether the server answers at all with a full handshake to the same server and carrier. While it does not (the network is down), the session and every open app connection are kept, and the tries alternate between moving the session again and a handshake, after 1, 2, 5, 10, 20 and then every 30 seconds, until one succeeds or the user stops the tunnel. When the network comes back, the kept session is moved and the connections continue; they are reset only if the server no longer knows the session (it keeps an idle one for 10 minutes; the client gives it up after 5).
+- When a session has heard nothing authenticated from the server for 10 seconds (or two keepalive intervals, if longer), it moves to a new socket of the same carrier, without a new handshake. With several sessions (`mux`) the quietest one counts.
+- If the moved session gets no answer within 4 s or four in-tunnel ping round trips, whichever is longer (at most 30 s), the client checks whether the server answers at all with a full handshake to the same server and carrier. While it does not (the network is down), the session and every open app connection are kept, and the tries alternate between moving the session again and a handshake, after 1, 2, 5, 10, 20 and then every 30 seconds, until one succeeds or the user stops the tunnel. When the network comes back, the kept session is moved and the connections continue; they are reset only if the server no longer knows the session (it keeps an idle one for 10 minutes; the client gives it up after 5).
 - After an outage both ends start over on the path (window, round-trip time) and resend what was lost at once, instead of climbing back from the small window the outage left.
 - In proxy mode without the kill switch, the system proxy is released after 45 seconds without a connection so the computer keeps internet access, and set again when the tunnel is back. With the kill switch on, it stays set.
 - On resume from sleep, or after a network change, recovery starts at once instead of waiting for the timers.
 - A first connection that fails (wrong key, address or carrier) is not retried: the tunnel stops and shows the error.
 
 Ordinary TCP errors (`ConnectionReset`, `BrokenPipe`, `UnexpectedEof`) are not written to the log.
+
+Inside a session there is a second, separate check for lost data: if data is in flight and no acknowledgement makes progress for `max(4 x SRTT, 1 s)`, the oldest unacknowledged frame is resent at once. It never reconnects or changes the carrier. On a TCP or TLS carrier nothing is lost on the way and nothing is resent; there a stall is only counted and logged, after 5 s of silence from the server with data queued.
+
+## RTT and queue delay
+
+The apps and `ostp` show two numbers. The RTT is the path's own round trip, measured from acknowledgements by the congestion controller; with several sessions, the lowest. The queue delay is how much longer the in-tunnel ping (`Ping`/`Pong`, which waits behind queued data) takes than that RTT, never below zero. The status line shows `queue=` only when it is above 200 ms. A move leaves the sessions without a sample for a while; the last RTT stays until a new one comes.
+
+## Server information
+
+After each connection, if the server says it supports it, the client asks for the server's information (operator, server, the user's key: usage, limit, expiry, device limit). It travels only inside the tunnel. `ostp_client::app::server_info()` returns the latest JSON and `request_server_info()` asks again; the apps show it in the information window (see [integrations.md](integrations.md#server-info-and-key-expiry)). A key that has expired is closed by the server with reason 6, and the client says so.
+
+## Updates
+
+`ostp update` re-runs the install script for a channel (`--branch stable|beta|alpha`, `--version` for an exact release); `ostp -V` shows the installed version with its channel. The apps check GitHub for a newer stable or beta release (never alpha) and install it only when the user presses the button (see [integrations.md](integrations.md#updates)).
 
 ## Device ID for subscriptions
 
@@ -49,7 +89,7 @@ A server can limit the devices of a subscription (see [tls.md](tls.md), *Device 
 "send_hwid": true
 ```
 
-Only `ostp import https://…/sub/…` and the apps' subscription fetch use it, and only at that moment; the tunnel never sends it. What goes out is the headers `x-hwid`, `x-device-os` (for example `Windows 11`, `Linux`, `macOS`, `Android 14`) and `x-device-model` (the CPU architecture on a computer, `Build.MODEL` on Android; never the computer's name). `x-hwid` is `hex(HMAC-SHA256(key = the system's machine identifier, message = "ostp-hwid:" + the server's host))` cut to 32 characters. The machine identifier is `MachineGuid` on Windows, `IOPlatformUUID` on macOS, `/etc/machine-id` on Linux and `ANDROID_ID` on Android; it is the HMAC key and is never sent or logged. With `send_hwid` off, `ostp import` of a subscription that limits devices stops with a message that says how to turn it on.
+Only `ostp import https://…/sub/…` and the apps' subscription fetch use it (`ostp_client::subscription::fetch_with_device`), and only at that moment; the tunnel never sends it. What goes out is the headers `x-hwid`, `x-device-os` (for example `Windows 11`, `Linux`, `macOS`, `Android 14`) and `x-device-model` (the CPU architecture on a computer, `Build.MODEL` on Android; never the computer's name). `x-hwid` is `hex(HMAC-SHA256(key = the system's machine identifier, message = "ostp-hwid:" + the server's host))` cut to 32 characters. The machine identifier is `MachineGuid` on Windows, `IOPlatformUUID` on macOS, `/etc/machine-id` on Linux and `ANDROID_ID` on Android; it is the HMAC key and is never sent or logged. With `send_hwid` off, `ostp import` of a subscription that limits devices stops with a message that says how to turn it on.
 
 ## Privacy of logs
 
