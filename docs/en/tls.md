@@ -76,7 +76,7 @@ The setup wizard (`ostp setup`, server modes) offers the same step at the end.
 | Command | What it does |
 |---|---|
 | `ostp cert status` | domain, frontend, issuer, expiry, next renewal |
-| `ostp cert renew [--force]` | renew now |
+| `ostp cert renew [--force]` | renew now; `--force` also when it is not due yet |
 | `ostp links` | per key: the TLS link on the domain and the UDP link |
 | `ostp uninstall` | also removes the site it added to nginx/apache/caddy |
 
@@ -172,7 +172,7 @@ ostp sub urls [number|name|key]       # users' subscription URLs
 
 The path: when `ostp sub enable` turns subscriptions on and the config names no path, it writes a random one, `/` and 10 characters of `[a-z0-9]`, and prints it, so the URL does not tell a scanner where to look. `--path` sets one of your own. A config that already has a path keeps it, `/sub` included, and a config that serves subscriptions without a `path` keeps the default `/sub`: URLs in use never change on their own. `ostp init` writes a random path into a new config.
 
-Each command changes exactly what it names, keeps a copy of the config in `config.json.bak` and does not restart the service: changes apply after `systemctl restart ostp`. When nginx, apache or caddy holds 443, the subscription path must be forwarded to OSTP. `ostp sub` does not touch the web server on its own: it prints the block to add, and with `--vhost` it rewrites the site OSTP created (config test first, rollback on failure).
+Each command changes exactly what it names, keeps a copy of the config in `config.json.bak` and restarts a running service to apply it (`--no-restart` skips that). When nginx, apache or caddy holds 443, the subscription path must be forwarded to OSTP. `ostp sub` does not touch the web server on its own: it prints the block to add, and with `--vhost` it rewrites the site OSTP created (config test first, rollback on failure).
 
 `ostp links` and `ostp links qr` print the URL of every key too, and the web panel shows it in the Share dialog.
 
@@ -200,6 +200,6 @@ The record is `devices.json` next to the config (mode 0600), keyed by a hash of 
 
 The desktop and Android apps and `ostp import` send the ID only when the owner turned it on (*Send a device ID to subscriptions*, or `send_hwid` in the client config; see [integrations.md](integrations.md)).
 
-The limit applies to fetching the subscription. Someone who copies the key from a link into another app is not stopped by it; a check at the handshake needs a protocol change and is planned for protocol v6.
+The limit applies to fetching the subscription. Someone who copies the key from a link into another app is not stopped by it: the handshake does not check the device limit (the server only reports the limit to the client inside the tunnel).
 
 Clients: in the Android app and the desktop GUI, import also takes an `https://` subscription URL (typed, from the clipboard or by QR). The subscription gets a card with usage and an update button, and its profiles are rewritten on every update. CLI: `ostp import https://…/sub/…`.

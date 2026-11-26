@@ -42,12 +42,75 @@ Sessions are tracked by `session_id`, not by address. When a frame that decrypts
 
 ---
 
+## Configuration reference
+
+The server's `config.json` (`/etc/ostp/config.json` after the install script; `-c PATH` picks another). Fields that are not listed are ignored: `ostp migrate` warns about them. Every `ostp` command that changes the file validates it first and keeps the previous copy as `config.json.bak`. The running server rereads `access_keys` and `server_info` from the file by itself within a few seconds; everything else is read at start.
+
+| Field | Meaning and default |
+|---|---|
+| `mode` | `"server"`. A relay node has `"relay"` (see [Relay node](#relay-node)) |
+| `listen` | Required. One address (`"0.0.0.0:50000"`) or an array. UDP and TCP (UoT) share the address |
+| `bind_ip` | Local source address for outgoing connections. Absent: the system chooses |
+| `access_keys` | Required, at least one entry (below) |
+| `domain` | Public name used in share links and subscriptions, with or without TLS. A bare host name |
+| `protocol` | `server_key`: the server's static private key (secret, never printed; made by `ostp key server new`). `accept_v5`: `true` by default; `false` refuses clients older than 0.5.0 and links without `pk`. Ignored while there is no `server_key`. See [Keys](#keys-ostp-key) |
+| `server_info` | What the server tells its clients, see [Server info](#server-info) |
+| `log` | `{ "privacy": "strict" or "normal" or "debug" }`, default `normal`, see [Privacy of logs](#privacy-of-logs-ostp-log-privacy) |
+| `debug` | The old flag. Without `log.privacy`, `true` means `debug` |
+| `api` | The management API and panel, see below. Absent: off |
+| `fallback` | The decoy listener, see [Fallback listener](#fallback-listener) |
+| `outbound` | An upstream proxy for client traffic, see [Outbound proxy](#outbound-proxy) |
+| `dns` | The filtering resolver, see [Built-in DNS](#built-in-dns-ostp-dns) |
+| `tls` | HTTPS on the domain, see [Domains and TLS](tls.md#server-configuration) |
+| `subscription` | Subscription URLs, see [Domains and TLS](tls.md#subscriptions) |
+| `overnet` | `.ov` for clients, see [overnet](#overnet-ov-for-clients-and-the-exit) |
+| `warp` | Cloudflare WARP as the exit, see [Cloudflare WARP](#cloudflare-warp-as-the-exit-ostp-warp) |
+| `local_access` | `false` by default. `true` lets clients reach the server's own services and private networks (see [What clients can reach](#4-what-clients-can-reach)) |
+| `config_version` | The schema the file was written for (currently 6); written by `ostp migrate`, never needed by hand |
+
+An `access_keys` entry is a bare key string or an object:
+
+```json
+{ "access_key": "...", "name": "alice", "limit_bytes": 107374182400,
+  "max_devices": 3, "expires_at": 1767225599, "sub_id": "0123456789abcdef0123456789abcdef" }
+```
+
+| Field | Meaning |
+|---|---|
+| `access_key` | The key itself (8 to 128 characters when you choose it with `--key`) |
+| `name` | A label for panels and `ostp links` |
+| `limit_bytes` | Traffic limit in bytes; absent: none |
+| `max_devices` | Devices that may fetch the subscription, by device ID; absent: none. See [the device limit](tls.md#device-limit) |
+| `expires_at` | When the key stops working, Unix seconds UTC; absent: never. See [Key expiry](#key-expiry) |
+| `sub_id` | The user's subscription token, 32 lowercase hex characters, unique among users. Absent: the old token, a hash of the key. See [Subscriptions](tls.md#subscriptions) |
+
+`api` fields: `enabled` (`false`), `bind` (`127.0.0.1:9090`), `token` (an empty string counts as none), `webpath` (empty: `panel`), `username` and `password_hash` (the panel sign-in). `ostp panel` writes them; see below.
+
+A wrong value stops the server at start with the field's name, and `ostp check` reports it without starting anything.
+
+### Wire versions
+
+The server speaks protocol v6 (Noise NKpsk0 with the server's static key, the `pk` in links) when `protocol.server_key` is set, and v5 next to it while `protocol.accept_v5` is `true` (the default; the transitional mode is planned to end in 0.6). Without a key it speaks v5 only, as 0.4.x did. A v5 client and a v6 client use the same port and the same access keys. The formats are in [specification.md](specification.md).
+
+### IPv6 on the server
+
+At start the server checks whether it can reach IPv6 destinations at all (an IPv6 UDP socket routed to a public address). If it cannot, it logs that and answers DNS queries for IPv6 addresses (AAAA) that come through the tunnel with an empty answer, so devices that have IPv6 use IPv4 from the start instead of connecting to addresses that reset. Apps with their own encrypted DNS are not covered. The result is part of what the server tells its clients (`server.ipv6`). The check is made once, at start.
+
+---
+
 ## Management API
 
 An optional REST API (`api.rs`), enabled via the `api` block in `config.json`, exposes server status, per-user traffic statistics, and key management for building panels/dashboards (e.g. 3x-ui-style integrations):
 
 - **Authentication**: either a static Bearer `token` (also used for relay-node federation, below), or a username/password-hash login (`POST /login`) issuing a session token — comparisons are constant-time to avoid timing side-channels. Without a sign-in (neither a token nor a username with a password hash) the API does not start at all, whatever the bind address: `127.0.0.1` is no protection, because every client reaches the server's loopback through the tunnel as `10.1.0.1`. An empty `"token": ""` counts as no token. `ostp panel enable` sets a sign-in.
-- **Endpoints** (under the configured `webpath`): `GET /server/status`, `GET`/`PUT /server/config`, `GET`/`POST /users`, `GET`/`PUT`/`DELETE /users/{key}`, `PUT /users/{key}/limit`, `POST /users/{key}/reset`, `POST /users/{key}/sub-id` (a new subscription link), `POST /users/bulk`, `GET`/`PUT /server/info`, `GET`/`POST`/`DELETE /audit`, `GET`/`PUT /router/rules`, and `GET /subscribe/{key}` (no Bearer token needed — the access key itself authenticates the request, returning a ready-to-use client config or `ostp://` share link).
+- **Endpoints**, all under `/<webpath>/api/` (`webpath` empty means `panel`):
+  - server: `GET /server/status`, `GET`/`PUT /server/config`, `GET`/`PUT /server/info`, `GET`/`PUT /router/rules`, `GET`/`POST`/`DELETE /audit`;
+  - users: `GET`/`POST /users`, `POST /users/bulk`, `GET`/`PUT`/`DELETE /users/{key}`, `PUT /users/{key}/limit`, `POST /users/{key}/reset`, `GET /users/{key}/share`, `POST /users/{key}/sub-id` (a new subscription link), `GET`/`DELETE /users/{key}/devices`, `DELETE /users/{key}/devices/{hwid}`, `POST /qr`;
+  - DNS: `GET /dns/stats`, `GET`/`DELETE /dns/log`, `GET`/`PUT /dns/settings`, `POST /dns/update`, `POST /dns/test`, `GET /dns/meta`;
+  - overnet: `GET`/`PUT /overnet`;
+  - sign-in: `POST /login`, `POST /logout`;
+  - `GET /subscribe/{key}`: no Bearer token needed, the access key itself authenticates the request; returns a ready-to-use client profile (with the server's `pk`) or an `ostp://` link.
+  - The panel itself is served at `/<webpath>/`; `/<webpath>` redirects there.
 - See the [Management API wiki page](https://github.com/ospab/ostp/wiki/Management-API) for the full request/response reference.
 
 ### Web panel: `ostp panel`
@@ -73,20 +136,21 @@ Open the panel on the server at `http://127.0.0.1:9090/<webpath>/`, from elsewhe
 
 Every 30 seconds the server writes per-user traffic to `.ostp_stats.json` next to its config (readable by root only; written to a temporary file and renamed). It is also written on a clean stop and read back on start, so traffic, and the traffic limits that depend on it, carry over restarts and updates; users no longer in the config are dropped. The DNS counters and query log are kept the same way in `.ostp_dns_activity.json` (root only, written every minute and on stop; "Clear" in the panel empties it).
 
-`ostp manage` (hidden from `--help`) prints the server's state and applies everyday changes as one JSON object, with `{"error": ...}` and exit code 1 on failure. Nothing asks questions, so it runs without a terminal: this is what the desktop and Android apps run over SSH.
+`ostp manage` prints the server's state and applies everyday changes. At a terminal it answers in text; without one, as the apps run it over SSH, it prints one JSON object, with `{"error": ...}` and exit code 1 on failure. `--json` asks for JSON at a terminal too. Nothing asks questions, so it runs without a terminal. A user change is one locked edit of the file: a change the panel made in between is not overwritten.
 
 | Command | What it does |
 |---|---|
 | `ostp manage install [--port N] [--host H] [--user NAME]` | First install: writes a server config with one user, opens the port in ufw or firewalld if one is active, registers and starts the service. On a configured server only makes sure the service runs |
 | `ostp manage status` | Version, service state, sessions, users, listen address, TLS domain and certificate, subscriptions, panel, `server_info` (what clients are told, see below), and the system: OS, load, memory, disk |
 | `ostp manage users` | Every user with links, subscription URL, traffic, limits and `expires_at` (Unix seconds or `null`) with `expired` |
-| `ostp manage user-add NAME [--key K] [--limit-bytes N] [--devices N] [--expires WHEN]`, `user-remove WHO`, `user-rename WHO NAME` | WHO is a number (as in `ostp links`), a name or a key. The running server picks up the change from the file; the last user cannot be removed |
+| `ostp manage user-add NAME [--key K] [--limit-bytes N] [--devices N] [--expires WHEN]`, `user-remove WHO`, `user-rename WHO NAME` | WHO is a number (as in `ostp links`), a name or a key; a key is tried first, then a name, then a number. A new user gets a random key (unless `--key`) and a random `sub_id`. The running server picks up the change from the file; the last user cannot be removed |
 | `ostp manage user-set WHO [--name N] [--limit-bytes N] [--devices N] [--expires WHEN] [--new-sub-id]` | Changes a user in one write; an option left out keeps its value, 0 removes a limit, `--expires never` removes the expiry, `--new-sub-id` gives a new subscription link (the old one stops working; see [tls.md](tls.md#subscriptions)) |
 | `ostp manage sub-ids [--assign-missing]` | Users whose subscription link is still a hash of the access key; with `--assign-missing` each gets a random `sub_id` and their old links stop working |
 | `ostp manage server-info [--name T] [--location T] [--contact T] [--about T \| --about-file PATH]` | Sets what the server tells its clients about itself; an option left out keeps its value, an empty one removes it |
 | `ostp manage user-limit WHO --devices N` | Limits the devices that may use the user's subscription (0 removes the limit); see [tls.md](tls.md#device-limit) |
 | `ostp manage user-devices WHO` | Devices that fetched the user's subscription, read from `devices.json` |
-| `ostp manage logs [-n N]` | The service log's last lines |
+| `ostp manage dns` | The DNS filter's settings from the config |
+| `ostp manage logs [-n N]` | The service log's last lines (200 by default) |
 | `ostp manage restart` | Restarts the service, reports whether it stayed up |
 
 `install.sh -y [-b beta] [--port N] [--host H] [--user NAME]` installs without the setup wizard and runs `ostp manage install` on a first install.
@@ -231,13 +295,26 @@ Rule syntax: `||domain^`, `@@||domain^`, `$important`, `*` in names, `/etc/hosts
 
 ## Fallback listener
 
-Every OSTP TCP listener sniffs the first byte of a connection: raw UoT is handled as always, TLS is terminated with the server's certificate when one is configured, and an HTTP request for the secret upgrade path continues as UoT (this is how nginx/apache/caddy on 443 hand clients to OSTP). Everything else is a decoy: a bare 404, or — with `fallback.enabled` — a transparent splice to `fallback.target` (e.g. a local nginx serving an ordinary site), so an active prober sees a normal website. `fallback.listen` adds one more such listener. Domains, certificates and the built-in HTTPS frontend are covered in [Domains and TLS](tls.md).
+Every OSTP TCP listener sniffs the first byte of a connection: raw UoT is handled as always, TLS is terminated with the server's certificate when one is configured, and an HTTP request for the secret upgrade path continues as UoT (this is how nginx/apache/caddy on 443 hand clients to OSTP). Everything else is a decoy: a bare 404, or — with `fallback.enabled` — a transparent splice to `fallback.target` (e.g. a local nginx serving an ordinary site), so an active prober sees a normal website. `fallback.listen` adds one more such listener. Fields: `enabled` (`false`), `listen` (`0.0.0.0:443`), `target` (`127.0.0.1:8080`). Domains, certificates and the built-in HTTPS frontend are covered in [Domains and TLS](tls.md).
 
 ---
 
 ## Outbound proxy
 
-By default client traffic leaves from the server's own address. With the `outbound` section, some or all of it goes through an upstream SOCKS5 proxy. Rules match on `domain_suffix`, `ip_cidr` and `protocol` and choose `proxy`, `direct` or `block` (`default_action` covers the rest), for example `.onion` to a local Tor and everything else direct. A rule can also set `send_from`, a local source address; the server-wide `bind_ip` is the default.
+By default client traffic leaves from the server's own address. With the `outbound` section, some or all of it goes through an upstream proxy.
+
+```json
+"outbound": {
+  "enabled": true, "protocol": "socks5", "address": "127.0.0.1", "port": 9050,
+  "username": "", "password": "",
+  "rules": [{ "domain_suffix": [".onion"], "action": "proxy" }],
+  "default_action": "direct"
+}
+```
+
+- `protocol` is `socks5` or `http`; any other value fails closed (nothing is sent directly). `http` carries TCP only: UDP that the rules send to an `http` proxy is refused, never sent directly. Use `socks5`, or give UDP an explicit `direct` or `block` rule. `username` and `password` are for a proxy that asks for them.
+- Rules match on `domain_suffix`, `ip_cidr` and `protocol` (`tcp` or `udp`) and choose `proxy`, `direct` or `block`; `default_action` covers the rest. A missing `action` or `default_action` means `proxy`, so set `default_action` to `direct` when only some traffic should use the proxy.
+- A rule can also set `send_from`, a local source address; the server-wide `bind_ip` is the default.
 
 ---
 
@@ -310,3 +387,15 @@ Clients need nothing new: in TUN mode and with the system proxy, `http://search.
 ## Relay node
 
 `"mode": "relay"` runs a node that forwards everything to one fixed OSTP server (`upstream_tcp` for UoT/TCP, `upstream_udp` for UDP): `Client -> Relay -> Server`. The relay holds no keys and makes no decisions; the target server authenticates every session end to end and drops what fails. Put disposable relay addresses in front of one server without trusting the relays with traffic. A relay keeps at most 4,096 UDP sessions and drops idle ones. Setup: `ostp init relay` or `ostp setup` (Linux, option 4). `upstream_api_url`, `upstream_api_token` and `sync_interval_secs` from older relay configs are ignored; `ostp migrate` removes them.
+
+---
+
+## Update and removal
+
+```
+ostp update [-b stable|beta|alpha] [-v VERSION]
+ostp uninstall [--yes] [--purge]
+```
+
+- `ostp update` (Linux) runs the install script from the repository's `master`, which downloads the release and checks it against the SHA-256 that GitHub publishes for it before installing anything. `-b` picks the channel (`stable` by default); `-v` an exact version such as `0.5.0` or `0.5.0-beta.1` instead of the latest on the channel. `install.sh` takes the same `-b` and `-v`. The configuration is kept. `ostp -V` prints the installed version with its channel; `ostp changelog` shows what changed.
+- `ostp uninstall` (Linux) stops and removes the service, deletes `/opt/ostp` and takes the site OSTP added to nginx, apache or caddy back out. The configuration stays in `/etc/ostp`, certificates and user keys with it. `--purge` deletes it too (for a config outside `/etc/ostp`, only the file and its `.bak`). It asks for `yes`; without a terminal it refuses unless `--yes` is given.
