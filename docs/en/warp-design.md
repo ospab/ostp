@@ -20,7 +20,7 @@ The official `warp-cli` in proxy mode did not work for this: in the operator's t
 - **DNS.** Names are resolved inside the tunnel (SOCKS5 with a domain, `socks5h` style), never by the server's own resolver. The server's DNS lists and DoH upstreams use the same proxy; today that fails with `unsupported scheme socks5h` because `ostp-dns` is built without reqwest's `socks` feature, which is fixed first.
 - **IPv6.** WARP gives the device an IPv6 address too; destinations with only IPv6 go through it. With the tunnel down they fail like IPv4.
 - **MTU.** 1280 inside the tunnel; TCP segments are cut to fit by the user-space stack.
-- **Keepalive.** 25 s, and a handshake is repeated when the last one is older than the WireGuard limit. A dead tunnel is reported by `ostp warp status` and in the panel, not hidden by retries.
+- **Keepalive.** 25 s, and a handshake is repeated when the last one is older than the WireGuard limit. A dead tunnel is reported by `ostp warp status`, not hidden by retries.
 
 ## Commands
 
@@ -40,7 +40,7 @@ The "address seen from outside" comes from `https://www.cloudflare.com/cdn-cgi/t
 
 - `config.json` gets a `warp` section (`enabled`, `mode`, `listen`, `endpoint`) and schema version 6 adds it switched off, as with `overnet`. The keys live only in `warp.json` next to the config (0600), never in `config.json`, a backup or a log.
 - Enabling writes the `outbound` section (SOCKS5 to `warp.listen`) for `--all`, and leaves the operator's rules in place for `--rules`; disabling puts back what was there before (kept in `warp.json`).
-- The web panel gets a WARP page: state, mode, the address seen from outside, register and license.
+- A WARP page in the web panel (state, mode, the address seen from outside, register and license) was planned and is not built: the panel has nothing about WARP, and `ostp warp status` is the only view.
 
 ## Implementation
 
@@ -85,6 +85,7 @@ Planned for wirelab (not written): one container as the WARP stand-in running pl
 
 ## Differences from the plan
 
+- No WARP page in the web panel (see "Configuration and files").
 - The tunnel's TCP/UDP stack is `smoltcp` driven directly (one driver task), not the client's TUN code: that code is tied to a TUN device and the client's flow handling. `netstack-smoltcp` (what the client's TUN mode uses) is used only on the other end, in the test peer.
 - MIPS: the release matrix builds `mipsel`; the new dependencies were not verified for it, and a router is a poor fit, so `ostp-warp` is excluded there with a `cfg` and `ostp warp` says so. The other targets are built with it (see the changelog and the report of the work for what was checked).
 - The DNS filter needed more than the `socks` feature: with a proxy on, its plain UDP, TCP and DoT upstreams also went out directly. They now go through the proxy as DNS over TCP, and a proxy that cannot be used fails queries and list downloads instead of falling back.

@@ -11,19 +11,17 @@ How to use it:
 
 ## 0. Automated checks
 
-Run by CI or by the developer before the manual run.
+Builds and tests run on GitHub Actions, not on the developer's machine (`.github/workflows/ci.yml`). CI starts by itself on a push of code (not of docs or changelogs) to `beta` and `master`; `alpha` is checked by hand with `gh workflow run ci.yml --ref alpha` or "Run workflow" in the Actions tab. Commands in the table are what CI runs; run one locally only when it is small.
 
 | # | Check | Expected | Prio |
 |---|---|---|---|
-| A-01 | `cargo test --workspace --lib` | all green | P1 |
-| A-02 | `cargo test -p ostp --bin ostp` (nginx/apache/caddy templates, CLI) | green | P1 |
-| A-03 | `cargo test -p ostp-jni` (every Kotlin `external fun` has a JNI export) | green | P1 |
-| A-04 | `flutter analyze lib` | no `error` | P1 |
-| A-05 | `node --check ostp-gui/src/main.js`, `servers.js` and `device_limit.js` | no errors | P1 |
-| A-05a | `flutter test test/servers_ui_test.dart` (first-run and server screens on a phone-sized view) | green, no overflow errors | P1 |
-| A-05b | `sudo cargo test -p ostp-ssh --test sshd -- --ignored --test-threads=1` on a throwaway machine with sshd (with `OSTP_BIN=target/debug/ostp` for the manager test) | green: key and password sign-in, sudo, host-key change refused, port forward, `ostp manage` over SSH | P2 |
+| A-01 | CI job *Tests (Linux)*: `cargo test -p ostp-core -p ostp-client -p ostp-server -p ostp -p ostp-ssh -p ostp-jni` (includes the CLI and its nginx/apache/caddy templates, the wire tests in `ostp/tests`, and that every Kotlin `external fun` has a JNI export) | all green | P1 |
+| A-02 | CI job *Tests and binary (Windows x64)*: `cargo test -p ostp-core -p ostp-client -p ostp-server -p ostp -p ostp-tun`, the desktop app's backend and its helper `ostpd` compile | all green | P1 |
+| A-03 | CI job *Linux binary (x86_64, musl)* builds `ostp` and runs `ostp --version` | green | P1 |
+| A-04 | CI job *Apps (checks and tests)*: `node --check` on every `ostp-gui/src/*.js`, `node --test ostp-gui/test/*.test.mjs`, `flutter analyze --no-fatal-infos`, `flutter test` (includes the first-run and server screens on a phone-sized view, the key-pin and server-key tests) | green, no overflow errors | P1 |
+| A-05 | `sudo cargo test -p ostp-ssh --test sshd -- --ignored --test-threads=1` on a throwaway machine with sshd (with `OSTP_BIN=target/debug/ostp` for the manager test) | green: key and password sign-in, sudo, host-key change refused, port forward, `ostp manage` over SSH | P2 |
 | A-06 | `cargo tree -i aws-lc-sys` at the root and in `ostp-gui/src-tauri` | empty | P1 |
-| A-07 | Release build on GHA | every job green, 21 files in the release | P1 |
+| A-07 | Release build: `scripts/gha.ps1` pushes the tag and `release.yml` builds every platform (never a local build) | every job green, the assets of every platform are attached to the release | P1 |
 
 ## 1. Test bed
 
@@ -31,7 +29,7 @@ Run by CI or by the developer before the manual run.
 - **Web servers for section 2.4:** separate clean machines or snapshots with nginx, apache (Debian and the RHEL family) and caddy.
 - **Clients:** Windows 10/11 x64 (arm64 if available), Android 8+ on arm64 and armv7, Linux x64 for the CLI.
 - **Networks:** a home ISP, a mobile network, if possible an IPv6-only network with NAT64 and a network with noticeable DPI filtering.
-- Record the version of every component in the report (`ostp --version`, About in the GUI, the APK version).
+- Record the version of every component in the report (`ostp -V`, which also shows the channel; About in the GUI; the APK version).
 
 ## 2. Server
 
@@ -42,7 +40,7 @@ Run by CI or by the developer before the manual run.
 | S-01 | Fresh install with `install.sh`, then `ostp setup` in Server mode | the `ostp` service is active, `ostp links` prints working links | P1 |
 | S-02 | `ostp update --branch beta` on a server running the previous version | new version, service restarted, keys and settings kept | P1 |
 | S-03 | `ostp migrate --dry-run` on configs from 0.4.5 and older (modular v0, flat v1) | steps, changes and unknown keys with suggestions are printed; the file is untouched | P1 |
-| S-04 | `ostp migrate` on the same configs | `config_version: 5`, `access_keys` and `api.token` kept, the server starts | P1 |
+| S-04 | `ostp migrate` on the same configs | `config_version: 6` (the `warp` section added, off), `access_keys` and `api.token` kept, the server starts | P1 |
 | S-05 | A config newer than supported (`config_version: 99`) | migrate refuses and leaves the file alone | P2 |
 | S-06 | `ostp check` on a valid and a broken config | "Config OK" / a clear error naming the field | P1 |
 | S-07 | Add a key to `config.json` of a running server | within ~5 s the new key connects, no restart | P1 |
@@ -136,6 +134,51 @@ Repeat for nginx, apache (Debian and RHEL) and caddy.
 | S-73 | Switch language and theme, open on a phone (360–414 px wide) | everything translated, the light theme is readable; no page scrolls sideways, users are cards, the top bar is one row of icons | P2 |
 | S-74 | Enable the API in the config without a sign-in (no token, no password), start the server | the panel does not start, the log says how to set a sign-in; with `"token": ""` a request with an empty `Authorization` header is refused | P1 |
 
+### 2.8 Protocol v6, key expiry, server information
+
+| # | Steps | Expected | Prio |
+|---|---|---|---|
+| S-80 | `ostp key`, `ostp links` on a new install | the server's public key is shown; every link has `pk=`; `legacy` (v5 clients) is on | P1 |
+| S-81 | Client with a link that has `pk` | connects, the log says protocol v6 | P1 |
+| S-82 | The same link with `pk` changed by one character | does not connect; the client says the server did not answer as expected (a server older than 0.5.0 or a replaced key) and to reissue the link; the server logs nothing about the attempt beyond what it logs for any unknown datagram | P1 |
+| S-83 | `ostp key legacy off`, then a link without `pk` (v5); then `ostp key legacy on` | the v5 client is refused after off and connects after on; v6 clients are unaffected | P1 |
+| S-84 | An existing server from 0.4.x: `ostp key`, then `ostp key server new` | before: no key, v5 only; after: key created, links get `pk=`; replacing a key later needs `--yes` and stops every older link | P2 |
+| S-85 | `ostp manage user-add test --expires 1d`, then `user-set test --expires never` and `--expires 2020-01-01` | the date is shown by `ostp manage users` (a date means the end of that day, UTC; `1d` is 24 hours from now); `never` clears it; a past date is accepted and the key counts as expired at once | P1 |
+| S-86 | A v6 client is connected; set `expires_at` of its key in `config.json` to the current Unix time plus a minute | the client stops and says the access key has expired; it does not reconnect; a v5 client with that key is refused as if over its limit | P1 |
+| S-87 | Remove a key from `config.json` while its client is connected | within ~5 s the client stops with "your key was revoked or removed" and does not reconnect | P1 |
+| S-88 | `systemctl stop ostp` while a client is connected | the client stops at once with "the server is shutting down" (not after 10 s of silence) and does not reconnect | P1 |
+| S-89 | `ostp manage server-info --name … --location … --contact … --about-file about.md`, then the same without arguments | the values are saved and shown; a client sees them only while connected: a packet probe (S-50) gets nothing new | P1 |
+| S-90 | The "i" of the subscription in the desktop and Android apps while connected | the operator's section (marked as the operator's words; empty fields say "Not given by the operator"), what the server reports (version, carriers, log privacy, IPv6, DNS filtering) and the key's traffic, limit, expiry and device limit; offline it opens with the last copy | P1 |
+| S-91 | The same against a server older than 0.5.0-beta.1 | the window says the server does not send information about itself | P2 |
+| S-92 | `ostp log privacy` shows the mode; set `strict`, `normal`, `debug` and restart | `normal` is the default; no mode but `debug` logs destinations (sites, SNI, DNS names); addresses are cut to /24 (IPv6 /48) in `normal` and tagged per UTC day in `strict`; `debug` says plainly what it records | P1 |
+| S-93 | `ostp -V`, then `ostp uninstall --yes`, then on another install `ostp uninstall --yes --purge` | `-V` shows version and channel; without `--purge` the config stays, with it everything is removed; no question is asked with `--yes` | P2 |
+| S-94 | Two `ostp` commands that edit the config at the same moment (for example `user-add` in a loop in two shells) | no lost write and no broken JSON: the config file is locked while it is changed | P2 |
+
+### 2.9 Subscription links
+
+| # | Steps | Expected | Prio |
+|---|---|---|---|
+| S-95 | A new user: `ostp manage users`, `ostp sub urls` | the subscription id (`sub_id`) is random and is not derived from the access key | P1 |
+| S-96 | `ostp manage user-set WHO --new-sub-id`; open the old and the new link | the old one gets the same 404 as any wrong path; the new one works (within ~5 s while the lookup index catches up); the access key is unchanged and the client keeps connecting | P1 |
+| S-97 | `ostp manage sub-ids`, then `sub-ids --assign-missing` on a config with users that have no `sub_id` | the first lists, the second gives each a random id and prints the new links | P2 |
+| S-98 | `ostp sub enable` on a config with no `subscription.path`; then on one with `/sub` | a random path (`/` and 10 characters) in the first case; `/sub` is kept in the second | P1 |
+| S-99 | Behind nginx, apache and caddy: a wrong subscription link, and a wrong path elsewhere | both give the web server's own 404 page (the site's own, if it has one); the two cannot be told apart | P1 (nginx), P2 (others) |
+
+### 2.10 Path, MTU, loss, IPv6
+
+| # | Steps | Expected | Prio |
+|---|---|---|---|
+| S-100 | A v6 client over UDP with `mtu` missing or `"auto"`; watch the log | `Path MTU: … bytes confirmed by a probe` lines climb to 1452 on a clean path; with `mtu` set to a number no probes run and the number is used | P1 |
+| S-101 | Over UDP on a path that drops datagrams above ~1300 bytes (`iptables -m length` on a test machine) | `Path MTU: probes of … bytes are lost; sending … bytes at most`; the tunnel works, no stream stalls | P2 |
+| S-102 | Over TLS and UoT | no probes; the size is the configured one (1350) | P2 |
+| S-103 | A v6 client over UDP with 1 % and 5 % loss (`tc netem`), a download and an upload | transfers finish; no stream is reset by loss alone; `Stall #n` log lines appear only for the first stall and then every power of two | P1 |
+| S-104 | A 0.4.x client (v5 link) under the same loss | works as before | P2 |
+| S-105 | Cut the client's network for 30 s, then restore it (UDP, then TLS) | the log says reconnecting; the connection comes back on the same carrier, the profile's, and nothing switches to another carrier; with the old path back, "Connection restored … no connection was dropped" | P1 |
+| S-106 | The same cut for more than 5 minutes | "giving up the old session", application connections reset, full handshakes repeat with pauses up to 30 s until the network is back or the user stops the tunnel | P2 |
+| S-107 | TLS download at full speed | the RTT shown is the path's, the queue delay is shown only when above 200 ms and stays small (the server keeps the queue to about 100 ms) | P2 |
+| S-108 | A server with IPv6 switched off in the kernel, a client device with IPv6 | no app hangs on IPv6 addresses: tunnel DNS answers AAAA with an empty set, the server log says `no IPv6 on this server` where it must | P1 |
+| S-109 | A server with IPv6 | IPv6 sites open through the tunnel; server information shows `ipv6: true` | P2 |
+
 ## 3. Desktop GUI (Windows, Linux)
 
 | # | Steps | Expected | Prio |
@@ -173,6 +216,10 @@ Repeat for nginx, apache (Debian and RHEL) and caddy.
 | G-29 | Server user with `max_devices: 1`. Import its `https://…/sub/…` in the GUI with *Send a device ID to subscriptions* off | a dialog "This subscription limits devices"; *Cancel*: the card says `Device ID needed: …`, nothing was sent; *Send and retry*: the switch turns on and the subscription is added; the panel lists one device with the OS (`Windows 11`) and the architecture | P1 |
 | G-29a | The same user from a second computer, then a background refresh with the switch off on a third | the second: the card and the toast show the server's `device_limit` message; the background refresh opens no dialog and writes `Device ID needed: …` on the card | P1 |
 | G-30 | *Server management → DNS* on a server with `ostp manage dns`: turn the filter, the takeover, encrypted-DNS block and safe search on and off, *Update lists* | each press asks first with `The service restarts and connected clients drop for a few seconds.` and a button that names the action; the result is shown like other actions and the tab reloads with the new state; the encrypted-DNS button is disabled with a reason while the takeover is off; lists, resolvers, rewrite and rule counts match `ostp manage dns`; against a server without `manage dns` the tab only says it is too old | P1 |
+| G-31 | Import a profile whose link has no `pk` (v5) | the profile is marked with a warning that anyone with the key can pose as that server; connecting is not blocked | P1 |
+| G-32 | A subscription whose server changed its key, then Update | the old profile is kept and the card asks whether to accept the new key or keep the old one; a key that appears where there was none is taken without a question | P1 |
+| G-33 | Settings with several subscriptions and manual profiles; a long list | profiles are grouped under their subscription (manual ones in their own group), groups fold and remember it, the one with the selected profile is open, a search field appears for a long list | P2 |
+| G-34 | *Server management → Users*: add a user with a limit, a device limit and an expiry date; edit; revoke | the values match `ostp manage users`; the expiry date and the new subscription link work as S-85 and S-96 | P1 |
 
 ## 4. Android
 
@@ -197,6 +244,10 @@ Repeat for nginx, apache (Debian and RHEL) and caddy.
 | M-17 | As G-28: a link with `owndns=true` / `dnsall=true`, then change *DNS of this server* in the profile editor | the notice before connecting (back button does nothing, buttons wait 5 seconds); the chosen DNS is the one the tunnel uses (operator: 10.1.0.1); the editor value is kept | P1 |
 | M-18 | As G-29 on a phone: a user with `max_devices: 1`, *Send a device ID to subscriptions* off, add its subscription, then a second phone | the dialog on the first (*Cancel* leaves a card message, *Send and retry* adds it); the panel shows `Android <version>` and the phone's model; the second phone gets the server's `device_limit` message on the card and in the snackbar; a background refresh on launch opens no dialog | P1 |
 | M-19 | As G-30 on a phone: *Settings → Server Management → DNS* | the same texts, confirmations and states as the desktop; the five tabs fit a 360 dp wide screen | P1 |
+| M-20 | As G-31 and G-32 on a phone | the same warning, the same question; the buttons fit a 360 dp wide screen | P1 |
+| M-21 | As G-33 and the server information window (S-90) on a phone | groups, search and the "i" window work; Markdown links in the "about" text open only after a confirmation | P2 |
+| M-22 | As G-34 on a phone | the users editor with limits, devices and expiry works on a 360 dp wide screen | P1 |
+| M-23 | Stop the server (`systemctl stop ostp`) and revoke the key while connected | the app shows the server's reason for 12 seconds in place of "Could not connect to the server" and does not connect again by itself | P1 |
 
 ## 5. CLI client
 
@@ -217,17 +268,20 @@ Repeat for nginx, apache (Debian and RHEL) and caddy.
 | X-02 | New clients against a server of the previous stable over UDP and UoT | connect | P1 |
 | X-03 | Links from older versions (`type=tcp`, no `type`, bracketed IPv6) | import the same way in every client | P1 |
 | X-04 | Server and client configs from older versions, unedited | start; `ostp` points at `migrate` | P1 |
+| X-05 | A 0.4.x client (a v5 link) against a 0.5.0 server with `legacy on` (the transitional mode) | connects over UDP and UoT | P1 |
+| X-06 | A 0.5.0 client with a v6 link against a 0.4.x server | does not connect and says why (a server older than 0.5.0, or a replaced key), not a bare timeout | P1 |
+| X-07 | A 0.5.0 client with a v5 link (no `pk`) against a 0.4.x server | connects as before, with the unverified-server warning in the apps | P1 |
 
 ## 7. Release criteria
 
-- **Beta:** every case in section 0 and every P1 passes. Failing P2 cases are listed as known issues in the release notes.
+- **Beta:** CI is green on the branch the beta is cut from (CI is run by hand on `alpha`), the release build is green, and every P1 case passes. Failing P2 cases are listed as known issues in the release notes.
 - **Stable:** every case, P2 included, passes on every platform in section 1.
 - Any crash, lost profiles or keys, a key leaking into a log, or traffic bypassing the tunnel with the kill switch on blocks the release whatever its priority.
 
 ## Report template
 
 ```
-Version: v0.4.6-beta.N        Date:            Tester:
+Version: v0.5.0-beta.N        Date:            Tester:
 Server: OS, IP versions, frontend (builtin / nginx / apache / caddy)
 Clients: Windows …, Android … (model, ABI), Linux …
 Networks: …

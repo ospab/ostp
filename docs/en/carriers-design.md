@@ -1,6 +1,6 @@
 # Carriers: OSTP inside other protocols
 
-Status: draft, nothing here is implemented. This page is the look the owner asked for before any code: what a carrier is here, what each candidate costs and what is known about how censors treat it. Statements about censors are marked with a source number from the end of the page; what could not be sourced is marked `(unverified)`. Carriers come after the wire changes of [v6-design.md](v6-design.md) and do not change the handshake.
+Status: draft. Of the carriers below only the two that existed before this page are implemented: plain UDP and UoT (TCP, optionally with TLS and an HTTP upgrade; section 1.1). `ws`, `quic`, `poll`, `webrtc` and `icmp` do not exist, there is no carrier interface yet (the client's `Transport` is still the two-variant enum), the link parser still knows only `udp` and `uot`, and subscriptions carry no minimum client version. What the code does for a reliable carrier today is in [specification.md](specification.md) §9.1, §9.5, §9.8 and §9.9. This page is the look the owner asked for before any code: what a carrier is here, what each candidate costs and what is known about how censors treat it. Statements about censors are marked with a source number from the end of the page; what could not be sourced is marked `(unverified)`. Carriers come after the wire changes of [v6-design.md](v6-design.md) and do not change the handshake.
 
 ## Direction
 
@@ -29,7 +29,7 @@ So a carrier already is, in practice, "something that moves whole datagrams betw
 | Maximum datagram size | The carrier reports it; the session's `mtu` (a `ProtocolConfig` field today) is set below it. | QUIC datagrams and ICMP have limits that differ from UDP's. |
 | Reliability | Either is accepted. The carrier says which. | OSTP has its own ARQ and CUBIC ([specification.md](specification.md) §9.1, §9.5). Over a reliable carrier it retransmits what the carrier already retransmits; this is how UoT works now. |
 | Ordering | Not required. | ARQ reorders. |
-| Own flow control | Must not stall the session in a way ARQ cannot see. | A stalled carrier looks like a silent server; the client reports it after the existing 10 s of silence and does nothing else. |
+| Own flow control | Must not stall the session in a way ARQ cannot see. | A stalled carrier looks like a silent server; the client's recovery acts after its silence limit (move the session, then full handshakes, always on the same carrier; [specification.md](specification.md) §9.6, §9.7). |
 | Liveness | The carrier reports "closed" or "failed" to the bridge. | The bridge uses it for the move to a new connection ([specification.md](specification.md) §9.6). |
 | Address | The server gives each carrier connection a `SocketAddr` label (a real one for UDP and TCP, a synthetic one where there is none). | `tcp_map` and the dispatcher are keyed by it. |
 
@@ -51,7 +51,7 @@ Existing keys keep their meaning: `sni`, `insecure`, `path`, `tls`, `name`. New 
 
 `type=uot&tls=1&path=...` keeps working and keeps meaning "TCP, TLS, upgrade, then raw UoT frames". `ws` is different: it keeps WebSocket framing after the upgrade, which is what a CDN that inspects frames needs and what [tls.md](tls.md) says the present path does not do.
 
-One trap in the current parser: an unknown `type=` becomes UDP without a word. An old client given `type=ws` would try UDP against a TLS port and fail by timeout. The new parser has to reject an unknown type with a clear error, and subscriptions have to say which minimum client version understands which type (the v6 design already adds that field). The old clients cannot be fixed; they only get a worse message.
+One trap in the current parser: an unknown `type=` becomes UDP without a word. An old client given `type=ws` would try UDP against a TLS port and fail by timeout. The new parser has to reject an unknown type with a clear error, and subscriptions have to say which minimum client version understands which type (the v6 design planned that field and it is not built). The old clients cannot be fixed; they only get a worse message.
 
 ## 2. Candidates
 
