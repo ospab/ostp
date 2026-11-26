@@ -148,15 +148,20 @@ void main() {
     await tester.tap(find.widgetWithText(Tab, 'Users'));
     await tester.pumpAndSettle();
     expect(find.text('me'), findsOneWidget);
-    expect(find.textContaining('941.9 MB'), findsOneWidget);
-    // "Add to this app" imports the user's links as profiles.
+    expect(find.textContaining('941.9 MiB', findRichText: true), findsOneWidget);
+    // A user opens in its own screen; "Add to this app" there imports the
+    // user's links as profiles.
+    await tester.tap(find.text('me'));
+    await tester.pumpAndSettle();
     await tester.tap(find.byTooltip('Add to this app').first);
     await tester.pumpAndSettle();
     expect(decodeProfiles(p.getString('profiles_json')).single.name, 'Amsterdam · me · UDP');
+    await tester.pageBack();
+    await tester.pumpAndSettle();
 
     await tester.tap(find.widgetWithText(Tab, 'Connection'));
     await tester.pumpAndSettle();
-    expect(find.text('64 DAYS LEFT'), findsOneWidget);
+    expect(find.textContaining(RegExp('64 days left', caseSensitive: false), findRichText: true), findsOneWidget);
 
     await tester.tap(find.widgetWithText(Tab, 'Management'));
     await tester.pumpAndSettle();
