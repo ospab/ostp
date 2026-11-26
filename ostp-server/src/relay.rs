@@ -283,11 +283,12 @@ pub async fn handle_message(
                 // automatic", Chrome's secure DNS upgrade).
                 refuse(target, "encrypted DNS is blocked: this server filters DNS");
                 return Ok(());
-            } else if router.overnet().refuses_encrypted_dns(&connect_target) {
-                // Same fallback, so `.ov` names reach the server's port-53 answer.
-                refuse(target, "encrypted DNS is blocked: this server serves .ov");
-                return Ok(());
             }
+            // Overnet does not refuse encrypted DNS of its own: a device whose
+            // Private DNS names a resolver (or a browser set to one) cannot
+            // fall back, and lost all name resolution while `.ov` was served.
+            // `.ov` is answered on any plain port-53 query; blocking DoH/DoT
+            // is the operator's explicit `ostp dns takeover`.
 
             let target_clone = connect_target.clone();
             let connect_tx_clone = connect_tx.clone();
@@ -601,7 +602,7 @@ pub async fn handle_message(
                 // DNS over QUIC (853) and DoH over HTTP/3 to a public resolver
                 // (443) skip the filtering the same way; dropped, so the device
                 // falls back to plain port 53.
-                if router.dns_server.is_dns_bypass(&target) || router.overnet().refuses_encrypted_dns(&target) {
+                if router.dns_server.is_dns_bypass(&target) {
                     if router.debug {
                         let _ = ui_event_tx.send(UiEvent::Log(format!("DNS [{session_id}:{stream_id}] encrypted DNS over UDP to {target} dropped")));
                     }

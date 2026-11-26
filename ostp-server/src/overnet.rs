@@ -200,19 +200,6 @@ impl Overnet {
         }
     }
 
-    /// Encrypted DNS to a public resolver (DoT/DoQ on 853, DoH to a resolver's
-    /// address on 443) would ask the internet about `.ov` and get NXDOMAIN:
-    /// Chrome and Edge upgrade to it on their own when the system DNS is
-    /// 1.1.1.1 or 8.8.8.8, Android with "Private DNS: automatic". While `.ov`
-    /// is served it is refused, the device falls back to port 53, and the
-    /// server answers `.ov` there.
-    pub fn refuses_encrypted_dns(&self, target: &str) -> bool {
-        if !(self.entry() && self.gateway_up()) {
-            return false;
-        }
-        ostp_dns::is_encrypted_dns_target(target)
-    }
-
     /// Classifies a client's `host:port` target. Errors when the target is
     /// in `.ov` but entry is off, so it is not tried on the internet.
     pub fn route(&self, target: &str) -> Result<Route> {
@@ -469,20 +456,6 @@ mod tests {
             RData::A(a) => Some(Ipv4Addr::from(a.address)),
             _ => None,
         })
-    }
-
-    #[test]
-    fn encrypted_dns_to_public_resolvers_is_refused_only_while_ov_is_served() {
-        let o = on();
-        assert!(o.refuses_encrypted_dns("1.1.1.1:443"));
-        assert!(o.refuses_encrypted_dns("8.8.8.8:853"));
-        assert!(o.refuses_encrypted_dns("dns.example:853"));
-        assert!(!o.refuses_encrypted_dns("93.184.216.34:443"));
-        assert!(!o.refuses_encrypted_dns("1.1.1.1:80"));
-        o.gateway_up.store(false, std::sync::atomic::Ordering::Relaxed);
-        assert!(!o.refuses_encrypted_dns("1.1.1.1:443"), "gateway down: .ov is not served, DoH is left alone");
-        let off = Overnet::new(OvernetConfig::default());
-        assert!(!off.refuses_encrypted_dns("1.1.1.1:443"));
     }
 
     #[test]

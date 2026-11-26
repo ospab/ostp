@@ -380,7 +380,7 @@ sudo ostp overnet disable    # .ov off (the exit has its own switch: exit off)
 
 The same switches are on the **overnet** page of the web panel (applied live, without a restart) and in the desktop and mobile apps under the server's management tab. `ostp check` prints the state of the section. `ostp migrate` writes the section into an older server config, switched off.
 
-Clients need nothing new: in TUN mode and with the system proxy, `http://search.ov/` opens in any browser. While `.ov` is served, encrypted DNS to public resolvers (DoT/DoQ on 853, DoH to a resolver's address on 443) is refused, as with `dns.block_doh_bypass`: Chrome and Edge upgrade to DoH on their own when the system DNS is 1.1.1.1 or 8.8.8.8, Android does with "Private DNS: automatic", and such a resolver answers NXDOMAIN for `.ov`. After the refusal the device asks plain port 53, which the server answers. A browser with DoH set to a fixed provider by hand (Firefox "Max protection", Chrome with a custom provider) keeps failing on `.ov`; turn that off for this connection.
+Clients need nothing new: in TUN mode and with the system proxy, `http://search.ov/` opens in any browser. The server answers `.ov` names on any plain DNS query (port 53), whatever resolver the device asks. It does not refuse encrypted DNS for that (it did before 0.5.0-beta.2, which left devices with Private DNS or a browser DoH provider set by hand without any name resolution). A device or browser that resolves over DoH or DoT does not see `.ov` names: turn encrypted DNS off for this connection, or block it for all clients with `ostp dns takeover` (see DNS).
 
 ---
 
