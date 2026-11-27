@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Monochrome glyph for the Quick Settings tile and the status bar: a shield
+     with a keyhole. Android tints it; only the alpha channel matters. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:fillType="evenOdd"
+        android:pathData="M12,2L4,5v6c0,5.05 3.41,9.76 8,11c4.59,-1.24 8,-5.95 8,-11V5L12,2zM12,8a2,2 0,0 1,1 3.73V15h-2v-3.27A2,2 0,0 1,12 8z" />
+</vector>

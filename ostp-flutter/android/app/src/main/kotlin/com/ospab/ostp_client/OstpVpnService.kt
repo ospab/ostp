@@ -24,7 +24,11 @@ class OstpVpnService : VpnService() {
     @Keep
     companion object {
         @Keep
+        @Volatile
         var isRunning = false
+        // Between a START and the core being up (or failing): the tile shows it as connecting.
+        @Volatile
+        var isStarting = false
         @Keep
         var instance: OstpVpnService? = null
         // Bumped on every start; a service instance may tear down only the tunnel it owns.
@@ -38,6 +42,8 @@ class OstpVpnService : VpnService() {
 
     // The generation of the tunnel this instance started (0 = none).
     private var ownedGeneration = 0
+    // The profile being connected, for the notification; null when the app saved none.
+    private var profileName: String? = null
     private var vpnInterface: ParcelFileDescriptor? = null
     private var wakeLock: PowerManager.WakeLock? = null
     private var networkCallback: android.net.ConnectivityManager.NetworkCallback? = null
@@ -61,6 +67,8 @@ class OstpVpnService : VpnService() {
         if (action == "START") {
             // A service started with startForegroundService must call startForeground
             // soon even if it then has nothing to run, or the system kills the app.
+            isStarting = true
+            OstpTileService.requestListeningState(applicationContext)
             startForegroundSafe()
             val configJson = intent.getStringExtra("configJson")
             if (configJson == null) {
@@ -114,12 +122,20 @@ class OstpVpnService : VpnService() {
             ).apply {
                 description = "VPN connection status"
                 setShowBadge(false)
+                setSound(null, null)
+                enableVibration(false)
+                enableLights(false)
             }
             val nm = getSystemService(NotificationManager::class.java)
             nm.createNotificationChannel(channel)
         }
     }
 
+    /**
+     * One quiet line: the profile and the state, and one action. No sound, no
+     * vibration, no badge, no timestamp; tapping it opens the app. The system
+     * already shows its own VPN key in the status bar.
+     */
     private fun buildNotification(connecting: Boolean): Notification {
         val stopIntent = PendingIntent.getService(
             this,
@@ -127,7 +143,6 @@ class OstpVpnService : VpnService() {
             Intent(this, OstpVpnService::class.java).apply { action = "STOP" },
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
-
         val openIntent = PendingIntent.getActivity(
             this,
             1,
@@ -135,22 +150,24 @@ class OstpVpnService : VpnService() {
                 ?.apply { addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP) },
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
-
-        val (statusText, actionLabel) = if (connecting) {
-            Pair("Connecting…", "Cancel")
-        } else {
-            Pair("Connected", "Disconnect")
-        }
+        val state = if (connecting) "Connecting…" else "Connected"
+        val title = profileName ?: "OSTP"
 
         return NotificationCompat.Builder(this, CHANNEL_ID)
-            .setContentTitle("OSTP VPN")
-            .setContentText(statusText)
-            .setSmallIcon(android.R.drawable.ic_lock_lock)
+            .setSmallIcon(R.drawable.ic_ostp_status)
+            .setContentTitle(title)
+            .setContentText(state)
             .setOngoing(true)
+            .setSilent(true)
+            .setOnlyAlertOnce(true)
             .setShowWhen(false)
-            .setContentIntent(openIntent)
-            .addAction(android.R.drawable.ic_delete, actionLabel, stopIntent)
+            .setLocalOnly(true)
+            .setCategory(NotificationCompat.CATEGORY_SERVICE)
+            .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
+            .setForegroundServiceBehavior(NotificationCompat.FOREGROUND_SERVICE_IMMEDIATE)
             .setPriority(NotificationCompat.PRIORITY_LOW)
+            .setContentIntent(openIntent)
+            .addAction(0, if (connecting) "Cancel" else "Disconnect", stopIntent)
             .build()
     }
 
@@ -277,9 +294,15 @@ class OstpVpnService : VpnService() {
     }
 
     private fun startVpn(configJson: String) {
-        if (vpnInterface != null) return
+        if (vpnInterface != null) {
+            // Already up: a second START changes nothing.
+            isStarting = false
+            OstpTileService.requestListeningState(applicationContext)
+            return
+        }
 
         acquireWakeLock()
+        profileName = OstpTileService.profileName(configJson)
 
         try {
             val json = org.json.JSONObject(configJson)
@@ -362,6 +385,7 @@ class OstpVpnService : VpnService() {
             if (success) {
                 Log.i("OstpVpnService", "OSTP Rust Core started successfully")
                 isRunning = true
+                isStarting = false
                 updateNotification(connected = true)
                 registerNetworkCallback()
             } else {
@@ -380,6 +404,7 @@ class OstpVpnService : VpnService() {
 
     private fun stopVpn() {
         isRunning = false
+        isStarting = false
         releaseWakeLock()
         // Stop following the network first, so no late callback signals a core that is going away.
         unregisterNetworkCallback()

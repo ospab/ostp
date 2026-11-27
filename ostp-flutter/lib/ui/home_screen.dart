@@ -247,6 +247,9 @@ class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin, 
 
     return {
       "mode": "client",
+      // Read only by the Android side (the Quick Settings tile and the
+      // notification show it); the core ignores keys it does not know.
+      "profile_name": p?.name ?? '',
       "debug": logPrivacy == 'debug',
       "log_privacy": logPrivacy,
       "ostp": {
