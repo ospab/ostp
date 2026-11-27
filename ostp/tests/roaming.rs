@@ -132,13 +132,23 @@ impl Relay {
 }
 
 async fn start_relay(upstream: SocketAddr) -> Relay {
-    let port = free_port();
-    let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
     let upstream = Arc::new(Mutex::new(upstream));
     let blackhole = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
+    // One port for both TCP and UDP. Picking a free port and binding it twice
+    // raced with the other tests, which run in parallel and take ports too, so
+    // the port is held by the TCP listener while UDP is bound to it.
+    let (listener, front) = loop {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        match UdpSocket::bind(listener.local_addr().unwrap()).await {
+            Ok(udp) => break (listener, udp),
+            Err(_) => continue,
+        }
+    };
+    let addr = listener.local_addr().unwrap();
+
     // UDP: one upstream socket per (client address, upstream).
-    let front = Arc::new(UdpSocket::bind(addr).await.unwrap());
+    let front = Arc::new(front);
     {
         let front = front.clone();
         let upstream = upstream.clone();
@@ -186,7 +196,6 @@ async fn start_relay(upstream: SocketAddr) -> Relay {
     }
 
     // TCP: plain splice to the current upstream.
-    let listener = TcpListener::bind(addr).await.unwrap();
     let tcp_conns: Arc<Mutex<Vec<tokio::task::AbortHandle>>> = Default::default();
     {
         let upstream = upstream.clone();
