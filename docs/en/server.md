@@ -315,6 +315,17 @@ By default client traffic leaves from the server's own address. With the `outbou
 - `protocol` is `socks5` or `http`; any other value fails closed (nothing is sent directly). `http` carries TCP only: UDP that the rules send to an `http` proxy is refused, never sent directly. Use `socks5`, or give UDP an explicit `direct` or `block` rule. `username` and `password` are for a proxy that asks for them.
 - Rules match on `domain_suffix`, `ip_cidr` and `protocol` (`tcp` or `udp`) and choose `proxy`, `direct` or `block`; `default_action` covers the rest. A missing `action` or `default_action` means `proxy`, so set `default_action` to `direct` when only some traffic should use the proxy.
 - A rule can also set `send_from`, a local source address; the server-wide `bind_ip` is the default.
+- Rules are taken in order; the first that matches wins.
+
+**Domain rules and traffic by address.** A client in proxy mode sends the site's name, so `domain_suffix` matches it. A client in TUN mode (Android, desktop TUN) only sees addresses. Its TCP connections carry the name of the TLS ClientHello (SNI) when it has one, and the server resolves that name itself (see [client.md](client.md)). For a connection or datagram that still names only an address, mostly QUIC (UDP/443, which YouTube and Google use), the server uses a name it remembers for that address:
+
+- the addresses its own DNS gave this client (queries to 10.1.0.1, or all port-53 queries with `intercept_all_port53`),
+- plain DNS answers this client got through the tunnel from another resolver (UDP from port 53),
+- the address the server resolved for this client's connection by name.
+
+A `domain_suffix` rule then matches the address as it would match the name. The names belong to the client's address: one client's DNS answers never change how another client is routed. A name is kept for 10 minutes, and at most 50 000 are kept in all, the oldest dropped first. An address that serves many names (a CDN) takes the last one seen. `ip_cidr` rules and the order of the rules work as before.
+
+Limits: encrypted DNS on the device (DNS over HTTPS in a browser, Android's Private DNS with a named server) hides the answers, so for QUIC to such addresses only a TCP connection with SNI fills the memory; an address no DNS answer or SNI named is matched by `ip_cidr` only; TLS with Encrypted Client Hello (ECH) shows no real name; the server does not read the name in QUIC Initial packets. When the rule for a remembered name says `proxy` and the proxy cannot carry UDP (an `http` proxy, or a failed UDP ASSOCIATE), the QUIC datagrams are dropped, not sent from the server's own address: the browser then falls back to TCP, where the name is known.
 
 ---
 

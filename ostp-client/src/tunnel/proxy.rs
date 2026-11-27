@@ -210,6 +210,27 @@ const MAX_QUEUED_DOWNLOAD: usize = 32 * 1024 * 1024;
 const LOCAL_FIRST_BYTE_TIMEOUT: Duration = Duration::from_secs(120);
 const LOCAL_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// A SOCKS5 method (from the private range) the TUN handler offers besides
+/// "no authentication": it has checked the exclusions for the connection
+/// already (by the program's address and its ClientHello), so a CONNECT by
+/// name is not resolved here once more to check them again. The proxy still
+/// answers with "no authentication".
+pub(crate) const TUN_CHECKED_METHOD: u8 = 0x80;
+
+/// SOCKS5 "connection not allowed by ruleset": the server refused the target
+/// by its rules (an outbound `block` rule, DNS filtering).
+pub(crate) const SOCKS_NOT_ALLOWED: u8 = 0x02;
+
+/// The SOCKS5 reply code for a connect the server refused with `msg`: "not
+/// allowed" when its rules blocked it, otherwise "host unreachable".
+pub(crate) fn socks_error_code(msg: &str) -> u8 {
+    if msg.contains("blocked") {
+        SOCKS_NOT_ALLOWED
+    } else {
+        0x04
+    }
+}
+
 /// A local connection's queue towards its task: the messages, and how many
 /// download bytes are in them.
 struct StreamSlot {
@@ -786,9 +807,11 @@ async fn handle_proxy_client(
         let mut second_byte = [0_u8; 1];
         read_exact_within(&mut client, &mut second_byte, LOCAL_REQUEST_TIMEOUT).await?;
         let nmethods = second_byte[0] as usize;
+        let mut tun_checked = false;
         if nmethods > 0 {
             let mut methods_buf = vec![0_u8; nmethods];
             read_exact_within(&mut client, &mut methods_buf, LOCAL_REQUEST_TIMEOUT).await?;
+            tun_checked = methods_buf.contains(&TUN_CHECKED_METHOD);
         }
         // Reply: version=5, NO AUTHENTICATION
         client.write_all(&[0x05, 0x00]).await?;
@@ -840,7 +863,7 @@ async fn handle_proxy_client(
         crate::logs::proxy_connect_request(stream_id, &target);
         let target_host = if let Some((host, _)) = split_host_port(&target) { host } else { target.clone() };
         let target_port = match split_host_port(&target) { Some((_, p)) => p, None => 0 };
-        if matcher.should_bypass_target(&target_host, target_port, connect_timeout).await {
+        if !tun_checked && matcher.should_bypass_target(&target_host, target_port, connect_timeout).await {
             return direct_connect_socks5(
                 client,
                 stream_id,
@@ -860,7 +883,7 @@ async fn handle_proxy_client(
                 client.write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await?;
             }
             Ok(Some(ProxyToClientMsg::Error(msg))) => {
-                client.write_all(&[0x05, 0x04, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await?;
+                client.write_all(&[0x05, socks_error_code(&msg), 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await?;
                 let _ = close_tx.send(stream_id).await;
                 return Err(anyhow!("SOCKS5 connect error: {msg}"));
             }

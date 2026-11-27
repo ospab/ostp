@@ -53,10 +53,24 @@ pub async fn connect_target(
     debug: bool,
     policy: Option<&crate::target_policy::TargetPolicy>,
 ) -> Result<TcpStream> {
+    connect_target_named(target, None, outbound, bind_ip, debug, policy).await
+}
+
+/// `connect_target` for a target given by address that is known under
+/// `known_name` (see `ip_names`): the name only chooses the rule, the
+/// connection goes to the address.
+pub async fn connect_target_named(
+    target: &str,
+    known_name: Option<&str>,
+    outbound: Option<&OutboundConfig>,
+    bind_ip: Option<&str>,
+    debug: bool,
+    policy: Option<&crate::target_policy::TargetPolicy>,
+) -> Result<TcpStream> {
     let connect_timeout = Duration::from_secs(10);
     if let Some(outbound) = outbound {
         if outbound.enabled {
-            let (action, rule_src) = select_outbound_action(target, "tcp", outbound, debug).await;
+            let (action, rule_src) = select_outbound_action_named(target, known_name, "tcp", outbound, debug).await;
             // Per-rule source wins; otherwise the server's global bind_ip.
             let eff_bind = rule_src.as_deref().or(bind_ip);
             if action == OutboundAction::Block {
@@ -182,10 +196,36 @@ pub async fn select_outbound_action(
     outbound: &OutboundConfig,
     debug: bool,
 ) -> (OutboundAction, Option<String>) {
+    select_outbound_action_named(target, None, protocol, outbound, debug).await
+}
+
+/// Whether any rule for `protocol` matches by name: only then is a name
+/// for an address worth looking up.
+pub fn has_domain_rules(outbound: &OutboundConfig, protocol: &str) -> bool {
+    outbound.enabled
+        && outbound.rules.iter().any(|r| {
+            !r.domain_suffix.is_empty()
+                && r.protocol.as_deref().map_or(true, |p| p.is_empty() || p.eq_ignore_ascii_case(protocol))
+        })
+}
+
+/// The rule for `target`. When the target is an address, `known_name` is a
+/// name it was given for (see `ip_names`): a rule's `domain_suffix` then
+/// matches that name as it would match a connection by name. Rules are
+/// still taken in order, the first that matches by name or by address wins.
+pub async fn select_outbound_action_named(
+    target: &str,
+    known_name: Option<&str>,
+    protocol: &str,
+    outbound: &OutboundConfig,
+    debug: bool,
+) -> (OutboundAction, Option<String>) {
     let (host, port) = match split_host_port(target) {
         Some(v) => v,
         None => return (outbound.default_action, None),
     };
+    // Only for an address: a target by name is matched by its own name.
+    let known_name = known_name.filter(|_| host.parse::<std::net::IpAddr>().is_ok());
 
     // Capture the matched rule's action AND its per-rule source IP together, so
     // the caller egresses from the address that rule asked for.
@@ -198,6 +238,7 @@ pub async fn select_outbound_action(
         }
         let hit = (rule.domain_suffix.is_empty() && rule.ip_cidr.is_empty())
             || match_domain_rule(&host, &rule.domain_suffix)
+            || known_name.is_some_and(|n| match_domain_rule(n, &rule.domain_suffix))
             || match_ip_rule(&host, port, &rule.ip_cidr).await;
         if hit {
             matched = Some((rule.action, rule.send_from.clone()));
@@ -207,7 +248,7 @@ pub async fn select_outbound_action(
 
     let (action, send_from) = matched.unwrap_or((outbound.default_action, None));
     if debug {
-        tracing::debug!("Outbound routing: target={target} action={action:?} send_from={send_from:?}");
+        tracing::debug!("Outbound routing: target={target} name={known_name:?} action={action:?} send_from={send_from:?}");
     }
     (action, send_from)
 }
@@ -705,6 +746,80 @@ mod tests {
         // because the implementation treats "example.com" as a suffix match
         assert!(match_domain_rule("example.com", &["example.com".to_string()]));
         assert!(match_domain_rule("sub.example.com", &["example.com".to_string()]));
+    }
+
+    fn rules(rules: Vec<OutboundRule>, default_action: OutboundAction) -> OutboundConfig {
+        OutboundConfig {
+            enabled: true,
+            protocol: "socks5".into(),
+            address: "127.0.0.1".into(),
+            port: 1,
+            username: String::new(),
+            password: String::new(),
+            rules,
+            default_action,
+        }
+    }
+
+    fn rule(domains: &[&str], cidrs: &[&str], protocol: Option<&str>, action: OutboundAction) -> OutboundRule {
+        OutboundRule {
+            domain_suffix: domains.iter().map(|s| s.to_string()).collect(),
+            ip_cidr: cidrs.iter().map(|s| s.to_string()).collect(),
+            protocol: protocol.map(Into::into),
+            action,
+            send_from: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_domain_rule_matches_an_address_known_by_that_name() {
+        let cfg = rules(vec![rule(&["google.com", "googlevideo.com"], &[], None, OutboundAction::Proxy)], OutboundAction::Direct);
+        let t = "142.250.74.14:443";
+        // Without a name only the default applies (what TUN clients got).
+        assert_eq!(select_outbound_action(t, "udp", &cfg, false).await.0, OutboundAction::Direct);
+        assert_eq!(select_outbound_action_named(t, Some("www.google.com"), "udp", &cfg, false).await.0, OutboundAction::Proxy);
+        assert_eq!(select_outbound_action_named(t, Some("rr2.googlevideo.com"), "tcp", &cfg, false).await.0, OutboundAction::Proxy);
+        assert_eq!(select_outbound_action_named(t, Some("example.org"), "udp", &cfg, false).await.0, OutboundAction::Direct);
+        // A target by name is matched by its own name only.
+        assert_eq!(select_outbound_action_named("example.org:443", Some("www.google.com"), "tcp", &cfg, false).await.0, OutboundAction::Direct);
+        assert_eq!(select_outbound_action("www.google.com:443", "tcp", &cfg, false).await.0, OutboundAction::Proxy);
+    }
+
+    #[tokio::test]
+    async fn rules_keep_their_order_with_a_known_name() {
+        // An address rule before the name rule wins, and the other way round.
+        let ip_first = rules(
+            vec![
+                rule(&[], &["142.250.0.0/15"], None, OutboundAction::Block),
+                rule(&["google.com"], &[], None, OutboundAction::Proxy),
+            ],
+            OutboundAction::Direct,
+        );
+        let t = "142.250.74.14:443";
+        assert_eq!(select_outbound_action_named(t, Some("google.com"), "udp", &ip_first, false).await.0, OutboundAction::Block);
+        let name_first = rules(
+            vec![
+                rule(&["google.com"], &[], None, OutboundAction::Proxy),
+                rule(&[], &[], Some("udp"), OutboundAction::Direct),
+            ],
+            OutboundAction::Block,
+        );
+        assert_eq!(select_outbound_action_named(t, Some("google.com"), "udp", &name_first, false).await.0, OutboundAction::Proxy);
+        assert_eq!(select_outbound_action_named(t, None, "udp", &name_first, false).await.0, OutboundAction::Direct);
+    }
+
+    #[test]
+    fn domain_rules_are_looked_for_per_protocol() {
+        let cfg = rules(vec![rule(&["google.com"], &[], Some("tcp"), OutboundAction::Proxy)], OutboundAction::Direct);
+        assert!(has_domain_rules(&cfg, "tcp"));
+        assert!(!has_domain_rules(&cfg, "udp"));
+        let any = rules(vec![rule(&["google.com"], &[], None, OutboundAction::Proxy)], OutboundAction::Direct);
+        assert!(has_domain_rules(&any, "udp"));
+        let ips = rules(vec![rule(&[], &["10.0.0.0/8"], None, OutboundAction::Proxy)], OutboundAction::Direct);
+        assert!(!has_domain_rules(&ips, "tcp"));
+        let mut off = any.clone();
+        off.enabled = false;
+        assert!(!has_domain_rules(&off, "udp"));
     }
 
     #[test]

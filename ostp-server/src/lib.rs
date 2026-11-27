@@ -30,6 +30,7 @@ mod relay;
 mod signal;
 pub mod dns;
 pub mod router;
+pub mod ip_names;
 pub mod overnet;
 pub mod warp;
 pub mod password;

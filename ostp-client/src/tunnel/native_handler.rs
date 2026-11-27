@@ -179,17 +179,20 @@ where
                 }
 
                 // ── Sniff TLS ClientHello for SNI ─────────────────────────────
-                let mut sniff_buf = [0u8; 2048];
-                let sniff_len =
-                    match tokio::time::timeout(
-                        std::time::Duration::from_millis(100),
-                        stream.read(&mut sniff_buf),
-                    )
-                    .await
-                    {
-                        Ok(Ok(n)) => n,
-                        _ => 0,
-                    };
+                // The whole ClientHello: a post-quantum one comes in two segments.
+                let mut sniff_buf = Vec::new();
+                crate::tunnel::sni_sniff::read_first_bytes(
+                    &mut stream,
+                    &mut sniff_buf,
+                    std::time::Duration::from_millis(100),
+                )
+                .await;
+                let sniff_len = sniff_buf.len();
+                let sni = if sniff_len > 0 {
+                    crate::tunnel::sni_sniff::extract_sni(&sniff_buf)
+                } else {
+                    None
+                };
 
                 // ── Decide: bypass or tunnel? ─────────────────────────────────
                 let mut should_bypass = false;
@@ -206,16 +209,14 @@ where
                 }
 
                 // 2. SNI domain check (belt-and-suspenders for CDNs / late-resolved IPs)
-                if !should_bypass && sniff_len > 0 {
-                    if let Some(sni) =
-                        crate::tunnel::sni_sniff::extract_sni(&sniff_buf[..sniff_len])
-                    {
+                if !should_bypass {
+                    if let Some(sni) = &sni {
                         if debug {
-                            crate::logs::tun_sni(&sni);
+                            crate::logs::tun_sni(sni);
                         }
-                        if matcher.match_domain(&sni) {
+                        if matcher.match_domain(sni) {
                             if debug {
-                                crate::logs::tun_bypass_sni(&sni, remote);
+                                crate::logs::tun_bypass_sni(sni, remote);
                             }
                             should_bypass = true;
                         }
@@ -285,34 +286,30 @@ where
                 }
 
                 // ── Tunnel path: forward via local OSTP SOCKS5 proxy ──────────
-                let Ok(mut socks) = tokio::net::TcpStream::connect(&proxy_addr).await else {
-                    return;
+                // By the ClientHello's name when it has one, so the server's
+                // `domain_suffix` rules match (by address only `ip_cidr` can);
+                // the server resolves it. A name it cannot connect to soon is
+                // tried again by the address the program used.
+                let name = sni.as_deref().and_then(|s| connect_name(s, remote));
+                let mut socks = None;
+                if let Some(name) = &name {
+                    let started = std::time::Instant::now();
+                    match socks_connect(&proxy_addr, &socks_connect_request(remote, Some(name))).await {
+                        Ok(s) => socks = Some(s),
+                        // The server's rules refused the name: not tried by address.
+                        Err(crate::tunnel::proxy::SOCKS_NOT_ALLOWED) => return,
+                        // A slow failure: the address would fail as slowly.
+                        Err(_) if started.elapsed() >= NAME_FALLBACK_WITHIN => return,
+                        Err(_) => {}
+                    }
+                }
+                let mut socks = match socks {
+                    Some(s) => s,
+                    None => match socks_connect(&proxy_addr, &socks_connect_request(remote, None)).await {
+                        Ok(s) => s,
+                        Err(_) => return,
+                    },
                 };
-
-                // SOCKS5 handshake (no auth)
-                if socks.write_all(&[5, 1, 0]).await.is_err() { return; }
-                let mut buf2 = [0u8; 2];
-                if socks.read_exact(&mut buf2).await.is_err() || buf2[0] != 5 || buf2[1] != 0 {
-                    return;
-                }
-
-                // CONNECT request
-                let mut req = vec![5u8, 1, 0];
-                match remote.ip() {
-                    std::net::IpAddr::V4(v4) => {
-                        req.push(1);
-                        req.extend_from_slice(&v4.octets());
-                    }
-                    std::net::IpAddr::V6(v6) => {
-                        req.push(4);
-                        req.extend_from_slice(&v6.octets());
-                    }
-                }
-                req.extend_from_slice(&remote.port().to_be_bytes());
-                if socks.write_all(&req).await.is_err() { return; }
-
-                let mut rep = [0u8; 10];
-                if socks.read_exact(&mut rep).await.is_err() || rep[1] != 0 { return; }
 
                 // Replay sniffed bytes
                 if sniff_len > 0 && socks.write_all(&sniff_buf[..sniff_len]).await.is_err() {
@@ -442,6 +439,191 @@ where
     let _ = tokio::io::copy_bidirectional(local, &mut spy).await;
     if spy.saw_reset {
         abort(local);
+    }
+}
+
+/// A connection by name that failed sooner than this (the server could not
+/// resolve the name, say) is tried again by address; a slower failure is
+/// not, it would only make the program wait twice.
+#[cfg(any(target_os = "windows", target_os = "linux", target_os = "android", test))]
+const NAME_FALLBACK_WITHIN: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Whether `ip` is an internet address. A connection to anything else (a
+/// LAN, this server's 10.1.0.1, a carrier-grade NAT range) keeps its
+/// address: the name of a ClientHello sent there may mean something else on
+/// the server.
+#[cfg(any(target_os = "windows", target_os = "linux", target_os = "android", test))]
+fn is_internet_address(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            let o = v4.octets();
+            !(v4.is_private()
+                || v4.is_loopback()
+                || v4.is_link_local()
+                || v4.is_unspecified()
+                || v4.is_broadcast()
+                || v4.is_multicast()
+                || o[0] == 0
+                || (o[0] == 100 && (o[1] & 0xC0) == 64) // 100.64.0.0/10
+                || o[0] >= 240)
+        }
+        std::net::IpAddr::V6(v6) => {
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return is_internet_address(std::net::IpAddr::V4(v4));
+            }
+            let s = v6.segments();
+            !(v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_multicast()
+                || (s[0] & 0xfe00) == 0xfc00 // unique local
+                || (s[0] & 0xffc0) == 0xfe80) // link local
+        }
+    }
+}
+
+/// The name a TUN connection to `remote` is sent to the server by, from the
+/// server name `sni` of its ClientHello: a DNS name (not an address), and
+/// only for a connection to an internet address.
+#[cfg(any(target_os = "windows", target_os = "linux", target_os = "android", test))]
+fn connect_name(sni: &str, remote: std::net::SocketAddr) -> Option<String> {
+    if !is_internet_address(remote.ip()) {
+        return None;
+    }
+    crate::tunnel::sni_sniff::routable_sni(sni)
+}
+
+/// A SOCKS5 CONNECT request for `remote`, by `name` (address type 3) when
+/// given, otherwise by the address (types 1 and 4).
+#[cfg(any(target_os = "windows", target_os = "linux", target_os = "android", test))]
+fn socks_connect_request(remote: std::net::SocketAddr, name: Option<&str>) -> Vec<u8> {
+    let mut req = vec![5u8, 1, 0];
+    match (name, remote.ip()) {
+        (Some(name), _) if !name.is_empty() && name.len() <= 255 => {
+            req.push(3);
+            req.push(name.len() as u8);
+            req.extend_from_slice(name.as_bytes());
+        }
+        (_, std::net::IpAddr::V4(v4)) => {
+            req.push(1);
+            req.extend_from_slice(&v4.octets());
+        }
+        (_, std::net::IpAddr::V6(v6)) => {
+            req.push(4);
+            req.extend_from_slice(&v6.octets());
+        }
+    }
+    req.extend_from_slice(&remote.port().to_be_bytes());
+    req
+}
+
+/// Opens a connection through the local SOCKS5 proxy with the CONNECT
+/// request `req`. On a refusal, the SOCKS5 reply code (0xFF when the local
+/// proxy could not be talked to at all).
+#[cfg(any(target_os = "windows", target_os = "linux", target_os = "android", test))]
+async fn socks_connect(proxy_addr: &str, req: &[u8]) -> Result<tokio::net::TcpStream, u8> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    const BROKEN: u8 = 0xFF;
+    let mut socks = tokio::net::TcpStream::connect(proxy_addr).await.map_err(|_| BROKEN)?;
+    // SOCKS5 handshake: no auth, and the mark that the exclusions are checked.
+    socks.write_all(&[5, 2, 0, crate::tunnel::proxy::TUN_CHECKED_METHOD]).await.map_err(|_| BROKEN)?;
+    let mut buf2 = [0u8; 2];
+    socks.read_exact(&mut buf2).await.map_err(|_| BROKEN)?;
+    if buf2 != [5, 0] {
+        return Err(BROKEN);
+    }
+    socks.write_all(req).await.map_err(|_| BROKEN)?;
+    // The local proxy answers with an IPv4 address: 10 bytes.
+    let mut rep = [0u8; 10];
+    socks.read_exact(&mut rep).await.map_err(|_| BROKEN)?;
+    match rep[1] {
+        0 => Ok(socks),
+        code => Err(code),
+    }
+}
+
+#[cfg(test)]
+mod connect_tests {
+    use super::*;
+
+    fn sa(s: &str) -> std::net::SocketAddr {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn a_connect_by_name_carries_the_sni() {
+        let remote = sa("142.250.74.14:443");
+        let name = connect_name("WWW.YouTube.com", remote).unwrap();
+        assert_eq!(name, "www.youtube.com");
+        let req = socks_connect_request(remote, Some(&name));
+        let mut want = vec![5, 1, 0, 3, 15];
+        want.extend_from_slice(b"www.youtube.com");
+        want.extend_from_slice(&443u16.to_be_bytes());
+        assert_eq!(req, want);
+    }
+
+    #[test]
+    fn without_a_name_the_address_is_sent() {
+        assert_eq!(socks_connect_request(sa("142.250.74.14:443"), None), vec![5, 1, 0, 1, 142, 250, 74, 14, 1, 187]);
+        let v6 = socks_connect_request(sa("[2a00:1450::200e]:443"), None);
+        assert_eq!(v6[3], 4);
+        assert_eq!(v6.len(), 4 + 16 + 2);
+    }
+
+    #[test]
+    fn no_name_for_local_addresses_or_address_snis() {
+        assert!(connect_name("panel.ostp.example", sa("10.1.0.1:443")).is_none());
+        assert!(connect_name("nas.home.example", sa("192.168.1.10:443")).is_none());
+        assert!(connect_name("x.example", sa("100.64.1.1:443")).is_none());
+        assert!(connect_name("x.example", sa("[fe80::1]:443")).is_none());
+        assert!(connect_name("x.example", sa("[fd00::1]:443")).is_none());
+        assert!(connect_name("142.250.74.14", sa("142.250.74.14:443")).is_none());
+        assert!(connect_name("localhost", sa("142.250.74.14:443")).is_none());
+        assert!(connect_name("x.example", sa("[2a00:1450::200e]:443")).is_some());
+    }
+
+    /// A fake local proxy that answers CONNECT with `code` and hands back
+    /// the request it got.
+    async fn fake_proxy(code: u8) -> (String, tokio::task::JoinHandle<Vec<u8>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap().to_string();
+        let task = tokio::spawn(async move {
+            let (mut s, _) = l.accept().await.unwrap();
+            let mut hello = [0u8; 4];
+            s.read_exact(&mut hello).await.unwrap();
+            assert_eq!(hello, [5, 2, 0, crate::tunnel::proxy::TUN_CHECKED_METHOD]);
+            s.write_all(&[5, 0]).await.unwrap();
+            let mut req = vec![0u8; 512];
+            let n = s.read(&mut req).await.unwrap();
+            req.truncate(n);
+            s.write_all(&[5, code, 0, 1, 0, 0, 0, 0, 0, 0]).await.unwrap();
+            req
+        });
+        (addr, task)
+    }
+
+    #[tokio::test]
+    async fn the_proxy_gets_the_name_and_a_refusal_is_reported() {
+        let req = socks_connect_request(sa("142.250.74.14:443"), Some("www.youtube.com"));
+        let (addr, task) = fake_proxy(0).await;
+        assert!(socks_connect(&addr, &req).await.is_ok());
+        assert_eq!(task.await.unwrap(), req);
+
+        let (addr, task) = fake_proxy(4).await;
+        assert_eq!(socks_connect(&addr, &req).await.err(), Some(4));
+        task.await.unwrap();
+
+        let (addr, task) = fake_proxy(crate::tunnel::proxy::SOCKS_NOT_ALLOWED).await;
+        assert_eq!(socks_connect(&addr, &req).await.err(), Some(crate::tunnel::proxy::SOCKS_NOT_ALLOWED));
+        task.await.unwrap();
+    }
+
+    #[test]
+    fn a_refusal_by_the_servers_rules_is_told_apart() {
+        use crate::tunnel::proxy::{socks_error_code, SOCKS_NOT_ALLOWED};
+        assert_eq!(socks_error_code("connect failed: blocked by outbound rule: a.example:443"), SOCKS_NOT_ALLOWED);
+        assert_eq!(socks_error_code("connect failed: a.example: blocked by DNS filtering"), SOCKS_NOT_ALLOWED);
+        assert_eq!(socks_error_code("connect failed: dns resolution failed for a.example:443"), 0x04);
     }
 }
 

@@ -465,8 +465,12 @@ pub async fn handle_message(
             // the client sends meanwhile wait in `udp_rx`.
             let router_task = router.clone();
             let udp_reply_clone = udp_reply_tx.clone();
+            let client_ip = peer_addr.ip();
             tokio::spawn(async move {
-                let session_router = std::sync::Arc::new(router_task.route_udp_associate(server_udp.clone()).await);
+                let session_router = std::sync::Arc::new(router_task.route_udp_associate(server_udp.clone(), client_ip).await);
+                // Plain DNS answers from other resolvers name the addresses
+                // this client will use (see `ip_names`).
+                let ip_names = router_task.ip_names.clone();
 
                 // Outbound UDP loop (tunnel -> target)
                 let tx_router = session_router.clone();
@@ -497,6 +501,9 @@ pub async fn handle_message(
                             _ = cancel_rx.recv() => break,
                             res = rx_sock.recv_from(&mut direct_buf) => {
                                 if let Ok((len, addr)) = res {
+                                    if addr.port() == 53 {
+                                        ip_names.remember_dns_answer(client_ip, &direct_buf[..len]);
+                                    }
                                     let _ = udp_reply_clone.try_send((session_id, stream_id, clean_ipv6_mapped_v4(addr).to_string(), direct_buf[..len].to_vec()));
                                 } else { break; }
                             }
@@ -504,6 +511,9 @@ pub async fn handle_message(
                                 match res {
                                     Ok((len, target_str)) => {
                                         proxy_errors = 0;
+                                        if target_str.ends_with(":53") {
+                                            ip_names.remember_dns_answer(client_ip, &proxy_buf[..len]);
+                                        }
                                         let _ = udp_reply_clone.try_send((session_id, stream_id, target_str, proxy_buf[..len].to_vec()));
                                     }
                                     Err(e) => {
@@ -521,6 +531,9 @@ pub async fn handle_message(
                             _ = cancel_rx.recv() => break,
                             res = rx_sock.recv_from(&mut direct_buf) => {
                                 if let Ok((len, addr)) = res {
+                                    if addr.port() == 53 {
+                                        ip_names.remember_dns_answer(client_ip, &direct_buf[..len]);
+                                    }
                                     let _ = udp_reply_clone.try_send((session_id, stream_id, clean_ipv6_mapped_v4(addr).to_string(), direct_buf[..len].to_vec()));
                                 } else { break; }
                             }

@@ -1,7 +1,7 @@
 use std::sync::{Arc, RwLock};
 use tokio::net::TcpStream;
 use anyhow::Result;
-use crate::outbound::{OutboundConfig, connect_target};
+use crate::outbound::{OutboundConfig, connect_target, connect_target_named};
 use crate::dns::DnsServer;
 use crate::overnet::{Overnet, OvernetConfig, Route};
 use crate::target_policy::TargetPolicy;
@@ -26,6 +26,9 @@ pub struct Router {
     pub ipv6_egress: bool,
     /// What the server tells a client about itself inside the tunnel.
     pub info: Arc<crate::server_info::ServerInfoState>,
+    /// Names clients were given for addresses, so `domain_suffix` rules
+    /// match traffic sent to an address (see `ip_names`).
+    pub ip_names: Arc<crate::ip_names::IpNames>,
 }
 
 /// Whether an IPv6 socket can be made and routed to a public address. A UDP
@@ -56,6 +59,7 @@ impl Router {
             local: Arc::new(RwLock::new((false, None))),
             debug,
             info: Arc::new(crate::server_info::ServerInfoState::default()),
+            ip_names: Arc::new(crate::ip_names::IpNames::default()),
         }
     }
 
@@ -113,7 +117,12 @@ impl Router {
         let target = match target.rsplit_once(':') {
             Some((host, port)) if host.parse::<std::net::IpAddr>().is_err() && !host.starts_with('[') => {
                 let proxied = cfg.as_ref().is_some_and(|c| c.enabled);
-                match self.dns_server.resolve_host(host, client).await {
+                let resolved = self.dns_server.resolve_host(host, client).await;
+                if let Ok(Some(ip)) = resolved {
+                    // QUIC to the same address then matches this name's rule.
+                    self.ip_names.remember(client, ip, host);
+                }
+                match resolved {
                     Err(reason) => return Err(anyhow::anyhow!("{host}: {reason}")),
                     Ok(Some(ip)) if !proxied || self.dns_server.explain(host).outcome == ostp_dns::Outcome::Rewritten => {
                         // 10.1.0.1 is the server itself as clients see it.
@@ -140,7 +149,13 @@ impl Router {
                 };
             }
         }
-        connect_target(&target, cfg.as_ref(), self.bind_ip.as_deref(), self.debug, Some(&self.policy())).await
+        // A target by address takes the rule of a name the client was given
+        // for that address, if any (a TUN client without the SNI, say).
+        let known_name = cfg
+            .as_ref()
+            .filter(|c| crate::outbound::has_domain_rules(c, "tcp"))
+            .and_then(|_| self.ip_names.name_for_target(client, &target));
+        connect_target_named(&target, known_name.as_deref(), cfg.as_ref(), self.bind_ip.as_deref(), self.debug, Some(&self.policy())).await
     }
 
     /// Whether a connection to `target` would be made by the upstream proxy
@@ -185,7 +200,9 @@ impl Router {
     }
     
     /// Establish a UDP session router that can dynamically route packets
-    pub async fn route_udp_associate(&self, server_udp: std::sync::Arc<tokio::net::UdpSocket>) -> UdpSessionRouter {
+    /// `client` is the client's address, whose remembered names (see
+    /// `ip_names`) the rules match datagrams to an address against.
+    pub async fn route_udp_associate(&self, server_udp: std::sync::Arc<tokio::net::UdpSocket>, client: std::net::IpAddr) -> UdpSessionRouter {
         let cfg = {
             let lock = self.outbound_cfg.read().unwrap();
             lock.clone()
@@ -226,12 +243,18 @@ impl Router {
             proxy,
             cfg,
             debug: self.debug,
+            ip_names: self.ip_names.clone(),
+            client,
         }
     }
     
     /// Unified DNS Routing and Resolution (AdBlock / Custom Domains / DoH)
     pub async fn route_dns(&self, client_ip: std::net::IpAddr, payload: &[u8]) -> Option<Vec<u8>> {
-        self.dns_server.handle(payload, client_ip).await
+        let answer = self.dns_server.handle(payload, client_ip).await;
+        if let Some(a) = &answer {
+            self.ip_names.remember_dns_answer(client_ip, a);
+        }
+        answer
     }
 }
 
@@ -241,6 +264,8 @@ pub struct UdpSessionRouter {
     proxy: Option<Arc<crate::outbound::UdpProxySocket>>,
     cfg: Option<OutboundConfig>,
     debug: bool,
+    ip_names: Arc<crate::ip_names::IpNames>,
+    client: std::net::IpAddr,
 }
 
 impl UdpSessionRouter {
@@ -250,7 +275,13 @@ impl UdpSessionRouter {
         }
         if let Some(cfg) = &self.cfg {
             if cfg.enabled {
-                let (action, _rule_src) = crate::outbound::select_outbound_action(target, "udp", cfg, self.debug).await;
+                // QUIC names no host: a name the client was given for the
+                // address picks the rule (a QUIC Initial's SNI is not read).
+                let known_name = crate::outbound::has_domain_rules(cfg, "udp")
+                    .then(|| self.ip_names.name_for_target(self.client, target))
+                    .flatten();
+                let (action, _rule_src) =
+                    crate::outbound::select_outbound_action_named(target, known_name.as_deref(), "udp", cfg, self.debug).await;
                 if action == crate::outbound::OutboundAction::Block {
                     return Err(anyhow::anyhow!("blocked by outbound udp rule: {}", target));
                 }
@@ -345,5 +376,85 @@ mod tests {
         assert!(!router.route_tcp(&format!("127.0.0.1:{other}"), me).await.is_err_and(|e| e.to_string().contains("server itself")));
         // Anything else still goes where the rules say: the dead proxy.
         assert!(router.route_tcp("198.51.100.7:80", me).await.is_err());
+    }
+
+    fn warp_for_google(proxy_port: u16) -> OutboundConfig {
+        OutboundConfig {
+            enabled: true,
+            protocol: "socks5".into(),
+            address: "127.0.0.1".into(),
+            port: proxy_port,
+            username: String::new(),
+            password: String::new(),
+            rules: vec![crate::outbound::OutboundRule {
+                domain_suffix: vec!["googlevideo.com".into(), "youtube.com".into()],
+                ip_cidr: Vec::new(),
+                protocol: None,
+                action: OutboundAction::Proxy,
+                send_from: None,
+            }],
+            default_action: OutboundAction::Direct,
+        }
+    }
+
+    /// QUIC to an address the client was given for a name with a proxy rule,
+    /// and no UDP proxy: dropped, never sent from the server's own address,
+    /// so the browser falls back to TCP. Another client's datagrams to the
+    /// same address are not affected.
+    #[tokio::test]
+    async fn udp_to_a_remembered_address_follows_the_name_rule_and_fails_closed() {
+        // Nothing listens on the proxy port: the UDP ASSOCIATE fails.
+        let dead = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dead_port = dead.local_addr().unwrap().port();
+        drop(dead);
+        let router = Router::new(Some(warp_for_google(dead_port)), None, DnsServer::new(Default::default(), None), false);
+        let me: std::net::IpAddr = "203.0.113.5".parse().unwrap();
+        let other: std::net::IpAddr = "203.0.113.6".parse().unwrap();
+        router.ip_names.remember(me, "198.51.100.7".parse().unwrap(), "rr1---sn-abc.googlevideo.com");
+
+        let udp = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let mine = router.route_udp_associate(udp.clone(), me).await;
+        assert!(mine.get_proxy_sock().is_none());
+        let e = mine.send_to(b"quic", "198.51.100.7:443").await.unwrap_err().to_string();
+        assert!(e.contains("no UDP proxy"), "{e}");
+
+        // Not this client's name: the default (direct) applies. A direct
+        // send may fail on a machine without a route, but not as a proxy drop.
+        let theirs = router.route_udp_associate(udp.clone(), other).await;
+        if let Err(e) = theirs.send_to(b"quic", "198.51.100.7:443").await {
+            assert!(!e.to_string().contains("no UDP proxy"), "{e}");
+        }
+    }
+
+    /// With a UDP proxy, the same datagram goes to it (SOCKS5 UDP header
+    /// with the address as the destination).
+    #[tokio::test]
+    async fn udp_to_a_remembered_address_goes_through_the_proxy() {
+        let relay = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let ctl = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let ctl_addr = ctl.local_addr().unwrap();
+        let (keepalive, _) = tokio::join!(tokio::net::TcpStream::connect(ctl_addr), ctl.accept());
+        let server_udp = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let proxy = crate::outbound::UdpProxySocket::Socks5 {
+            tcp_keepalive: keepalive.unwrap(),
+            udp_sock: server_udp.clone(),
+            proxy_bnd_addr: relay.local_addr().unwrap(),
+        };
+        let me: std::net::IpAddr = "203.0.113.5".parse().unwrap();
+        let names = Arc::new(crate::ip_names::IpNames::default());
+        names.remember(me, "198.51.100.7".parse().unwrap(), "www.youtube.com");
+        let r = UdpSessionRouter {
+            direct: server_udp,
+            policy: TargetPolicy::public_only(),
+            proxy: Some(Arc::new(proxy)),
+            cfg: Some(warp_for_google(1)),
+            debug: false,
+            ip_names: names,
+            client: me,
+        };
+        r.send_to(b"quic", "198.51.100.7:443").await.unwrap();
+        let mut buf = [0u8; 64];
+        let n = tokio::time::timeout(std::time::Duration::from_secs(5), relay.recv(&mut buf)).await.unwrap().unwrap();
+        assert_eq!(&buf[..n], &[0, 0, 0, 1, 198, 51, 100, 7, 1, 187, b'q', b'u', b'i', b'c']);
     }
 }
