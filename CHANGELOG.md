@@ -8,6 +8,8 @@ Older history is on the [Releases](https://github.com/ospab/ostp/releases) page 
 
 ## [Unreleased]
 
+## [0.5.0-beta.2] - 2026-11-27
+
 ### Fixed
 - Android: the Quick Settings tile and the notification say Connected only once the server answers (Connecting… until then), and the tile now really updates while the shade is open (the refresh call the service used works only for active tiles, so it did nothing). If the connection ends on its own while the app is closed (the server closed the session, the key expired), the VPN turns off within a few seconds instead of staying on with no traffic. Development: CI compiles the Android app (debug APK, arm64) and runs its unit tests. Tested in CI only; not yet on a phone.
 - Server outbound rules by domain (`domain_suffix`, e.g. WARP for google.com and youtube.com) now apply to clients in TUN mode (Android, desktop TUN). The client sent only the destination address, so a domain rule never matched and Google saw the server's own address (over IPv6 on a server that has it) instead of WARP's. The client now sends the site name from the TLS handshake (it also reads a ClientHello that arrives in two segments, as Chrome's and Firefox's post-quantum ones do); if the server cannot connect by that name within 3 s, the client retries once by address. For UDP and QUIC the server matches an address by the names it saw for that client in DNS answers and connections by name (10 minutes per name, at most 50,000); a datagram whose rule needs a proxy that cannot carry UDP is dropped, and the browser falls back to TCP where the name is known. Tested with unit tests; not yet on a device or with WARP.
