@@ -73,16 +73,24 @@
                 android:resource="@xml/update_file_paths"/>
         </provider>
 
-        <!-- Quick Settings Tile -->
+        <!-- Quick Settings Tile. The icon is the monochrome glyph: the system
+             tints tile icons by alpha, so the colour launcher icon showed as a
+             white blob in the tile picker and before the first update. Not an
+             ACTIVE_TILE on purpose: the system rebinds it each time the shade
+             opens, so it never shows a state left over from a dead process. -->
         <service
             android:name=".OstpTileService"
-            android:icon="@mipmap/launcher_icon"
+            android:icon="@drawable/ic_ostp_status"
             android:label="OSTP VPN"
             android:permission="android.permission.BIND_QUICK_SETTINGS_TILE"
             android:exported="true">
             <intent-filter>
                 <action android:name="android.service.quicksettings.action.QS_TILE"/>
             </intent-filter>
+            <!-- Announced as an on/off switch by accessibility services (API 30+). -->
+            <meta-data
+                android:name="android.service.quicksettings.TOGGLEABLE_TILE"
+                android:value="true"/>
         </service>
     </application>
     <!-- Required to query activities that can process text, see:

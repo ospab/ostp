@@ -33,6 +33,10 @@ class OstpVpnService : VpnService() {
         // requests (subscriptions, update checks) go through it when the person wants that.
         @Volatile
         var localProxyAddr = ""
+        // The core's connection_state while the tunnel runs (0 none, 1 handshake or
+        // reconnect, 2 connected to the server); 0 when no tunnel runs.
+        @Volatile
+        var linkState = 0
         @Keep
         var instance: OstpVpnService? = null
         // Bumped on every start; a service instance may tear down only the tunnel it owns.
@@ -42,7 +46,31 @@ class OstpVpnService : VpnService() {
         private const val NOTIF_ID = 1001
         private const val CHANNEL_ID = "ostp_vpn_channel"
         private const val WAKE_LOCK_TAG = "ostp:vpn_wakelock"
+
+        // How long the core may report "not connected" before the service ends the
+        // tunnel. The app, when it is open, polls every second and stops sooner with
+        // the reason the server gave; these limits only matter when nothing else
+        // watches (the tunnel was started from the tile, or the app was closed).
+        const val CORE_GONE_AFTER_UP_MS = 5_000L
+        const val CORE_SILENT_AT_START_MS = 25_000L
+
+        /**
+         * True when the core has stopped for good: it was connected (or
+         * connecting) and has reported 0 for [CORE_GONE_AFTER_UP_MS], or it never
+         * reported anything in [CORE_SILENT_AT_START_MS] after the start. The
+         * core reconnects on its own and reports 1 meanwhile, so a reconnect is
+         * never taken for a stop.
+         */
+        fun coreGone(everUp: Boolean, zeroForMs: Long, sinceStartMs: Long): Boolean =
+            if (everUp) zeroForMs >= CORE_GONE_AFTER_UP_MS else sinceStartMs >= CORE_SILENT_AT_START_MS
     }
+
+    // Reads the core's state off the main thread (the JNI call takes the core's lock).
+    private var watcher: java.util.concurrent.ScheduledExecutorService? = null
+    // Main-thread only: what the watcher has seen of the current tunnel.
+    private var watchStartedAt = 0L
+    private var coreEverUp = false
+    private var zeroSince = 0L
 
     // The generation of the tunnel this instance started (0 = none).
     private var ownedGeneration = 0
@@ -72,7 +100,8 @@ class OstpVpnService : VpnService() {
             // A service started with startForegroundService must call startForeground
             // soon even if it then has nothing to run, or the system kills the app.
             isStarting = true
-            OstpTileService.requestListeningState(applicationContext)
+            if (!isRunning) linkState = 0
+            OstpTileService.refresh()
             startForegroundSafe()
             val configJson = intent.getStringExtra("configJson")
             if (configJson == null) {
@@ -97,9 +126,19 @@ class OstpVpnService : VpnService() {
         return START_NOT_STICKY
     }
 
+    /**
+     * The type passed here must be one declared on the service in the manifest
+     * (connectedDevice). Its runtime prerequisite on Android 14+ is met by the
+     * declared CHANGE_NETWORK_STATE permission ("Foreground service types",
+     * Connected device). ServiceCompat drops the type below API 29.
+     *
+     * Without POST_NOTIFICATIONS (Android 13+, a runtime permission the app does
+     * not ask for) the service still runs in the foreground; the system only
+     * hides this notification from the shade and lists the app in its task manager.
+     */
     private fun startForegroundSafe() {
         try {
-            ServiceCompat.startForeground(this, NOTIF_ID, buildNotification(connecting = true), ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE)
+            ServiceCompat.startForeground(this, NOTIF_ID, buildNotification(connecting = linkState != 2), ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE)
         } catch (e: Throwable) {
             // Blocked notifications (Android 13+) do not prevent the foreground state;
             // anything else is logged and the tunnel still tries to start.
@@ -183,7 +222,7 @@ class OstpVpnService : VpnService() {
             Log.e("OstpVpnService", "Failed to update notification", e)
         }
         // Refresh Quick Settings tile state
-        OstpTileService.requestListeningState(applicationContext)
+        OstpTileService.refresh()
     }
 
     private fun acquireWakeLock() {
@@ -301,7 +340,7 @@ class OstpVpnService : VpnService() {
         if (vpnInterface != null) {
             // Already up: a second START changes nothing.
             isStarting = false
-            OstpTileService.requestListeningState(applicationContext)
+            OstpTileService.refresh()
             return
         }
 
@@ -391,8 +430,12 @@ class OstpVpnService : VpnService() {
                 localProxyAddr = localProxy
                 isRunning = true
                 isStarting = false
-                updateNotification(connected = true)
+                // The core is up, the server has not answered yet: "Connecting…"
+                // until the watcher sees connection_state 2.
+                linkState = 0
+                updateNotification(connected = false)
                 registerNetworkCallback()
+                startWatcher()
             } else {
                 Log.e("OstpVpnService", "Failed to start OSTP Rust Core")
                 stopVpn()
@@ -407,10 +450,66 @@ class OstpVpnService : VpnService() {
         }
     }
 
+    /**
+     * Follows the core's connection_state once a second: the notification and
+     * the tile say "Connected" only when the server answered, and a core that
+     * stopped on its own (the server closed the session, the key expired) ends
+     * the tunnel instead of leaving a VPN that carries nothing.
+     */
+    private fun startWatcher() {
+        stopWatcher()
+        watchStartedAt = android.os.SystemClock.elapsedRealtime()
+        coreEverUp = false
+        zeroSince = 0L
+        val ex = java.util.concurrent.Executors.newSingleThreadScheduledExecutor()
+        watcher = ex
+        ex.scheduleWithFixedDelay({
+            val state = try {
+                org.json.JSONObject(OstpClientSdk.getMetrics()).optInt("connection_state", 0)
+            } catch (e: Throwable) {
+                -1
+            }
+            if (state >= 0) mainHandler.post { onCoreState(ex, state) }
+        }, 1, 1, java.util.concurrent.TimeUnit.SECONDS)
+    }
+
+    private fun stopWatcher() {
+        watcher?.shutdownNow()
+        watcher = null
+    }
+
+    private fun onCoreState(from: java.util.concurrent.ScheduledExecutorService, state: Int) {
+        // A reading from a watcher already stopped (the tunnel ended or restarted) is dropped.
+        if (from !== watcher || !isRunning) return
+        val now = android.os.SystemClock.elapsedRealtime()
+        if (state != 0) {
+            coreEverUp = true
+            zeroSince = 0L
+        } else if (zeroSince == 0L) {
+            zeroSince = now
+        }
+        // Anything short of 2 is shown as connecting; the notification and the
+        // tile change only when the shown state does.
+        val shown = if (state == 2) 2 else 1
+        if (shown != linkState) {
+            linkState = shown
+            updateNotification(connected = shown == 2)
+        }
+        if (state == 0 && coreGone(coreEverUp, now - zeroSince, now - watchStartedAt)) {
+            Log.w("OstpVpnService", "The core reports no connection; ending the tunnel")
+            try {
+                OstpClientSdk.addLog("The connection ended, so the VPN was turned off")
+            } catch (_: Throwable) {}
+            stopVpn()
+        }
+    }
+
     private fun stopVpn() {
         isRunning = false
         isStarting = false
         localProxyAddr = ""
+        linkState = 0
+        stopWatcher()
         releaseWakeLock()
         // Stop following the network first, so no late callback signals a core that is going away.
         unregisterNetworkCallback()
@@ -429,11 +528,11 @@ class OstpVpnService : VpnService() {
         vpnInterface = null
 
         try {
-            stopForeground(true)
+            ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
         } catch (e: Throwable) {
             Log.e("OstpVpnService", "stopForeground failed", e)
         }
-        OstpTileService.requestListeningState(applicationContext)
+        OstpTileService.refresh()
         stopSelf()
     }
 
@@ -451,6 +550,7 @@ class OstpVpnService : VpnService() {
         if (ownsTunnel) {
             stopVpn()
         } else {
+            stopWatcher()
             releaseWakeLock()
         }
     }

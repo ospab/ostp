@@ -22,6 +22,7 @@ Builds and tests run on GitHub Actions, not on the developer's machine (`.github
 | A-05 | `sudo cargo test -p ostp-ssh --test sshd -- --ignored --test-threads=1` on a throwaway machine with sshd (with `OSTP_BIN=target/debug/ostp` for the manager test) | green: key and password sign-in, sudo, host-key change refused, port forward, `ostp manage` over SSH | P2 |
 | A-06 | `cargo tree -i aws-lc-sys` at the root and in `ostp-gui/src-tauri` | empty | P1 |
 | A-07 | Release build: `scripts/gha.ps1` pushes the tag and `release.yml` builds every platform (never a local build) | every job green, the assets of every platform are attached to the release | P1 |
+| A-08 | CI job *Android app (compile and unit tests)*: `flutter build apk --debug --target-platform android-arm64` (Kotlin, manifest and resources; the Rust library is not built) and `./gradlew :app:testDebugUnitTest` (the tile's states, when the service ends a tunnel whose core stopped) | green | P1 |
 
 ## 1. Test bed
 
@@ -248,6 +249,8 @@ Repeat for nginx, apache (Debian and RHEL) and caddy.
 | M-21 | As G-33 and the server information window (S-90) on a phone | groups, search and the "i" window work; Markdown links in the "about" text open only after a confirmation | P2 |
 | M-22 | As G-34 on a phone | the users editor with limits, devices and expiry works on a 360 dp wide screen | P1 |
 | M-23 | Stop the server (`systemctl stop ostp`) and revoke the key while connected | the app shows the server's reason for 12 seconds in place of "Could not connect to the server" and does not connect again by itself | P1 |
+| M-24 | Add the OSTP tile to Quick Settings; with a profile chosen in the app, tap it with the shade left open, then tap again; long-press it; tap it on the lock screen | the tile shows the profile and "Connecting…", then the profile name lit once the server answered (not when the VPN merely started); the notification is one quiet line (profile, *Connecting…* / *Connected*, *Disconnect*); the second tap turns both off; a long press opens the app; on the lock screen it asks to unlock first; with no profile it says "No profile" and a tap opens the app | P1 |
+| M-25 | Connect from the tile with the app closed, then stop the server or revoke the key | within a few seconds the VPN turns off, the notification goes and the tile shows off (no VPN left that carries nothing) | P1 |
 
 ## 5. CLI client
 

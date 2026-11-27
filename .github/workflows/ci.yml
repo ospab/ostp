@@ -4,7 +4,9 @@
 #
 # Results: `gh run list --workflow ci.yml`, `gh run view <id> --log-failed`.
 # Binaries: `gh run download <id> --name ostp-linux-amd64` (or ostp-windows-amd64).
-# The apps themselves (APK, desktop installers) are built by release.yml.
+# The published apps (APK, desktop installers) are built by release.yml; here
+# the Android app is compiled as a debug APK so Kotlin and resource errors show
+# before a release.
 name: CI
 
 # Pushes to beta and master that change code; text-only changes (docs,
@@ -155,3 +157,35 @@ jobs:
       - name: flutter test
         working-directory: ostp-flutter
         run: flutter test
+
+  # The Android side (Kotlin services, Quick Settings tile, manifest, resources)
+  # was compiled only by release.yml, so an error there showed up at release.
+  # A debug APK for arm64 compiles all of it. The Rust library (ostp_jni) is
+  # not built: Kotlin loads it at run time only, Gradle does not need it, and
+  # the APK made here is thrown away.
+  android:
+    name: Android app (compile and unit tests)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: zulu
+          java-version: '17'
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.41.6'
+          channel: stable
+          cache: true
+      # Gradle's dependencies and wrapper (written from the default branch only).
+      - uses: gradle/actions/setup-gradle@v4
+      - name: Debug APK (arm64, without the Rust library)
+        working-directory: ostp-flutter
+        run: |
+          flutter pub get
+          flutter build apk --debug --target-platform android-arm64
+      # JVM tests of the tile and service logic (android/app/src/test).
+      # flutter build wrote local.properties and the Gradle wrapper.
+      - name: Kotlin unit tests
+        working-directory: ostp-flutter/android
+        run: ./gradlew :app:testDebugUnitTest

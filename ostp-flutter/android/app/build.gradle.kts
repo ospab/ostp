@@ -49,6 +49,12 @@ android {
         targetCompatibility = JavaVersion.VERSION_17
     }
 
+    // The unit tests touch only plain logic; android.jar stubs return defaults
+    // instead of throwing if a class they load reaches for the framework.
+    testOptions {
+        unitTests.isReturnDefaultValues = true
+    }
+
     kotlinOptions {
         jvmTarget = JavaVersion.VERSION_17.toString()
     }
@@ -116,4 +122,6 @@ flutter {
 
 dependencies {
     implementation("androidx.core:core-ktx:1.13.1")
+    // JVM unit tests of the tile and service logic (src/test), run by CI.
+    testImplementation("junit:junit:4.13.2")
 }
