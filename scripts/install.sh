@@ -318,6 +318,9 @@ EOF
 
     if systemctl is-active --quiet ostp.service 2>/dev/null; then
         echo "Restarting ostp service..."
+        # Tells the running server this stop is a restart: its clients reconnect
+        # instead of stopping (see RESTART_MARKER in ostp-server).
+        date +%s > /run/ostp-restarting 2>/dev/null || true
         systemctl restart ostp.service
         echo "Service restarted."
     elif systemctl is-enabled --quiet ostp.service 2>/dev/null; then

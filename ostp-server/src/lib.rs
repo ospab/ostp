@@ -878,9 +878,16 @@ async fn run_server_loop(
                         let _ = ui_event_tx.send(UiEvent::Info("Shutdown command received".to_string()));
                         // Every v6 session is told the server is stopping. The
                         // service manager's stop and restart both arrive here
-                        // as SIGTERM, so the server cannot tell them apart:
-                        // the reason is always 5, never 1.
-                        dispatcher.close_all(ostp_core::CloseReason::ServerShutdown);
+                        // as SIGTERM; `ostp` leaves a marker right before it
+                        // restarts the service (see `RESTART_MARKER`), and then
+                        // the reason is "restarting", which clients answer by
+                        // reconnecting instead of stopping.
+                        let reason = if restart_announced() {
+                            ostp_core::CloseReason::ServerRestarting
+                        } else {
+                            ostp_core::CloseReason::ServerShutdown
+                        };
+                        dispatcher.close_all(reason);
                         let until = Instant::now() + CLOSE_FLUSH;
                         while Instant::now() < until {
                             if let Err(e) = handle_tick(
@@ -1529,5 +1536,50 @@ mod traffic_tests {
         assert_eq!(restore_user_traffic(&broken, &stats, &keys), 0);
         assert!(stats.read().unwrap().is_empty());
         std::fs::remove_file(broken).unwrap();
+    }
+}
+
+/// Written by `ostp` right before it restarts the service (a config change,
+/// `ostp restart`, an update), read and removed by the server as it stops.
+/// A stop with the marker present is a restart: clients are told so and
+/// reconnect on their own instead of stopping. In /run, so it never outlives
+/// a reboot.
+pub const RESTART_MARKER: &str = "/run/ostp-restarting";
+
+/// How old a marker may be and still count: a restart that systemd carries out
+/// takes seconds; an older one was left behind by a restart that never came.
+const RESTART_MARKER_MAX_AGE: u64 = 120;
+
+/// Marks the next stop as a restart (see `RESTART_MARKER`). Best effort: when
+/// it cannot be written the stop is announced as a shutdown, as before.
+pub fn mark_restart() {
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let _ = std::fs::write(RESTART_MARKER, now.to_string());
+}
+
+/// Whether this stop was announced as a restart; the marker is consumed.
+fn restart_announced() -> bool {
+    let Ok(text) = std::fs::read_to_string(RESTART_MARKER) else { return false };
+    let _ = std::fs::remove_file(RESTART_MARKER);
+    restart_marker_fresh(&text, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0))
+}
+
+fn restart_marker_fresh(text: &str, now: u64) -> bool {
+    text.trim().parse::<u64>().is_ok_and(|at| at <= now && now - at <= RESTART_MARKER_MAX_AGE)
+}
+
+#[cfg(test)]
+mod restart_marker_tests {
+    use super::restart_marker_fresh;
+
+    #[test]
+    fn a_recent_marker_is_a_restart_and_an_old_or_bad_one_is_not() {
+        assert!(restart_marker_fresh("1000", 1000));
+        assert!(restart_marker_fresh("1000
+", 1100));
+        assert!(!restart_marker_fresh("1000", 1121), "older than two minutes");
+        assert!(!restart_marker_fresh("2000", 1000), "from the future");
+        assert!(!restart_marker_fresh("garbage", 1000));
+        assert!(!restart_marker_fresh("", 1000));
     }
 }

@@ -61,6 +61,9 @@ const MIGRATION_CONNECT_BUDGET: Duration = Duration::from_secs(20);
 /// resets them all.
 const KEEP_SESSION_THROUGH_OUTAGE: Duration = Duration::from_secs(300);
 
+/// How long the tunnel waits for a server that said it is restarting.
+const SERVER_RESTART_WAIT: Duration = Duration::from_secs(120);
+
 /// Pause after a failed full-handshake attempt, by attempt number; the last
 /// value repeats until the user stops the tunnel.
 const RETRY_BACKOFF_SECS: [u64; 6] = [1, 2, 5, 10, 20, 30];
@@ -412,6 +415,10 @@ pub struct Bridge {
     /// the path is lost could not resolve the server's name until the tunnel
     /// worked again; it uses these instead.
     last_server_addrs: std::sync::Mutex<Vec<std::net::SocketAddr>>,
+    /// Set when the server said it is restarting (`CloseReason::ServerRestarting`):
+    /// the tunnel stays up and new sessions are tried every second until then;
+    /// past it the tunnel stops as for any other close.
+    restart_deadline: Option<Instant>,
     /// The session that asks for the server's info: the first whose server
     /// announced FEATURE_SERVER_INFO since the sessions were set up.
     info_session: Option<usize>,
@@ -481,6 +488,7 @@ impl Bridge {
             established_once: false,
             held_proxy: std::collections::VecDeque::new(),
             last_server_addrs: std::sync::Mutex::new(Vec::new()),
+            restart_deadline: None,
             info_session: None,
             info_pieces: Default::default(),
         })
@@ -698,7 +706,10 @@ impl Bridge {
     /// The server ended the session on purpose and said why (v6 `Close`). Not
     /// a failure of the path or of the protocol, so nothing is recovered or
     /// reconnected: the tunnel stops, the reason goes to the user, and the user
-    /// decides what to do (the client never reconnects on its own after this).
+    /// decides what to do. The one exception is a restart: the server comes
+    /// back in seconds, so the tunnel stays up and a new session is made as
+    /// soon as it answers (within `SERVER_RESTART_WAIT`). The app connections
+    /// of the old session are gone with the server's state either way.
     /// The acknowledgement of the `Close` was sent with this batch of frames.
     async fn on_server_close(
         &mut self,
@@ -707,6 +718,15 @@ impl Bridge {
         tx: &mpsc::Sender<UiEvent>,
         proxy_tx: &mpsc::UnboundedSender<(u32, ProxyToClientMsg)>,
     ) {
+        if reason == ostp_core::CloseReason::ServerRestarting && self.restart_deadline.is_none() {
+            self.restart_deadline = Some(Instant::now() + SERVER_RESTART_WAIT);
+            // A first try is pointless while the server is still stopping.
+            self.begin_reconnect("The server is restarting", false, tx, proxy_tx).await;
+            if let Link::Down { since, attempt, .. } = self.link {
+                self.link = Link::Down { since, attempt, next_try: Instant::now() + Duration::from_secs(1), handshake_next: true };
+            }
+            return;
+        }
         let message = crate::app::server_close_message(reason, text);
         let _ = tx
             .send(UiEvent::Log(format!("Session closed by the server (reason {}). {message}", reason.to_wire())))
@@ -1316,6 +1336,31 @@ impl Bridge {
                     tx.send(UiEvent::TunnelStopped).await.ok();
                     return true;
                 }
+                // A restarting server: a new session every second until it is
+                // back, or the tunnel stops once the wait is over.
+                if let Some(deadline) = self.restart_deadline {
+                    if Instant::now() >= deadline {
+                        self.restart_deadline = None;
+                        let msg = format!(
+                            "The server did not come back within {} s after restarting. Connect again later.",
+                            SERVER_RESTART_WAIT.as_secs()
+                        );
+                        tx.send(UiEvent::Log(msg.clone())).await.ok();
+                        crate::app::set_stop_notice(Some(msg.clone()));
+                        self.close_sessions().await;
+                        self.reset_proxy_streams(tx, proxy_tx, "server did not come back");
+                        let _ = tx.send(UiEvent::ServerClosed(msg)).await;
+                        tx.send(UiEvent::TunnelStopped).await.ok();
+                        return true;
+                    }
+                    self.link = Link::Down {
+                        since,
+                        attempt: attempt + 1,
+                        next_try: Instant::now() + Duration::from_secs(1),
+                        handshake_next: true,
+                    };
+                    return true;
+                }
                 let wait = RETRY_BACKOFF_SECS[(attempt as usize).min(RETRY_BACKOFF_SECS.len() - 1)];
                 tx.send(UiEvent::Log(format!(
                     "Reconnect attempt {} failed: {err}. Next try in {wait}s", attempt + 1
@@ -1397,6 +1442,9 @@ impl Bridge {
             }
         }
         self.established_once = true;
+        if self.restart_deadline.take().is_some() {
+            tx.send(UiEvent::Log("Reconnected after the server restarted".to_string())).await.ok();
+        }
 
         // The system proxy is for proxy mode; in TUN mode the TUN device
         // carries the traffic and setting it too hides a TUN that never came up.

@@ -39,12 +39,22 @@ fn has_systemd_unit() -> bool {
 }
 
 pub(crate) fn systemctl(args: &[&str]) -> bool {
+    mark_if_restart(args);
     Command::new("systemctl").args(args).output().is_ok_and(|o| o.status.success())
+}
+
+/// A restart of the service is announced to its clients as one (they reconnect
+/// instead of stopping): see `ostp_server::RESTART_MARKER`.
+fn mark_if_restart(args: &[&str]) {
+    if args.first() == Some(&"restart") && args.iter().any(|a| *a == "ostp" || *a == "ostp.service") {
+        ostp_server::mark_restart();
+    }
 }
 
 /// Like `systemctl`, but with the terminal attached, so polkit can ask for a
 /// password and systemctl's own messages show.
 pub(crate) fn systemctl_visible(args: &[&str]) -> bool {
+    mark_if_restart(args);
     Command::new("systemctl").args(args).status().is_ok_and(|s| s.success())
 }
 

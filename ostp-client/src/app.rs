@@ -51,7 +51,7 @@ pub fn server_close_message(reason: ostp_core::CloseReason, note: &str) -> Strin
     use ostp_core::CloseReason::*;
     let what = match reason {
         Normal => "The server closed the connection.",
-        ServerRestarting => "The server closed the connection: it is restarting. Press Connect again in a moment.",
+        ServerRestarting => "The server is restarting: reconnecting on its own.",
         KeyRevoked => "The server closed the connection: your key was revoked or removed. Ask the server owner for a new key.",
         TrafficLimit => "The server closed the connection: the traffic limit of your key is used up. Ask the server owner to raise it.",
         TooManySessions => "The server closed the connection: too many sessions are open with this key, and this was the oldest. Close it on your other devices, then connect again.",
@@ -137,7 +137,7 @@ mod tests {
         assert!(server_close_message(CloseReason::KeyRevoked, "").contains("Ask the server owner"));
         assert!(server_close_message(CloseReason::TrafficLimit, "").contains("Ask the server owner"));
         assert!(server_close_message(CloseReason::KeyExpired, "").contains("has expired"));
-        assert!(server_close_message(CloseReason::ServerRestarting, "").contains("Connect again"));
+        assert!(server_close_message(CloseReason::ServerRestarting, "").contains("reconnecting"));
     }
 
     #[test]
