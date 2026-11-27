@@ -295,9 +295,12 @@ class OstpVpnService : VpnService() {
                 .addDnsServer(dnsServer)
                 .setMtu(Math.max(1280, json.optJSONObject("ostp")?.optInt("mtu", 1140) ?: 1140))
 
-            // Always add fallback IPv4 DNS servers
-            try { builder.addDnsServer("1.1.1.1") } catch (e: Throwable) {}
-            try { builder.addDnsServer("8.8.8.8") } catch (e: Throwable) {}
+            // Only the DNS the user chose (or the server's, or 1.1.1.1 by default).
+            // Fixed fallbacks (1.1.1.1 and 8.8.8.8) used to be added too: with the
+            // server's resolver or one of the user's own chosen, the phone still
+            // asked Cloudflare and Google, past the server's filtering. Every DNS
+            // query goes through the tunnel anyway, so a fallback adds no
+            // reliability, only another resolver that sees the names.
             // NOTE: Do NOT add IPv6 DNS servers here — Android would send DNS
             // queries over IPv6, but our smoltcp TUN stack processes them as
             // IPv4 only, causing all DNS to silently fail on LTE (IPv6-only networks).
