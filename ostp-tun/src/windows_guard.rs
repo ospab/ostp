@@ -239,11 +239,11 @@ mod tests {
         assert!(r.args.iter().any(|x| x == "protocol=any"));
         assert!(!r.args.iter().any(|x| x.starts_with("remoteport")));
         let ips = r.args.last().unwrap();
-        assert!(ips.starts_with("remoteip=::2-2001:db8::4,"));
+        assert!(ips.starts_with("remoteip=::,::2-2001:db8::4,"));
         // fe80::/10 and ff00::/8 are gaps, the server is a gap
         assert!(ips.contains("2001:db8::4,"));
         assert!(ips.contains("2001:db8::6-"));
-        assert!(ips.contains("fec0::-feff:ffff:ffff:ffff:ffff:ffff:ffff:ffff,"));
+        assert!(ips.contains("fec0::-feff:ffff:ffff:ffff:ffff:ffff:ffff:ffff"));
     }
 
     #[test]
