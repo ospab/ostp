@@ -406,6 +406,12 @@ pub struct Bridge {
     /// Proxy events taken off the channel while the sending window was full,
     /// in their order (see `HELD_PROXY_MAX`).
     held_proxy: std::collections::VecDeque<ProxyEvent>,
+    /// The server's addresses from the last lookup that worked. While the
+    /// tunnel is up the system resolver can only reach DNS through it (on
+    /// Windows a firewall rule stops DNS anywhere else), so a reconnect after
+    /// the path is lost could not resolve the server's name until the tunnel
+    /// worked again; it uses these instead.
+    last_server_addrs: std::sync::Mutex<Vec<std::net::SocketAddr>>,
     /// The session that asks for the server's info: the first whose server
     /// announced FEATURE_SERVER_INFO since the sessions were set up.
     info_session: Option<usize>,
@@ -474,6 +480,7 @@ impl Bridge {
             proxy_guard: None,
             established_once: false,
             held_proxy: std::collections::VecDeque::new(),
+            last_server_addrs: std::sync::Mutex::new(Vec::new()),
             info_session: None,
             info_pieces: Default::default(),
         })
@@ -1740,11 +1747,7 @@ impl Bridge {
         // Set when a server stayed silent to the handshake of a v6 profile.
         let mut v6_silent = false;
 
-        let mut resolved_addrs: Vec<std::net::SocketAddr> = match timeout(RESOLVE_TIMEOUT, tokio::net::lookup_host(&self.server_addr)).await {
-            Ok(Ok(addrs)) => addrs.collect(),
-            Ok(Err(e)) => return Err(anyhow::anyhow!("failed to resolve server address {}: {}", self.server_addr, e)),
-            Err(_) => return Err(anyhow::anyhow!("resolving server address {} timed out", self.server_addr)),
-        };
+        let mut resolved_addrs: Vec<std::net::SocketAddr> = self.resolve_server().await?;
         // IPv4 first. Addresses are tried strictly in order, each burning its
         // full retry budget before the next is touched, so this ordering decides
         // how long a bad family stalls the whole connect. Mobile carriers
@@ -1996,15 +1999,35 @@ impl Bridge {
         Err(last_err)
     }
 
+    /// The server's addresses: a fresh lookup when it works, otherwise those
+    /// of the last lookup that did (see `last_server_addrs`). An address
+    /// given as an IP never needs DNS.
+    async fn resolve_server(&self) -> Result<Vec<std::net::SocketAddr>> {
+        let err = match timeout(RESOLVE_TIMEOUT, tokio::net::lookup_host(&self.server_addr)).await {
+            Ok(Ok(addrs)) => {
+                let addrs: Vec<std::net::SocketAddr> = addrs.collect();
+                if !addrs.is_empty() {
+                    *self.last_server_addrs.lock().unwrap_or_else(|e| e.into_inner()) = addrs.clone();
+                    return Ok(addrs);
+                }
+                anyhow::anyhow!("no IP addresses resolved for {}", self.server_addr)
+            }
+            Ok(Err(e)) => anyhow::anyhow!("failed to resolve server address {}: {}", self.server_addr, e),
+            Err(_) => anyhow::anyhow!("resolving server address {} timed out", self.server_addr),
+        };
+        let cached = self.last_server_addrs.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        if cached.is_empty() {
+            return Err(err);
+        }
+        tracing::info!("{err}; using the server's last known addresses");
+        Ok(cached)
+    }
+
     /// Opens a connection to the server over the configured transport,
     /// trying the resolved addresses IPv4-first and NAT64 once, as the
     /// handshake path does.
     async fn connect_server(&self, tx: &mpsc::Sender<UiEvent>) -> Result<crate::transport::Transport> {
-        let mut addrs: Vec<std::net::SocketAddr> = timeout(RESOLVE_TIMEOUT, tokio::net::lookup_host(&self.server_addr))
-            .await
-            .map_err(|_| anyhow::anyhow!("resolving server address {} timed out", self.server_addr))?
-            .with_context(|| format!("failed to resolve server address {}", self.server_addr))?
-            .collect();
+        let mut addrs: Vec<std::net::SocketAddr> = self.resolve_server().await?;
         addrs.sort_by_key(|addr| addr.is_ipv6());
 
         let mut last_err = anyhow::anyhow!("no IP addresses resolved for {}", self.server_addr);
