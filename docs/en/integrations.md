@@ -58,6 +58,10 @@ Two answers of the server have their own handling:
 
 The CLI sends the ID only with `"send_hwid": true` in the config (see [client.md](client.md)).
 
+### Subscriptions and updates through the tunnel
+
+The setting *Use the tunnel for subscriptions and updates* (on by default, in both apps) sends the app's own requests (subscription refresh, update check, update download) through the core's local SOCKS5 proxy while the tunnel is up; see [client.md](client.md#the-apps-own-requests-through-the-tunnel). On Android the app is excluded from the VPN, so without it these requests leave from the real address. The method channel takes `viaTunnel` on `fetchSubscription`, `checkForUpdates` and `downloadUpdate`; `MainActivity` turns it into the proxy address only while `OstpVpnService.isRunning`. `OstpClientSdk.fetchSubscription` and `checkForUpdates` take that address as their last argument (empty: direct), and `AppUpdater` uses a `java.net.Proxy` of type SOCKS for the download. On the desktop the Tauri commands `fetch_subscription`, `check_updates` and `install_update` take `viaTunnel` and `socks`. A failed request through the tunnel is an error; it is not repeated direct.
+
 ### Server info and key expiry
 
 A server sends its info to a connected client only inside the tunnel (see [specification.md](specification.md#83-server-info-v5-and-v6)). The client asks for it once after each connection when the server says it supports it, and on demand:

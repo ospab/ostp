@@ -6,6 +6,8 @@ import 'package:flutter/services.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:url_launcher/url_launcher.dart';
 
+import '../models/app_traffic.dart';
+
 /// Update check shared by the start-up check and the button in settings.
 /// The native core knows this build's release tag (e.g. v0.4.6-beta.2) and
 /// compares it with GitHub releases: the newest stable newer than this
@@ -31,7 +33,7 @@ Future<String?> buildTag() async {
 Future<void> checkForUpdates(BuildContext context, SharedPreferences prefs, {required bool manual}) async {
   Map<String, dynamic> r;
   try {
-    final raw = await _channel.invokeMethod<String>('checkForUpdates').timeout(const Duration(seconds: 30));
+    final raw = await _channel.invokeMethod<String>('checkForUpdates', {'viaTunnel': appViaTunnel(prefs)}).timeout(const Duration(seconds: 30));
     r = jsonDecode(raw ?? '{}') as Map<String, dynamic>;
     if (r['error'] != null) throw Exception(r['error']);
   } on TimeoutException {
@@ -100,7 +102,7 @@ Future<void> checkForUpdates(BuildContext context, SharedPreferences prefs, {req
           onPressed: () {
             Navigator.pop(dialogContext);
             // The screen's context, not the dialog's: the dialog is gone by the time the download ends.
-            _updateNow(context, offer['tag'] as String, offer['url'] as String);
+            _updateNow(context, prefs, offer['tag'] as String, offer['url'] as String);
           },
           child: const Text('Update now'),
         ),
@@ -119,7 +121,7 @@ String _reason(Object e) {
 /// Downloads the APK of [tag] (checked against the SHA-256 GitHub publishes),
 /// then hands it to the system installer. Runs only after the user tapped
 /// "Update now"; on any failure it says why and offers the release page.
-Future<void> _updateNow(BuildContext context, String tag, String releaseUrl) async {
+Future<void> _updateNow(BuildContext context, SharedPreferences prefs, String tag, String releaseUrl) async {
   final progress = ValueNotifier<double?>(null);
   var cancelled = false;
   final navigator = Navigator.of(context, rootNavigator: true);
@@ -164,7 +166,7 @@ Future<void> _updateNow(BuildContext context, String tag, String releaseUrl) asy
   String? path;
   String? failure;
   try {
-    path = await _channel.invokeMethod<String>('downloadUpdate', {'tag': tag});
+    path = await _channel.invokeMethod<String>('downloadUpdate', {'tag': tag, 'viaTunnel': appViaTunnel(prefs)});
   } catch (e) {
     failure = _reason(e);
   }

@@ -718,6 +718,10 @@ fn null_jstring(env: &mut JNIEnv) -> jstring {
 /// sent is a hash of `android_id` made for the URL's host (the id itself is not
 /// sent), with `os` and `model` as plain text. A device-limit refusal comes back as
 /// `{"error": "device:<code>:<message>"}`.
+///
+/// A non-empty `proxy` (`host:port` of the core's local SOCKS5 proxy) sends the
+/// request through the tunnel, the name resolved there; a failure is returned as an
+/// error and the request is never repeated outside the tunnel.
 #[no_mangle]
 pub extern "system" fn Java_net_ostp_client_OstpClientSdk_fetchSubscription(
     mut env: JNIEnv,
@@ -727,9 +731,10 @@ pub extern "system" fn Java_net_ostp_client_OstpClientSdk_fetchSubscription(
     android_id: JString,
     os: JString,
     model: JString,
+    proxy: JString,
 ) -> jstring {
     guarded!("fetchSubscription", panic_jstring(&mut env), {
-        fetch_subscription(unsafe { env.unsafe_clone() }, class, url, send_hwid, android_id, os, model)
+        fetch_subscription(unsafe { env.unsafe_clone() }, class, url, send_hwid, android_id, os, model, proxy)
     })
 }
 
@@ -741,11 +746,15 @@ fn fetch_subscription(
     android_id: JString,
     os: JString,
     model: JString,
+    proxy: JString,
 ) -> jstring {
     let mut text = |s: &JString| -> Option<String> { env.get_string(s).ok().map(String::from) };
-    let (Some(url), Some(android_id), Some(os), Some(model)) = (text(&url), text(&android_id), text(&os), text(&model)) else {
+    let (Some(url), Some(android_id), Some(os), Some(model), Some(proxy)) =
+        (text(&url), text(&android_id), text(&os), text(&model), text(&proxy))
+    else {
         return null_jstring(&mut env);
     };
+    let proxy = Some(proxy).filter(|p| !p.trim().is_empty());
     let result = match Runtime::new() {
         Ok(rt) => rt.block_on(async {
             let device = if send_hwid != 0 {
@@ -753,7 +762,7 @@ fn fetch_subscription(
             } else {
                 None
             };
-            ostp_client::subscription::fetch_with_device(&url, device.as_ref()).await
+            ostp_client::subscription::fetch_via(&url, device.as_ref(), proxy.as_deref()).await
         }),
         Err(e) => Err(anyhow::anyhow!("failed to create tokio runtime: {e}")),
     };
@@ -774,17 +783,23 @@ pub extern "system" fn Java_net_ostp_client_OstpClientSdk_buildTag(mut env: JNIE
     })
 }
 
-/// Newer stable/beta releases on GitHub as JSON, or {"error": ...}.
+/// Newer stable/beta releases on GitHub as JSON, or {"error": ...}. A non-empty
+/// `proxy` (`host:port` of the core's local SOCKS5 proxy) sends the request through
+/// the tunnel; if that fails the error is returned, the request is not repeated direct.
 #[no_mangle]
-pub extern "system" fn Java_net_ostp_client_OstpClientSdk_checkForUpdates(mut env: JNIEnv, class: JClass) -> jstring {
+pub extern "system" fn Java_net_ostp_client_OstpClientSdk_checkForUpdates(mut env: JNIEnv, class: JClass, proxy: JString) -> jstring {
     guarded!("checkForUpdates", panic_jstring(&mut env), {
-        check_for_updates(unsafe { env.unsafe_clone() }, class)
+        check_for_updates(unsafe { env.unsafe_clone() }, class, proxy)
     })
 }
 
-fn check_for_updates(mut env: JNIEnv, _class: JClass) -> jstring {
+fn check_for_updates(mut env: JNIEnv, _class: JClass, proxy: JString) -> jstring {
+    let Some(proxy) = env.get_string(&proxy).ok().map(String::from) else {
+        return null_jstring(&mut env);
+    };
+    let proxy = Some(proxy).filter(|p| !p.trim().is_empty());
     let result = match Runtime::new() {
-        Ok(rt) => rt.block_on(ostp_client::updates::check()),
+        Ok(rt) => rt.block_on(ostp_client::updates::check_via(proxy.as_deref())),
         Err(e) => Err(anyhow::anyhow!("failed to create tokio runtime: {e}")),
     };
     match result {

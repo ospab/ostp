@@ -161,9 +161,15 @@ fn pick(current: &Version, releases: &[(Version, Release)]) -> (Option<Release>,
 }
 
 pub async fn check() -> Result<UpdateCheck> {
+    check_via(None).await
+}
+
+/// [`check`] through the core's local SOCKS5 proxy (`host:port`) when given: GitHub then sees the
+/// tunnel's address, not the user's. A failure through the proxy is reported, never retried direct.
+pub async fn check_via(proxy: Option<&str>) -> Result<UpdateCheck> {
     let current_tag = build_tag();
     let Some(current) = Version::parse(&current_tag) else { bail!("cannot read this build's version ({current_tag})") };
-    let (code, body) = crate::subscription::https_get(RELEASES_API, "application/vnd.github+json").await?;
+    let (code, body) = crate::subscription::https_get(RELEASES_API, "application/vnd.github+json", proxy).await?;
     match code {
         200 => {}
         403 | 429 => bail!("GitHub is rate-limiting update checks from this address; try again later"),
@@ -230,7 +236,7 @@ fn app_asset_name(installer: bool) -> Option<String> {
 
 /// Downloads this system's build of release `tag` and checks it against the
 /// SHA-256 GitHub published for it. `progress` gets (bytes so far, total).
-pub async fn download_app_update(tag: &str, mut progress: impl FnMut(u64, u64)) -> Result<Downloaded> {
+pub async fn download_app_update(tag: &str, proxy: Option<&str>, mut progress: impl FnMut(u64, u64)) -> Result<Downloaded> {
     let current = Version::parse(&build_tag()).ok_or_else(|| anyhow::anyhow!("cannot read this build's version"))?;
     let wanted = Version::parse(tag).ok_or_else(|| anyhow::anyhow!("not a release tag: {tag}"))?;
     if !tag.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-') {
@@ -243,7 +249,7 @@ pub async fn download_app_update(tag: &str, mut progress: impl FnMut(u64, u64)) 
     let installer = installed_by_setup();
     let name = app_asset_name(installer).ok_or_else(|| anyhow::anyhow!("there is no desktop build for this system"))?;
     let url = format!("https://api.github.com/repos/ospab/ostp/releases/tags/{tag}");
-    let (code, body) = crate::subscription::https_get(&url, "application/vnd.github+json").await?;
+    let (code, body) = crate::subscription::https_get(&url, "application/vnd.github+json", proxy).await?;
     match code {
         200 => {}
         404 => bail!("GitHub has no release {tag}"),
@@ -272,7 +278,7 @@ pub async fn download_app_update(tag: &str, mut progress: impl FnMut(u64, u64)) 
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir)?;
     let path = dir.join(&name);
-    download_verified(&asset.browser_download_url, &path, asset.size, &sha, &mut progress).await?;
+    download_verified(&asset.browser_download_url, &path, asset.size, &sha, proxy, &mut progress).await?;
     Ok(Downloaded { path, installer })
 }
 
@@ -281,6 +287,7 @@ async fn download_verified(
     dest: &std::path::Path,
     size: u64,
     sha: &str,
+    proxy: Option<&str>,
     progress: &mut impl FnMut(u64, u64),
 ) -> Result<()> {
     use sha2::{Digest, Sha256};
@@ -294,7 +301,7 @@ async fn download_verified(
         if u.host != "github.com" && !u.host.ends_with(".githubusercontent.com") {
             bail!("the download was redirected to {}, which is not GitHub", u.host);
         }
-        let tcp = tokio::time::timeout(READ_STALL, tokio::net::TcpStream::connect((u.host.as_str(), u.port)))
+        let tcp = tokio::time::timeout(READ_STALL, crate::subscription::connect_tcp(&u.host, u.port, proxy))
             .await
             .map_err(|_| anyhow::anyhow!("{} did not answer", u.host))??;
         let opts = crate::transport::tls::TlsClientOptions { sni: u.host.clone(), insecure: false };

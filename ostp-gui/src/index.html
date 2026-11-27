@@ -301,6 +301,17 @@
 
           <div class="toggle-row" style="border-top:none;">
             <div class="toggle-text">
+              <span class="toggle-name">Use the tunnel for subscriptions and updates</span>
+              <span class="toggle-hint">Update subscriptions and check for updates through the tunnel when connected, so your provider and GitHub do not see where the requests go. When the tunnel is off they go direct. If the tunnel is on but the request fails, you get an error and it is not sent direct.</span>
+            </div>
+            <label class="toggle">
+              <input type="checkbox" id="in-via-tunnel" />
+              <span class="toggle-track"><span class="toggle-thumb"></span></span>
+            </label>
+          </div>
+
+          <div class="toggle-row" style="border-top:none;">
+            <div class="toggle-text">
               <span class="toggle-name">Send a device ID to subscriptions</span>
               <span class="toggle-hint">Some servers limit the devices of a subscription. The ID is a hash made for that server; it is sent only when you fetch a subscription.</span>
             </div>

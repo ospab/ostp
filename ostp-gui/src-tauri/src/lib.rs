@@ -705,24 +705,43 @@ async fn request_server_info(state: tauri::State<'_, AppState>) -> Result<bool, 
 /// `send_hwid` is the "Send a device ID to subscriptions" setting. Only when it is
 /// true is a device ID made (a hash for this server's host) and sent. A server's
 /// device-limit refusal comes back as `device:<code>:<message>`.
+///
+/// `via_tunnel` is the "Use the tunnel for subscriptions and updates" setting and `socks`
+/// the local proxy address from the settings. With the setting on and the tunnel running the
+/// request goes through the core's local SOCKS5 proxy; a failure there is an error and is
+/// not repeated direct. With the tunnel down it goes direct.
 #[tauri::command]
-async fn fetch_subscription(url: String, send_hwid: Option<bool>) -> Result<serde_json::Value, String> {
+async fn fetch_subscription(
+    url: String,
+    send_hwid: Option<bool>,
+    via_tunnel: Option<bool>,
+    socks: Option<String>,
+    state: tauri::State<'_, AppState>,
+) -> Result<serde_json::Value, String> {
     if url.len() > 2048 || !url.trim().to_ascii_lowercase().starts_with("https://") {
         return Err("a subscription URL must be an https:// address of at most 2048 characters".into());
     }
     let send_hwid = send_hwid.unwrap_or(false);
+    let proxy = app_proxy(&state, via_tunnel, socks.as_deref()).await;
     off_thread(std::time::Duration::from_secs(30), move || async move {
         let device = if send_hwid {
             Some(ostp_client::hwid::local_device(&url).map_err(|e| e.to_string())?)
         } else {
             None
         };
-        let doc = ostp_client::subscription::fetch_with_device(&url, device.as_ref())
+        let doc = ostp_client::subscription::fetch_via(&url, device.as_ref(), proxy.as_deref())
             .await
             .map_err(|e| ostp_client::subscription::error_text(&e))?;
         serde_json::to_value(doc).map_err(|e| e.to_string())
     })
     .await
+}
+
+/// The proxy for the app's own requests: the core's local SOCKS5 proxy while the tunnel is
+/// running and the setting is on (the default), otherwise none and the request goes direct.
+async fn app_proxy(state: &AppState, via_tunnel: Option<bool>, socks: Option<&str>) -> Option<String> {
+    let running = state.0.lock().await.tunnel.is_some();
+    ostp_client::subscription::app_proxy(via_tunnel.unwrap_or(true), running, socks)
 }
 
 /// The release this build was cut from, e.g. "v0.4.6-beta.2".
@@ -733,9 +752,14 @@ fn app_build_tag() -> String {
 
 /// Newer stable and beta releases on GitHub, if any.
 #[tauri::command]
-async fn check_updates() -> Result<serde_json::Value, String> {
-    off_thread(std::time::Duration::from_secs(30), || async {
-        let r = ostp_client::updates::check().await.map_err(|e| format!("{e:#}"))?;
+async fn check_updates(
+    via_tunnel: Option<bool>,
+    socks: Option<String>,
+    state: tauri::State<'_, AppState>,
+) -> Result<serde_json::Value, String> {
+    let proxy = app_proxy(&state, via_tunnel, socks.as_deref()).await;
+    off_thread(std::time::Duration::from_secs(30), move || async move {
+        let r = ostp_client::updates::check_via(proxy.as_deref()).await.map_err(|e| format!("{e:#}"))?;
         serde_json::to_value(r).map_err(|e| e.to_string())
     })
     .await
@@ -746,11 +770,18 @@ async fn check_updates() -> Result<serde_json::Value, String> {
 /// next to the app are replaced. The app then quits and the new one starts.
 /// Runs only when the user pressed "Update now".
 #[tauri::command]
-async fn install_update(tag: String, state: tauri::State<'_, AppState>, app: tauri::AppHandle) -> Result<(), String> {
+async fn install_update(
+    tag: String,
+    via_tunnel: Option<bool>,
+    socks: Option<String>,
+    state: tauri::State<'_, AppState>,
+    app: tauri::AppHandle,
+) -> Result<(), String> {
+    let proxy = app_proxy(&state, via_tunnel, socks.as_deref()).await;
     let progress_app = app.clone();
     let downloaded = off_thread(std::time::Duration::from_secs(900), move || async move {
         let mut last = 0u64;
-        let d = ostp_client::updates::download_app_update(&tag, |done, total| {
+        let d = ostp_client::updates::download_app_update(&tag, proxy.as_deref(), |done, total| {
             // About one event per percent; the bar does not need more.
             if done == total || done - last >= total / 100 {
                 last = done;

@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import '../models/app_traffic.dart';
 import '../models/device_limit.dart';
 import '../models/log_privacy.dart';
 import '../services/updates.dart' as updates;
@@ -28,6 +29,7 @@ class _MoreSettingsScreenState extends State<MoreSettingsScreen> {
   late bool _showRtt;
   late bool _autoUpdateCheck;
   late bool _sendHwid;
+  late bool _viaTunnel;
   bool _isCheckingUpdates = false;
 
   @override
@@ -41,6 +43,7 @@ class _MoreSettingsScreenState extends State<MoreSettingsScreen> {
     _showRtt = p.getBool('show_rtt') ?? true;
     _autoUpdateCheck = p.getBool(updates.autoUpdateCheckKey) ?? true;
     _sendHwid = p.getBool(sendHwidKey) ?? false;
+    _viaTunnel = appViaTunnel(p);
   }
 
   @override
@@ -60,6 +63,7 @@ class _MoreSettingsScreenState extends State<MoreSettingsScreen> {
     p.setBool('show_rtt', _showRtt);
     p.setBool(updates.autoUpdateCheckKey, _autoUpdateCheck);
     p.setBool(sendHwidKey, _sendHwid);
+    p.setBool(appViaTunnelKey, _viaTunnel);
   }
 
   Future<void> _checkForUpdates() async {
@@ -240,6 +244,12 @@ class _MoreSettingsScreenState extends State<MoreSettingsScreen> {
             decoration: _card,
             child: Column(children: [
               _toggle('Check for updates', 'When the app opens: stable and beta releases', _autoUpdateCheck, (v) => _autoUpdateCheck = v),
+              _toggle(
+                'Use the tunnel for subscriptions and updates',
+                'Update subscriptions and check for updates through the tunnel when connected, so your provider and GitHub do not see where the requests go. When the tunnel is off they go direct. If the tunnel is on but the request fails, you get an error and it is not sent direct.',
+                _viaTunnel,
+                (v) => _viaTunnel = v,
+              ),
               _toggle(
                 'Send a device ID to subscriptions',
                 'Some servers limit the devices of a subscription. The ID is a hash made for that server; it is sent only when you fetch a subscription.',

@@ -68,20 +68,22 @@ object OstpClientSdk {
      * With [sendHwid] false the other three arguments are ignored and nothing about the
      * device is sent. With it true the core derives the per-server identifier from
      * [androidId] (the id itself is never sent) and sends [os] and [model] as text.
+     * A non-empty [proxy] ("host:port" of the core's local SOCKS5 proxy) sends the request
+     * through the tunnel; a failure is an error, never a retry outside the tunnel.
      */
     @Keep
     @JvmStatic
-    external fun fetchSubscription(url: String, sendHwid: Boolean, androidId: String, os: String, model: String): String
+    external fun fetchSubscription(url: String, sendHwid: Boolean, androidId: String, os: String, model: String, proxy: String): String
 
     /** Release tag of this build, e.g. "v0.4.6-beta.2". */
     @Keep
     @JvmStatic
     external fun buildTag(): String
 
-    /** Newer stable/beta releases as JSON, or {"error": ...}. Blocking: call off the UI thread. */
+    /** Newer stable/beta releases as JSON, or {"error": ...}. Blocking: call off the UI thread. A non-empty [proxy] is as for [fetchSubscription]. */
     @Keep
     @JvmStatic
-    external fun checkForUpdates(): String
+    external fun checkForUpdates(proxy: String): String
 
     /**
      * One request to the SSH server manager as JSON; `{"ok": ...}` or

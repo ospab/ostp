@@ -1,4 +1,5 @@
 import { shouldAskDnsNotice, effectiveDns, filtersDns } from './dns_notice.js';
+import { trafficArgs, viaTunnelOn } from './app_traffic.js';
 import { classifyFetchError, cardMessage, shouldAskToSend, SEND_DIALOG } from './device_limit.js';
 import { linkPk, protocolLabel } from './server_pk.js';
 import { pinKey, pinAction } from './key_pin.js';
@@ -292,6 +293,7 @@ const showLogPrivacyHint = () => { logPrivacyHint.textContent = LOG_PRIVACY_HINT
 const inShowRtt     = $('in-show-rtt');
 const inShowSpeed   = $('in-show-speed');
 const inSendHwid    = $('in-send-hwid');
+const inViaTunnel  = $('in-via-tunnel');
 const groupKillSwitch  = $('group-kill-switch');
 
 const inTtlDesync     = $('cs-ttl-desync');
@@ -1356,7 +1358,7 @@ function applySubscription(sub, doc) {
 const sendHwidOn = () => !!loadClientSettings().sendHwid;
 
 async function downloadSubscription(url, sendHwid) {
-  const doc = await invoke('fetch_subscription', { url, sendHwid });
+  const doc = await invoke('fetch_subscription', { url, sendHwid, ...trafficArgs(loadClientSettings()) });
   if (!doc) throw new Error('subscriptions need the desktop app');
   return doc;
 }
@@ -1966,7 +1968,7 @@ async function checkUpdates({ manual }) {
   const btn = $('btn-check-updates');
   if (manual) { btn.disabled = true; btn.textContent = 'Checking…'; }
   try {
-    const r = await invoke('check_updates');
+    const r = await invoke('check_updates', trafficArgs(loadClientSettings()));
     if (!r) throw new Error('update checks need the desktop app');
     // Offer the beta only when it is newer than the newest stable.
     const offer = r.beta || r.stable;
@@ -2026,7 +2028,7 @@ async function installUpdate() {
   buttons.forEach(b => { b.disabled = true; });
   setUpdateStatus(`Downloading ${pendingUpdate.tag}…`);
   try {
-    await invoke('install_update', { tag: pendingUpdate.tag });
+    await invoke('install_update', { tag: pendingUpdate.tag, ...trafficArgs(loadClientSettings()) });
     setUpdateStatus('Installing. The app will restart.');
   } catch (e) {
     setUpdateStatus('The update was not installed: ' + (e?.message || e), true);
@@ -2066,6 +2068,7 @@ function loadSettingsIntoForm() {
   inShowSpeed.checked   = s.showSpeed !== false;
   $('in-update-check').checked = s.updateCheck !== false;
   inSendHwid.checked    = !!s.sendHwid;
+  inViaTunnel.checked   = viaTunnelOn(s);
   if (inTtlDesync) inTtlDesync.checked = !!s.ttlDesync;
   updateClientVisibility();
 }
@@ -2116,6 +2119,7 @@ function collectAndSaveSettings() {
     showSpeed:    inShowSpeed.checked,
     updateCheck:  $('in-update-check').checked,
     sendHwid:     inSendHwid.checked,
+    viaTunnel:    inViaTunnel.checked,
     ttlDesync:    inTtlDesync ? inTtlDesync.checked : false,
   };
   // Cheap and local: safe to run on every debounced keystroke.
@@ -2364,7 +2368,7 @@ window.addEventListener('DOMContentLoaded', async () => {
 
   // Client settings — wire all inputs
   inLogPrivacy.addEventListener('change', showLogPrivacyHint);
-  [inTun, inKillSwitch, inAutoconnect, inLaunchStartup, inLogPrivacy, inShowRtt, inShowSpeed, inSendHwid, inTtlDesync, $('in-update-check')]
+  [inTun, inKillSwitch, inAutoconnect, inLaunchStartup, inLogPrivacy, inShowRtt, inShowSpeed, inSendHwid, inViaTunnel, inTtlDesync, $('in-update-check')]
     .filter(Boolean)
     .forEach(el => el.addEventListener('change', collectAndSaveSettings));
   [inMtu, inDns, inSocks, inExDomains, inExIps, inExProcs]

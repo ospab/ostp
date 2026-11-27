@@ -25,6 +25,15 @@ class MainActivity : FlutterActivity() {
     private val updater by lazy { AppUpdater(applicationContext) }
     private var updateInProgress = false
 
+    /**
+     * The core's local SOCKS5 proxy ("host:port", reachable on loopback) for the app's own
+     * requests, or "" for a direct request. Only when the person wants it ([viaTunnel]) and the
+     * tunnel is up: with the tunnel down there is nothing to go through, and the request goes
+     * direct as it always did. A failure through the proxy is never retried direct.
+     */
+    private fun appProxy(viaTunnel: Boolean): String =
+        if (viaTunnel && OstpVpnService.isRunning) OstpVpnService.localProxyAddr else ""
+
     private fun getAppIconBase64(pm: PackageManager, appInfo: ApplicationInfo): String? {
         try {
             val drawable = pm.getApplicationIcon(appInfo)
@@ -183,10 +192,11 @@ class MainActivity : FlutterActivity() {
                     }
                 }
                 "checkForUpdates" -> {
+                    val viaTunnel = call.argument<Boolean>("viaTunnel") ?: false
                     // A network round trip to GitHub: never on the UI thread.
                     Thread {
                         try {
-                            val json = net.ostp.client.OstpClientSdk.checkForUpdates()
+                            val json = net.ostp.client.OstpClientSdk.checkForUpdates(appProxy(viaTunnel))
                             runOnUiThread { result.success(json) }
                         } catch (e: Throwable) {
                             runOnUiThread { result.error("ERROR", e.message, null) }
@@ -196,13 +206,14 @@ class MainActivity : FlutterActivity() {
                 "downloadUpdate" -> {
                     // Only on the user's tap on "Update now". Tens of MB: never on the UI thread.
                     val tag = call.argument<String>("tag") ?: ""
+                    val proxy = appProxy(call.argument<Boolean>("viaTunnel") ?: false)
                     if (updateInProgress) {
                         result.error("BUSY", "An update is already downloading", null)
                     } else {
                         updateInProgress = true
                         Thread {
                             try {
-                                val file = updater.download(tag)
+                                val file = updater.download(tag, proxy)
                                 runOnUiThread { updateInProgress = false; result.success(file.absolutePath) }
                             } catch (e: Throwable) {
                                 runOnUiThread { updateInProgress = false; result.error("UPDATE_FAILED", e.message ?: e.javaClass.simpleName, null) }
@@ -259,6 +270,7 @@ class MainActivity : FlutterActivity() {
                     // The device is described only when the person turned "Send a device ID to
                     // subscriptions" on: otherwise ANDROID_ID is not even read.
                     val sendHwid = call.argument<Boolean>("sendHwid") ?: false
+                    val proxy = appProxy(call.argument<Boolean>("viaTunnel") ?: false)
                     val androidId = if (sendHwid) {
                         android.provider.Settings.Secure.getString(contentResolver, android.provider.Settings.Secure.ANDROID_ID) ?: ""
                     } else ""
@@ -266,7 +278,7 @@ class MainActivity : FlutterActivity() {
                     val deviceModel = android.os.Build.MODEL ?: ""
                     Thread {
                         try {
-                            val doc = net.ostp.client.OstpClientSdk.fetchSubscription(url, sendHwid, androidId, deviceOs, deviceModel)
+                            val doc = net.ostp.client.OstpClientSdk.fetchSubscription(url, sendHwid, androidId, deviceOs, deviceModel, proxy)
                             runOnUiThread { result.success(doc) }
                         } catch (e: Throwable) {
                             runOnUiThread { result.error("ERROR", e.message, null) }

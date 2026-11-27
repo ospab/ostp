@@ -10,6 +10,8 @@ import org.json.JSONObject
 import java.io.File
 import java.io.IOException
 import java.net.HttpURLConnection
+import java.net.InetSocketAddress
+import java.net.Proxy
 import java.net.URL
 import java.security.MessageDigest
 import java.util.concurrent.atomic.AtomicBoolean
@@ -31,8 +33,12 @@ class AppUpdater(private val context: Context) {
         cancelled.set(true)
     }
 
-    /** Blocking; call off the UI thread. Returns the verified APK. */
-    fun download(tag: String): File {
+    /**
+     * Blocking; call off the UI thread. Returns the verified APK. A non-empty [proxy]
+     * ("host:port" of the core's local SOCKS5 proxy) sends every request through the tunnel;
+     * a failure then is an error, never a retry outside it.
+     */
+    fun download(tag: String, proxy: String = ""): File {
         cancelled.set(false)
         downloaded.set(0)
         total.set(0)
@@ -42,7 +48,7 @@ class AppUpdater(private val context: Context) {
         val abi = deviceAbi() ?: throw UpdateException("There is no build for this device (${Build.SUPPORTED_ABIS.joinToString()})")
         val name = "ostp-android-$abi.apk"
 
-        val release = JSONObject(String(httpGet("https://api.github.com/repos/ospab/ostp/releases/tags/$tag", "application/vnd.github+json", null)))
+        val release = JSONObject(String(httpGet("https://api.github.com/repos/ospab/ostp/releases/tags/$tag", "application/vnd.github+json", null, proxy)))
         val assets = release.optJSONArray("assets") ?: throw UpdateException("Release $tag has no files")
         var asset: JSONObject? = null
         for (i in 0 until assets.length()) {
@@ -66,7 +72,7 @@ class AppUpdater(private val context: Context) {
         val file = File(dir, name)
         try {
             val md = MessageDigest.getInstance("SHA-256")
-            val body = httpGet(asset.getString("browser_download_url"), "application/octet-stream", Sink(file, md, size))
+            val body = httpGet(asset.getString("browser_download_url"), "application/octet-stream", Sink(file, md, size), proxy)
             if (body.isNotEmpty()) throw IOException("Unexpected response body")
             if (downloaded.get() != size) throw UpdateException("The download was cut short (${downloaded.get()} of $size bytes)")
             val hex = md.digest().joinToString("") { "%02x".format(it) }
@@ -102,10 +108,25 @@ class AppUpdater(private val context: Context) {
     private fun deviceAbi(): String? =
         Build.SUPPORTED_ABIS.firstOrNull { it == "arm64-v8a" || it == "armeabi-v7a" }
 
+    /**
+     * SOCKS5 with the name left unresolved (HttpURLConnection hands the host name to the proxy),
+     * so the tunnel's far end resolves it, not this phone's network.
+     */
+    private fun openConnection(u: URL, proxy: String): HttpURLConnection {
+        if (proxy.isBlank()) return u.openConnection() as HttpURLConnection
+        val colon = proxy.lastIndexOf(':')
+        val port = proxy.substring(colon + 1).toIntOrNull()
+        if (colon < 1 || port == null) throw UpdateException("Bad local proxy address: $proxy")
+        var host = proxy.substring(0, colon).trim('[', ']')
+        if (host == "0.0.0.0" || host == "::" || host.isEmpty()) host = "127.0.0.1"
+        val p = Proxy(Proxy.Type.SOCKS, InetSocketAddress.createUnresolved(host, port))
+        return u.openConnection(p) as HttpURLConnection
+    }
+
     private class Sink(val file: File, val md: MessageDigest, val limit: Long)
 
     /** GET with manual redirects kept on GitHub's hosts. A sink streams the body to a file and returns an empty array. */
-    private fun httpGet(start: String, accept: String, sink: Sink?): ByteArray {
+    private fun httpGet(start: String, accept: String, sink: Sink?, proxy: String): ByteArray {
         var url = start
         repeat(6) {
             val u = URL(url)
@@ -113,7 +134,7 @@ class AppUpdater(private val context: Context) {
             if (u.protocol != "https" || !(host == "github.com" || host == "api.github.com" || host.endsWith(".githubusercontent.com"))) {
                 throw UpdateException("The download was redirected to $host, which is not GitHub")
             }
-            val c = u.openConnection() as HttpURLConnection
+            val c = openConnection(u, proxy)
             try {
                 c.instanceFollowRedirects = false
                 c.connectTimeout = 15_000

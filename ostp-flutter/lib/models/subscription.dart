@@ -4,6 +4,7 @@ import 'dart:convert';
 import 'package:flutter/services.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import 'app_traffic.dart';
 import 'device_limit.dart';
 import 'key_pin.dart';
 import 'ostp_profile.dart';
@@ -167,13 +168,15 @@ class SubscriptionStore {
 
   bool get sendHwid => prefs.getBool(sendHwidKey) ?? false;
 
+  bool get viaTunnel => appViaTunnel(prefs);
+
   /// The native core downloads it (verified TLS, same parser as the CLI). The device
   /// ID is sent only when "Send a device ID to subscriptions" is on.
   Future<Map<String, dynamic>> _fetch(String url) async {
     final String? raw;
     try {
       raw = await _channel
-          .invokeMethod<String>('fetchSubscription', {'url': url.trim(), 'sendHwid': sendHwid})
+          .invokeMethod<String>('fetchSubscription', {'url': url.trim(), 'sendHwid': sendHwid, 'viaTunnel': viaTunnel})
           .timeout(const Duration(seconds: 45));
     } on TimeoutException {
       throw Exception('the server did not answer in time');

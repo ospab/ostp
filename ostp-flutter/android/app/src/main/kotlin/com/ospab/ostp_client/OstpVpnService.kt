@@ -29,6 +29,10 @@ class OstpVpnService : VpnService() {
         // Between a START and the core being up (or failing): the tile shows it as connecting.
         @Volatile
         var isStarting = false
+        // The core's local SOCKS5 proxy ("host:port") while it runs, else empty. The app's own
+        // requests (subscriptions, update checks) go through it when the person wants that.
+        @Volatile
+        var localProxyAddr = ""
         @Keep
         var instance: OstpVpnService? = null
         // Bumped on every start; a service instance may tear down only the tunnel it owns.
@@ -384,6 +388,7 @@ class OstpVpnService : VpnService() {
             val success = OstpClientSdk.startClient(configJson, fd, "", localProxy)
             if (success) {
                 Log.i("OstpVpnService", "OSTP Rust Core started successfully")
+                localProxyAddr = localProxy
                 isRunning = true
                 isStarting = false
                 updateNotification(connected = true)
@@ -405,6 +410,7 @@ class OstpVpnService : VpnService() {
     private fun stopVpn() {
         isRunning = false
         isStarting = false
+        localProxyAddr = ""
         releaseWakeLock()
         // Stop following the network first, so no late callback signals a core that is going away.
         unregisterNetworkCallback()

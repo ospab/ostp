@@ -85,6 +85,16 @@ After each connection, if the server says it supports it, the client asks for th
 
 `ostp update` re-runs the install script for a channel (`--branch stable|beta|alpha`, `--version` for an exact release); `ostp -V` shows the installed version with its channel. The apps check GitHub for a newer stable or beta release (never alpha) and install it only when the user presses the button (see [integrations.md](integrations.md#updates)).
 
+## The app's own requests through the tunnel
+
+The apps make a few requests of their own: refreshing a subscription (to the provider's domain) and the update check and download (to GitHub). Without care they leave from the user's real address, so the provider's network sees the subscription domain and GitHub sees the user. The setting *Use the tunnel for subscriptions and updates* (on by default; Android: *More settings*, *Application*; desktop: *More settings*, *Application*) sends them through the core's local SOCKS5 proxy (`local_proxy.bind_addr` / `socks5_bind`, default `127.0.0.1:1088`; a `0.0.0.0` bind is reached on `127.0.0.1`) while the tunnel is up. The name is sent to the proxy as text (`socks5h`), so it is resolved at the far end of the tunnel, not by the local network.
+
+- Tunnel down: the request goes direct, as before.
+- Tunnel up but the request fails (the proxy cannot be reached, or the tunnel cannot reach the host): the app shows the error. It never repeats the request direct, because that would send exactly what the setting hides.
+- Setting off: always direct.
+
+`ostp import` and the CLI are not affected; for the library, `ostp_client::subscription::fetch_via` and `ostp_client::updates::check_via` take the proxy.
+
 ## Device ID for subscriptions
 
 A server can limit the devices of a subscription (see [tls.md](tls.md), *Device limit*). Sending the device's ID is off by default and has to be turned on: the top-level key `send_hwid` of the client config (`false` when absent), or the switch *Send a device ID to subscriptions* in the apps.

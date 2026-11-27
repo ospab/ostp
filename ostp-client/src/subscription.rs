@@ -145,8 +145,17 @@ pub async fn fetch(url: &str) -> Result<SubscriptionDoc> {
 /// Like [`fetch`], and sends `x-hwid`, `x-device-os` and `x-device-model` when a
 /// device is given. A server that limits devices answers with a [`DeviceError`].
 pub async fn fetch_with_device(url: &str, device: Option<&Device>) -> Result<SubscriptionDoc> {
+    fetch_via(url, device, None).await
+}
+
+/// Like [`fetch_with_device`], through the running core's local SOCKS5 proxy when
+/// `proxy` is given (`host:port` or `socks5h://host:port`): the name is resolved by
+/// the tunnel's far end, so neither the provider's DNS nor its network sees the
+/// subscription domain. A failure through the proxy is an error; the request is
+/// never repeated outside the tunnel.
+pub async fn fetch_via(url: &str, device: Option<&Device>, proxy: Option<&str>) -> Result<SubscriptionDoc> {
     let u = parse_url(url)?;
-    let body = tokio::time::timeout(TIMEOUT, get(&u, "application/json", device))
+    let body = tokio::time::timeout(TIMEOUT, get(&u, "application/json", device, proxy))
         .await
         .map_err(|_| anyhow!("{} did not answer within {}s", u.host, TIMEOUT.as_secs()))??;
     let text = String::from_utf8(body).map_err(|_| anyhow!("the subscription is not text"))?;
@@ -158,16 +167,16 @@ pub async fn fetch_with_device(url: &str, device: Option<&Device>) -> Result<Sub
 }
 
 /// GET over verified TLS; returns the status code and the body.
-pub(crate) async fn https_get(url: &str, accept: &str) -> Result<(u16, Vec<u8>)> {
+pub(crate) async fn https_get(url: &str, accept: &str, proxy: Option<&str>) -> Result<(u16, Vec<u8>)> {
     let u = parse_url(url)?;
-    let raw = tokio::time::timeout(TIMEOUT, get_raw(&u, accept, None))
+    let raw = tokio::time::timeout(TIMEOUT, get_raw(&u, accept, None, proxy))
         .await
         .map_err(|_| anyhow!("{} did not answer within {}s", u.host, TIMEOUT.as_secs()))??;
     split_response(&raw)
 }
 
-async fn get(u: &Url, accept: &str, device: Option<&Device>) -> Result<Vec<u8>> {
-    parse_response(&get_raw(u, accept, device).await?)
+async fn get(u: &Url, accept: &str, device: Option<&Device>, proxy: Option<&str>) -> Result<Vec<u8>> {
+    parse_response(&get_raw(u, accept, device, proxy).await?)
 }
 
 /// The request head as sent.
@@ -182,10 +191,123 @@ fn request_head(u: &Url, accept: &str, device: Option<&Device>) -> String {
     )
 }
 
-async fn get_raw(u: &Url, accept: &str, device: Option<&Device>) -> Result<Vec<u8>> {
-    let tcp = tokio::net::TcpStream::connect((u.host.as_str(), u.port))
+/// The local proxy address (`host:port`, with or without `socks5h://`) the core
+/// listens on, as something to connect to: a wildcard bind (`0.0.0.0`, `[::]`)
+/// is reached on loopback. Empty text means no proxy.
+pub fn proxy_endpoint(proxy: &str) -> Result<Option<(String, u16)>> {
+    let p = proxy.trim();
+    if p.is_empty() {
+        return Ok(None);
+    }
+    let p = match p.split_once("://") {
+        Some((scheme, rest)) if scheme.eq_ignore_ascii_case("socks5h") || scheme.eq_ignore_ascii_case("socks5") => rest,
+        Some((scheme, _)) => bail!("unsupported proxy scheme {scheme}://: only socks5h:// is supported"),
+        None => p,
+    };
+    let p = p.trim_end_matches('/');
+    let (host, port) = p.rsplit_once(':').ok_or_else(|| anyhow!("the proxy address must be host:port"))?;
+    let port: u16 = port.parse().map_err(|_| anyhow!("bad proxy port"))?;
+    if port == 0 {
+        bail!("bad proxy port");
+    }
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    let host = match host.parse::<std::net::IpAddr>() {
+        Ok(ip) if ip.is_unspecified() => (if ip.is_ipv4() { "127.0.0.1" } else { "::1" }).to_string(),
+        _ if host.is_empty() => "127.0.0.1".to_string(),
+        _ => host.to_string(),
+    };
+    Ok(Some((host, port)))
+}
+
+/// The proxy for the app's own requests (subscription refresh, update check and download):
+/// the core's local SOCKS5 proxy, but only when the person wants requests through the tunnel
+/// (`via_tunnel`) and the tunnel is running. Otherwise `None`, a direct request, as before.
+/// `bind` is `local_proxy.bind_addr` (default `127.0.0.1:1088`).
+pub fn app_proxy(via_tunnel: bool, tunnel_running: bool, bind: Option<&str>) -> Option<String> {
+    if !(via_tunnel && tunnel_running) {
+        return None;
+    }
+    let bind = bind.map(str::trim).filter(|b| !b.is_empty()).unwrap_or("127.0.0.1:1088");
+    Some(format!("socks5h://{bind}"))
+}
+
+/// The SOCKS5 CONNECT request (no authentication). A name is sent as text so the
+/// proxy resolves it: what `socks5h` means.
+fn socks5_connect_request(host: &str, port: u16) -> Result<Vec<u8>> {
+    let mut req = vec![5, 1, 0];
+    match host.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(ip)) => {
+            req.push(1);
+            req.extend_from_slice(&ip.octets());
+        }
+        Ok(std::net::IpAddr::V6(ip)) => {
+            req.push(4);
+            req.extend_from_slice(&ip.octets());
+        }
+        Err(_) => {
+            if host.is_empty() || host.len() > 255 {
+                bail!("bad host name");
+            }
+            req.push(3);
+            req.push(host.len() as u8);
+            req.extend_from_slice(host.as_bytes());
+        }
+    }
+    req.extend_from_slice(&port.to_be_bytes());
+    Ok(req)
+}
+
+/// TCP to `host:port`: direct, or through the SOCKS5 proxy at `proxy`. A proxy
+/// that refuses or cannot be reached is an error, never a reason to go direct.
+pub(crate) async fn connect_tcp(host: &str, port: u16, proxy: Option<&str>) -> Result<tokio::net::TcpStream> {
+    let Some((ph, pp)) = proxy.map(proxy_endpoint).transpose()?.flatten() else {
+        return tokio::net::TcpStream::connect((host, port))
+            .await
+            .with_context(|| format!("cannot connect to {host}:{port}"));
+    };
+    let mut s = tokio::net::TcpStream::connect((ph.as_str(), pp))
         .await
-        .with_context(|| format!("cannot connect to {}:{}", u.host, u.port))?;
+        .with_context(|| format!("cannot reach the local proxy at {ph}:{pp} (is the tunnel up?)"))?;
+    s.write_all(&[5, 1, 0]).await?;
+    let mut greet = [0u8; 2];
+    s.read_exact(&mut greet).await.context("the local proxy closed the connection")?;
+    if greet != [5, 0] {
+        bail!("the local proxy at {ph}:{pp} did not accept an unauthenticated SOCKS5 connection");
+    }
+    s.write_all(&socks5_connect_request(host, port)?).await?;
+    let mut head = [0u8; 4];
+    s.read_exact(&mut head).await.context("the local proxy closed the connection")?;
+    if head[0] != 5 {
+        bail!("{ph}:{pp} is not a SOCKS5 proxy");
+    }
+    if head[1] != 0 {
+        let why = match head[1] {
+            2 => "not allowed",
+            3 => "network unreachable",
+            4 => "host unreachable",
+            5 => "connection refused",
+            6 => "TTL expired",
+            _ => "failed",
+        };
+        bail!("the tunnel could not reach {host}:{port} ({why}); nothing was sent outside the tunnel");
+    }
+    let rest = match head[3] {
+        1 => 4 + 2,
+        4 => 16 + 2,
+        3 => {
+            let mut l = [0u8; 1];
+            s.read_exact(&mut l).await?;
+            l[0] as usize + 2
+        }
+        _ => bail!("bad answer from the local proxy"),
+    };
+    let mut skip = vec![0u8; rest];
+    s.read_exact(&mut skip).await?;
+    Ok(s)
+}
+
+async fn get_raw(u: &Url, accept: &str, device: Option<&Device>, proxy: Option<&str>) -> Result<Vec<u8>> {
+    let tcp = connect_tcp(&u.host, u.port, proxy).await?;
     let _ = tcp.set_nodelay(true);
     let opts = TlsClientOptions { sni: u.host.clone(), insecure: false };
     let mut s = wrap_tls(tcp, &opts, TIMEOUT).await?;
@@ -378,6 +500,93 @@ mod tests {
 
     fn url() -> Url {
         parse_url("https://vpn.example.com/sub/tok").unwrap()
+    }
+
+    #[test]
+    fn proxy_strings_become_a_loopback_endpoint() {
+        let ep = |s: &str| proxy_endpoint(s).unwrap();
+        assert_eq!(ep("socks5h://127.0.0.1:1088"), Some(("127.0.0.1".into(), 1088)));
+        assert_eq!(ep("127.0.0.1:1088"), Some(("127.0.0.1".into(), 1088)));
+        // A wildcard bind is reached on loopback.
+        assert_eq!(ep("0.0.0.0:9050"), Some(("127.0.0.1".into(), 9050)));
+        assert_eq!(ep("[::]:9050"), Some(("::1".into(), 9050)));
+        assert_eq!(ep("localhost:1"), Some(("localhost".into(), 1)));
+        assert_eq!(ep("  "), None);
+        assert!(proxy_endpoint("http://127.0.0.1:8080").is_err());
+        assert!(proxy_endpoint("127.0.0.1").is_err());
+        assert!(proxy_endpoint("127.0.0.1:0").is_err());
+    }
+
+    #[test]
+    fn the_app_uses_the_proxy_only_when_asked_and_the_tunnel_is_up() {
+        assert_eq!(app_proxy(true, true, None).as_deref(), Some("socks5h://127.0.0.1:1088"));
+        assert_eq!(app_proxy(true, true, Some("127.0.0.1:9050")).as_deref(), Some("socks5h://127.0.0.1:9050"));
+        assert_eq!(app_proxy(true, true, Some(" ")).as_deref(), Some("socks5h://127.0.0.1:1088"));
+        assert_eq!(app_proxy(false, true, None), None, "setting off: direct");
+        assert_eq!(app_proxy(true, false, None), None, "tunnel down: direct");
+        // What it returns is what the connector understands, wildcard binds included.
+        let p = app_proxy(true, true, Some("0.0.0.0:1088")).unwrap();
+        assert_eq!(proxy_endpoint(&p).unwrap(), Some(("127.0.0.1".into(), 1088)));
+    }
+
+    #[test]
+    fn socks5_request_sends_the_name_not_an_address() {
+        let r = socks5_connect_request("api.github.com", 443).unwrap();
+        assert_eq!(&r[..4], &[5, 1, 0, 3]);
+        assert_eq!(r[4] as usize, "api.github.com".len());
+        assert_eq!(&r[5..5 + 14], b"api.github.com");
+        assert_eq!(&r[19..], &443u16.to_be_bytes());
+        assert_eq!(socks5_connect_request("1.2.3.4", 80).unwrap(), vec![5, 1, 0, 1, 1, 2, 3, 4, 0, 80]);
+        assert_eq!(socks5_connect_request("::1", 80).unwrap()[3], 4);
+    }
+
+    /// A one-shot SOCKS5 proxy: returns the address it listens on and the
+    /// (host, port) it was asked for; `reply` is the SOCKS reply code.
+    async fn fake_proxy(reply: u8) -> (String, tokio::task::JoinHandle<(String, u16)>) {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap().to_string();
+        let h = tokio::spawn(async move {
+            let (mut c, _) = l.accept().await.unwrap();
+            let mut g = [0u8; 3];
+            c.read_exact(&mut g).await.unwrap();
+            assert_eq!(g, [5, 1, 0]);
+            c.write_all(&[5, 0]).await.unwrap();
+            let mut h = [0u8; 5];
+            c.read_exact(&mut h).await.unwrap();
+            assert_eq!(&h[..4], &[5, 1, 0, 3]);
+            let mut name = vec![0u8; h[4] as usize + 2];
+            c.read_exact(&mut name).await.unwrap();
+            let port = u16::from_be_bytes([name[name.len() - 2], name[name.len() - 1]]);
+            let host = String::from_utf8(name[..name.len() - 2].to_vec()).unwrap();
+            c.write_all(&[5, reply, 0, 1, 0, 0, 0, 0, 0, 0]).await.unwrap();
+            (host, port)
+        });
+        (addr, h)
+    }
+
+    #[tokio::test]
+    async fn connects_through_the_proxy_with_the_name() {
+        let (addr, asked) = fake_proxy(0).await;
+        let s = connect_tcp("vpn.example.com", 443, Some(&format!("socks5h://{addr}"))).await;
+        assert!(s.is_ok(), "{:?}", s.err());
+        assert_eq!(asked.await.unwrap(), ("vpn.example.com".to_string(), 443));
+    }
+
+    #[tokio::test]
+    async fn a_refusal_from_the_tunnel_is_an_error_not_a_direct_retry() {
+        let (addr, _asked) = fake_proxy(4).await;
+        let e = connect_tcp("vpn.example.com", 443, Some(&addr)).await.unwrap_err();
+        assert!(e.to_string().contains("nothing was sent outside the tunnel"), "{e}");
+    }
+
+    #[tokio::test]
+    async fn a_dead_proxy_is_an_error_not_a_direct_retry() {
+        // Bind and drop: nothing listens on this port any more.
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap().to_string();
+        drop(l);
+        let e = connect_tcp("vpn.example.com", 443, Some(&addr)).await.unwrap_err();
+        assert!(e.to_string().contains("local proxy"), "{e}");
     }
 
     #[test]
