@@ -7,6 +7,23 @@ pub mod windows_route {
     include!("windows_route.rs");
 }
 
+pub mod windows_guard {
+    include!("windows_guard.rs");
+}
+
+fn netsh(args: &[String]) -> bool {
+    const CREATE_NO_WINDOW: u32 = 0x08000000;
+    Command::new("netsh").creation_flags(CREATE_NO_WINDOW).args(args).output().is_ok_and(|o| o.status.success())
+}
+
+/// Deletes every DNS/IPv6 guard rule (a missing one is not an error). Run before the
+/// rules are added, so a crash's leftovers go, and when the tunnel goes down.
+fn remove_guard_rules() {
+    for name in windows_guard::GUARD_RULE_NAMES {
+        netsh(&windows_guard::delete_rule_args(name));
+    }
+}
+
 /// The bypass routes in place, so a network change can move them.
 struct BypassRoutes {
     nets: Vec<(std::net::Ipv4Addr, u8)>,
@@ -68,9 +85,14 @@ impl Drop for WindowsRouteGuard {
                 .args(["advfirewall", "firewall", "delete", "rule", &format!("name={rule}")])
                 .output();
         }
+        remove_guard_rules();
         let _ = Command::new("netsh")
             .creation_flags(CREATE_NO_WINDOW)
             .args(["interface", "ipv4", "set", "dnsservers", "name=ostp_tun", "source=dhcp"])
+            .output();
+        let _ = Command::new("netsh")
+            .creation_flags(CREATE_NO_WINDOW)
+            .args(["interface", "ipv6", "set", "dnsservers", "name=ostp_tun", "source=dhcp"])
             .output();
     }
 }
@@ -112,6 +134,9 @@ async fn set_tun_mtu(idx: u32, mtu: u16) {
 
 pub async fn create(opts: OstpTunOptions) -> Result<OstpTunInterface> {
     const CREATE_NO_WINDOW: u32 = 0x08000000;
+
+    // Leftovers of a crashed session would block DNS for everything that follows.
+    remove_guard_rules();
 
     let (phys_gw, phys_if) = windows_route::sys::get_default_ipv4_route()
         .ok_or_else(|| anyhow!("Cannot find physical default IPv4 route"))?;
@@ -218,6 +243,7 @@ pub async fn create(opts: OstpTunOptions) -> Result<OstpTunInterface> {
     // `store=active`: they go away with the adapter even if the guard never runs.
     let ipv6_if = Some(idx).filter(|_| crate::capture_ipv6(opts.server_ip));
     guard.ipv6_if = ipv6_if;
+    let mut ipv6_captured = false;
     if let Some(idx) = ipv6_if {
         let ok = tokio::task::spawn_blocking(move || {
             let run = |args: &[&str]| {
@@ -232,8 +258,9 @@ pub async fn create(opts: OstpTunOptions) -> Result<OstpTunInterface> {
         .unwrap_or(false);
         if ok {
             tracing::info!("IPv6 routed through the tunnel (if_index={idx}).");
+            ipv6_captured = true;
         } else {
-            tracing::error!("Could not route IPv6 through the tunnel: IPv6 connections may bypass the VPN.");
+            tracing::error!("Could not route IPv6 through the tunnel: IPv6 is blocked outside it instead.");
         }
     }
 
@@ -267,17 +294,62 @@ pub async fn create(opts: OstpTunOptions) -> Result<OstpTunInterface> {
             .output();
     });
 
-    if let Some(ref dns) = opts.dns_server {
-        if !dns.is_empty() {
-            let dns_clone = dns.clone();
-            let _ = tokio::task::spawn_blocking(move || {
-                let _ = Command::new("netsh")
-                    .creation_flags(CREATE_NO_WINDOW)
-                    .args(["interface", "ipv4", "set", "dnsservers",
-                           "name=ostp_tun", "static", &dns_clone, "primary"])
-                    .output();
-            });
+    // DNS: the adapter always has a resolver (the configured one, else 1.1.1.1) and the
+    // lowest metric, so Windows prefers it; the firewall rules then block DNS to every
+    // other address, since Windows also asks the resolvers of the other adapters.
+    // The server's host name is resolved before this point; a later lookup of it (a
+    // reconnect) goes through the tunnel's resolver.
+    let configured: Option<std::net::IpAddr> = opts
+        .dns_server
+        .as_deref()
+        .map(str::trim)
+        .filter(|d| !d.is_empty())
+        .and_then(|d| d.parse().ok());
+    if opts.dns_server.as_deref().is_some_and(|d| !d.trim().is_empty()) && configured.is_none() {
+        tracing::warn!("tun.dns is not an IP address; using {}", windows_guard::DEFAULT_TUN_DNS);
+    }
+    let dns_v4 = match configured {
+        Some(std::net::IpAddr::V4(a)) => a,
+        _ => windows_guard::DEFAULT_TUN_DNS,
+    };
+    let dns_v6 = match configured {
+        Some(std::net::IpAddr::V6(a)) if ipv6_captured => Some(a),
+        _ => None,
+    };
+    let server_ip = opts.server_ip;
+    let (dns4, metric4, blocked, total) = tokio::task::spawn_blocking(move || {
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        let dns4 = netsh(&s(&["interface", "ipv4", "set", "dnsservers", "name=ostp_tun", "static", &dns_v4.to_string(), "primary", "validate=no"]));
+        let metric4 = netsh(&s(&["interface", "ipv4", "set", "interface", "name=ostp_tun", "metric=1"]));
+        if ipv6_captured {
+            if let Some(d6) = dns_v6 {
+                netsh(&s(&["interface", "ipv6", "set", "dnsservers", "name=ostp_tun", "static", &d6.to_string(), "primary", "validate=no"]));
+            }
+            netsh(&s(&["interface", "ipv6", "set", "interface", "name=ostp_tun", "metric=1"]));
         }
+        let mut rules = windows_guard::dns_guard_rules(Some(dns_v4), dns_v6, server_ip, ipv6_captured);
+        if !ipv6_captured {
+            rules.push(windows_guard::ipv6_block_rule(server_ip));
+        }
+        let total = rules.len();
+        let blocked = rules.iter().filter(|r| netsh(&r.args)).count();
+        (dns4, metric4, blocked, total)
+    })
+    .await
+    .unwrap_or((false, false, 0, 1));
+    if !dns4 {
+        tracing::error!("Could not set the resolver {dns_v4} on ostp_tun.");
+    }
+    if !metric4 {
+        tracing::warn!("Could not lower the metric of ostp_tun; Windows may prefer other adapters' resolvers.");
+    }
+    if blocked == total {
+        tracing::info!(
+            "DNS outside the tunnel is blocked (resolver {dns_v4}){}.",
+            if ipv6_captured { "" } else { "; IPv6 outside the tunnel is blocked too (it is not carried)" }
+        );
+    } else {
+        tracing::error!("Only {blocked} of {total} firewall rules against DNS/IPv6 leaks were added: queries may leave outside the tunnel.");
     }
 
     if opts.kill_switch {
